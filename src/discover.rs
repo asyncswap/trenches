@@ -185,6 +185,15 @@ async fn scan_candidates<P: Provider>(provider: &P, from: u64, to: u64) -> Vec<(
             Ok(Err(e)) => {
                 failed += 1;
                 crate::trace(&format!("launch scan {start}..{end} failed: {e}"));
+                // Rate limits are the failure people actually hit, and they are
+                // the reason the screen looks empty. Say so where it is read.
+                let msg = e.to_string();
+                let rate_limited = msg.contains("429") || msg.to_lowercase().contains("rate limit");
+                crate::events::log(
+                    if rate_limited { crate::events::Level::Warn } else { crate::events::Level::Error },
+                    if rate_limited { "Discovery rate limited by the RPC" } else { "Discovery scan failed" },
+                    &[("blocks", format!("{start}..{end}")), ("reason", msg.chars().take(120).collect())],
+                );
             }
             Err(_) => {
                 failed += 1;
@@ -676,6 +685,66 @@ fn merge_publish(shared: &Arc<Mutex<Vec<Row>>>, fresh: &[Row], big: &[Row]) {
     *shared.lock().unwrap() = merged;
 }
 
+/// Tokens discovery has seen before, newest first.
+///
+/// The launch window is ten minutes wide, so without this the screen could only
+/// ever show what graduated since you opened it — a coin found twenty minutes
+/// ago fell off and was gone, including one you had just been looking at. The
+/// window still decides what is NEW; this decides what is remembered.
+const RECENTS_MAX: usize = 150;
+
+fn recents_path() -> String {
+    // Pons is Robinhood Chain's launchpad and this scan only runs there, so one
+    // file needs no chain key.
+    format!("{}/discovered-pons.json", crate::state_dir())
+}
+
+fn load_recents() -> Vec<(Address, Address, u64)> {
+    let Ok(text) = std::fs::read_to_string(recents_path()) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        crate::trace("recents: cache is not readable JSON, starting empty");
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for it in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let get = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("").parse::<Address>();
+        if let (Ok(token), Ok(pool)) = (get("token"), get("pool")) {
+            out.push((token, pool, it.get("block").and_then(|b| b.as_u64()).unwrap_or(0)));
+        }
+    }
+    crate::trace(&format!("recents: loaded {} remembered tokens", out.len()));
+    out
+}
+
+fn save_recents(rows: &[(Address, Address, u64)]) {
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(t, p, b)| {
+            serde_json::json!({ "token": format!("{t:#x}"), "pool": format!("{p:#x}"), "block": b })
+        })
+        .collect();
+    let Ok(text) = serde_json::to_string_pretty(&arr) else { return };
+    // Written to a temporary name and renamed, so an interrupted write cannot
+    // leave a half-file that fails to parse on the next open.
+    let path = recents_path();
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Remember a token that was picked, so it is on the list next time even if it
+/// was never a fresh graduation — a top-tokens choice, or one added by address.
+pub fn remember(token: Address, pool: Address, block: u64) {
+    let mut rows = load_recents();
+    rows.retain(|(t, _, _)| *t != token);
+    rows.insert(0, (token, pool, block));
+    rows.truncate(RECENTS_MAX);
+    save_recents(&rows);
+}
+
 /// Background loop: rescan launches, fetch each pool concurrently, and publish
 /// rows into `shared` AS EACH RESOLVES so the UI fills in live. Ends when `stop`.
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
@@ -696,7 +765,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // How far the launch log has been read. Everything below hangs off this:
     // the window is scanned once, and after that only the blocks that are new.
     let mut scanned_to: Option<u64> = None;
-    let mut known: Vec<(Address, Address, u64)> = Vec::new();
+    // Seeded from disk, so the screen has something to show the instant it
+    // opens rather than an empty table waiting on a scan.
+    let mut known: Vec<(Address, Address, u64)> = load_recents();
 
     while !stop.load(Ordering::Relaxed) {
         // A head read that did not answer is not block zero. It used to fall
@@ -708,6 +779,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             Ok(Ok(h)) if h > 0 => h,
             _ => {
                 crate::trace("discovery: no head block, skipping this round");
+                crate::events::warn("No head block from the RPC, skipping a discovery round", &[]);
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 continue;
             }
@@ -734,12 +806,26 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
         }
         scanned_to = Some(head);
-        // Age out anything that has fallen off the back of the window, so the
-        // list tracks the window instead of growing without bound.
-        known.retain(|(_, _, b)| b + LAUNCH_WINDOW >= head);
+        // Newest first, and bounded — but NOT aged out by the launch window.
+        // Falling off the window means "no longer a new graduation", not "no
+        // longer worth showing"; dropping it was what made a coin you were
+        // looking at vanish while you looked at it.
+        known.sort_by(|a, b| b.2.cmp(&a.2));
+        known.truncate(RECENTS_MAX);
+        save_recents(&known);
         let cands = known.clone();
 
-        let mut acc: Vec<Row> = Vec::new();
+        // Rows survive between rounds, keyed by token, and keep their place.
+        //
+        // Every arriving row used to re-sort and republish the entire list, so
+        // the table reshuffled under the cursor as results trickled in — and
+        // each round started from an empty accumulator, so everything already
+        // on screen was thrown away and rebuilt. What you had selected moved,
+        // or briefly stopped existing.
+        //
+        // Now a resolved row replaces its previous self in place, and the
+        // ranking is applied once the round is done rather than on every
+        // arrival.
         let mut stream = futures::stream::iter(cands)
             .map(|(t, p, b)| full_row(&provider, &logs, t, p, b, trader, head))
             .buffer_unordered(CONCURRENCY);
@@ -747,10 +833,16 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            acc.push(row);
-            let mut sorted = acc.clone();
-            sort_rows(&mut sorted);
-            *shared.lock().unwrap() = sorted; // publish incrementally
+            let mut cur = shared.lock().unwrap();
+            match cur.iter_mut().find(|r| r.grad.token == row.grad.token) {
+                Some(slot) => *slot = row, // refresh, same position
+                None => cur.push(row),     // genuinely new, at the end
+            }
+        }
+        // One re-rank per round. The order is then stable until the next one.
+        {
+            let mut cur = shared.lock().unwrap();
+            sort_rows(&mut cur);
         }
         tokio::time::sleep(Duration::from_millis(1200)).await;
     }

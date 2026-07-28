@@ -8,6 +8,7 @@ mod config;
 mod contracts;
 mod discover;
 mod engine;
+mod events;
 mod ledger;
 mod pnl;
 mod pricing;
@@ -198,12 +199,27 @@ pub fn trace(msg: &str) {
     // lines, so `l` shows it. Discovery and pool resolution only ever wrote to
     // the trace file, so the one screen someone opens when something looks
     // broken was the one place their failures did not appear.
+    //
+    // But only what a person would want to read. The trace file records every
+    // poll — `market:` alone lands about ten times a second — and putting that
+    // on screen buried the handful of lines that meant something under
+    // thousands of identical ones. The file still gets everything; the screen
+    // gets events.
+    const POLLING: [&str; 5] = ["market:", "pool ", "tape:", "ui:", "rpc:"];
+    if POLLING.iter().any(|p| msg.starts_with(p)) {
+        return;
+    }
     if let Ok(mut ring) = diagnostics().lock() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let (h, m, sec) = ((now % 86400) / 3600, (now % 3600) / 60, now % 60);
+        // A repeat says nothing the previous line did not. A scan that fails
+        // the same way every round should read as one fact, not a wall.
+        if ring.back().is_some_and(|l| l.get(11..) == Some(msg)) {
+            return;
+        }
         ring.push_back(format!("[{h:02}:{m:02}:{sec:02}] {msg}"));
         while ring.len() > 500 {
             ring.pop_front();
@@ -615,6 +631,13 @@ async fn main() -> eyre::Result<()> {
     // the top, so it has answered by the time anything is drawn — and detached,
     // so a slow or absent network delays nothing. It only ever reports.
     update::spawn_check();
+    events::info(
+        "Trenches started",
+        &[
+            ("version", env!("CARGO_PKG_VERSION").to_string()),
+            ("commit", env!("TRENCHES_COMMIT").to_string()),
+        ],
+    );
 
     // Loads what is there, or writes a starter file and says so. A first run
     // used to end on a file-not-found for a path the user had never heard of.
@@ -955,6 +978,7 @@ async fn app(
             let exit = match resume.take() {
                 Some(i) => {
                     save_last_chain(&reg.networks[i].name);
+                    events::action("Resumed last chain", &[("chain", reg.networks[i].name.clone())]);
                     chain_session_on(terminal, reg, &reg.networks[i], i, false).await?
                 }
                 None => chain_session(terminal, reg, None).await?,
@@ -1046,6 +1070,7 @@ async fn chain_session(
             // Remembered only once it is actually chosen, so a chain you looked
             // at and backed out of is not where you land next time.
             save_last_chain(&reg.networks[i].name);
+            events::action("Selected chain", &[("chain", reg.networks[i].name.clone())]);
             (i, &reg.networks[i])
         }
         // Esc on the first screen means back, not quit. `q` is how you leave,
@@ -1603,16 +1628,28 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             }
                         }
                         KeyCode::Char('Q') => return Ok(Exit::Quit),
-                        KeyCode::Char('D') => ui::docs(terminal)?,
+                        KeyCode::Char('D') => {
+                            events::action("Opened docs", &[]);
+                            ui::docs(terminal)?
+                        }
                         // Back to the account list on this same chain.
-                        KeyCode::Char('W') => return Ok(Exit::ChangeAccount),
+                        KeyCode::Char('W') => {
+                            events::action("Changing account", &[("from", events::short(&format!("{:#x}", bot.trader)))]);
+                            return Ok(Exit::ChangeAccount);
+                        }
                         // Back to the chain picker without restarting.
-                        KeyCode::Char('C') => return Ok(Exit::ChangeChain),
+                        KeyCode::Char('C') => {
+                            events::action("Changing chain", &[("from", bot.net.clone())]);
+                            return Ok(Exit::ChangeChain);
+                        }
                         KeyCode::Char('?') => { show_help = true; }
                         // Theme picker with live preview (persists the choice).
                         KeyCode::Char('T') => {
                             match ui::widgets::theme_picker(terminal)? {
-                                Some(name) => bot.status = format!("Changed theme to {name}"),
+                                Some(name) => {
+                                    events::action("Changed theme", &[("theme", name.clone())]);
+                                    bot.status = format!("Changed theme to {name}");
+                                }
                                 None => bot.status = "theme unchanged".into(),
                             }
                         }
@@ -1703,6 +1740,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // done with, and a half-cleared screen is worse than none:
                         // it still trades.
                         KeyCode::Delete => {
+                            events::action("Cleared the selected pool", &[
+                                ("was", bot.pool.sym.clone()),
+                                ("token", events::short(&format!("{:#x}", bot.pool.token))),
+                            ]);
                             let blank = blank_pool(&bot.net.clone());
                             bot.pool = to_poolcfg(&blank);
                             bot.routes.clear();
@@ -2632,15 +2673,31 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // what the machinery reported (scans, RPC failures). Both carry an
         // [HH:MM:SS] stamp, so a stable sort on the first ten characters puts
         // them back in the order they actually happened.
-        let mut all: Vec<String> = bot.logs.iter().cloned().collect();
-        if let Ok(ring) = diagnostics().lock() {
-            all.extend(ring.iter().cloned());
-        }
+        // Events only. Every line here is one thing that happened — an action,
+        // an order, a fill, a failure — with the details that make it
+        // actionable. The poll stream (`market:` ten times a second, TELEMETRY
+        // every two) still goes to the trace and session files in full, but it
+        // has no business on the screen someone opens to find out what went
+        // wrong: it buried every informative line under thousands that were not.
+        let is_noise = |l: &str| {
+            let body = l.get(11..).unwrap_or(l); // past the [HH:MM:SS] stamp
+            body.starts_with("TELEMETRY") || body.starts_with("market:") || body.starts_with("pool ")
+        };
+        let mut all: Vec<String> = bot.logs.iter().filter(|l| !is_noise(l)).cloned().collect();
+        all.extend(events::recent());
         all.sort_by(|a, b| a.chars().take(10).cmp(b.chars().take(10)));
         let scroll = orders_scroll.min(all.len().saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
         for l in all.iter().rev().skip(scroll).take(h.max(1)).rev() {
-            let color = if l.contains("REVERT") || l.contains("FAIL") || l.contains("failed") || l.contains("error") {
+            let color = if let Some(lvl) = events::Level::of(l) {
+                ui::widgets::tone_color(match lvl {
+                    events::Level::Error => view::Tone::Bad,
+                    events::Level::Warn => view::Tone::Warn,
+                    events::Level::Trade => view::Tone::Good,
+                    events::Level::Action => view::Tone::Info,
+                    events::Level::Info => view::Tone::Normal,
+                })
+            } else if l.contains("REVERT") || l.contains("FAIL") || l.contains("failed") || l.contains("error") {
                 ui::widgets::tone_color(view::Tone::Bad)
             } else if l.contains("SKIP") || l.contains("skipped") || l.contains("WARN") || l.contains("would revert") {
                 ui::widgets::tone_color(view::Tone::Warn)
