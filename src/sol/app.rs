@@ -385,6 +385,9 @@ pub struct SolBot {
     // Cost basis / PnL, same model as the EVM engine.
     pub bought_qty: f64,
     pub bought_cost: f64,
+    /// Unix seconds of the buy that opened the current position — the clock the
+    /// hold time is measured from. Cleared on the sell that closes it.
+    pub entry_at: Option<u64>,
     pub realized_pnl: f64,
     pub last_fill_pnl: Option<f64>,
     pub trades: u32,
@@ -427,6 +430,7 @@ impl SolBot {
             priority_level: PriorityLevel::High,
             bought_qty: 0.0,
             bought_cost: 0.0,
+            entry_at: None,
             realized_pnl: 0.0,
             last_fill_pnl: None,
             trades: 0,
@@ -676,6 +680,10 @@ impl SolBot {
             if action == "BUY" {
                 self.bought_cost += sol;
                 self.bought_qty = self.token_bal.max(self.bought_qty);
+                // Adding to a position does not restart its clock.
+                if self.entry_at.is_none() {
+                    self.entry_at = Some(crate::ledger::now());
+                }
                 self.note(format!("Buy for {sol:.6} SOL confirmed, signature {short}"));
             } else {
                 let pnl = sol - self.bought_cost;
@@ -699,10 +707,12 @@ impl SolBot {
                         quote_sym: "SOL".into(),
                         quote_usd: self.sol_usd,
                         tx: sig.clone(),
+                        held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
                     },
                 );
                 self.bought_cost = 0.0;
                 self.bought_qty = 0.0;
+                self.entry_at = None;
                 self.note(format!("Sell for {sol:.6} SOL confirmed with profit {pnl:+.6}, signature {short}"));
             }
         }
@@ -805,7 +815,14 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
 fn market_panel(bot: &SolBot) -> PanelView {
     let mut p = PanelView::new(" Pool [p] ");
     match &bot.coin {
-        None => p.line_toned("no coin selected — press f", Tone::Dim),
+        None => {
+            p.line("");
+            p.line_toned("  No coin selected", Tone::Normal);
+            p.line("");
+            p.line_toned("  [f] find coins in the trenches", Tone::Info);
+            p.line_toned("  [t] top coins", Tone::Info);
+            p.line_toned("  [p] add a coin by mint address", Tone::Info);
+        }
         Some(c) => {
             p.spans(vec![
                 lbl("Venue"),
@@ -903,7 +920,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     } else {
         // The trader is the same wallet on every row, so it belongs in the
         // title once rather than eating 44 columns per line.
-        format!(" Orders ({total})  ·  {}  [l] ", bot.trader())
+        format!(" Orders ({total})  [l] ")
     };
     let mut t = TableView::new(
         title,

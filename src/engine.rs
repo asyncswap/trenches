@@ -207,6 +207,10 @@ pub struct Bot {
     pub entry_mc: f64,              // mkt cap (ETH) captured at the last buy — for the trade log
     pub entry_pooled_eth: f64,      // pooled ETH captured at the last buy
     pub entry_tx: Option<TxHash>,   // the last buy's tx hash (cross-checkable entry record)
+    /// Unix seconds of the buy that opened the current position. Cleared when
+    /// the position is closed, so the next buy starts a fresh clock rather than
+    /// measuring from a coin sold days ago.
+    pub entry_at: Option<u64>,
     pub trades: u64,
     pub fails: u64,
     pub skips: u64,
@@ -342,7 +346,7 @@ impl Bot {
     }
 
     fn daily_path(&self) -> String {
-        format!("{}/daily-{}.json", crate::STATE_DIR, self.account)
+        format!("{}/daily-{}.json", crate::state_dir(), self.account)
     }
 
     /// On the first good balance read (and on a day rollover), set/roll the
@@ -505,6 +509,11 @@ impl Bot {
                 self.entry_mc = if self.price() > 0.0 { self.token_supply / self.price() } else { 0.0 };
                 self.entry_pooled_eth = self.r0;
                 self.entry_tx = Some(hash);
+                // Only the FIRST buy of a position starts the clock. Adding to a
+                // winner should not reset how long you have been in it.
+                if self.entry_at.is_none() {
+                    self.entry_at = Some(crate::ledger::now());
+                }
             }
             Side::Sell => {
                 let from_basis = tok.min(self.bought_qty);
@@ -540,10 +549,16 @@ impl Bot {
                         quote_sym: self.pool.quote_sym.clone(),
                         quote_usd: self.pool.quote_usd,
                         tx: format!("{hash:#x}"),
+                        held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
                     },
                 );
                 self.bought_cost = (self.bought_cost - cost).max(0.0);
                 self.bought_qty = (self.bought_qty - from_basis).max(0.0);
+                // Position closed: the next buy opens a new one, and its hold
+                // time starts then rather than continuing this one's.
+                if self.bought_qty <= 1e-12 {
+                    self.entry_at = None;
+                }
             }
         }
     }

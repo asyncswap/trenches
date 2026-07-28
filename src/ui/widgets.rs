@@ -404,7 +404,7 @@ pub fn set_theme(name: &str, persist: bool) -> bool {
         *p = next;
     }
     if persist {
-        let _ = std::fs::create_dir_all(crate::STATE_DIR);
+        let _ = std::fs::create_dir_all(crate::state_dir());
         let _ = std::fs::write(THEME_PATH, name);
     }
     true

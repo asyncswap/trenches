@@ -124,7 +124,7 @@ fn price_ids(pools: &[SelPool]) -> Vec<&'static str> {
 /// Remember the last pool used, per chain, so the next session starts on it.
 /// The wallet unlocked last, so it can be offered first next time.
 fn last_wallet_path() -> String {
-    format!("{STATE_DIR}/last-wallet.txt")
+    format!("{}/last-wallet.txt", state_dir())
 }
 
 fn load_last_wallet() -> Option<String> {
@@ -135,7 +135,7 @@ fn load_last_wallet() -> Option<String> {
 }
 
 fn save_last_wallet(name: &str) {
-    let _ = std::fs::create_dir_all(STATE_DIR);
+    let _ = std::fs::create_dir_all(state_dir());
     let _ = std::fs::write(last_wallet_path(), name);
 }
 
@@ -144,7 +144,7 @@ fn save_last_wallet(name: &str) {
 /// Stored by NAME rather than by index: the config is a file people edit, and an
 /// index would silently point at a different chain the moment a line moved.
 fn last_chain_path() -> String {
-    format!("{STATE_DIR}/last-chain.txt")
+    format!("{}/last-chain.txt", state_dir())
 }
 
 fn load_last_chain() -> Option<String> {
@@ -155,7 +155,7 @@ fn load_last_chain() -> Option<String> {
 }
 
 fn save_last_chain(name: &str) {
-    let _ = std::fs::create_dir_all(STATE_DIR);
+    let _ = std::fs::create_dir_all(state_dir());
     let _ = std::fs::write(last_chain_path(), name);
 }
 
@@ -172,7 +172,7 @@ pub fn trace(msg: &str) {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
     let f = FILE.get_or_init(|| {
-        std::fs::create_dir_all(STATE_DIR).ok()?;
+        std::fs::create_dir_all(state_dir()).ok()?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -180,7 +180,7 @@ pub fn trace(msg: &str) {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{STATE_DIR}/evm-trace-{ts}.log"))
+            .open(format!("{}/evm-trace-{ts}.log", state_dir()))
             .ok()
             .map(Mutex::new)
     });
@@ -209,7 +209,30 @@ pub fn trace_pool(where_: &str, p: &engine::PoolCfg) {
 /// Directory for everything this bot writes: session logs, the daily PnL file,
 /// the saved theme, the last pool. One constant so a rename cannot leave half
 /// the app writing to the old place.
-pub const STATE_DIR: &str = ".trenches";
+/// Everything this bot writes: session logs, traces, the theme, cached tokens,
+/// the fill ledger, the daily PnL baseline.
+///
+/// Resolved once, and ABSOLUTE. It used to be the literal `".trenches"`, which
+/// is relative to whatever directory the shell happened to be in — so a binary
+/// on your PATH scattered a fresh, empty state directory everywhere it was run
+/// from, and a PnL calendar opened from the wrong folder found no trades because
+/// they were written somewhere else. Every doc already said `~/.trenches`.
+///
+/// A `./.trenches` that already exists still wins, so a checkout that has been
+/// accumulating logs keeps them.
+pub fn state_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let local = std::path::Path::new(".trenches");
+        if local.is_dir() {
+            return ".trenches".to_string();
+        }
+        match config::home_dir() {
+            Some(h) => h.join(".trenches").to_string_lossy().into_owned(),
+            None => ".trenches".to_string(),
+        }
+    })
+}
 
 /// Read an ERC-20 symbol on-chain (fallback "TOK").
 async fn read_symbol<P: Provider>(provider: &P, token: alloy::primitives::Address) -> String {
@@ -414,7 +437,7 @@ fn compute_pool_id(token: alloy::primitives::Address, fee: u32, tick_spacing: i3
 /// app found out. Keeping them together meant a file you were told to edit grew
 /// hundreds of entries you never wrote, and burying an RPC URL among them.
 fn token_cache_path(chain_id: u64) -> String {
-    format!("{STATE_DIR}/tokens-{chain_id}.json")
+    format!("{}/tokens-{chain_id}.json", state_dir())
 }
 
 /// Read a chain's cached tokens. A missing or unreadable cache is empty, never
@@ -503,6 +526,30 @@ async fn main() -> eyre::Result<()> {
                 println!("trenches {} ({})", env!("CARGO_PKG_VERSION"), env!("TRENCHES_COMMIT"));
                 return Ok(());
             }
+            // Create the config and state directories, then stop. The
+            // installer calls this so a fresh machine has both, with the schema
+            // line in place, before the app is ever opened.
+            //
+            // The binary does it rather than the install script, so the starter
+            // config has exactly one definition. A copy in a shell script is a
+            // copy that drifts the first time a field is added.
+            "--init" => {
+                let (_, path, created) = Registry::load_or_create()?;
+                std::fs::create_dir_all(state_dir())?;
+                println!();
+                if created {
+                    println!("  Wrote a starter config:");
+                } else {
+                    println!("  Config already present:");
+                }
+                println!("    {}", path.display());
+                println!("    {}   logs, cache, PnL history", state_dir());
+                println!();
+                println!("  It works as-is on public endpoints. Open the app and press `e`,");
+                println!("  or edit the file — your editor will complete it from the schema.");
+                println!();
+                return Ok(());
+            }
             "--help" | "-h" => {
                 println!("trenches {} ({})", env!("CARGO_PKG_VERSION"), env!("TRENCHES_COMMIT"));
                 println!();
@@ -510,6 +557,7 @@ async fn main() -> eyre::Result<()> {
                 println!();
                 println!("USAGE:");
                 println!("    trenches            start the app");
+                println!("    trenches --init     write the config and state dirs, then exit");
                 println!("    trenches --version  print the version");
                 println!();
                 println!("There are no other flags — everything is a keypress once you are in.");
@@ -970,14 +1018,19 @@ async fn chain_session_on(
         }
     }
 
-    // 2) Account: keystore accounts + each HD mnemonic's first few addresses.
     // 2) Account: keystores on disk, or make one. There is no separate account
-    // list any more — a seed phrase in a config file is not an account we are
-    // willing to offer, so the only accounts are encrypted keystores.
-    let (account, signer) = loop {
+    // list — a seed phrase in a config file is not an account we are willing to
+    // offer, so the only accounts are encrypted keystores.
+    //
+    // Optional, and skipped entirely when there is nothing to unlock. Esc goes
+    // on WITHOUT an account: the dashboard is worth looking at before you commit
+    // a key to it — prices, launches, the tape — and making an unlock the price
+    // of entry means anyone who just wants to watch hands over a password first.
+    // `W` unlocks one at any point.
+    let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = None;
+    while !wallet::list_keystores().is_empty() {
         let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
-            // Esc steps back to the chain picker rather than closing the app.
-            return Ok(Exit::ChangeChain);
+            break;
         };
         let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
             continue;
@@ -988,13 +1041,14 @@ async fn chain_session_on(
                 // Only after a successful unlock: a mistyped password should
                 // not change which wallet comes up next time.
                 save_last_wallet(&ks);
-                break (ks, sg);
+                unlocked = Some((ks, sg));
+                break;
             }
             Err(_) => {
                 ui::select(terminal, "Wrong password for that wallet", &["Back".into()])?;
             }
         }
-    };
+    }
 
     // 3) Pools: ours (from the registry) + public real-world pools we added.
     let pools = collect_pools(net);
@@ -1019,7 +1073,17 @@ async fn chain_session_on(
         }
     }
 
-    let trader = signer.address();
+    // No account: a throwaway key builds the provider and `trader` stays zero to
+    // mark it. Nothing is ever signed with it — every key that sends is guarded
+    // on that zero address — but it keeps ONE provider type and one code path,
+    // rather than a second generic instantiation of the whole dashboard that
+    // differs only in whether it can sign.
+    let no_account = unlocked.is_none();
+    let (account, signer) = match unlocked {
+        Some((ks, sg)) => (ks, sg),
+        None => ("(no account)".to_string(), alloy::signers::local::LocalSigner::random()),
+    };
+    let trader = if no_account { alloy::primitives::Address::ZERO } else { signer.address() };
     let wallet = EthereumWallet::from(signer);
     // with_recommended_fillers() adds the gas / nonce / chain-id fillers.
     // Without it the WalletFiller tries to sign a tx that has no nonce/gas/fee
@@ -1031,11 +1095,11 @@ async fn chain_session_on(
         .await?;
 
     // Per-session log in a .bot/ folder (created if missing).
-    std::fs::create_dir_all(STATE_DIR)?;
+    std::fs::create_dir_all(state_dir())?;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let log_path = format!("{STATE_DIR}/session-{secs}.log");
+    let log_path = format!("{}/session-{secs}.log", state_dir());
     let log = std::fs::File::create(&log_path)?;
 
     let mut bot = Bot {
@@ -1064,6 +1128,7 @@ async fn chain_session_on(
         entry_mc: 0.0,
         entry_pooled_eth: 0.0,
         entry_tx: None,
+        entry_at: None,
         trades: 0,
         fails: 0,
         skips: 0,
@@ -1188,7 +1253,7 @@ fn persist_pool(chain_id: u64, p: &SelPool) -> eyre::Result<()> {
             "name": p.sym, "symbol": p.sym, "address": token_addr, "pools": [pool_obj]
         })),
     }
-    std::fs::create_dir_all(STATE_DIR)?;
+    std::fs::create_dir_all(state_dir())?;
     std::fs::write(&path, serde_json::to_string_pretty(&tokens_val)?)?;
     Ok(())
 }
@@ -1441,6 +1506,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     if show_help {
                         show_help = false;
                         if k.code == KeyCode::Char('?') { continue; }
+                    }
+                    // No account: nothing can be signed, and the throwaway key
+                    // that built the provider must never be asked to try.
+                    if bot.trader.is_zero()
+                        && matches!(k.code, KeyCode::Char('b' | 's' | 'a' | 'r' | 'x' | 'S'))
+                    {
+                        bot.status = "no account — press [W] to unlock one".into();
+                        continue;
                     }
                     // Nothing selected means nothing to trade: the order keys
                     // have no pool to act on, and the zero address would go to
@@ -2018,8 +2091,17 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // The knobs moved to their own Settings box, which freed these rows.
     let (logo_box, indent_cols) = ui::image::header_box(ui::widgets::themed_block("").inner(c[0]));
     let venue = header_venue(bot);
+    let avail = c[0].width.saturating_sub(indent_cols + 32);
     let name = match venue {
         ui::image::Venue::Uniswap => format!("UNISWAP {}", bot.pool.kind.proto().to_uppercase()),
+        // The launchpad is called pons.family, and on a wide terminal there is
+        // room to say so. On a narrow one the full name would drop out of large
+        // type altogether and render as small text, which is a worse trade than
+        // the short form set properly — so the fuller name is used only when it
+        // actually fits.
+        ui::image::Venue::Pons if ui::bigtext::width("PONS.FAMILY") <= avail => {
+            "PONS.FAMILY".to_string()
+        }
         v => v.display_name(&bot.net),
     };
 
@@ -2028,7 +2110,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     let name_style = Style::default()
         .fg(ui::widgets::tone_color(view::Tone::Accent))
         .add_modifier(Modifier::BOLD);
-    let avail = c[0].width.saturating_sub(indent_cols + 32);
     let head_left = if ui::bigtext::width(&name) <= avail {
         Paragraph::new(ui::bigtext::render(&name, name_style))
     } else {
@@ -2133,7 +2214,21 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             Line::from(vec![
                 hint("{ } "),
                 sbold(format!("{:<10}", "slippage")),
-                val(format!("{:.0}%", bot.slippage_pct)),
+                val(format!("{:<10}", format!("{:.0}%", bot.slippage_pct))),
+                // Under the guard it sits beside, because they are the same kind
+                // of switch: both refuse a trade rather than shaping one.
+                hint("[n] "),
+                sbold(format!("{:<10}", "dedup")),
+                Span::styled(
+                    if bot.guard_dup { "ON" } else { "OFF" },
+                    Style::default()
+                        .fg(if bot.guard_dup {
+                            ui::widgets::tone_color(view::Tone::Good)
+                        } else {
+                            ui::widgets::tone_color(view::Tone::Bad)
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 hint("< > "),
@@ -2348,12 +2443,24 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // "Which account am I?" belongs with the balances, not in the header.
         Line::from(vec![
             lbl("Account"),
-            Span::styled(
-                format!("{}", bot.trader),
-                Style::default()
-                    .fg(ui::widgets::tone_color(view::Tone::Info))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            // A zero address is not an account, and printing forty characters of
+            // zeroes says "something is wrong" rather than "you have not
+            // unlocked one". Name the key that fixes it instead.
+            if bot.trader.is_zero() {
+                Span::styled(
+                    "no account — press [W] to unlock one",
+                    Style::default()
+                        .fg(ui::widgets::tone_color(view::Tone::Warn))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!("{}", bot.trader),
+                    Style::default()
+                        .fg(ui::widgets::tone_color(view::Tone::Info))
+                        .add_modifier(Modifier::BOLD),
+                )
+            },
         ]),
         Line::from(vec![lbl("ETH"), Span::raw(format!("{:.6}", bot.eth))]),
         Line::from(vec![lbl(&bot.pool.sym), Span::raw(format!("{:.4}", bot.token_bal))]),

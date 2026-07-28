@@ -198,7 +198,7 @@ fn draw(
 
     let rows = Layout::vertical([
         Constraint::Length(3),  // totals
-        Constraint::Length(14), // the grid
+        Constraint::Length(20), // the grid
         Constraint::Min(5),     // winners / losers
         Constraint::Length(1),  // keys
     ])
@@ -305,21 +305,28 @@ fn grid(
     const NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     // Every cell is the same width, so the columns line up under their headings
     // without a table widget and its borders eating four rows of a fourteen-row
-    // box.
+    // box. One space between cells reads as a gap between tiles.
     const W: usize = 11;
+    const GAP: &str = " ";
+
+    // Centred in the panel. Seven fixed-width columns do not grow with the box,
+    // so on a wide terminal the whole month sat against the left edge with half
+    // the panel empty beside it.
+    let grid_w = (W * 7 + 6) as u16;
+    let pad = " ".repeat(((area.width.saturating_sub(2).saturating_sub(grid_w)) / 2) as usize);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(
-        NAMES
-            .iter()
-            .map(|n| {
-                Span::styled(
-                    format!("{n:^W$}"),
-                    Style::default().fg(widgets::border_color()).add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect::<Vec<_>>(),
-    ));
+    let mut head: Vec<Span> = vec![Span::raw(pad.clone())];
+    for (i, n) in NAMES.iter().enumerate() {
+        if i > 0 {
+            head.push(Span::raw(GAP));
+        }
+        head.push(Span::styled(
+            format!("{n:^W$}"),
+            Style::default().fg(widgets::border_color()).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(head));
 
     let lead = ledger::weekday(year, month, 1) as usize;
     let last = ledger::days_in_month(year, month) as usize;
@@ -328,12 +335,16 @@ fn grid(
     // worst case at 37 cells.
     for week in 0..6 {
         // Two lines per week: the date, then what it made.
-        let mut top: Vec<Span> = Vec::new();
-        let mut bot: Vec<Span> = Vec::new();
+        let mut top: Vec<Span> = vec![Span::raw(pad.clone())];
+        let mut bot: Vec<Span> = vec![Span::raw(pad.clone())];
         let mut any = false;
 
         for wd in 0..7 {
             let idx = week * 7 + wd;
+            if wd > 0 {
+                top.push(Span::raw(GAP));
+                bot.push(Span::raw(GAP));
+            }
             if idx < lead || idx - lead >= last {
                 top.push(Span::raw(" ".repeat(W)));
                 bot.push(Span::raw(" ".repeat(W)));
@@ -347,18 +358,29 @@ fn grid(
 
             // The date. Selected wins over today: today is a fact you can
             // re-derive, the selection is the one you just made.
-            let date_style = if is_sel {
-                Style::default()
-                    .fg(widgets::fg_highlight())
-                    .bg(widgets::bg_selection())
-                    .add_modifier(Modifier::BOLD)
+            // The tile's own background, shared by both of its rows so the cell
+            // reads as one block rather than two lines that happen to line up.
+            let fill = if is_sel {
+                Some(widgets::bg_selection())
+            } else if day.trades > 0 {
+                Some(widgets::bg_highlight())
+            } else {
+                None
+            };
+            let tile = |st: Style| match fill {
+                Some(bg) => st.bg(bg),
+                None => st,
+            };
+
+            let date_style = tile(if is_sel {
+                Style::default().fg(widgets::fg_highlight()).add_modifier(Modifier::BOLD)
             } else if is_today {
                 Style::default().fg(tone_color(Tone::Accent)).add_modifier(Modifier::BOLD)
             } else if day.trades > 0 {
                 Style::default().fg(tone_color(Tone::Normal))
             } else {
                 Style::default().fg(tone_color(Tone::Dim))
-            };
+            });
             top.push(Span::styled(format!("{:^W$}", format!("{d}")), date_style));
 
             // The figure. A day with no trades gets a rule rather than "$0" —
@@ -368,12 +390,9 @@ fn grid(
             } else {
                 (money(day.pnl_usd), pnl_tone(day.pnl_usd))
             };
-            let mut st = Style::default().fg(tone_color(tone));
+            let mut st = tile(Style::default().fg(tone_color(tone)));
             if day.trades > 0 {
                 st = st.add_modifier(Modifier::BOLD);
-            }
-            if is_sel {
-                st = st.bg(widgets::bg_selection());
             }
             bot.push(Span::styled(format!("{text:^W$}"), st));
         }
@@ -383,6 +402,9 @@ fn grid(
         }
         lines.push(Line::from(top));
         lines.push(Line::from(bot));
+        // A blank row between weeks: without it the tiles stack into one column
+        // of colour and the week boundaries disappear.
+        lines.push(Line::from(""));
     }
 
     f.render_widget(Paragraph::new(lines).block(themed_block(" Calendar ")), area);
@@ -418,6 +440,10 @@ fn breakdown(f: &mut Frame, area: Rect, by_day: &[Vec<&Fill>], year: i32, month:
             Span::styled(
                 format!("{:>8}  ", format!("{:+.0}%", fl.ret_pct())),
                 Style::default().fg(tone_color(pnl_tone(fl.pnl))),
+            ),
+            Span::styled(
+                format!("{:>7}  ", fl.held()),
+                Style::default().fg(tone_color(Tone::Info)),
             ),
             Span::styled(
                 format!("{:.4} {}", fl.pnl, fl.quote_sym),
@@ -502,6 +528,7 @@ mod tests {
             quote_sym: "ETH".into(),
             quote_usd: usd,
             tx: "0x0".into(),
+            held_secs: Some(7),
         }
     }
 

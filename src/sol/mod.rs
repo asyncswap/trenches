@@ -49,7 +49,7 @@ pub fn trace(msg: &str) {
 
     let start = START.get_or_init(std::time::Instant::now);
     let f = FILE.get_or_init(|| {
-        std::fs::create_dir_all(crate::STATE_DIR).ok()?;
+        std::fs::create_dir_all(crate::state_dir()).ok()?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -57,7 +57,7 @@ pub fn trace(msg: &str) {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/sol-trace-{ts}.log", crate::STATE_DIR))
+            .open(format!("{}/sol-trace-{ts}.log", crate::state_dir()))
             .ok()
             .map(Mutex::new)
     });

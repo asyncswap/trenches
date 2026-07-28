@@ -41,12 +41,32 @@ pub struct Fill {
     pub quote_usd: f64,
     /// The sell's transaction hash/signature.
     pub tx: String,
+    /// How long the position was held, in seconds.
+    ///
+    /// Optional because the entry time is not always known — a coin bought
+    /// before this field existed, or sold from a bag the app did not see bought,
+    /// has no start to measure from. Guessing one would make the number a lie
+    /// exactly where it is most interesting.
+    #[serde(default)]
+    pub held_secs: Option<u64>,
 }
 
 impl Fill {
     /// Profit in dollars, at the rate that applied when it was made.
     pub fn usd(&self) -> f64 {
         self.pnl * self.quote_usd
+    }
+
+    /// How long it was held, short enough for a column. A trade measured in
+    /// seconds is the whole point of this app, so seconds are not rounded away.
+    pub fn held(&self) -> String {
+        match self.held_secs {
+            None => "—".into(),
+            Some(s) if s < 60 => format!("{s}s"),
+            Some(s) if s < 3600 => format!("{}m{}s", s / 60, s % 60),
+            Some(s) if s < 86_400 => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+            Some(s) => format!("{}d", s / 86_400),
+        }
     }
 
     /// Return on cost, as a percentage. Zero when there was no cost to return
@@ -69,7 +89,7 @@ pub fn path(account: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    format!("{}/fills-{}.jsonl", crate::STATE_DIR, safe)
+    format!("{}/fills-{}.jsonl", crate::state_dir(), safe)
 }
 
 /// Append one fill. Failures are swallowed on purpose: a full disk must not
@@ -77,7 +97,7 @@ pub fn path(account: &str) -> String {
 pub fn append(account: &str, f: &Fill) {
     use std::io::Write;
     let Ok(line) = serde_json::to_string(f) else { return };
-    let _ = std::fs::create_dir_all(crate::STATE_DIR);
+    let _ = std::fs::create_dir_all(crate::state_dir());
     if let Ok(mut h) = std::fs::OpenOptions::new().create(true).append(true).open(path(account)) {
         let _ = writeln!(h, "{line}");
     }
@@ -89,7 +109,7 @@ pub fn append(account: &str, f: &Fill) {
 /// sign with different keys and so write different files, but a Tuesday is one
 /// Tuesday. Each fill carries its own chain, so they stay tellable apart.
 pub fn load_all() -> Vec<Fill> {
-    let Ok(dir) = std::fs::read_dir(crate::STATE_DIR) else { return Vec::new() };
+    let Ok(dir) = std::fs::read_dir(crate::state_dir()) else { return Vec::new() };
     let mut v: Vec<Fill> = dir
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -283,6 +303,7 @@ mod tests {
             quote_sym: "ETH".into(),
             quote_usd: 2000.0,
             tx: "0xabc".into(),
+            held_secs: Some(42),
         };
         assert!((f.usd() - 200.0).abs() < 1e-9);
         assert!((f.ret_pct() - 20.0).abs() < 1e-9);
@@ -301,6 +322,7 @@ mod tests {
             quote_sym: "SOL".into(),
             quote_usd: 150.0,
             tx: "sig".into(),
+            held_secs: None,
         };
         assert_eq!(f.ret_pct(), 0.0);
         assert!((f.usd() - 150.0).abs() < 1e-9);
@@ -310,7 +332,7 @@ mod tests {
     fn account_labels_cannot_escape_the_state_directory() {
         // Labels come from config; a path separator in one must not aim the
         // ledger at another directory.
-        assert_eq!(path("../../etc/passwd"), format!("{}/fills-------etc-passwd.jsonl", crate::STATE_DIR));
-        assert_eq!(path("main"), format!("{}/fills-main.jsonl", crate::STATE_DIR));
+        assert_eq!(path("../../etc/passwd"), format!("{}/fills-------etc-passwd.jsonl", crate::state_dir()));
+        assert_eq!(path("main"), format!("{}/fills-main.jsonl", crate::state_dir()));
     }
 }

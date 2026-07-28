@@ -210,15 +210,15 @@ pub struct Registry {
 /// something anyone decided, and the app writing to a file it tells you to edit
 /// is exactly what the config/cache split exists to avoid.
 pub fn onboarded() -> bool {
-    std::path::Path::new(crate::STATE_DIR).join("onboarded").exists()
+    std::path::Path::new(crate::state_dir()).join("onboarded").exists()
 }
 
 /// Remember that they have. Failures are ignored — the cost is seeing the docs
 /// once more, which is not worth failing a startup over.
 pub fn mark_onboarded() {
-    let _ = std::fs::create_dir_all(crate::STATE_DIR);
+    let _ = std::fs::create_dir_all(crate::state_dir());
     let _ = std::fs::write(
-        std::path::Path::new(crate::STATE_DIR).join("onboarded"),
+        std::path::Path::new(crate::state_dir()).join("onboarded"),
         "The docs have been read once, so the app no longer opens on them.\n\
          Delete this file to get them back on start, or set start_on_docs in\n\
          your config to decide it outright.\n",
