@@ -1,0 +1,30 @@
+# Secrets. This is the important part of this file.
+#
+# The config holds RPC URLs with API keys in them, and older ones held seed
+# phrases. Nothing that can carry a key goes in git — not once, not "just to get
+# started", because git remembers.
+config.json
+deployments.json
+*.key
+*.pem
+.env
+.env.*
+
+# Keystores, if the app is ever pointed at a directory inside the repo. Those
+# files are encrypted, but an encrypted key in a repo is still a key in a repo.
+keystores/
+*.keystore
+
+# Build output. Five gigabytes of it.
+target/
+**/*.rs.bk
+
+# Runtime state and cache: session logs, traces, the theme, cached tokens, the
+# fill ledger. Machine-local by definition, and the logs record addresses and
+# amounts.
+.trenches/
+.bot/
+*.log
+
+# macOS
+.DS_Store

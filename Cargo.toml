@@ -1,0 +1,83 @@
+[package]
+name = "trenches"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Testnets and local nodes. Off in a release: without this they are not
+# compiled in at all, so a production binary cannot offer a chain nobody trades.
+testnet = []
+# Solana/pump.fun support is OFF by default: the solana crate tree is heavy and
+# would slow the EVM-only `cargo build --release` cycle. Build with
+# `cargo build --release --features solana` when working on that side.
+default = []
+solana = [
+    "dep:solana-pubkey",
+    "dep:solana-keypair",
+    "dep:solana-signer",
+    "dep:solana-instruction",
+    "dep:solana-message",
+    "dep:solana-transaction",
+    "dep:solana-hash",
+    "dep:solana-system-interface",
+    "dep:borsh",
+    "dep:bincode",
+    "dep:eth-keystore",
+    "dep:tokio-tungstenite",
+]
+
+[dependencies]
+alloy = { version = "0.8", features = ["full", "node-bindings", "signer-keystore", "signer-mnemonic"] }
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Already in the tree via alloy — reused for Solana key derivation (BIP39 seed +
+# SLIP-0010 ed25519) and base58, so they cost no extra build time.
+bs58 = "0.5"
+# Markdown for the in-app docs viewer. Same parser steer's TUI uses; it emits a
+# plain event stream, which maps straight onto themed ratatui spans.
+pulldown-cmark = { version = "0.9", default-features = false }
+coins-bip39 = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+# Theme engine. `default-features = false` deliberately drops opaline's own
+# `ratatui` feature: it pulls ratatui-core 0.1 for ratatui 0.30, and this bot is
+# on 0.29. We only need the token tables and map OpalineColor -> Color::Rgb
+# ourselves, which is a 3-field struct copy.
+opaline = { path = "../opaline", default-features = false, features = ["builtin-themes"] }
+
+# --- solana (optional, behind the `solana` feature) ---
+# Targeted crates rather than the `solana-sdk` umbrella: we only need keys,
+# PDAs, instruction/message/transaction building. RPC goes over the `reqwest`
+# JSON-RPC client we already use for EVM batch calls.
+solana-pubkey = { version = "3", features = ["borsh", "curve25519"], optional = true }
+solana-keypair = { version = "3", optional = true }
+solana-signer = { version = "3", optional = true }
+solana-instruction = { version = "3", optional = true }
+solana-message = { version = "3", optional = true }
+# `bincode` feature pulls in signing (new_signed_with_payer) + the wire format.
+solana-transaction = { version = "3", features = ["bincode"], optional = true }
+solana-hash = { version = "3", optional = true }
+solana-system-interface = { version = "2", optional = true }
+borsh = { version = "1.5", features = ["derive"], optional = true }
+# Solana's transaction wire format. Pinned to 1.x — that's what solana-transaction
+# itself uses, and 2.x is a different, incompatible API.
+bincode = { version = "1.3", optional = true }
+# Web3 Secret Storage (scrypt + AES-128-CTR + MAC). Solana's own CLI keeps keys
+# in PLAINTEXT json, so we reuse the encrypted format the EVM side already uses
+# — one password protects both chains. Both crates are already in the tree via
+# alloy, so they add no build time.
+eth-keystore = { version = "0.5", optional = true }
+rand = "0.8"
+# WebSocket, for pump.fun logsSubscribe (launches are far too rare in the
+# signature stream to discover by polling). Already present via alloy-transport-ws.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true

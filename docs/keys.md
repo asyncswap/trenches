@@ -1,0 +1,125 @@
+# KEYS
+
+Every binding, and what separates a lowercase key from its shifted twin.
+
+The pattern throughout: **lowercase acts, uppercase escalates.** `s` sells a
+slice, `S` liquidates everything. `q` asks before quitting, `Q` does not.
+
+## Trading
+
+```
+b        buy the configured size
+s        sell the configured slice of your balance
+x        sell the entire balance of this token
+S        liquidate EVERY token holding, across every known pool  (EVM)
+```
+
+`x` empties one position. `S` empties the wallet — it sweeps every pool the bot
+knows about. It is the only key that can touch tokens you are not currently
+looking at.
+
+## Sizing and protection
+
+```
+[  ]     buy size          smaller / larger
+(  )     sell size         smaller / larger, in 10% steps
+{  }     slippage          looser / tighter
+<  >     price impact cap  (EVM)  ·  priority fee  (Solana)
+0        turn the price impact cap off entirely  (EVM)
+```
+
+**Slippage** is how far the fill may drift from the quote before the trade
+reverts. **Price impact** is different: it shrinks the trade itself so a single
+swap cannot move the pool price more than the set percentage. `off` means
+uncapped — full-size swaps.
+
+## Finding something to trade
+
+```
+f        live trenches — launches as they happen
+F        verified pools — the static, curated list          (EVM)
+t        top tokens — leaderboard and big-fish scan         (EVM)
+p        pools — switch pool, add by address, create new    (EVM)
+p        add a token by contract address (CA)                (Solana)
+h        wallet holdings — leftover tokens you still hold   (EVM)
+Del      deselect the current pool — back to the empty state  (EVM)
+```
+
+`f` is the live feed: coins appearing right now. `F` is the hand-curated list
+that does not change. `t` is for established tokens, not fresh launches.
+
+`Del` deselects whatever pool you are on and puts the screen back to empty: no pool, no tape, no position readout, and
+the order keys do nothing until you pick something. Nothing carries over between
+sessions either — the app always starts empty, so `b` is never one keystroke
+from a coin you opened days ago.
+
+## Liquidity
+
+```
+a        add liquidity to the current pool     (EVM, V4 only)
+r        remove one liquidity position         (EVM)
+```
+
+V3 pools are trade-only here; these keys need a V4 pool.
+
+## Arb
+
+```
+d        pick a second pool / toggle arb mode  (EVM)
+e        execute the arb                       (EVM)
+```
+
+## Modes and guards
+
+```
+M        toggle mode — manual or copy
+m        pick a mode from a list               (EVM)
+g        profit filter on/off                  (EVM)
+n        duplicate-buy guard on/off            (EVM)
+```
+
+The profit filter holds back trades that would lose money. With it **off**,
+every trade runs, including losing ones.
+
+## View
+
+```
+l        cycle Trades / Orders / Logs
+c        buyer scatter for this pool           (EVM)
+L        PnL calendar — a month of trading at a time
+R        force a price refresh                 (EVM)
+T        theme picker
+D        these docs
+?        shortcuts overlay
+```
+
+`L` opens the calendar: one cell per day, what it made in dollars, and the
+trades behind it. `h j k l` move a day (`j`/`k` a whole week, since that is what
+the grid's rows are), the arrows change month, `1` `2` `3` switch the summary
+between the last 1, 7 and 30 days, `t` jumps back to today and backspace returns
+to the whole month.
+
+A day with no trades shows `·`, not `$0` — a flat day and a day you sat out are
+different facts. History starts from the first sell after this feature landed:
+profit was never written down before that, so it cannot be recovered.
+
+## Leaving
+
+```
+W        change wallet — back to the account list, same chain
+C        change chain — back to the picker, without restarting
+q        quit, after a yes/no prompt
+Q        quit immediately, no prompt
+esc      go back one screen (on the trading screen it asks, like q)
+```
+
+## Inside lists and tables
+
+```
+↑ ↓      or j / k    move
+enter    select
+h j k l  or tab      switch document  (docs)
+↑ ↓ PgUp PgDn        scroll           (docs)
+home end             jump to top / bottom
+esc      back
+```

@@ -1,0 +1,399 @@
+//! Deployment registry (networks -> tokens -> pools) + accounts, loaded from
+//! deployments.json — the same hierarchical format as the Zig engine.
+//!
+//! Some schema fields (verified-pool metadata, explorer labels) mirror the JSON
+//! and aren't all read yet — they back the dormant Verified-pool feature.
+#![allow(dead_code)]
+
+use alloy::primitives::Address;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Pool {
+    pub label: String,
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub pool_id: String,
+    #[serde(default)]
+    pub address: String,
+    pub currency0: String,
+    pub currency1: String,
+    pub fee: u32,
+    #[serde(default)]
+    pub tick_spacing: u32,
+    #[serde(default)]
+    pub state_view: String,
+    #[serde(default)]
+    pub owned: bool, // true only for pools we actually created/own
+}
+
+fn default_kind() -> String {
+    "v4".to_string()
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Token {
+    pub name: String,
+    pub symbol: String,
+    pub address: String,
+    #[serde(default)]
+    pub pools: Vec<Pool>,
+}
+
+/// A real-world v4 pool we don't own but want to trade/test against. Only its
+/// key parameters are needed — the pool id is computed from them.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PublicPool {
+    pub label: String,
+    pub token: String, // currency1 (ETH is currency0)
+    #[serde(default)]
+    pub sym: String,
+    pub fee: u32,
+    pub tick_spacing: u32,
+}
+
+/// Which family of chain a registry entry describes. Drives the whole app path
+/// after the start-screen picker: EVM uses alloy + Uniswap, Solana uses the
+/// pump.fun engine. Defaults to `Evm` so every existing registry entry keeps
+/// working untouched.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChainKind {
+    #[default]
+    Evm,
+    Solana,
+}
+
+impl ChainKind {
+    pub fn is_solana(&self) -> bool {
+        *self == ChainKind::Solana
+    }
+    /// Short tag for the picker / header.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ChainKind::Evm => "evm",
+            ChainKind::Solana => "sol",
+        }
+    }
+}
+
+#[derive(Default, Debug, Deserialize, Clone)]
+pub struct Network {
+    pub name: String,
+    /// EVM chain id. Absent/0 for Solana entries.
+    #[serde(default)]
+    pub chain_id: u64,
+    /// Chain family — `"evm"` (default) or `"solana"`.
+    #[serde(default)]
+    pub kind: ChainKind,
+    pub rpc: String,
+    /// Extra RPC endpoints. Requests round-robin across `rpc` + these, with
+    /// failover, so no single provider's rate limit caps throughput.
+    #[serde(default)]
+    pub rpcs: Vec<String>,
+    /// WebSocket endpoint. Solana providers often host WS on a DIFFERENT domain
+    /// (e.g. `wss://ws.us.fluxrpc.com` for `https://us.fluxrpc.com`), so it can't
+    /// reliably be derived from `rpc` — set it explicitly when they differ.
+    #[serde(default)]
+    pub ws: Option<String>,
+    /// Optional separate endpoint for Discovery's batched pool-metric reads, kept
+    /// off the trading `rpc` so a graduation scan never starves the trade loop.
+    /// Best a batch-capable provider (e.g. Alchemy). Falls back to `rpc` if unset.
+    #[serde(default)]
+    pub discovery_rpc: Option<String>,
+    /// Hand-curated "verified" pools (e.g. Robinhood stock tokens). Resolved ONCE
+    /// and pinned by pool_id — the bot only prices these, never mines them. Edit
+    /// by hand to add/remove. Everything else is live bot discovery.
+    #[serde(default)]
+    pub verified_pools: Vec<VerifiedPool>,
+    #[serde(default)]
+    pub tokens: Vec<Token>,
+    #[serde(default)]
+    pub public_pools: Vec<PublicPool>,
+}
+
+/// A pinned, pre-resolved pool for a "verified" token (stock tokens, etc.).
+#[derive(Debug, Deserialize, Clone)]
+pub struct VerifiedPool {
+    pub sym: String,
+    pub token: String,
+    pub pool_id: String,
+    #[serde(default)]
+    pub quote: String, // "USDG" (default) or "WETH"
+    #[serde(default)]
+    pub tick_spacing: i32,
+    #[serde(default)]
+    pub fee: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Account {
+    pub name: String,
+    pub address: String,
+    #[serde(default)]
+    pub keystore: Option<String>,
+}
+
+/// RugCheck integration — token risk scoring (creator rug history, LP lock,
+/// mint/freeze authority, holder concentration).
+///
+/// Keys live in the config file rather than in source, so they stay out of git.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RugCheck {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Base URL. Defaults to the public API.
+    #[serde(default = "default_rugcheck_url")]
+    pub base_url: String,
+    /// Full API key. Optional — the report endpoints work unauthenticated, the
+    /// key just raises rate limits.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Shielded key: safe to expose, but capped at 5 req/s per IP. Used only if
+    /// no full key is set.
+    #[serde(default)]
+    pub shield_key: Option<String>,
+    /// Normalised score (0-100) at or above which a coin is flagged. RugCheck
+    /// scores risk, so HIGHER is worse.
+    #[serde(default = "default_risk_threshold")]
+    pub warn_score: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_rugcheck_url() -> String {
+    "https://api.rugcheck.xyz".to_string()
+}
+fn default_risk_threshold() -> u32 {
+    40
+}
+
+impl Default for RugCheck {
+    fn default() -> Self {
+        RugCheck {
+            enabled: true,
+            base_url: default_rugcheck_url(),
+            api_key: None,
+            shield_key: None,
+            warn_score: default_risk_threshold(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Registry {
+    #[serde(default)]
+    pub default_account: Option<String>,
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+    #[serde(default)]
+    pub networks: Vec<Network>,
+    /// Token risk scoring. Absent = defaults (enabled, public API, no key).
+    #[serde(default)]
+    pub rugcheck: RugCheck,
+}
+
+/// Where the registry lives, in the order it is looked for.
+///
+/// 1. `$TRENCHES_CONFIG`, for anyone running several profiles.
+/// 2. `~/.config/trenches/deployments.json` — the real home.
+/// 3. `./deployments.json`, only if it already exists.
+///
+/// The cwd came first historically, which was fine when the binary was run out
+/// of its own checkout and fatal the moment it was installed to `~/.local/bin`:
+/// a fresh user's first `trenches` died on a missing file in whatever directory
+/// their shell happened to be in.
+pub fn config_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("TRENCHES_CONFIG") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    // A local file wins over the shared one, so a checkout still behaves as it
+    // always did and nobody's working setup moves under them.
+    let local = std::path::PathBuf::from("deployments.json");
+    if local.exists() {
+        return local;
+    }
+    config_dir().join("deployments.json")
+}
+
+/// The user's home directory.
+///
+/// `HOME` is not set on Windows — it is `USERPROFILE` there — and every path in
+/// this app was reading `HOME` alone. On Windows that meant the keystore
+/// directory failed to resolve at all, so the wallet screen had nothing to
+/// offer and no way to say why, while the site and the installer both advertised
+/// Windows support.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    for k in ["HOME", "USERPROFILE"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                return Some(std::path::PathBuf::from(v));
+            }
+        }
+    }
+    // Windows also splits it across two variables when neither of the above is
+    // set — an older shell, or a service account.
+    match (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+        (Ok(d), Ok(p)) if !d.is_empty() && !p.is_empty() => Some(std::path::PathBuf::from(format!("{d}{p}"))),
+        _ => None,
+    }
+}
+
+/// `~/.config/trenches`, or the platform equivalent.
+pub fn config_dir() -> std::path::PathBuf {
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        if !x.trim().is_empty() {
+            return std::path::PathBuf::from(x).join("trenches");
+        }
+    }
+    home_dir()
+        .unwrap_or_else(|| ".".into())
+        .join(".config")
+        .join("trenches")
+}
+
+/// A registry with nothing secret in it, written on first run.
+///
+/// There is no place for a seed phrase in it, and that is not an omission: the
+/// config type has no field for one, so a phrase written here is ignored rather
+/// than honoured. Accounts are password-encrypted keystores, full stop. A config
+/// file gets backed up, synced between machines, and pasted into a bug report by
+/// someone trying to be helpful — none of which should be able to cost anyone
+/// their funds.
+///
+/// The RPCs are public endpoints, so a first run works before anyone has signed
+/// up for anything, and the keyed alternatives are named in `_help` rather than
+/// left for the user to discover.
+pub fn starter_json() -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "$schema": "https://trenches.sh/config.schema.json",
+        "_help": [
+            "Trenches configuration. Edit this file, then restart the app.",
+            "",
+            "rpc            The endpoint the app trades through. The defaults are public and",
+            "               rate-limited; for anything serious put your own key-bearing URL here.",
+            "discovery_rpc  Optional. Used for log-heavy scans (new pools, buyer charts). Public",
+            "               endpoints usually refuse these, so discovery stays quiet without one.",
+            "               Alchemy, Helius, QuickNode and Ankr all work.",
+            "accounts       Added from inside the app — press W. Nothing to write by hand.",
+            "",
+            "This file holds API keys. It is yours, it stays on this machine, and nothing here",
+            "is sent anywhere except the endpoints you name. Never put a seed phrase in it: the",
+            "app reads password-encrypted keystores and never needs one.",
+        ],
+        "accounts": [],
+        "networks": [
+            {
+                "name": "robinhood-mainnet",
+                "chain_id": 4663,
+                "rpc": "https://rpc.mainnet.chain.robinhood.com/rpc",
+                "discovery_rpc": "",
+                "tokens": [],
+                "public_pools": []
+            },
+            {
+                "name": "solana-mainnet",
+                "chain_id": 900,
+                "rpc": "https://api.mainnet-beta.solana.com",
+                "discovery_rpc": "",
+                "tokens": [],
+                "public_pools": []
+            }
+        ],
+        "rugcheck": {
+            "enabled": true,
+            "base_url": "https://api.rugcheck.xyz",
+            "api_key": null,
+            "warn_score": 40
+        }
+    }))
+    .unwrap_or_default()
+}
+
+/// The chains we develop against: a testnet and a local node.
+///
+/// Behind the `testnet` cargo feature, so a production binary does not merely
+/// hide them — it does not contain them. A runtime flag would still leave the
+/// endpoints in the shipped binary and one argument away from a picker that
+/// offers a chain nobody can trade on.
+///
+/// Build with them:  cargo build --release --features solana,testnet
+#[cfg(feature = "testnet")]
+pub fn dev_networks() -> Vec<Network> {
+    let mk = |name: &str, chain_id: u64, rpc: &str| Network {
+        name: name.to_string(),
+        chain_id,
+        kind: ChainKind::Evm,
+        rpc: rpc.to_string(),
+        rpcs: Vec::new(),
+        ws: None,
+        discovery_rpc: None,
+        ..Default::default()
+    };
+    vec![
+        mk("robinhood-testnet", 46630, "https://rpc.testnet.chain.robinhood.com/rpc"),
+        mk("anvil-local", 31337, "http://127.0.0.1:8545"),
+    ]
+}
+
+/// Nothing, in a production build.
+#[cfg(not(feature = "testnet"))]
+pub fn dev_networks() -> Vec<Network> {
+    Vec::new()
+}
+
+impl Registry {
+    pub fn load(path: &str) -> eyre::Result<Registry> {
+        let bytes = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&bytes)?)
+    }
+
+    /// Load the registry, writing a starter file if there is nothing yet.
+    ///
+    /// Returns the config path alongside it, and whether this run created it —
+    /// a first run has something to say that later runs do not.
+    pub fn load_or_create() -> eyre::Result<(Registry, std::path::PathBuf, bool)> {
+        let path = config_path();
+        if path.exists() {
+            let reg = Registry::load(&path.to_string_lossy())
+                .map_err(|e| eyre::eyre!("{} could not be read: {e}", path.display()))?;
+            return Ok((reg, path, false));
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, starter_json())?;
+        let reg = Registry::load(&path.to_string_lossy())?;
+        Ok((reg, path, true))
+    }
+
+    pub fn network(&self, name_or_chain: &str) -> Option<&Network> {
+        self.networks
+            .iter()
+            .find(|n| n.name.eq_ignore_ascii_case(name_or_chain) || n.chain_id.to_string() == name_or_chain)
+    }
+}
+
+impl Network {
+    /// Every RPC endpoint for this network, primary first.
+    pub fn rpc_pool(&self) -> Vec<String> {
+        let mut v = vec![self.rpc.clone()];
+        v.extend(self.rpcs.iter().cloned());
+        v.retain(|u| !u.trim().is_empty());
+        v
+    }
+}
+
+impl Pool {
+    pub fn is_v4(&self) -> bool {
+        !self.kind.eq_ignore_ascii_case("toy")
+    }
+    pub fn token(&self) -> eyre::Result<Address> {
+        // The non-ETH side (currency1 for an ETH pool).
+        Ok(self.currency1.parse()?)
+    }
+}
