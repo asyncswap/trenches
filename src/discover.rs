@@ -779,7 +779,10 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             Ok(Ok(h)) if h > 0 => h,
             _ => {
                 crate::trace("discovery: no head block, skipping this round");
-                crate::events::warn("No head block from the RPC, skipping a discovery round", &[]);
+                crate::events::warn(
+                    "Could not read the latest block number, so this discovery round was skipped",
+                    &[("retry_in", "1.5s".to_string())],
+                );
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 continue;
             }

@@ -1511,7 +1511,17 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // Arb mode: also read the second pool.
                 let pref_b = *pool_b_cell.lock().unwrap();
                 if let Some(pb) = pref_b {
-                    if let Ok(Ok(mb)) = tokio::time::timeout(Duration::from_millis(1500), engine::read_market(&provider, pb, trader)).await {
+                    // The second pool gets the same treatment as the first:
+                    // reading it in full every poll would have doubled the
+                    // request rate the moment arb mode was switched on.
+                    let read_b = async {
+                        if full {
+                            engine::read_market(&provider, pb, trader).await
+                        } else {
+                            engine::read_price_only(&provider, pb, trader).await
+                        }
+                    };
+                    if let Ok(Ok(mb)) = tokio::time::timeout(Duration::from_millis(1500), read_b).await {
                         *market_b.lock().unwrap() = mb;
                     }
                 }
@@ -1583,7 +1593,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             _ = render.tick() => {
                 let m = *market.lock().unwrap();
                 bot.apply_market(m);
-                bot.mkt_b = *market_b.lock().unwrap();
+                // Same rule as pool A: a light read has no reserves to give, so
+                // take only what it actually fetched or the panel blinks.
+                let mb = *market_b.lock().unwrap();
+                if mb.full {
+                    bot.mkt_b = mb;
+                } else {
+                    bot.mkt_b.sqrt_price = mb.sqrt_price;
+                    bot.mkt_b.tick = mb.tick;
+                    bot.mkt_b.read_ms = mb.read_ms;
+                }
                 let blk = block.load(Ordering::Relaxed);
                 sma = if prices.is_empty() { bot.price() } else { prices.iter().sum::<f64>() / prices.len() as f64 };
                 bot.ref_price = sma; // reference for the profitability filter

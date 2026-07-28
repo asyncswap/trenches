@@ -93,7 +93,20 @@ pub fn log(level: Level, what: &str, details: &[(&str, String)]) {
     let line = render(now, level, what, details);
 
     if let Ok(mut r) = ring().lock() {
-        r.push_back(line.clone());
+        // A condition that persists repeats every round. Ten identical lines
+        // are not ten facts — they are one fact and a duration, so the repeat
+        // is counted onto the existing line instead of stacking beneath it.
+        // The timestamp advances to the latest occurrence, which is the one a
+        // reader wants: when did this last happen, not when did it start.
+        let body = body_of(&line);
+        let repeat = r.back().map(|last| body_of(last) == body).unwrap_or(false);
+        if repeat {
+            let n = r.back().and_then(|l| count_of(l)).unwrap_or(1) + 1;
+            r.pop_back();
+            r.push_back(format!("{line}  (×{n})"));
+        } else {
+            r.push_back(line.clone());
+        }
         while r.len() > 500 {
             r.pop_front();
         }
@@ -117,6 +130,21 @@ fn render(now: u64, level: Level, what: &str, details: &[(&str, String)]) -> Str
         }
     }
     line
+}
+
+/// A line without its timestamp or repeat count, for comparing one to the next.
+fn body_of(line: &str) -> &str {
+    let body = line.get(11..).unwrap_or(line);
+    match body.rfind("  (×") {
+        Some(i) => &body[..i],
+        None => body,
+    }
+}
+
+/// How many times the line has already been seen.
+fn count_of(line: &str) -> Option<u64> {
+    let i = line.rfind("  (×")?;
+    line[i + 5..].trim_end_matches(')').parse().ok()
 }
 
 fn write_session(line: &str) {
@@ -203,6 +231,17 @@ mod tests {
         let marker = "a marker no other test writes";
         log(Level::Info, marker, &[]);
         assert!(recent().iter().any(|l| l.contains(marker)), "not in the ring");
+    }
+
+    #[test]
+    fn a_repeated_condition_is_counted_rather_than_stacked() {
+        let what = "a condition that keeps happening";
+        for _ in 0..5 {
+            log(Level::Warn, what, &[]);
+        }
+        let lines: Vec<String> = recent().into_iter().filter(|l| l.contains(what)).collect();
+        assert_eq!(lines.len(), 1, "the same fact was written {} times", lines.len());
+        assert!(lines[0].ends_with("(×5)"), "the repeats were not counted: {}", lines[0]);
     }
 
     #[test]
