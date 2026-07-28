@@ -24,12 +24,17 @@ Use `tab` to move between these documents, `↑` `↓` to scroll, `esc` to go ba
 
 - **Overview** — the screens, and the two numbers that decide whether a trade is
   a good idea.
-- **Keys** — every binding, including what separates `s` from `S` and `f` from
-  `F`.
 - **Accounts** — how to make one, and what the bot will never do with it.
 - **Config** — where settings live, and how to set an API key.
+- **Shortcuts** — every binding, including what separates `s` from `S` and `f`
+  from `F`.
 - **Terms** and **Privacy** — what this software promises, which is very little.
 - **License** — how you may use and share it.
+- **Finish** — the checks worth doing, and the way in.
+
+You can act from these pages, not just read them. `T` changes the theme, `W`
+makes an account on the Accounts page, and `e` saves an API key on Config. `enter`
+starts at any point.
 
 ## Before you trade real size
 

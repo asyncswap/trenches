@@ -199,12 +199,17 @@ pub fn select_table(
 pub const DOCS: &[(&str, &str)] = &[
     ("Welcome", include_str!("../docs/welcome.md")),
     ("Overview", include_str!("../docs/overview.md")),
-    ("Keys", include_str!("../docs/keys.md")),
+    // Setup first, then the shortcuts. The bindings only mean something once
+    // you have an account and an endpoint to use them against.
     ("Accounts", include_str!("../docs/wallets.md")),
     ("Config", include_str!("../docs/config.md")),
+    ("Shortcuts", include_str!("../docs/keys.md")),
     ("Terms", include_str!("../docs/terms.md")),
     ("Privacy", include_str!("../docs/privacy.md")),
     ("License", include_str!("../docs/license.md")),
+    // Last, and the reason the reader is a sequence rather than a menu: someone
+    // who scrolls to the end should find a door, not run out of pages.
+    ("Finish", include_str!("../docs/finish.md")),
 ];
 
 /// Scrollable markdown viewer for the bundled docs.
@@ -212,22 +217,90 @@ pub const DOCS: &[(&str, &str)] = &[
 /// Left column picks a document, right renders it. Rendering happens per frame
 /// rather than being cached: the docs are a few kilobytes, and a cache would
 /// have to be invalidated on every theme change.
+/// Enter API keys and endpoints, and write them to the config.
+///
+/// Reachable from the start screen, because "edit this JSON file" is a poor
+/// answer to "how do I make it fast" when the app is already open and knows
+/// which fields it wants. Everything here ends up in the same file the Config
+/// page describes — this is a way in, not a second source of truth.
+pub fn endpoints_screen(term: &mut Term) -> eyre::Result<()> {
+    loop {
+        let names = crate::config::network_names();
+        if names.is_empty() {
+            select(term, "No networks in your config", &["Back".to_string()])?;
+            return Ok(());
+        }
+        let mut items = names.clone();
+        items.push("Done".to_string());
+
+        let Some(i) = select(term, "Which chain's RPC endpoints?", &items)? else {
+            return Ok(());
+        };
+        if i >= names.len() {
+            return Ok(());
+        }
+        let net = &names[i];
+
+        // Solana providers usually serve websockets on a different host, so it
+        // is asked for separately rather than derived from the HTTP URL.
+        let solana = net.to_lowercase().starts_with("solana");
+        let mut fields: Vec<(&str, &str, &str)> = vec![(
+            "rpc",
+            "Trading RPC URL",
+            "Every trade goes through this. Paste the one with your key in it.",
+        )];
+        if solana {
+            fields.push(("ws", "Websocket URL", "Optional. Often a different host than the RPC."));
+        }
+        fields.push((
+            "discovery_rpc",
+            "Discovery RPC URL",
+            "Optional. For log-heavy scans — new pools, charts. Public endpoints refuse these.",
+        ));
+
+        for (field, title, hint) in fields {
+            // Esc on any prompt stops the walk rather than skipping to the next
+            // question: backing out should not quietly leave half a setup.
+            let Some(v) = input(term, &format!("{net} — {title}"), hint)? else {
+                break;
+            };
+            if let Err(e) = crate::config::set_network_field(net, field, &v) {
+                select(term, &format!("Could not save: {e}"), &["Back".to_string()])?;
+                break;
+            }
+        }
+
+        select(
+            term,
+            &format!("Saved to {}", crate::config::config_path().display()),
+            &["Back".to_string()],
+        )?;
+    }
+}
+
 /// The docs, as the screen the app opens on.
 ///
 /// Same reader, different contract: `enter` starts and `q` leaves, and the
 /// footer says so. Returns whether to go on — `false` means the user quit from
 /// here rather than starting.
-pub fn start_screen(term: &mut Term) -> eyre::Result<bool> {
-    docs_inner(term, true)
+pub fn start_screen(
+    term: &mut Term,
+    new_wallet: &mut dyn FnMut(&mut Term) -> eyre::Result<()>,
+) -> eyre::Result<bool> {
+    docs_inner(term, true, Some(new_wallet))
 }
 
 /// The docs, opened with `D` from inside a session. Esc returns to where you
 /// came from.
 pub fn docs(term: &mut Term) -> eyre::Result<()> {
-    docs_inner(term, false).map(|_| ())
+    docs_inner(term, false, None).map(|_| ())
 }
 
-fn docs_inner(term: &mut Term, start: bool) -> eyre::Result<bool> {
+fn docs_inner(
+    term: &mut Term,
+    start: bool,
+    mut new_wallet: Option<&mut dyn FnMut(&mut Term) -> eyre::Result<()>>,
+) -> eyre::Result<bool> {
     let (mut sel, mut scroll) = (0usize, 0u16);
     // Written by the draw closure so the key handler can clamp against what was
     // actually laid out, rather than guessing.
@@ -256,10 +329,18 @@ fn docs_inner(term: &mut Term, start: bool) -> eyre::Result<bool> {
             );
 
             let block = widgets::themed_block(format!(" {} ", DOCS[sel].0))
-                .title_bottom(if start {
-                    " j/k or tab switch · ↑/↓ scroll · enter start trading · q quit "
+                // The footer names what THIS page can do. A fixed strip listing
+                // every key would be a second shortcuts index nobody reads.
+                .title_bottom(if !start {
+                    " j/k or tab switch · ↑/↓ scroll · T theme · esc back ".to_string()
                 } else {
-                    " j/k or tab switch · ↑/↓ scroll · esc back "
+                    let action = match DOCS[sel].0 {
+                        "Accounts" => " · W make an account",
+                        "Config" => " · e set API keys",
+                        "Finish" => " · W account · e API keys",
+                        _ => "",
+                    };
+                    format!(" j/k switch · ↑/↓ scroll · T theme{action} · enter start · q quit ")
                 });
             let inner = block.inner(cols[1]);
             let body = markdown::render(DOCS[sel].1);
@@ -302,6 +383,25 @@ fn docs_inner(term: &mut Term, start: bool) -> eyre::Result<bool> {
                     // else both simply close the reader.
                     KeyCode::Enter if start => return Ok(true),
                     KeyCode::Char('q') if start => return Ok(false),
+                    // The actions a page talks about, available on the page
+                    // that talks about them. Reading "press W to make an
+                    // account" and then having to leave to do it is the kind of
+                    // gap that turns a five-minute setup into an evening.
+                    KeyCode::Char('e') if start => {
+                        endpoints_screen(term)?;
+                    }
+                    KeyCode::Char('W') if start => {
+                        if let Some(f) = new_wallet.as_deref_mut() {
+                            f(term)?;
+                        }
+                    }
+                    // Themes work here so the reader can pick one while there is
+                    // still a lot of text on screen to judge it against.
+                    KeyCode::Char('T') => {
+                        if let Some(name) = widgets::theme_picker(term)? {
+                            widgets::set_theme(&name, true);
+                        }
+                    }
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     // hjkl and tab all move between documents; the arrows scroll
                     // the one you are reading.

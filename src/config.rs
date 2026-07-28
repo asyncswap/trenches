@@ -193,6 +193,36 @@ pub struct Registry {
     /// Token risk scoring. Absent = defaults (enabled, public API, no key).
     #[serde(default)]
     pub rugcheck: RugCheck,
+    /// Whether to open on the docs.
+    ///
+    /// Absent means "until you have been through them once" — the docs are
+    /// onboarding, and onboarding that repeats forever is a splash screen you
+    /// learn to dismiss without reading. Set it explicitly to keep them
+    /// (`true`) or never see them again (`false`); `D` opens them from anywhere
+    /// either way.
+    #[serde(default)]
+    pub start_on_docs: Option<bool>,
+}
+
+/// Has the user been through the docs at least once?
+///
+/// A marker in the CACHE, not the config: it is something that happened, not
+/// something anyone decided, and the app writing to a file it tells you to edit
+/// is exactly what the config/cache split exists to avoid.
+pub fn onboarded() -> bool {
+    std::path::Path::new(crate::STATE_DIR).join("onboarded").exists()
+}
+
+/// Remember that they have. Failures are ignored — the cost is seeing the docs
+/// once more, which is not worth failing a startup over.
+pub fn mark_onboarded() {
+    let _ = std::fs::create_dir_all(crate::STATE_DIR);
+    let _ = std::fs::write(
+        std::path::Path::new(crate::STATE_DIR).join("onboarded"),
+        "The docs have been read once, so the app no longer opens on them.\n\
+         Delete this file to get them back on start, or set start_on_docs in\n\
+         your config to decide it outright.\n",
+    );
 }
 
 /// Where the registry lives, in the order it is looked for.
@@ -285,6 +315,7 @@ pub fn starter_json() -> String {
             "is sent anywhere except the endpoints you name. Never put a seed phrase in it: the",
             "app reads password-encrypted keystores and never needs one.",
         ],
+        "start_on_docs": null,
         "accounts": [],
         "networks": [
             {
@@ -344,6 +375,75 @@ pub fn dev_networks() -> Vec<Network> {
 #[cfg(not(feature = "testnet"))]
 pub fn dev_networks() -> Vec<Network> {
     Vec::new()
+}
+
+/// Set one field on one network, in the config file, in place.
+///
+/// Edits a parsed `Value` rather than serialising the `Registry` back out. The
+/// config is a file a person owns and may have put things in that this app does
+/// not model — comments in `_help`, fields from a newer version, keys we have
+/// no struct for. Round-tripping through our own types would silently delete
+/// every one of them.
+///
+/// Written to a temporary file and renamed, so an interrupted write cannot
+/// leave a truncated config where the working one was.
+pub fn set_network_field(network: &str, field: &str, value: &str) -> eyre::Result<()> {
+    let path = config_path();
+    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t)?,
+        Err(_) => serde_json::from_str(&starter_json())?,
+    };
+
+    let nets = root
+        .get_mut("networks")
+        .and_then(|n| n.as_array_mut())
+        .ok_or_else(|| eyre::eyre!("config has no networks list"))?;
+    let net = nets
+        .iter_mut()
+        .find(|n| n.get("name").and_then(|x| x.as_str()) == Some(network))
+        .ok_or_else(|| eyre::eyre!("no network called {network} in the config"))?;
+
+    // An empty value clears the field rather than writing "", so backing out of
+    // a prompt does not leave an endpoint that resolves to nothing.
+    let obj = net.as_object_mut().ok_or_else(|| eyre::eyre!("malformed network entry"))?;
+    if value.trim().is_empty() {
+        obj.remove(field);
+    } else {
+        obj.insert(field.to_string(), serde_json::Value::String(value.trim().to_string()));
+    }
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// The names of the networks in the config, for a picker.
+///
+/// Testnets and local nodes are left out. Nobody sets an API key on a chain with
+/// no money on it or on a node running on their own laptop, so listing them is
+/// two rows of noise in front of the two that matter. They stay editable by hand
+/// in the file.
+pub fn network_names() -> Vec<String> {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("networks").and_then(|n| n.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|n| n.get("name").and_then(|x| x.as_str()))
+                    .filter(|n| {
+                        let n = n.to_lowercase();
+                        !n.contains("testnet") && !n.contains("anvil") && !n.contains("local")
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 impl Registry {

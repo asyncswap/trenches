@@ -1,20 +1,14 @@
 # OVERVIEW
 
-A terminal trading bot. Nothing trades by itself — every order is a key
-you press.
+The screens, and the two numbers that decide whether a trade is a good idea.
 
-**Available on**
+What each venue actually lets you do, since it is not the same everywhere:
 
-- Robinhood Chain
-- Solana
-
-**Supported protocols**
-
-- Uniswap V3 — trade only
-- Uniswap V4 — trade, and add or remove liquidity
-- pons.family — launch discovery, graduations into Uniswap
-- pump.fun — bonding curves, live launches
-- PumpSwap AMM — graduated coins
+- **Uniswap V3** — trade only
+- **Uniswap V4** — trade, and add or remove liquidity
+- **pons.family** — launch discovery, and graduations into Uniswap
+- **pump.fun** — bonding curves, live launches
+- **PumpSwap AMM** — graduated coins
 
 ## The screens
 
@@ -32,7 +26,7 @@ you press.
 
 ## Keys
 
-The **Keys** page lists every binding in full, including the shifted variants.
+The **Shortcuts** page lists every binding in full, including the shifted variants.
 The essentials:
 
 Sizing and protection:

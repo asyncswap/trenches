@@ -1,4 +1,4 @@
-# KEYS
+# SHORTCUTS
 
 Every binding, and what separates a lowercase key from its shifted twin.
 

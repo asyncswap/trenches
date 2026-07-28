@@ -72,6 +72,30 @@ Every config carries a `$schema` line pointing at
 will validate the file, complete field names as you type, and tell you what each
 one is for.
 
+## Opening on the docs
+
+The app shows these pages on the way in until you have been through them once,
+then goes straight to the chain picker. `D` opens them from anywhere regardless.
+
+To decide it outright:
+
+```json
+"start_on_docs": true
+```
+
+`true` keeps them on every start, `false` never shows them. Leave it out for the
+default. The "have they been read" marker is `~/.trenches/onboarded` — delete it
+to get them back on start.
+
+## Where it opens
+
+After the first run the bot goes straight to the chain you used last and asks
+for that account's password. `C` changes chain, `W` changes account, and `esc`
+from the account list steps back to the chain picker.
+
+The chain is remembered in `~/.trenches/last-chain.txt`, by name — an index
+would point at a different chain the moment you reordered the file.
+
 ## No seed phrases
 
 There is no field for one. Accounts are password-encrypted keystores, shared with

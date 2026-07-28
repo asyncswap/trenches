@@ -139,6 +139,26 @@ fn save_last_wallet(name: &str) {
     let _ = std::fs::write(last_wallet_path(), name);
 }
 
+/// The chain used last, remembered across runs.
+///
+/// Stored by NAME rather than by index: the config is a file people edit, and an
+/// index would silently point at a different chain the moment a line moved.
+fn last_chain_path() -> String {
+    format!("{STATE_DIR}/last-chain.txt")
+}
+
+fn load_last_chain() -> Option<String> {
+    std::fs::read_to_string(last_chain_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_last_chain(name: &str) {
+    let _ = std::fs::create_dir_all(STATE_DIR);
+    let _ = std::fs::write(last_chain_path(), name);
+}
+
 /// Append a diagnostic line to this session's trace.
 ///
 /// Separate from the trading log: that records what was traded, this records
@@ -786,12 +806,55 @@ async fn app(
     // It is also the screen Esc falls back to. Esc on the chain picker used to
     // quit the app outright, which is not what "back" means anywhere else.
     loop {
-        if !ui::start_screen(terminal)? {
-            return Ok(());
+        // The docs can make an account, because the Accounts page tells you to
+        // and the app is already open. `wallet_screen` handles the whole flow —
+        // create, import, name, password — and its return value is a selection
+        // this caller has no use for.
+        //
+        // Which chain has to be asked. The two derive differently from the same
+        // phrase — Ethereum on m/44'/60', Solana on m/44'/501' — so guessing
+        // hands someone an address that does not match what their wallet shows,
+        // with nothing on screen to explain why.
+        let mut make_wallet = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>| -> eyre::Result<()> {
+            let opts = vec![
+                "Robinhood Chain / EVM".to_string(),
+                "Solana".to_string(),
+            ];
+            let Some(i) = ui::select(t, "An account for which chain?", &opts)? else {
+                return Ok(());
+            };
+            let kind = if i == 1 { config::ChainKind::Solana } else { config::ChainKind::Evm };
+            wallet_screen(t, kind).map(|_| ())
+        };
+        // Docs on the way in — the first time, or whenever the config asks for
+        // them. Skipping straight to the chain picker on a machine that has
+        // already been set up is the difference between onboarding and a splash
+        // screen you learn to dismiss without reading.
+        let show = reg.start_on_docs.unwrap_or(!config::onboarded());
+        if show {
+            if !ui::start_screen(terminal, &mut make_wallet)? {
+                return Ok(());
+            }
+            config::mark_onboarded();
         }
-        // Chain changes loop back to the picker; Esc there returns here.
+        // Straight back to the chain used last, if there is one.
+        //
+        // The picker is a question with one obvious answer for anyone past
+        // their first run — you trade the same chain most days. `C` still
+        // changes it, and Esc from the account list lands on the picker, so
+        // nothing is unreachable; it is just no longer in the way.
+        let mut resume = load_last_chain()
+            .and_then(|n| reg.networks.iter().position(|x| x.name == n));
+
         loop {
-            match chain_session(terminal, reg, None).await? {
+            let exit = match resume.take() {
+                Some(i) => {
+                    save_last_chain(&reg.networks[i].name);
+                    chain_session_on(terminal, reg, &reg.networks[i], i).await?
+                }
+                None => chain_session(terminal, reg, None).await?,
+            };
+            match exit {
                 Exit::ChangeChain => continue,
                 Exit::Docs => break,
                 _ => return Ok(()),
@@ -834,7 +897,10 @@ async fn chain_session(
         })
         .collect();
 
-    const COLS: &[u16] = &[26];
+    // Wide enough that a chain name has room around it rather than filling its
+    // box edge to edge. The mark beside it is square and sized off the row
+    // count, so widening this does not stretch the logo.
+    const COLS: &[u16] = &[44];
     // Mainnets first, then test and local. No divider row: the ordering already
     // groups them, and a rule just costs a line.
     let (mut rows, mut back): (Vec<ui::PickRow>, Vec<Option<usize>>) = (Vec::new(), Vec::new());
@@ -865,7 +931,12 @@ async fn chain_session(
         |row| brand(row).as_deref().and_then(ui::image::for_network),
     )?;
     let (net_idx, net) = match chosen.and_then(|r| back.get(r).copied().flatten()) {
-        Some(i) => (i, &reg.networks[i]),
+        Some(i) => {
+            // Remembered only once it is actually chosen, so a chain you looked
+            // at and backed out of is not where you land next time.
+            save_last_chain(&reg.networks[i].name);
+            (i, &reg.networks[i])
+        }
         // Esc on the first screen means back, not quit. `q` is how you leave,
         // and it asks first.
         None => return Ok(Exit::Docs),
