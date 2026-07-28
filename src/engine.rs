@@ -730,9 +730,15 @@ impl Bot {
         if let Some(eth) = m.eth {
             self.eth = eth;
         }
-        self.token_bal = m.token_bal;
-        self.ready = m.ready;
+        if let Some(t) = m.token_bal {
+            self.token_bal = t;
+        }
         self.last_read_ms = m.read_ms;
+        // Liquidity and reserves come only from a full read. A light one did
+        // not ask, and "did not ask" is not "there is none".
+        if m.full {
+            self.ready = m.ready;
+        }
         if m.gas_price > 0.0 {
             self.gas_price = m.gas_price;
         }
@@ -1831,11 +1837,16 @@ pub struct Market {
     /// PnL read as having lost the whole balance — so both flickered between
     /// the truth and zero on alternate polls.
     pub eth: Option<f64>,
-    pub token_bal: f64,
+    /// Balances, or None on a light read that did not ask for them.
+    pub token_bal: Option<f64>,
     pub ready: bool,
     pub read_ms: f64,
     pub gas_price: f64, // wei, for the profitability filter
     pub supply: f64,    // token totalSupply (human units), for market cap
+    /// False on a price-only read. Everything a light read did not fetch must
+    /// be carried over rather than treated as newly-zero — without this the
+    /// pool reads as illiquid seven times a second between full reads.
+    pub full: bool,
 }
 
 /// Read price/liquidity + balances for a pool. Standalone so a background task
@@ -1845,16 +1856,50 @@ pub async fn read_market<P: Provider>(
     pref: PoolRef,
     trader: Address,
 ) -> eyre::Result<Market> {
+    read_market_inner(provider, pref, trader, true).await
+}
+
+/// Price and liquidity only — no balances, no gas price, no total supply.
+///
+/// Those four reads were being made on every poll, seven times a second, and
+/// they are the three-quarters of the traffic that earns a 429. A total supply
+/// does not change; a balance changes only when you trade. Splitting them off
+/// leaves the price — the one number that has to be current — reading at full
+/// rate on a fraction of the requests.
+pub async fn read_price_only<P: Provider>(
+    provider: &P,
+    pref: PoolRef,
+    trader: Address,
+) -> eyre::Result<Market> {
+    read_market_inner(provider, pref, trader, false).await
+}
+
+async fn read_market_inner<P: Provider>(
+    provider: &P,
+    pref: PoolRef,
+    trader: Address,
+    full: bool,
+) -> eyre::Result<Market> {
     let t0 = Instant::now();
 
     // No pool selected (empty network) — still show ETH + gas, empty market.
     if pref.kind.is_empty() {
-        let eth = crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader))
-            .await
-            .map(wei_to_f64)
-            .ok();
+        let eth = if full {
+            crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader))
+                .await
+                .map(wei_to_f64)
+                .ok()
+        } else {
+            None
+        };
         let gas = provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0);
-        return Ok(Market { eth, gas_price: gas, read_ms: t0.elapsed().as_secs_f64() * 1000.0, ..Default::default() });
+        return Ok(Market {
+            eth,
+            gas_price: gas,
+            read_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            full,
+            ..Default::default()
+        });
     }
 
     let erc = IERC20::new(pref.token, provider);
@@ -1881,6 +1926,24 @@ pub async fn read_market<P: Provider>(
 
     let cb_tok = erc.balanceOf(trader);
     let cb_sup = erc.totalSupply();
+    if !full {
+        // The cheap path. Everything left None or zero is carried over from the
+        // last full read by `apply_market`, which never overwrites a known value
+        // with an absent one.
+        return Ok(Market {
+            sqrt_price: sqrt_p,
+            tick,
+            r0: 0.0,
+            r1: 0.0,
+            eth: None,
+            token_bal: None,
+            ready: false,
+            read_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            gas_price: 0.0,
+            supply: 0.0,
+            full: false,
+        });
+    }
     let (eth_bal, tok_bal, gas, sup) = tokio::join!(
         crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)),
         crate::rpcstats::timed("balanceOf", cb_tok.call()),
@@ -1897,6 +1960,7 @@ pub async fn read_market<P: Provider>(
     // its reserve as ~0). Tracked tokens are 18-dec; the quote may be ETH (18) or
     // a stablecoin (e.g. USDG 6).
     let a_raw = if sqrt_p > 0.0 { l / sqrt_p } else { 0.0 }; // token0 raw reserve
+
     let b_raw = l * sqrt_p; // token1 raw reserve
     let qd = pref.quote.decimals() as i32;
     let tdi = td as i32; // tracked-token decimals — read on-chain, NOT assumed
@@ -1927,11 +1991,12 @@ pub async fn read_market<P: Provider>(
         r0,
         r1,
         eth: eth_bal.ok().map(wei_to_f64), // native ETH is always 18-dec
-        token_bal: units_to_f64(tok_bal?._0, td),
+        token_bal: tok_bal.ok().map(|t| units_to_f64(t._0, td)),
         ready: r0 > 0.0 && r1 > 0.0,
         read_ms: t0.elapsed().as_secs_f64() * 1000.0,
         gas_price,
         supply,
+        full: true,
     })
 }
 

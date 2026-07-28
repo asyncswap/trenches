@@ -1481,12 +1481,27 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             let mut last_swap_block_b = 0u64; // pool B (arb mode) tape cursor
             let mut tape_pref = *pool_cell.lock().unwrap();
             let mut tape_b_key = alloy::primitives::Address::ZERO;
+            // Balances, gas price and total supply are read once a second; the
+            // price is read every poll. Reading all four every time was ~30
+            // requests a second at this cadence, three quarters of it re-asking
+            // for a supply that cannot change and a balance that changes only
+            // when you trade — and it earned a 429 on the public endpoint, which
+            // then delayed the one read that does have to be current.
+            let mut poll: u64 = 0;
             loop {
                 tick.tick().await;
                 let pref = *pool_cell.lock().unwrap();
+                poll += 1;
+                let full = poll % 8 == 1;
                 match tokio::time::timeout(
                     Duration::from_millis(1500),
-                    engine::read_market(&provider, pref, trader),
+                    async {
+                        if full {
+                            engine::read_market(&provider, pref, trader).await
+                        } else {
+                            engine::read_price_only(&provider, pref, trader).await
+                        }
+                    },
                 )
                 .await
                 {
@@ -1625,7 +1640,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let _ = tokio::time::timeout(Duration::from_secs(3), bot.place(provider, side)).await;
                         }
                     }
-                } else if rpc_ok.load(Ordering::Relaxed) {
+                } else if rpc_ok.load(Ordering::Relaxed) && !bot.pool.kind.is_empty() {
+                    // Only when a pool is actually selected. `ready` is false
+                    // both for a pool with no liquidity AND for no pool at all,
+                    // so the empty state was being told to add liquidity to a
+                    // pool it did not have — and the line overwrote whatever the
+                    // last action had said.
                     bot.status = "This pool has no active liquidity. Press a to add liquidity.".into();
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(3), bot.reap(provider)).await;
@@ -2058,7 +2078,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     events::action("Loaded pool", &pool_facts(&bot.pool));
                                     match persist_pool(&network, &p) {
                                         Ok(()) => {
-                                            events::info("Saved pool to your list", &pool_facts(&bot.pool));
                                             bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label)))
                                         }
                                         Err(e) => {
@@ -2205,7 +2224,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                         // they survive restarts (not just this session).
                                         match persist_pool(&network, &p) {
                                             Ok(()) => {
-                                                events::info("Saved pool to your list", &pool_facts(&bot.pool));
                                                 bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label)))
                                             }
                                             Err(e) => {
