@@ -193,6 +193,29 @@ pub fn trace(msg: &str) {
             let _ = f.flush();
         }
     }
+
+    // And keep a copy in memory, stamped the same way the engine stamps its own
+    // lines, so `l` shows it. Discovery and pool resolution only ever wrote to
+    // the trace file, so the one screen someone opens when something looks
+    // broken was the one place their failures did not appear.
+    if let Ok(mut ring) = diagnostics().lock() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (h, m, sec) = ((now % 86400) / 3600, (now % 3600) / 60, now % 60);
+        ring.push_back(format!("[{h:02}:{m:02}:{sec:02}] {msg}"));
+        while ring.len() > 500 {
+            ring.pop_front();
+        }
+    }
+}
+
+/// In-memory copy of the trace lines, for the log screen.
+pub fn diagnostics() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static RING: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::OnceLock::new();
+    RING.get_or_init(Default::default)
 }
 
 /// Everything the pricing math depends on, in one line, whenever a pool loads.
@@ -2605,9 +2628,18 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Panel::Logs => {
         // Logs view: last N lines (fit to panel), errors/skips highlighted.
         let h = mid_area.height.saturating_sub(2) as usize;
-        let scroll = orders_scroll.min(bot.logs.len().saturating_sub(1));
+        // Two streams, one screen: what the bot did (trades, state changes) and
+        // what the machinery reported (scans, RPC failures). Both carry an
+        // [HH:MM:SS] stamp, so a stable sort on the first ten characters puts
+        // them back in the order they actually happened.
+        let mut all: Vec<String> = bot.logs.iter().cloned().collect();
+        if let Ok(ring) = diagnostics().lock() {
+            all.extend(ring.iter().cloned());
+        }
+        all.sort_by(|a, b| a.chars().take(10).cmp(b.chars().take(10)));
+        let scroll = orders_scroll.min(all.len().saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
-        for l in bot.logs.iter().rev().skip(scroll).take(h.max(1)).rev() {
+        for l in all.iter().rev().skip(scroll).take(h.max(1)).rev() {
             let color = if l.contains("REVERT") || l.contains("FAIL") || l.contains("failed") || l.contains("error") {
                 ui::widgets::tone_color(view::Tone::Bad)
             } else if l.contains("SKIP") || l.contains("skipped") || l.contains("WARN") || l.contains("would revert") {

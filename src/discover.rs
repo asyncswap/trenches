@@ -693,6 +693,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         Some(l) => l,
         None => return,
     };
+    // How far the launch log has been read. Everything below hangs off this:
+    // the window is scanned once, and after that only the blocks that are new.
+    let mut scanned_to: Option<u64> = None;
+    let mut known: Vec<(Address, Address, u64)> = Vec::new();
+
     while !stop.load(Ordering::Relaxed) {
         // A head read that did not answer is not block zero. It used to fall
         // back to 0, which made the window below `0..0` — a real getLogs call
@@ -707,7 +712,32 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 continue;
             }
         };
-        let cands = scan_candidates(&logs, head.saturating_sub(LAUNCH_WINDOW), head).await;
+        // Only the blocks that have appeared since the last pass.
+        //
+        // This used to re-read the whole 6,000-block window every round, three
+        // chunked getLogs calls at a time, once a second, forever — asking the
+        // node the same question about the same blocks for as long as the
+        // screen was open. That is what earned the 429s, and once rate-limited
+        // every other read on the same endpoint (price, balance, metadata)
+        // queued behind it. A round now costs one small query covering the
+        // handful of blocks actually mined since the last one.
+        let from = match scanned_to {
+            None => head.saturating_sub(LAUNCH_WINDOW),
+            Some(t) if head > t => t + 1,
+            Some(_) => head + 1, // nothing new; scan_candidates returns at once
+        };
+        if from <= head {
+            for c in scan_candidates(&logs, from, head).await {
+                if !known.iter().any(|(t, _, _)| *t == c.0) {
+                    known.push(c);
+                }
+            }
+        }
+        scanned_to = Some(head);
+        // Age out anything that has fallen off the back of the window, so the
+        // list tracks the window instead of growing without bound.
+        known.retain(|(_, _, b)| b + LAUNCH_WINDOW >= head);
+        let cands = known.clone();
 
         let mut acc: Vec<Row> = Vec::new();
         let mut stream = futures::stream::iter(cands)
@@ -1152,30 +1182,58 @@ async fn blockscout_top(client: &reqwest::Client) -> Vec<LeaderRow> {
         .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
         .header("Accept", "application/json")
         .send();
+    // Every failure below used to return an empty list, which the screen drew
+    // as "Top Tokens (0)" — identical to a chain with no tokens on it. An empty
+    // result must never be able to mean "the request failed" in silence.
     let resp = match tokio::time::timeout(RPC_TIMEOUT, req).await {
         Ok(Ok(r)) => r,
-        _ => return Vec::new(),
+        Ok(Err(e)) => {
+            crate::trace(&format!("top tokens: request failed: {e}"));
+            return Vec::new();
+        }
+        Err(_) => {
+            crate::trace("top tokens: request timed out");
+            return Vec::new();
+        }
     };
+    let status = resp.status();
     let json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            crate::trace(&format!("top tokens: HTTP {status}, body was not JSON: {e}"));
+            return Vec::new();
+        }
     };
     let items = match json.get("items").and_then(|v| v.as_array()) {
         Some(a) => a,
-        None => return Vec::new(),
+        None => {
+            crate::trace(&format!("top tokens: HTTP {status}, no `items` array in the response"));
+            return Vec::new();
+        }
     };
     let mut rows: Vec<LeaderRow> = Vec::new();
+    let mut skipped = 0usize;
     for it in items {
         let addr_s = it.get("address_hash").or_else(|| it.get("address")).and_then(|v| v.as_str()).unwrap_or("");
         let token = match addr_s.parse::<Address>() { Ok(a) => a, Err(_) => continue };
         if token == WETH { continue; }
         let mc_usd = it.get("circulating_market_cap").map(json_f64).unwrap_or(0.0);
-        if mc_usd <= 0.0 { continue; }
+        // Dropped for want of a market cap. Counted, because "every token was
+        // skipped" and "there were no tokens" look the same on screen.
+        if mc_usd <= 0.0 {
+            skipped += 1;
+            continue;
+        }
         let sym = it.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let vol_usd = it.get("volume_24h").map(json_f64).unwrap_or(0.0);
         let holders = it.get("holders_count").or_else(|| it.get("holders")).map(|v| json_f64(v) as u64).unwrap_or(0);
         rows.push(LeaderRow { sym, token, mkt_cap_usd: mc_usd, vol_usd, holders, pooled: 0.0, pooled_unit: "" });
     }
+    crate::trace(&format!(
+        "top tokens: {} of {} items usable ({skipped} had no market cap)",
+        rows.len(),
+        items.len()
+    ));
     rows.sort_by(|a, b| b.mkt_cap_usd.partial_cmp(&a.mkt_cap_usd).unwrap_or(std::cmp::Ordering::Equal));
     rows.truncate(25);
     rows
@@ -1222,15 +1280,38 @@ async fn enrich_pooled(client: &reqwest::Client, url: &str, rows: &mut [LeaderRo
 
 /// Resolve a bare token address to a tradable v3 WETH-pool Grad (the most-liquid
 /// fee tier). None if the token has no live WETH pool.
-async fn resolve_v3_grad<P: Provider>(provider: &P, token: Address, sym: &str) -> Option<Grad> {
+async fn resolve_v3_grad<P: Provider>(
+    provider: &P,
+    token: Address,
+    sym: &str,
+) -> Result<Option<Grad>, String> {
     let factory = IV3Factory::new(V3_FACTORY, provider);
+    let mut errors = 0usize;
+    let mut last = String::new();
     for fee in [10000u32, 3000, 500, 100] {
-        if let Ok(p) = factory.getPool(token, WETH, fee.try_into().unwrap()).call().await {
+        match factory.getPool(token, WETH, fee.try_into().unwrap()).call().await {
+            Err(e) => {
+                // A lookup that never completed says nothing about whether a
+                // pool exists. Reporting it as "no live WETH pool" told the user
+                // a fact about the chain based on a failed request.
+                errors += 1;
+                last = e.to_string();
+                crate::trace(&format!("resolve {sym} fee {fee}: getPool failed: {e}"));
+            }
+            Ok(p) => {
             let addr = p.pool;
             if addr != Address::ZERO {
-                let liq = IV3Pool::new(addr, provider).liquidity().call().await.map(|l| l._0).unwrap_or(0);
+                let liq = match IV3Pool::new(addr, provider).liquidity().call().await {
+                    Ok(l) => l._0,
+                    Err(e) => {
+                        errors += 1;
+                        last = e.to_string();
+                        crate::trace(&format!("resolve {sym} fee {fee}: liquidity read failed: {e}"));
+                        continue;
+                    }
+                };
                 if liq > 0 {
-                    return Some(Grad {
+                    return Ok(Some(Grad {
                         token,
                         kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: WETH < token },
                         quote: engine::Quote::Eth,
@@ -1238,12 +1319,18 @@ async fn resolve_v3_grad<P: Provider>(provider: &P, token: Address, sym: &str) -
                         fee,
                         launch_block: 0,
                         meta: engine::Meta::default(),
-                    });
+                    }));
                 }
+                crate::trace(&format!("resolve {sym} fee {fee}: pool {addr:#x} has no liquidity"));
+            }
             }
         }
     }
-    None
+    if errors > 0 {
+        return Err(format!("could not check ({errors} lookups failed: {last})"));
+    }
+    crate::trace(&format!("resolve {sym}: no WETH pool with liquidity at any fee tier"));
+    Ok(None)
 }
 
 /// The top-tokens screen ('t'): tabbed leaderboard + big-fish. Returns the chosen
@@ -1258,6 +1345,21 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
     let url = disc_url.unwrap_or_else(|| PUBLIC_RPC.to_string());
     let mut leader = blockscout_top(&client).await;
     enrich_pooled(&client, &url, &mut leader).await; // fill pooled ETH depth
+
+    // Only keep what can actually be traded.
+    //
+    // Blockscout ranks every ERC-20 on the chain by market cap, and most of the
+    // top of that list — bridged stablecoins, wrapped majors — has no WETH pool
+    // with liquidity in it. The screen listed them anyway, so the top entries
+    // were the ones Enter could not open, and it answered "no live WETH pool"
+    // to a row it had just offered. `pooled` is already the pool's WETH depth,
+    // so it is exactly the test for whether a row is worth showing.
+    let listed = leader.len();
+    leader.retain(|r| r.pooled > 0.0);
+    crate::trace(&format!(
+        "top tokens: {} of {listed} have a funded WETH pool; the rest are not tradable here",
+        leader.len()
+    ));
 
     let mut sel: usize = 0;
     let mut note = String::new();
@@ -1299,8 +1401,11 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
                         if let Some(r) = leader.get(sel) {
                             draw_status(term, "\nResolving pool…")?;
                             match resolve_v3_grad(provider, r.token, &r.sym).await {
-                                Some(g) => return Ok(Some(g)),
-                                None => note = "  · last pick: no live WETH pool".into(),
+                                Ok(Some(g)) => return Ok(Some(g)),
+                                Ok(None) => {
+                                    note = format!("  · {}: no live WETH pool", r.sym)
+                                }
+                                Err(why) => note = format!("  · {}: {why}", r.sym),
                             }
                         }
                     }
