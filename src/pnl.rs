@@ -139,7 +139,13 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     // logo when we return.
     crate::ui::image::clear();
 
-    let fills = ledger::load_all();
+    let mut fills = ledger::load_all();
+    // Re-read on a timer, so a fill that lands while this screen is open shows
+    // up. It was loaded once at open, which meant trading in one window and
+    // watching in another showed yesterday's picture indefinitely. The ledger
+    // is a small local file — reading it costs nothing and never touches the
+    // network.
+    let mut reload = std::time::Instant::now();
     let today = ledger::date_of(ledger::now());
     let (mut year, mut month) = (today.y, today.m);
     // Which day the winners/losers list is showing. `None` = the whole month,
@@ -148,6 +154,10 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     let mut range = Range::Week;
 
     loop {
+        if reload.elapsed() >= Duration::from_secs(2) {
+            fills = ledger::load_all();
+            reload = std::time::Instant::now();
+        }
         term.draw(|f| draw(f, &fills, year, month, sel, range, today))?;
 
         if !event::poll(Duration::from_millis(250))? {
@@ -183,19 +193,19 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
             // was before. A "30D" total sitting above one highlighted date is
             // asking to be misread as that date's.
             KeyCode::Char('h') => {
-                sel = step_day(sel, -1, year, month);
+                sel = step_day(sel, -1, year, month, today);
                 range = Range::Day;
             }
             KeyCode::Char('l') => {
-                sel = step_day(sel, 1, year, month);
+                sel = step_day(sel, 1, year, month, today);
                 range = Range::Day;
             }
             KeyCode::Char('k') => {
-                sel = step_day(sel, -7, year, month);
+                sel = step_day(sel, -7, year, month, today);
                 range = Range::Day;
             }
             KeyCode::Char('j') => {
-                sel = step_day(sel, 7, year, month);
+                sel = step_day(sel, 7, year, month, today);
                 range = Range::Day;
             }
             KeyCode::Char('1') => range = Range::Day,
@@ -217,11 +227,18 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
 
 /// Move the selected day, clamped to the month. No selection means start from
 /// the first or last day, depending on which way you asked to go.
-fn step_day(sel: Option<u32>, by: i32, y: i32, m: u32) -> Option<u32> {
+fn step_day(sel: Option<u32>, by: i32, y: i32, m: u32, today: Date) -> Option<u32> {
     let last = ledger::days_in_month(y, m);
     let cur = match sel {
         Some(d) => d as i32,
+        // Nothing selected yet. On the month you are actually in, the first
+        // press lands on today — that is where you are, and counting from the
+        // 1st to find it is work the app can do for you. On any other month
+        // there is no "here", so it starts at whichever end you came from.
         None => {
+            if today.y == y && today.m == m {
+                return Some(today.d);
+            }
             if by > 0 {
                 0
             } else {
@@ -840,6 +857,20 @@ mod tests {
         assert_eq!(truncate("PEPE", 12), "PEPE");
         assert_eq!(truncate("SUPERLONGTICKERNAME", 12), "SUPERLONGTI…");
         assert_eq!(truncate("SUPERLONGTICKERNAME", 12).chars().count(), 12);
+    }
+
+    #[test]
+    fn the_first_move_lands_on_today_in_the_current_month() {
+        let today = Date { y: 2026, m: 7, d: 28 };
+        // Whichever direction you press first, you start where you are.
+        assert_eq!(step_day(None, 1, 2026, 7, today), Some(28));
+        assert_eq!(step_day(None, -1, 2026, 7, today), Some(28));
+        assert_eq!(step_day(None, 7, 2026, 7, today), Some(28));
+        // A month you are only looking at has no "here" to start from.
+        assert_eq!(step_day(None, 1, 2026, 6, today), Some(1));
+        assert_eq!(step_day(None, -1, 2026, 6, today), Some(30));
+        // Once something is selected it moves normally.
+        assert_eq!(step_day(Some(28), 1, 2026, 7, today), Some(29));
     }
 
     #[test]

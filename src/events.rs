@@ -149,6 +149,13 @@ fn count_of(line: &str) -> Option<u64> {
 
 fn write_session(line: &str) {
     use std::io::Write;
+    // Not from the test suite. `state_dir()` resolves to the real `.trenches`
+    // when tests run in the repo, so every logging test was appending to the
+    // user's actual session log — putting "a condition that keeps happening"
+    // into the record someone attaches to a bug report.
+    if cfg!(test) {
+        return;
+    }
     static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     let f = FILE.get_or_init(|| {
         std::fs::create_dir_all(crate::state_dir()).ok()?;
