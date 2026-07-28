@@ -713,8 +713,14 @@ impl Bot {
         let was_ready = self.ready;
         self.sqrt_price = m.sqrt_price;
         self.tick = m.tick;
-        self.r0 = m.r0;
-        self.r1 = m.r1;
+        // Reserves come only from a full read. A light one returns zero for
+        // them because it did not ask — assigning that made price, pooled depth
+        // and market cap flip to nothing between full reads, which on screen is
+        // a panel that blinks.
+        if m.full {
+            self.r0 = m.r0;
+            self.r1 = m.r1;
+        }
         crate::trace(&format!(
             "market: price={:.10} r0={:.6} r1={:.6} tick={} quote_dec={} token_dec={} supply={:.4}",
             self.price(),
