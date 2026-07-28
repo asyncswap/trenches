@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Transaction assembly: instructions → signed wire bytes → sent → confirmed.
 //!
 //! Compute-budget instructions are hand-encoded rather than pulling another

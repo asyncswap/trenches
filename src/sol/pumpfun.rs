@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! pump.fun bonding-curve state and pricing.
 //!
 //! One account — `BondingCurve` — drives everything: the trenches list (price,

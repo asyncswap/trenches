@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Signing: unlock a keystore by password, or derive an account from a registry
 //! mnemonic — never a raw private key input.
 //!
@@ -15,10 +17,21 @@ use alloy::signers::local::{
 
 /// Where keystores live. Shared with Foundry deliberately, so a wallet made in
 /// either tool shows up in the other.
+/// Where NEW keystores are written: beside the config.
+///
+/// The app derives, encrypts and writes these itself and never shells out to
+/// `cast`, so writing into Foundry's directory was a convention we borrowed
+/// rather than one we depend on — and it put files under a tool's name for
+/// users who do not have that tool. Encrypted keys next to the config is also
+/// the right shape for backup: a keystore is meant to survive being copied.
 pub fn keystore_dir() -> eyre::Result<std::path::PathBuf> {
-    let home = crate::config::home_dir()
-        .ok_or_else(|| eyre::eyre!("cannot find your home directory (HOME / USERPROFILE unset)"))?;
-    Ok(home.join(".foundry/keystores"))
+    Ok(crate::config::config_dir().join("keystores"))
+}
+
+/// Foundry's directory, still READ so a wallet made with `cast` shows up here
+/// and one made here can be used there. Never written to.
+pub fn foundry_keystore_dir() -> Option<std::path::PathBuf> {
+    crate::config::home_dir().map(|h| h.join(".foundry/keystores"))
 }
 
 /// A keystore file on disk.
@@ -27,31 +40,59 @@ pub struct KeystoreEntry {
     pub path: std::path::PathBuf,
 }
 
+/// The file a listed keystore actually lives in.
+///
+/// Never rebuild a keystore path from its name: the list spans two directories,
+/// so `keystore_dir().join(name)` points at the wrong one for anything found in
+/// Foundry's — and a missing file surfaces as "wrong password", which sends the
+/// user hunting for a fault in the one thing that was correct.
+pub fn keystore_path(id: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(id);
+    if p.is_file() {
+        return Some(p);
+    }
+    // A bare name still resolves, for anything that stored one before paths
+    // became the identifier.
+    list_keystores().into_iter().find(|k| k.name == id).map(|k| k.path)
+}
+
 /// Every keystore in the directory, sorted by name.
 ///
 /// Equivalent to `cast wallet list`, without needing Foundry installed. An
 /// unreadable or missing directory is an empty list, not an error: a first-run
 /// user has no keystores yet and that is not a failure.
 pub fn list_keystores() -> Vec<KeystoreEntry> {
-    let Ok(dir) = keystore_dir() else {
-        return Vec::new();
-    };
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<KeystoreEntry> = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-        .filter_map(|e| {
+    // Ours first, then Foundry's. Order matters on a name collision: a wallet
+    // this app wrote wins, and the Foundry one is skipped rather than shown
+    // twice under the same name with different keys behind it.
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(d) = keystore_dir() {
+        dirs.push(d);
+    }
+    if let Some(d) = foundry_keystore_dir() {
+        dirs.push(d);
+    }
+
+    let mut out: Vec<KeystoreEntry> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()).filter(|e| e.path().is_file()) {
             let name = e.file_name().to_string_lossy().to_string();
             // Editor leftovers and dotfiles are not wallets.
             if name.starts_with('.') || name.ends_with('~') {
-                return None;
+                continue;
             }
-            Some(KeystoreEntry { name, path: e.path() })
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+            // Deduped on the PATH, and only to survive the same directory being
+            // listed twice. Two directories may each hold a `robin` and those
+            // are two different keys — both belong in the list.
+            let path = e.path();
+            if seen.insert(path.clone()) {
+                out.push(KeystoreEntry { name, path });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Deployment registry (networks -> tokens -> pools) + accounts, loaded from
 //! deployments.json — the same hierarchical format as the Zig engine.
 //!
@@ -81,8 +83,9 @@ impl ChainKind {
 #[derive(Default, Debug, Deserialize, Clone)]
 pub struct Network {
     pub name: String,
-    /// EVM chain id. Absent/0 for Solana entries.
-    #[serde(default)]
+    /// EVM chain id. `null` or absent for Solana, which has no equivalent —
+    /// `deserialize_with` accepts both so an explicit null is not an error.
+    #[serde(default, deserialize_with = "null_as_zero")]
     pub chain_id: u64,
     /// Chain family — `"evm"` (default) or `"solana"`.
     #[serde(default)]
@@ -160,6 +163,15 @@ pub struct RugCheck {
     pub warn_score: u32,
 }
 
+/// Accept `null` where a number is expected, mapping it to 0.
+///
+/// `"chain_id": null` is how a Solana entry says "this does not apply", and the
+/// derived impl would reject it outright. Zero is the same thing the field
+/// already means when absent.
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -235,19 +247,48 @@ pub fn mark_onboarded() {
 /// of its own checkout and fatal the moment it was installed to `~/.local/bin`:
 /// a fresh user's first `trenches` died on a missing file in whatever directory
 /// their shell happened to be in.
+/// What the config file is called.
+pub const CONFIG_NAME: &str = "config.json";
+/// What it used to be called. Read, never written.
+pub const LEGACY_NAME: &str = "deployments.json";
+
 pub fn config_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("TRENCHES_CONFIG") {
         if !p.trim().is_empty() {
             return std::path::PathBuf::from(p);
         }
     }
-    // A local file wins over the shared one, so a checkout still behaves as it
-    // always did and nobody's working setup moves under them.
-    let local = std::path::PathBuf::from("deployments.json");
+    // A local `config.json` still wins, so a checkout can deliberately carry its
+    // own settings. A local `deployments.json` does NOT: that is the old name,
+    // a copy is lying around in every working tree, and letting it outrank the
+    // real config meant `--init` kept reporting a stray file in whatever folder
+    // the shell happened to be in.
+    let local = std::path::PathBuf::from(CONFIG_NAME);
     if local.exists() {
         return local;
     }
-    config_dir().join("deployments.json")
+    let canonical = config_dir().join(CONFIG_NAME);
+    if canonical.exists() {
+        return canonical;
+    }
+    // Only when nothing current exists: an old config in the config directory is
+    // still worth reading rather than starting someone from scratch.
+    let legacy = config_dir().join(LEGACY_NAME);
+    if legacy.exists() {
+        return legacy;
+    }
+    canonical
+}
+
+/// Where a fresh config is WRITTEN, ignoring whatever sits in the working
+/// directory. "Create my config" should put it where the docs say it lives.
+pub fn init_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("TRENCHES_CONFIG") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    config_dir().join(CONFIG_NAME)
 }
 
 /// The user's home directory.
@@ -304,12 +345,20 @@ pub fn starter_json() -> String {
         "_help": [
             "Trenches configuration. Edit this file, then restart the app.",
             "",
+            "chain_id       EVM only. Solana has no equivalent, so the field is simply absent",
+            "               there — networks are identified by name.",
             "rpc            The endpoint the app trades through. The defaults are public and",
             "               rate-limited; for anything serious put your own key-bearing URL here.",
             "discovery_rpc  Optional. Used for log-heavy scans (new pools, buyer charts). Public",
             "               endpoints usually refuse these, so discovery stays quiet without one.",
             "               Alchemy, Helius, QuickNode and Ankr all work.",
+            "ws             Websocket, Solana only. Often a different host than the RPC.",
             "accounts       Added from inside the app — press W. Nothing to write by hand.",
+            "",
+            "The *_example keys are placeholders showing each provider's URL shape. Copy one",
+            "over the real field (rpc / ws / discovery_rpc), paste your key, and delete the",
+            "example — the app ignores any field it does not recognise, so they cost nothing",
+            "if you leave them.",
             "",
             "This file holds API keys. It is yours, it stays on this machine, and nothing here",
             "is sent anywhere except the endpoints you name. Never put a seed phrase in it: the",
@@ -320,16 +369,32 @@ pub fn starter_json() -> String {
         "networks": [
             {
                 "name": "robinhood-mainnet",
+                "kind": "evm",
                 "chain_id": 4663,
                 "rpc": "https://rpc.mainnet.chain.robinhood.com/rpc",
+                // Log-heavy scans only — new pools, buyer charts. The public
+                // endpoint refuses these, so discovery stays quiet until set.
                 "discovery_rpc": "",
+                "discovery_rpc_alchemy_example": "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
                 "tokens": [],
                 "public_pools": []
             },
             {
                 "name": "solana-mainnet",
-                "chain_id": 900,
+                // Explicitly null, not absent: Solana has no EVM chain id, and a
+                // reader should see that the question was asked and answered
+                // rather than wonder whether a line went missing.
+                "chain_id": null,
+                "kind": "solana",
+                // The public endpoint works and is slow. Swap the whole URL for
+                // a keyed one — the placeholders below are the shape each
+                // provider expects, so a key can be dropped straight in.
                 "rpc": "https://api.mainnet-beta.solana.com",
+                "rpc_helius_example": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+                // Websocket. Providers usually serve it on a different host than
+                // HTTP, which is why it is a separate field rather than derived.
+                "ws": "",
+                "ws_flux_example": "wss://ws.us.fluxrpc.com?key=YOUR_FLUX_KEY",
                 "discovery_rpc": "",
                 "tokens": [],
                 "public_pools": []

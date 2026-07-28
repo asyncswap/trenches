@@ -4761,6 +4761,7 @@ dependencies = [
  "solana-transaction",
  "tokio",
  "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]

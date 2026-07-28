@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Chain logos, drawn as half-block pixel art.
 //!
 //! Ghostty (and most modern terminals) can display real images via the Kitty

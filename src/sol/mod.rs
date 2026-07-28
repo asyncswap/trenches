@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Solana / pump.fun chain adapter. Behind the `solana` cargo feature so the
 //! EVM-only build stays fast (the solana crate tree is heavy).
 //!
@@ -62,10 +64,54 @@ pub fn trace(msg: &str) {
             .map(Mutex::new)
     });
     if let Some(f) = f {
-        // Seconds since session start beats wall-clock here: the questions are
-        // about elapsed time ("nothing after a minute"), not time of day.
+        // Both clocks. Elapsed answers "nothing happened for a minute"; the wall
+        // clock is what lets a trace line be lined up against the session log,
+        // which is the only way to see what the bot was doing around a fill.
         if let Ok(mut f) = f.lock() {
-            let _ = writeln!(f, "{:8.3}  {msg}", start.elapsed().as_secs_f64());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let (h, m, s) = ((now % 86400) / 3600, (now % 3600) / 60, now % 60);
+            let _ = writeln!(
+                f,
+                "[{h:02}:{m:02}:{s:02}] {:8.3}  {msg}",
+                start.elapsed().as_secs_f64()
+            );
+            let _ = f.flush();
+        }
+    }
+}
+
+/// Append a line to the session log, the durable record of what was done and
+/// when.
+///
+/// The trace log next to it is for diagnosing a run in progress, so it counts
+/// seconds since start. That is the wrong clock for "when did I buy this" — the
+/// question the fill history asks, and one nobody can answer from an elapsed
+/// count once the process is gone. This is the EVM side's `session-<ts>.log`,
+/// same name and same `[HH:MM:SS] ` prefix, so one parser reads both chains.
+pub fn session(line: &str) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let f = FILE.get_or_init(|| {
+        std::fs::create_dir_all(crate::state_dir()).ok()?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/session-{ts}.log", crate::state_dir()))
+            .ok()
+            .map(Mutex::new)
+    });
+    if let Some(f) = f {
+        if let Ok(mut f) = f.lock() {
+            let _ = writeln!(f, "{line}");
             let _ = f.flush();
         }
     }

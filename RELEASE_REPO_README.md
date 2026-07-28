@@ -1,9 +1,9 @@
 <!--
-  This is the README for the PUBLIC releases repo (github.com/asyncswap/trenches),
-  not for this source tree. Copy it there; nothing else from this repo goes with it.
+  This is the README for the PUBLIC repo (github.com/asyncswap/trenches).
+  Copy it there.
 
-  That repo holds three things: tagged releases with binaries attached, this
-  README, and the issue tracker. No source.
+  That repo holds the source, tagged releases with binaries attached, this README
+  and the issue tracker.
 -->
 
 # Trenches
@@ -84,10 +84,23 @@ described anywhere.
 
 ## Source
 
-The source is private. Releases, this README and the tracker are what live here.
+All of it is here. Trenches is licensed **AGPL-3.0-only** — read it, fork it,
+modify it, run it yourself.
 
-We read every issue, and feedback shapes what gets built — that part is genuinely
-open even though the code is not.
+Money moves through this software, so you should be able to see exactly what it
+signs and where it sends it. That is not a claim worth making about code nobody
+can read.
+
+Build it yourself:
+
+```sh
+git clone https://github.com/asyncswap/trenches
+cd trenches
+cargo build --release --features solana
+```
+
+Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commits are signed off
+under the DCO; there is no CLA and no copyright assignment.
 
 ---
 
@@ -105,8 +118,20 @@ open even though the code is not.
 
 ## Licence
 
-See the licence bundled with each release, and at
-[trenches.sh/license](https://trenches.sh/license).
+**AGPL-3.0-only.** Copyright (C) 2026 AsyncSwap Labs. Full text in
+[LICENSE](LICENSE).
+
+Use it, modify it, redistribute it, run it yourself. If you modify Trenches and
+offer it to other people as a network service, the AGPL asks you to publish your
+changes to those users — a hosted fork gives its improvements back rather than
+taking them private. Running it on your own machine asks nothing of you.
+
+Services built *around* Trenches — hosted RPCs, analytics, AI models — are
+independent services reached over an API. They carry their own licenses. The AGPL
+covers the bot, not what is on the other side of a network call.
+
+"Trenches" and trenches.sh are trademarks, held separately from the code license.
+Fork it and say so; do not ship your fork *as* Trenches.
 
 Trenches is a tool, not advice. What you trade with it is your decision and your
 risk.

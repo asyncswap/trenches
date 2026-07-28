@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! PumpSwap AMM — where pump.fun coins trade **after** they graduate.
 //!
 //! Once `BondingCurve.complete` flips, liquidity migrates to this constant-product

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Robinhood Chain speed bot (Rust). Full feature port of the Zig engine,
 //! built speed-first: concurrent reads, pre-flight gas protection, and ready
 //! for a local Nitro node over ws:// or IPC (remote ~380ms -> local ~1ms).
@@ -13,6 +15,7 @@ mod pricing;
 #[cfg(feature = "solana")]
 mod sol;
 mod ui;
+mod update;
 mod v3;
 mod v4;
 mod view;
@@ -436,14 +439,19 @@ fn compute_pool_id(token: alloy::primitives::Address, fee: u32, tick_spacing: i3
 /// from the chain at any time. Config is what a person decides; this is what the
 /// app found out. Keeping them together meant a file you were told to edit grew
 /// hundreds of entries you never wrote, and burying an RPC URL among them.
-fn token_cache_path(chain_id: u64) -> String {
-    format!("{}/tokens-{chain_id}.json", state_dir())
+fn token_cache_path(network: &str) -> String {
+    // Filesystem-safe: a network name comes from config and can hold anything.
+    let safe: String = network
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    format!("{}/tokens-{safe}.json", state_dir())
 }
 
 /// Read a chain's cached tokens. A missing or unreadable cache is empty, never
 /// an error: it can always be rebuilt by finding the coins again.
-fn load_token_cache(chain_id: u64) -> Vec<config::Token> {
-    std::fs::read_to_string(token_cache_path(chain_id))
+fn load_token_cache(network: &str) -> Vec<config::Token> {
+    std::fs::read_to_string(token_cache_path(network))
         .ok()
         .and_then(|t| serde_json::from_str::<Vec<config::Token>>(&t).ok())
         .unwrap_or_default()
@@ -453,7 +461,7 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
     let mut v = Vec::new();
     // Config first, then cache: a token someone wrote by hand should win over
     // one the app stumbled across, and `collect_pools` dedupes downstream.
-    let cached = load_token_cache(net.chain_id);
+    let cached = load_token_cache(&net.name);
     for t in net.tokens.iter().chain(cached.iter()) {
         for p in &t.pools {
             if !p.is_v4() {
@@ -534,7 +542,16 @@ async fn main() -> eyre::Result<()> {
             // config has exactly one definition. A copy in a shell script is a
             // copy that drifts the first time a field is added.
             "--init" => {
-                let (_, path, created) = Registry::load_or_create()?;
+                // Always the canonical path — not whatever `config_path()`
+                // resolves to from the current directory.
+                let path = config::init_path();
+                let created = !path.exists();
+                if created {
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
+                    std::fs::write(&path, config::starter_json())?;
+                }
                 std::fs::create_dir_all(state_dir())?;
                 println!();
                 if created {
@@ -571,6 +588,11 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
+    // Ask whether there is a newer release, in the background. Started here, at
+    // the top, so it has answered by the time anything is drawn — and detached,
+    // so a slow or absent network delays nothing. It only ever reports.
+    update::spawn_check();
+
     // Loads what is there, or writes a starter file and says so. A first run
     // used to end on a file-not-found for a path the user had never heard of.
     let (mut reg, cfg_path, created) = Registry::load_or_create()?;
@@ -582,6 +604,13 @@ async fn main() -> eyre::Result<()> {
     // invites a first trade that goes nowhere, and an anvil node nobody is
     // running is a dead row. Never written to the config either way.
     reg.networks.extend(config::dev_networks());
+
+    // A build without the solana feature cannot trade Solana, so it does not
+    // offer it. The dispatch below still refuses politely if one slips through,
+    // but a chain in the picker that answers "not compiled in" is a door that
+    // opens onto a wall — better never to draw the door.
+    #[cfg(not(feature = "solana"))]
+    reg.networks.retain(|n| !n.kind.is_solana());
     let _ = REGISTRY_PATH.set(cfg_path.to_string_lossy().into_owned());
     if created {
         println!();
@@ -625,16 +654,24 @@ async fn solana_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     reg: &Registry,
     net: &config::Network,
+    // False on the way in, true when `W` sent us back round — same contract as
+    // the EVM side.
+    ask_account: bool,
 ) -> eyre::Result<Exit> {
     // Offer keystore accounts first, then mnemonic-derived ones. The addresses
     // shown are ed25519/base58 — not the EVM addresses for the same seed.
     // Same rule as the EVM side: keystores only. A seed phrase in a config file
     // is not an account we are willing to offer, so the wallet screen IS the
     // account picker here too.
-    let signer = loop {
+    // Optional, exactly like the EVM side. Esc goes on WITHOUT an account and
+    // the dashboard opens read-only: prices, launches and the tape are worth
+    // seeing before committing a key to the machine, and `W` unlocks one at any
+    // point. Skipped entirely when there is nothing to unlock — an empty list
+    // you have to Esc past is a question with no answer standing in the way.
+    let mut unlocked: Option<solana_keypair::Keypair> = None;
+    while ask_account && !wallet::list_keystores().is_empty() {
         let Some(ks) = wallet_screen(terminal, config::ChainKind::Solana)? else {
-            // Esc steps back to the chain picker rather than closing the app.
-            return Ok(Exit::ChangeChain);
+            break;
         };
         let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
             continue;
@@ -642,19 +679,26 @@ async fn solana_app(
         match sol::wallet::keypair_from_keystore(&ks, &pass) {
             Ok(kp) => {
                 save_last_wallet(&ks);
-                break kp;
+                unlocked = Some(kp);
+                break;
             }
             Err(e) => {
                 ui::select(terminal, &format!("Could not unlock: {e}"), &["Back".into()])?;
             }
         }
-    };
+    }
+    // No account: a throwaway key builds the client. Nothing is ever signed with
+    // it — the order keys are guarded on `has_account` — but it keeps ONE code
+    // path rather than a second dashboard differing only in whether it can sign.
+    let has_account = unlocked.is_some();
+    let signer = unlocked.unwrap_or_else(solana_keypair::Keypair::new);
 
     let exit = sol::app::run(
         terminal,
         net.rpc_pool(),
         net.ws.as_deref(),
         signer,
+        has_account,
         &reg.rugcheck,
         &view::pretty_network(&net.name),
     )
@@ -662,7 +706,7 @@ async fn solana_app(
     if exit == Exit::ChangeAccount {
         // Straight back to the wallet list on this same chain — the same shape
         // the EVM session uses, so both chains behave identically.
-        return Box::pin(solana_app(terminal, reg, net)).await;
+        return Box::pin(solana_app(terminal, reg, net, true)).await;
     }
     Ok(exit)
 }
@@ -687,29 +731,18 @@ fn wallet_screen(
                 found.insert(0, k);
             }
         }
-        let mut labels: Vec<String> = found
-            .iter()
-            // The path, not the address: it tells you WHERE the key is, which
-            // is what you need when deciding whether to trust it.
-            .enumerate()
-            .map(|(i, k)| {
-                let last = i == 0 && load_last_wallet().as_deref() == Some(k.name.as_str());
-                format!(
-                    "{:<16} {}{}",
-                    k.name,
-                    short_home(&k.path),
-                    if last { "   · last used" } else { "" }
-                )
-            })
-            .collect();
-        labels.push("＋ Create a new wallet".to_string());
-        labels.push("＋ Import a private key".to_string());
-        labels.push(match kind {
-            // Name the path, because the same phrase gives a different address
-            // on each chain and "it did not match" is the failure mode.
-            config::ChainKind::Solana => "＋ Import a seed phrase  (m/44'/501')".to_string(),
-            config::ChainKind::Evm => "＋ Import a seed phrase  (m/44'/60')".to_string(),
-        });
+        let mut labels: Vec<String> = vec![
+            "＋ Create new account".to_string(),
+            "＋ Import private key".to_string(),
+            "＋ Import seed phrase".to_string(),
+        ];
+        // The PATH alone, not the name beside it. The keystore's filename is the
+        // last segment of the path, so printing both said everything twice —
+        // and what you actually check before unlocking a key is where it lives.
+        labels.extend(found.iter().enumerate().map(|(i, k)| {
+            let last = i == 0 && load_last_wallet().as_deref() == Some(k.name.as_str());
+            format!("{}{}", short_home(&k.path), if last { "   · last used" } else { "" })
+        }));
 
         let chain = match kind {
             config::ChainKind::Solana => "Solana",
@@ -723,20 +756,21 @@ fn wallet_screen(
         let Some(i) = ui::select(terminal, &title, &labels)? else {
             return Ok(None);
         };
-        if i < found.len() {
-            return Ok(Some(found[i].name.clone()));
+        const ACTIONS: usize = 3;
+        if i >= ACTIONS {
+            return Ok(Some(found[i - ACTIONS].name.clone()));
         }
 
         // Creating: name, then the secret if importing, then a password.
         let Some(name) = ui::input(terminal, "Wallet name", "e.g. robin — becomes the file name")? else {
             continue;
         };
-        let secret = match i - found.len() {
+        let secret = match i {
             1 => ui::password(terminal, "Private key (hidden)")?,
             2 => ui::password(terminal, "Seed phrase (hidden)")?,
             _ => None,
         };
-        if i - found.len() > 0 && secret.is_none() {
+        if i > 0 && secret.is_none() {
             continue;
         }
         let Some(pass) = ui::password(terminal, "Password for the new keystore")? else {
@@ -753,7 +787,7 @@ fn wallet_screen(
         // Each arm returns the address as text: the two chains format addresses
         // differently, and the Solana path used to hand back a placeholder that
         // rendered as 0x000…000.
-        let made: eyre::Result<String> = match i - found.len() {
+        let made: eyre::Result<String> = match i {
             1 => match kind {
                 #[cfg(feature = "solana")]
                 config::ChainKind::Solana => {
@@ -898,7 +932,7 @@ async fn app(
             let exit = match resume.take() {
                 Some(i) => {
                     save_last_chain(&reg.networks[i].name);
-                    chain_session_on(terminal, reg, &reg.networks[i], i).await?
+                    chain_session_on(terminal, reg, &reg.networks[i], i, false).await?
                 }
                 None => chain_session(terminal, reg, None).await?,
             };
@@ -969,9 +1003,15 @@ async fn chain_session(
             .map(|n| n.to_lowercase())
     };
     let _ = keep_net;
+    // The chain picker is the first thing drawn, so it is where a waiting
+    // update gets said. One line, no prompt to dismiss, no blocking.
+    let title = match update::available() {
+        Some(v) => format!("Select chain          ▲ {v} available — curl -fsSL https://trenches.sh/install | sh"),
+        None => "Select chain".to_string(),
+    };
     let chosen = ui::select_table(
         terminal,
-        "Select chain",
+        &title,
         &[],
         COLS,
         &rows,
@@ -989,7 +1029,7 @@ async fn chain_session(
         // and it asks first.
         None => return Ok(Exit::Docs),
     };
-    chain_session_on(terminal, reg, net, net_idx).await
+    chain_session_on(terminal, reg, net, net_idx, false).await
 }
 
 /// The session for one already-chosen network.
@@ -998,6 +1038,10 @@ async fn chain_session_on(
     reg: &Registry,
     net: &config::Network,
     _net_idx: usize,
+    // False on the way in, true when `W` sent us back round. A first run should
+    // reach the dashboard without being asked for a password it may not need —
+    // watching costs nothing and unlocking is one keypress away.
+    ask_account: bool,
 ) -> eyre::Result<Exit> {
 
     // Solana networks take an entirely separate path: different signing curve,
@@ -1005,7 +1049,7 @@ async fn chain_session_on(
     if net.kind.is_solana() {
         #[cfg(feature = "solana")]
         {
-            return solana_app(terminal, reg, net).await;
+            return solana_app(terminal, reg, net, false).await;
         }
         #[cfg(not(feature = "solana"))]
         {
@@ -1028,14 +1072,17 @@ async fn chain_session_on(
     // of entry means anyone who just wants to watch hands over a password first.
     // `W` unlocks one at any point.
     let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = None;
-    while !wallet::list_keystores().is_empty() {
+    while ask_account && !wallet::list_keystores().is_empty() {
         let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
             break;
         };
         let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
             continue;
         };
-        let path = wallet::keystore_dir()?.join(&ks);
+        let Some(path) = wallet::keystore_path(&ks) else {
+            ui::select(terminal, &format!("{ks} is no longer on disk"), &["Back".into()])?;
+            continue;
+        };
         match alloy::signers::local::LocalSigner::decrypt_keystore(&path, &pass) {
             Ok(sg) => {
                 // Only after a successful unlock: a mistyped password should
@@ -1174,12 +1221,12 @@ async fn chain_session_on(
 
     // --- trading dashboard (same terminal), with live option switching ---
     let verified = build_verified(net);
-    let exit = run(terminal, &provider, &mut bot, pools, assets, net.chain_id, net.discovery_rpc.clone(), verified).await?;
+    let exit = run(terminal, &provider, &mut bot, pools, assets, net.name.clone(), net.discovery_rpc.clone(), verified).await?;
     if exit == Exit::ChangeAccount {
         // Straight back to the account list on this same chain. Recursing
         // rebuilds the provider around the new signer, which is the whole
         // reason this cannot be swapped in place.
-        return Box::pin(chain_session_on(terminal, reg, net, _net_idx)).await;
+        return Box::pin(chain_session_on(terminal, reg, net, _net_idx, true)).await;
     }
     Ok(exit)
 }
@@ -1191,9 +1238,9 @@ async fn chain_session_on(
 /// file that silently grows a few hundred entries is one nobody can find their
 /// own RPC URL in any more. The cache is disposable: delete it and the coins
 /// come back the next time they are found.
-fn persist_pool(chain_id: u64, p: &SelPool) -> eyre::Result<()> {
+fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
     use serde_json::{json, Value};
-    let path = token_cache_path(chain_id);
+    let path = token_cache_path(network);
     let mut tokens_val: Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -1289,7 +1336,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     bot: &mut Bot,
     mut pools: Vec<SelPool>,
     assets: Vec<(alloy::primitives::Address, String)>,
-    chain_id: u64,
+    network: String,
     discovery_rpc: Option<String>,
     verified: Vec<discover::VerifiedPool>,
 ) -> eyre::Result<Exit> {
@@ -1882,7 +1929,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     *pool_cell.lock().unwrap() = bot.pool.as_ref();
                                     prices.clear();
                                     bot.status = format!("Now trading {}", pool_sentence(&p.label));
-                                    match persist_pool(chain_id, &p) {
+                                    match persist_pool(&network, &p) {
                                         Ok(()) => bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label))),
                                         Err(e) => bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label))),
                                     }
@@ -2022,7 +2069,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     if i < 3 {
                                         // Persist created/added pools to the registry so
                                         // they survive restarts (not just this session).
-                                        match persist_pool(chain_id, &p) {
+                                        match persist_pool(&network, &p) {
                                             Ok(()) => bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label))),
                                             Err(e) => bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label))),
                                         }
@@ -2439,6 +2486,31 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD),
         )
     };
+    // Nothing to report without an account.
+    //
+    // A row of zeroes is not "empty", it is a claim: zero balance, zero
+    // realized, zero trades. None of that is known until a key is unlocked, and
+    // showing it invites someone to read a wallet they have not opened. Same
+    // shape as the Pool panel's empty state — say what is missing, then the key
+    // that fixes it.
+    if bot.trader.is_zero() {
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No account",
+                Style::default()
+                    .fg(ui::widgets::tone_color(view::Tone::Normal))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  [W] unlock or create an account",
+                Style::default().fg(ui::widgets::tone_color(view::Tone::Info)),
+            )),
+        ])
+        .block(ui::widgets::themed_block(" Wallet [W] "));
+        f.render_widget(empty, cols[wallet_col]);
+    } else {
     let wallet = Paragraph::new(vec![
         // "Which account am I?" belongs with the balances, not in the header.
         Line::from(vec![
@@ -2527,6 +2599,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     ])
     .block(ui::widgets::themed_block(" Wallet [W] "));
     f.render_widget(wallet, cols[wallet_col]);
+    }
 
     match view {
         Panel::Logs => {

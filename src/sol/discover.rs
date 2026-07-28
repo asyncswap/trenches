@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! pump.fun launch discovery — the Solana "trenches".
 //!
 //! Mirrors the EVM discovery flow: scan for launches, fetch each one's live

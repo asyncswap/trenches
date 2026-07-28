@@ -21,6 +21,19 @@ typed.
 On first run the bot writes a starter `config.json` and tells you where. It works
 as-is on public endpoints.
 
+To write it yourself, or to check where it went:
+
+```
+trenches --init
+```
+
+That creates the config and the state directory, prints both paths, and exits.
+It never overwrites a config that already exists. The installer runs it for you.
+
+**If you keep a `config.json` or `deployments.json` in the directory you run
+from, that file wins** and the one under `~/.config` is never created. Handy for
+a checkout with its own settings; confusing if you did not mean to.
+
 **Other locations, in the order they are checked:**
 
 1. `$TRENCHES_CONFIG` — a full path, for running more than one profile
@@ -64,6 +77,16 @@ only raises the rate limit.
 
 Restart the bot after editing. Nothing here is sent anywhere except to the
 endpoints you name.
+
+### Without leaving the app
+
+Press **D** for these docs, then **e**. It asks for each endpoint in turn — one
+chain at a time — and writes them to the config. Esc stops the walk without
+saving the rest, and an empty answer clears a field rather than blanking it to
+an endpoint that resolves to nothing.
+
+The file is written to a temporary name and renamed into place, so an
+interrupted write cannot leave you with a truncated config.
 
 ### Editor help
 

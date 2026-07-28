@@ -56,3 +56,22 @@ Notes for whoever picks these up:
   budget time to derive the contract calls the way the pump.fun path was
   verified (build a known-good trade with the official tooling, then diff our
   encoding against it account by account).
+
+## License
+
+Trenches is licensed under the **GNU Affero General Public License v3.0**
+(AGPL-3.0-only). Copyright (C) 2026 AsyncSwap Labs. Full text in
+[LICENSE](LICENSE); the reasoning and the trademark and commercial-services
+carve-outs are in [NOTICE](NOTICE) and [docs/license.md](docs/license.md).
+
+You may use, read, modify, redistribute and self-host it. If you modify Trenches
+and offer it to others as a network service, the AGPL asks you to publish your
+changes to those users — a hosted fork gives its improvements back rather than
+taking them private.
+
+Independent services reached over an API — hosted RPCs, analytics, AI models —
+carry their own licenses. The AGPL covers the bot, not what is on the far side of
+a network call.
+
+Contributions come in under the same license, signed off under the DCO. No CLA.
+See [CONTRIBUTING.md](CONTRIBUTING.md).

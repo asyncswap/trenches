@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Native ratatui selection screens — arrow-key list menus and a masked
 //! password field — so the whole bot (selection + trading) is one TUI app.
 //!
@@ -247,7 +249,7 @@ pub fn endpoints_screen(term: &mut Term) -> eyre::Result<()> {
         let mut fields: Vec<(&str, &str, &str)> = vec![(
             "rpc",
             "Trading RPC URL",
-            "Every trade goes through this. Paste the one with your key in it.",
+            "Enter your RPC endpoint",
         )];
         if solana {
             fields.push(("ws", "Websocket URL", "Optional. Often a different host than the RPC."));
@@ -332,7 +334,7 @@ fn docs_inner(
                 // The footer names what THIS page can do. A fixed strip listing
                 // every key would be a second shortcuts index nobody reads.
                 .title_bottom(if !start {
-                    " j/k or tab switch · ↑/↓ scroll · T theme · esc back ".to_string()
+                    " j/k or tab switch · ↑/↓ scroll · e set API keys · T theme · esc back ".to_string()
                 } else {
                     let action = match DOCS[sel].0 {
                         "Accounts" => " · W make an account",
@@ -387,7 +389,7 @@ fn docs_inner(
                     // that talks about them. Reading "press W to make an
                     // account" and then having to leave to do it is the kind of
                     // gap that turns a five-minute setup into an evening.
-                    KeyCode::Char('e') if start => {
+                    KeyCode::Char('e') => {
                         endpoints_screen(term)?;
                     }
                     KeyCode::Char('W') if start => {
@@ -587,6 +589,32 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
 }
 
 /// Masked password entry. Returns the typed string, or None if cancelled.
+/// A password that wipes itself when it goes out of scope.
+///
+/// A `String` freed normally leaves its bytes in the heap until something else
+/// happens to reuse them — readable from a core dump, a swap file, or a
+/// debugger attached to the process. The window is small and the risk is not
+/// theoretical: this is the one secret the user types by hand, and the file it
+/// unlocks is designed to be safe to copy precisely BECAUSE the password is not
+/// stored anywhere. Leaving it in freed memory undoes that.
+///
+/// Deref means callers use it exactly like a `&str`.
+pub struct Secret(String);
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
 pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
     // This screen owns the terminal now: take down any image the previous one
     // left, which also marks every placement stale so it redraws on return.

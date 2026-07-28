@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! The PnL calendar (`L`).
 //!
 //! A month of trading as a grid, one cell per day, coloured by whether that day
@@ -26,20 +28,26 @@ use crate::view::Tone;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-/// How far back the summary line looks. Bound to `1` / `2` / `3`.
+/// How far back the summary line looks. Bound to `1` through `5`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Range {
     Day,
     Week,
     Month,
+    Year,
+    All,
 }
 
 impl Range {
+    /// Days counted back from today. All-time gets a span wider than any
+    /// plausible history rather than a special case at every call site.
     fn days(self) -> i64 {
         match self {
             Range::Day => 1,
             Range::Week => 7,
             Range::Month => 30,
+            Range::Year => 365,
+            Range::All => i64::MAX / 2,
         }
     }
 
@@ -48,8 +56,16 @@ impl Range {
             Range::Day => "1D",
             Range::Week => "7D",
             Range::Month => "30D",
+            Range::Year => "1Y",
+            Range::All => "ALL",
         }
     }
+}
+
+/// How many week-rows a month occupies, Monday-first. Between 4 and 6.
+fn weeks_in(year: i32, month: u32) -> usize {
+    let lead = ledger::weekday(year, month, 1) as usize;
+    (lead + ledger::days_in_month(year, month) as usize).div_ceil(7)
 }
 
 /// A day's trading, already totalled.
@@ -81,14 +97,28 @@ fn money(v: f64) -> String {
     } else if a >= 1_000.0 {
         format!("{sign}${:.1}K", a / 1e3)
     } else if a >= 1.0 {
-        format!("{sign}${a:.0}")
+        format!("{sign}${a:.2}")
     } else if a > 0.0 {
         // Sub-dollar days are still days you traded; rounding them to $0 would
         // make a cell look empty when it is not.
-        format!("{sign}${a:.2}")
+        format!("{sign}${a:.3}")
     } else {
         "$0".into()
     }
+}
+
+/// Mix a colour toward the panel background.
+///
+/// A tile painted in the full tone is too loud to read a figure off, and the
+/// figure is the only reason the tile exists. A tint keeps the green/red signal
+/// while leaving enough contrast for the number on top of it.
+fn tint(c: ratatui::style::Color, amount: f64) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    let (Color::Rgb(r, g, b), Color::Rgb(br, bg, bb)) = (c, widgets::bg_panel()) else {
+        return c;
+    };
+    let mix = |a: u8, b: u8| ((a as f64) * amount + (b as f64) * (1.0 - amount)) as u8;
+    Color::Rgb(mix(r, br), mix(g, bg), mix(b, bb))
 }
 
 /// The colour a figure carries: green up, red down, dim flat.
@@ -149,13 +179,30 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
             // week is what the grid's rows literally are. One set of keys for
             // moving through the data, which is how every other list in the app
             // behaves.
-            KeyCode::Char('h') => sel = step_day(sel, -1, year, month),
-            KeyCode::Char('l') => sel = step_day(sel, 1, year, month),
-            KeyCode::Char('k') => sel = step_day(sel, -7, year, month),
-            KeyCode::Char('j') => sel = step_day(sel, 7, year, month),
+            // Landing on a day snaps the range back to a single day, whatever it
+            // was before. A "30D" total sitting above one highlighted date is
+            // asking to be misread as that date's.
+            KeyCode::Char('h') => {
+                sel = step_day(sel, -1, year, month);
+                range = Range::Day;
+            }
+            KeyCode::Char('l') => {
+                sel = step_day(sel, 1, year, month);
+                range = Range::Day;
+            }
+            KeyCode::Char('k') => {
+                sel = step_day(sel, -7, year, month);
+                range = Range::Day;
+            }
+            KeyCode::Char('j') => {
+                sel = step_day(sel, 7, year, month);
+                range = Range::Day;
+            }
             KeyCode::Char('1') => range = Range::Day,
             KeyCode::Char('2') => range = Range::Week,
             KeyCode::Char('3') => range = Range::Month,
+            KeyCode::Char('4') => range = Range::Year,
+            KeyCode::Char('5') => range = Range::All,
             // Back to the whole month, and back to this month.
             KeyCode::Backspace => sel = None,
             KeyCode::Char('t') => {
@@ -198,7 +245,10 @@ fn draw(
 
     let rows = Layout::vertical([
         Constraint::Length(3),  // totals
-        Constraint::Length(20), // the grid
+        // Sized to the month on screen: a heading, then three rows per week with
+        // a blank row between them, plus the block's own border. A fixed height
+        // either clipped February or left a hole under a long month.
+        Constraint::Length(weeks_in(year, month) as u16 * 4 + 2), // the grid
         Constraint::Min(5),     // winners / losers
         Constraint::Length(1),  // keys
     ])
@@ -214,20 +264,23 @@ fn draw(
         }
     }
 
-    header(f, rows[0], fills, year, month, range, today);
+    header(f, rows[0], fills, &by_day, year, month, range, sel, today);
     grid(f, rows[1], &by_day, year, month, sel, today);
     breakdown(f, rows[2], &by_day, year, month, sel);
     keys(f, rows[3]);
 }
 
 /// Range total, month total, and how the days split.
+#[allow(clippy::too_many_arguments)]
 fn header(
     f: &mut Frame,
     area: Rect,
     fills: &[Fill],
+    by_day: &[Vec<&Fill>],
     year: i32,
     month: u32,
     range: Range,
+    sel: Option<u32>,
     today: Date,
 ) {
     // The range is counted back from TODAY, not from the month on screen —
@@ -240,7 +293,13 @@ fn header(
             ledger::days_from_civil(d.y, d.m, d.d) >= cutoff
         })
         .collect();
-    let r = summarise(&recent);
+    // With a day selected, "1D" means THAT day rather than today — the cursor is
+    // the thing you are asking about. Widen the range and it goes back to being
+    // a window counted off today, which is the only reading "30D" can have.
+    let r = match sel {
+        Some(d) if range == Range::Day => summarise(&by_day[d as usize]),
+        _ => summarise(&recent),
+    };
 
     let month_fills: Vec<&Fill> = fills
         .iter()
@@ -251,35 +310,78 @@ fn header(
         .collect();
     let m = summarise(&month_fills);
 
+    // Neither of these pads. Spacing is decided below, where it can be measured
+    // against the box; a closure that quietly adds its own is a closure whose
+    // output is wider than the string the layout was computed from.
     let label = |s: &str| {
         Span::styled(
-            format!("{s} "),
+            s.to_string(),
             Style::default().fg(widgets::border_color()).add_modifier(Modifier::BOLD),
         )
     };
     let val = |v: f64| {
         Span::styled(
-            format!("{}  ", money(v)),
+            money(v),
             Style::default().fg(tone_color(pnl_tone(v))).add_modifier(Modifier::BOLD),
         )
     };
     let dim = |s: String| Span::styled(s, Style::default().fg(tone_color(Tone::Dim)));
 
-    let win_rate = |d: &Day| {
-        if d.trades == 0 {
-            "no trades".to_string()
-        } else {
-            format!("{}/{} won  ", d.wins, d.trades)
-        }
+    // The centre follows the cursor: while a day is selected it reports that
+    // day, and falls back to the month once the selection is cleared. Reading a
+    // month's win rate while a single day is highlighted invites you to read it
+    // as that day's.
+    let focus = match sel {
+        Some(d) => summarise(&by_day[d as usize]),
+        None => summarise(&month_fills),
     };
+    let scope = match sel {
+        Some(d) => format!("{} {d}", ledger::MONTHS[(month - 1) as usize]),
+        None => "MONTH".to_string(),
+    };
+    let rate = if focus.trades == 0 {
+        format!("{scope} · no trades")
+    } else {
+        format!(
+            "{scope} · {}/{} Wins · {:.0}% Win rate",
+            focus.wins,
+            focus.trades,
+            focus.wins as f64 / focus.trades as f64 * 100.0
+        )
+    };
+    // Range left, MONTH right, the win rate centred between them — and the two
+    // sides mirror, so each label sits against its own edge with its figure
+    // inboard of it.
+    //
+    // Every width here is the width of a span that actually gets rendered. The
+    // previous version measured strings the closures then padded, so the row
+    // came out six columns wider than the box and the right-hand figure was
+    // truncated at the border.
+    let l_lab = format!("{} ", range.label());
+    let l_val = money(r.pnl_usd);
+    let r_val = money(m.pnl_usd);
+    let r_lab = " MONTH";
+
+    let inner = area.width.saturating_sub(2) as usize;
+    let used = l_lab.chars().count()
+        + l_val.chars().count()
+        + rate.chars().count()
+        + r_val.chars().count()
+        + r_lab.chars().count();
+    let slack = inner.saturating_sub(used);
+    // Split so the two gaps add back to exactly the slack. Halving twice loses
+    // the odd column, and losing it on the right is what pushes past the edge.
+    let gap_l = slack / 2;
+    let gap_r = slack - gap_l;
 
     let body = vec![Line::from(vec![
-        label(range.label()),
+        label(&l_lab),
         val(r.pnl_usd),
-        dim(win_rate(&r)),
-        label("   MONTH"),
+        Span::raw(" ".repeat(gap_l)),
+        dim(rate),
+        Span::raw(" ".repeat(gap_r)),
         val(m.pnl_usd),
-        dim(win_rate(&m)),
+        label(r_lab),
     ])];
 
     f.render_widget(
@@ -304,22 +406,27 @@ fn grid(
 ) {
     const NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     // Every cell is the same width, so the columns line up under their headings
-    // without a table widget and its borders eating four rows of a fourteen-row
-    // box. One space between cells reads as a gap between tiles.
+    // without a table widget and its borders eating four rows of the box.
     const W: usize = 11;
-    const GAP: &str = " ";
+    // The single column between two cells. The selection outline is drawn HERE
+    // rather than inside the cell: a border painted on the tile's own edges sits
+    // within the coloured block instead of around it, which reads as a box in a
+    // box. Everything below follows from wanting the outline outside the fill.
+    const EDGE: usize = 1;
 
     // Centred in the panel. Seven fixed-width columns do not grow with the box,
     // so on a wide terminal the whole month sat against the left edge with half
-    // the panel empty beside it.
-    let grid_w = (W * 7 + 6) as u16;
+    // the panel empty beside it. The outer two edge columns are part of the grid
+    // now, because the outline needs somewhere to go on the first and last day
+    // of a week.
+    let grid_w = (W * 7 + EDGE * 8) as u16;
     let pad = " ".repeat(((area.width.saturating_sub(2).saturating_sub(grid_w)) / 2) as usize);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut head: Vec<Span> = vec![Span::raw(pad.clone())];
+    let mut head: Vec<Span> = vec![Span::raw(pad.clone()), Span::raw(" ".repeat(EDGE))];
     for (i, n) in NAMES.iter().enumerate() {
         if i > 0 {
-            head.push(Span::raw(GAP));
+            head.push(Span::raw(" ".repeat(EDGE)));
         }
         head.push(Span::styled(
             format!("{n:^W$}"),
@@ -331,80 +438,145 @@ fn grid(
     let lead = ledger::weekday(year, month, 1) as usize;
     let last = ledger::days_in_month(year, month) as usize;
 
-    // 6 rows covers every month layout — 31 days starting on a Sunday is the
-    // worst case at 37 cells.
-    for week in 0..6 {
-        // Two lines per week: the date, then what it made.
-        let mut top: Vec<Span> = vec![Span::raw(pad.clone())];
-        let mut bot: Vec<Span> = vec![Span::raw(pad.clone())];
-        let mut any = false;
+    // The day in a given slot, or None where the month has not started or has
+    // already ended.
+    let day_at = |week: usize, wd: usize| -> Option<u32> {
+        let idx = week * 7 + wd;
+        (idx >= lead && idx - lead < last).then(|| (idx - lead + 1) as u32)
+    };
+    let weeks = weeks_in(year, month);
 
-        for wd in 0..7 {
-            let idx = week * 7 + wd;
-            if wd > 0 {
-                top.push(Span::raw(GAP));
-                bot.push(Span::raw(GAP));
+    // Where the cursor is, as a (week, weekday) pair. The outline is made of
+    // whole rows, so this has to be known before any of them are built.
+    let cursor = sel.and_then(|d| {
+        (1..=last as u32).contains(&d).then(|| {
+            let idx = lead + d as usize - 1;
+            (idx / 7, idx % 7)
+        })
+    });
+
+    // The row that separates two weeks, and which carries the outline's top or
+    // bottom rule when the cursor is next to it.
+    //
+    // Every week gets one whether or not it is selected. Drawing them only
+    // around the cursor made the selected week two rows taller than the others,
+    // so the whole grid below it shifted every time the cursor changed row.
+    // Which days are drawn as an outline, and in what colour.
+    //
+    // The roles are inverted from the obvious arrangement: a day you traded gets
+    // a border in its own colour, and the CURSOR is the solid block. A filled
+    // rectangle is what the eye lands on first, so it belongs to the thing you
+    // are pointing at rather than to every day in the month at once.
+    let boxed = |w: usize, wd: usize| -> Option<Tone> {
+        if w >= weeks || cursor == Some((w, wd)) {
+            return None;
+        }
+        let day = summarise(&by_day[day_at(w, wd)? as usize]);
+        (day.trades > 0).then(|| pnl_tone(day.pnl_usd))
+    };
+
+    // The solid block a day gets when the cursor is on it. Its own colour where
+    // it traded, the accent where it did not.
+    let cursor_fill = |w: usize, wd: usize| -> Option<Style> {
+        if cursor != Some((w, wd)) {
+            return None;
+        }
+        let day = summarise(&by_day[day_at(w, wd)? as usize]);
+        let tone = if day.trades == 0 { Tone::Accent } else { pnl_tone(day.pnl_usd) };
+        Some(
+            Style::default()
+                .bg(tint(tone_color(tone), 0.85))
+                .fg(widgets::bg_panel())
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    for week in 0..weeks {
+        // A blank row between weeks. Without it the rule closing one week sits
+        // directly against the rule opening the next and reads as one thick line.
+        if week > 0 {
+            lines.push(Line::from(""));
+        }
+
+        // Three rows per week, and the box lives INSIDE them rather than adding
+        // a row above and below. That is the whole difference: same tile height
+        // as an untraded day, so an outlined day is no bigger than any other.
+        let mut top: Vec<Span> = vec![Span::raw(pad.clone())];
+        let mut mid: Vec<Span> = vec![Span::raw(pad.clone())];
+        let mut bot: Vec<Span> = vec![Span::raw(pad.clone())];
+
+        for wd in 0..8 {
+            // The column between two cells, shared by both. A cursor claims it
+            // so its block is the same width as a box; otherwise it carries an
+            // upright, joined where two boxes meet.
+            let l = (wd > 0).then(|| wd - 1);
+            let fill = l
+                .and_then(|l| cursor_fill(week, l))
+                .or_else(|| (wd < 7).then(|| cursor_fill(week, wd)).flatten());
+            let lb = l.and_then(|l| boxed(week, l));
+            let rb = (wd < 7).then(|| boxed(week, wd)).flatten();
+
+            if let Some(st) = fill {
+                top.push(Span::styled(" ".repeat(EDGE), st));
+                mid.push(Span::styled(" ".repeat(EDGE), st));
+                bot.push(Span::styled(" ".repeat(EDGE), st));
+            } else {
+                let tone = lb.or(rb).unwrap_or(Tone::Accent);
+                let st = Style::default().fg(tone_color(tone));
+                let pick = |both: &'static str, left: &'static str, right: &'static str| {
+                    match (lb.is_some(), rb.is_some()) {
+                        (true, true) => Span::styled(both, st),
+                        (true, false) => Span::styled(left, st),
+                        (false, true) => Span::styled(right, st),
+                        _ => Span::raw(" ".repeat(EDGE)),
+                    }
+                };
+                top.push(pick("┬", "┐", "┌"));
+                mid.push(pick("│", "│", "│"));
+                bot.push(pick("┴", "┘", "└"));
             }
-            if idx < lead || idx - lead >= last {
+            if wd == 7 {
+                break;
+            }
+
+            let Some(d) = day_at(week, wd) else {
                 top.push(Span::raw(" ".repeat(W)));
+                mid.push(Span::raw(" ".repeat(W)));
                 bot.push(Span::raw(" ".repeat(W)));
                 continue;
-            }
-            any = true;
-            let d = (idx - lead + 1) as u32;
+            };
             let day = summarise(&by_day[d as usize]);
             let is_today = today.y == year && today.m == month && today.d == d;
-            let is_sel = sel == Some(d);
+            let text =
+                if day.trades == 0 { format!("{d}") } else { money(day.pnl_usd) };
 
-            // The date. Selected wins over today: today is a fact you can
-            // re-derive, the selection is the one you just made.
-            // The tile's own background, shared by both of its rows so the cell
-            // reads as one block rather than two lines that happen to line up.
-            let fill = if is_sel {
-                Some(widgets::bg_selection())
-            } else if day.trades > 0 {
-                Some(widgets::bg_highlight())
+            if let Some(st) = cursor_fill(week, wd) {
+                top.push(Span::styled(" ".repeat(W), st));
+                mid.push(Span::styled(format!("{text:^W$}"), st));
+                bot.push(Span::styled(" ".repeat(W), st));
+            } else if let Some(tone) = boxed(week, wd) {
+                let st = Style::default().fg(tone_color(tone));
+                top.push(Span::styled("─".repeat(W), st));
+                mid.push(Span::styled(
+                    format!("{text:^W$}"),
+                    st.add_modifier(Modifier::BOLD),
+                ));
+                bot.push(Span::styled("─".repeat(W), st));
             } else {
-                None
-            };
-            let tile = |st: Style| match fill {
-                Some(bg) => st.bg(bg),
-                None => st,
-            };
-
-            let date_style = tile(if is_sel {
-                Style::default().fg(widgets::fg_highlight()).add_modifier(Modifier::BOLD)
-            } else if is_today {
-                Style::default().fg(tone_color(Tone::Accent)).add_modifier(Modifier::BOLD)
-            } else if day.trades > 0 {
-                Style::default().fg(tone_color(Tone::Normal))
-            } else {
-                Style::default().fg(tone_color(Tone::Dim))
-            });
-            top.push(Span::styled(format!("{:^W$}", format!("{d}")), date_style));
-
-            // The figure. A day with no trades gets a rule rather than "$0" —
-            // a flat day and a day you sat out are different facts.
-            let (text, tone) = if day.trades == 0 {
-                ("·".to_string(), Tone::Dim)
-            } else {
-                (money(day.pnl_usd), pnl_tone(day.pnl_usd))
-            };
-            let mut st = tile(Style::default().fg(tone_color(tone)));
-            if day.trades > 0 {
-                st = st.add_modifier(Modifier::BOLD);
+                let fg = if is_today { Tone::Accent } else { Tone::Dim };
+                let mut st = Style::default().fg(tone_color(fg));
+                if is_today {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                top.push(Span::raw(" ".repeat(W)));
+                mid.push(Span::styled(format!("{text:^W$}"), st));
+                bot.push(Span::raw(" ".repeat(W)));
             }
-            bot.push(Span::styled(format!("{text:^W$}"), st));
         }
 
-        if !any {
-            break;
-        }
         lines.push(Line::from(top));
+        lines.push(Line::from(mid));
         lines.push(Line::from(bot));
-        // A blank row between weeks: without it the tiles stack into one column
-        // of colour and the week boundaries disappear.
-        lines.push(Line::from(""));
     }
 
     f.render_widget(Paragraph::new(lines).block(themed_block(" Calendar ")), area);
@@ -489,8 +661,8 @@ fn keys(f: &mut Frame, area: Rect) {
             Span::styled(" day   ", dim),
             Span::styled("← →", key),
             Span::styled(" month   ", dim),
-            Span::styled("1 2 3", key),
-            Span::styled(" 1D 7D 30D   ", dim),
+            Span::styled("1 2 3 4 5", key),
+            Span::styled(" 1D 7D 30D 1Y ALL   ", dim),
             Span::styled("bksp", key),
             Span::styled(" whole month   ", dim),
             Span::styled("t", key),
@@ -532,15 +704,149 @@ mod tests {
         }
     }
 
+    /// Render the grid to a test backend and read the roles back off it.
+    ///
+    /// The arrangement is deliberately inverted — a day you traded is an
+    /// outline, the cursor is a solid block — and which is which is exactly the
+    /// thing that has been wrong at every step of getting here.
+    #[test]
+    fn traded_days_are_outlined_and_the_cursor_is_solid() {
+        use ratatui::backend::TestBackend;
+
+        // Two traded days: one the cursor sits on, one it does not.
+        let (traded, selected) = (10u32, 20u32);
+        let f = fill(0, 1.0, 1.0);
+        let mut by_day: Vec<Vec<&Fill>> = vec![Vec::new(); 32];
+        by_day[traded as usize].push(&f);
+        by_day[selected as usize].push(&f);
+
+        let today = Date { y: 2026, m: 7, d: 1 };
+        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        term.draw(|fr| grid(fr, fr.area(), &by_day, 2026, 7, Some(selected), today)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let at = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+
+        // Exactly one box, and it is the day the cursor is NOT on. Corners are
+        // counted inside the panel frame, whose own corner is the same glyph.
+        let mut corners = Vec::new();
+        for y in 1..buf.area.height - 1 {
+            for x in 1..buf.area.width - 1 {
+                if at(x, y) == "┌" {
+                    corners.push((x, y));
+                }
+            }
+        }
+        assert_eq!(corners.len(), 1, "expected one outlined day, got {corners:?}");
+        let (x0, y0) = corners[0];
+        let x1 = (x0..buf.area.width)
+            .find(|&x| at(x, y0) == "┐")
+            .expect("top rule never closes");
+        let y1 = y0 + 2; // three rows: rule, figure, rule
+        assert_eq!(at(x0, y1), "└");
+        assert_eq!(at(x1, y1), "┘");
+        for x in (x0 + 1)..x1 {
+            assert_eq!(at(x, y0), "─", "gap in the top rule at {x}");
+        }
+        for y in (y0 + 1)..y1 {
+            assert_eq!(at(x0, y), "│", "gap in the left upright at {y}");
+            assert_eq!(at(x1, y), "│", "gap in the right upright at {y}");
+        }
+        let inside: String = ((x0 + 1)..x1).map(|x| at(x, y0 + 1)).collect();
+        assert!(inside.contains("$1.00"), "the outline is around the wrong day: {inside:?}");
+
+        // The cursor is solid: a run of cells carrying a background, three rows
+        // tall, and never outlined.
+        let solid: Vec<(u16, u16)> = (1..buf.area.height - 1)
+            .flat_map(|y| (1..buf.area.width - 1).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].style().bg.is_some_and(|b| b != widgets::bg_panel()))
+            .collect();
+        assert!(!solid.is_empty(), "the cursor has no fill");
+        let rows: std::collections::BTreeSet<u16> = solid.iter().map(|&(_, y)| y).collect();
+        assert_eq!(rows.len(), 3, "the cursor's block is not three rows tall: {rows:?}");
+        for &(x, y) in &solid {
+            assert_ne!(at(x, y), "│", "the cursor should be filled, not outlined");
+        }
+    }
+
+    /// An outlined day occupies exactly the rows an untraded one does.
+    ///
+    /// The border used to be drawn AROUND the tile, adding a row above and
+    /// below, which made every traded day two rows taller than its neighbours.
+    /// It is drawn inside the tile now, so the grid keeps one rhythm.
+    #[test]
+    fn an_outlined_day_is_no_taller_than_a_plain_one() {
+        use ratatui::backend::TestBackend;
+
+        let f = fill(0, 1.0, 1.0);
+        let mut by_day: Vec<Vec<&Fill>> = vec![Vec::new(); 32];
+        by_day[10].push(&f);
+        let today = Date { y: 2026, m: 7, d: 1 };
+
+        // Where the last day of the month lands, with and without a traded day
+        // above it in the grid.
+        let row_of_31 = |by_day: &Vec<Vec<&Fill>>| -> u16 {
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|fr| grid(fr, fr.area(), by_day, 2026, 7, None, today)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .find(|&y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .contains("31")
+                })
+                .expect("the 31st never rendered")
+        };
+
+        assert_eq!(row_of_31(&by_day), row_of_31(&vec![Vec::new(); 32]));
+    }
+
+    /// Moving the cursor must not move anything else.
+    ///
+    /// The rule rows above and below the tile were drawn only around the
+    /// selected week, which made that week two rows taller than the others — so
+    /// every row below the cursor jumped each time it changed week. They are
+    /// permanent now, and this is what says so.
+    #[test]
+    fn the_grid_does_not_shift_when_the_cursor_moves() {
+        use ratatui::backend::TestBackend;
+
+        let by_day: Vec<Vec<&Fill>> = vec![Vec::new(); 32];
+        let today = Date { y: 2026, m: 7, d: 1 };
+
+        // Where the last day of the month renders, under three different cursors.
+        let row_of_last_day = |sel: Option<u32>| -> u16 {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            term.draw(|fr| grid(fr, fr.area(), &by_day, 2026, 7, sel, today)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .find(|&y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .contains("31")
+                })
+                .expect("the 31st never rendered")
+        };
+
+        let unselected = row_of_last_day(None);
+        assert_eq!(row_of_last_day(Some(1)), unselected, "cursor on week 1 moved the grid");
+        assert_eq!(row_of_last_day(Some(15)), unselected, "cursor on week 3 moved the grid");
+        assert_eq!(row_of_last_day(Some(31)), unselected, "cursor on the last week moved the grid");
+    }
+
     #[test]
     fn money_stays_inside_a_calendar_cell() {
         // Every cell is 11 columns; a figure that overflows would shove the
         // whole week's columns out of alignment.
+        // Three decimals below a dollar, two above: a day worth fractions of a
+        // cent still has to read as a number rather than rounding to nothing.
         for v in [0.0, 0.42, -0.42, 9.0, -940.0, 1234.0, -98_765.0, 4_200_000.0] {
-            assert!(money(v).chars().count() <= 9, "{v} → {}", money(v));
+            assert!(money(v).chars().count() <= 10, "{v} → {}", money(v));
         }
         assert_eq!(money(0.0), "$0");
-        assert_eq!(money(-940.0), "-$940");
+        assert_eq!(money(-940.0), "-$940.00");
+        assert_eq!(money(0.001), "$0.001");
         assert_eq!(money(1234.0), "$1.2K");
         assert_eq!(money(4_200_000.0), "$4.2M");
     }
@@ -598,5 +904,17 @@ mod tests {
         assert_eq!(Range::Day.days(), 1);
         assert_eq!(Range::Week.days(), 7);
         assert_eq!(Range::Month.days(), 30);
+        assert_eq!(Range::Year.days(), 365);
+    }
+
+    #[test]
+    fn all_time_reaches_back_past_any_fill_without_overflowing() {
+        // All-time is a very large span rather than a special case, so the
+        // cutoff subtraction has to stay inside i64 for it to be safe.
+        let today = ledger::days_from_civil(2026, 7, 28);
+        let cutoff = today.checked_sub(Range::All.days() - 1);
+        assert!(cutoff.is_some(), "all-time cutoff overflowed");
+        // And it must predate anything a ledger could hold — day 0 is 1970.
+        assert!(cutoff.unwrap() < ledger::days_from_civil(1970, 1, 1));
     }
 }

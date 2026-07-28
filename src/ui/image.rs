@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Real terminal images via the Kitty graphics protocol.
 //!
 //! An image is not a ratatui widget: it sits on its own layer, so drawing over

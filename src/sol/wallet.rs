@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Solana key derivation from the SAME registry mnemonic the EVM side uses, so
 //! one seed phrase drives both chains and nothing new has to be stored.
 //!
@@ -82,9 +84,9 @@ pub fn mnemonic_address(phrase: &str, account: u32) -> eyre::Result<String> {
 
 /// Where Solana keystores live, alongside the EVM ones.
 fn keystore_dir() -> eyre::Result<std::path::PathBuf> {
-    let home = crate::config::home_dir()
-        .ok_or_else(|| eyre::eyre!("cannot find your home directory (HOME / USERPROFILE unset)"))?;
-    Ok(home.join(".foundry/keystores"))
+    // One directory for both chains — the picker lists them together, and a
+    // second location would only be somewhere else to lose a key.
+    crate::wallet::keystore_dir()
 }
 
 /// Encrypt a mnemonic-derived Solana key into a password-protected keystore.
@@ -106,7 +108,8 @@ pub fn create_keystore(phrase: &str, account: u32, name: &str, password: &str) -
 
 /// Unlock a Solana keystore by password.
 pub fn keypair_from_keystore(name: &str, password: &str) -> eyre::Result<Keypair> {
-    let path = keystore_dir()?.join(name);
+    let path = crate::wallet::keystore_path(name)
+        .ok_or_else(|| eyre::eyre!("{name} is no longer on disk"))?;
     let bytes = eth_keystore::decrypt_key(&path, password)
         .map_err(|e| eyre::eyre!("failed to unlock keystore '{name}': {e}"))?;
     let secret: [u8; 32] = bytes

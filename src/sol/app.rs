@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! The Solana dashboard — the pump.fun counterpart to the EVM trading screen.
 //!
 //! Deliberately mirrors the EVM layout field-for-field: same header (account /
@@ -383,6 +385,10 @@ pub struct SolBot {
     /// minute, so this is the knob that matters once auto is on.
     pub priority_level: PriorityLevel,
     // Cost basis / PnL, same model as the EVM engine.
+    /// Whether a real keystore was unlocked. Everything that spends is guarded
+    /// on this, so a throwaway signer can build the client without ever being
+    /// able to send.
+    pub has_account: bool,
     pub bought_qty: f64,
     pub bought_cost: f64,
     /// Unix seconds of the buy that opened the current position — the clock the
@@ -429,6 +435,7 @@ impl SolBot {
             priority_auto: false,
             priority_level: PriorityLevel::High,
             bought_qty: 0.0,
+            has_account: true,
             bought_cost: 0.0,
             entry_at: None,
             realized_pnl: 0.0,
@@ -473,6 +480,9 @@ impl SolBot {
         let (h, m, s) = ((now % 86400) / 3600, (now % 3600) / 60, now % 60);
         let line = format!("[{h:02}:{m:02}:{s:02}] {msg}");
         super::trace(&format!("ui: {msg}"));
+        // The ring holds 500 lines and dies with the process; the session log is
+        // what is still there tomorrow when you want to know when you bought.
+        super::session(&line);
         self.logs.push_back(line);
         while self.logs.len() > RING {
             self.logs.pop_front();
@@ -490,7 +500,9 @@ impl SolBot {
             .unwrap_or(0);
         let (h, m, s) = ((now % 86400) / 3600, (now % 3600) / 60, now % 60);
         super::trace(&format!("tape: {msg}"));
-        self.logs.push_back(format!("[{h:02}:{m:02}:{s:02}] {msg}"));
+        let line = format!("[{h:02}:{m:02}:{s:02}] {msg}");
+        super::session(&line);
+        self.logs.push_back(line);
         while self.logs.len() > RING {
             self.logs.pop_front();
         }
@@ -769,6 +781,21 @@ fn lbl(t: &str) -> Cell {
 fn wallet_panel(bot: &SolBot) -> PanelView {
     let mut p = PanelView::new(" Wallet [W] ");
     let pnl_tone = |v: f64| if v >= 0.0 { Tone::Good } else { Tone::Bad };
+
+    // Nothing to report without an account.
+    //
+    // A column of zeroes is not "empty", it is a claim — zero balance, zero
+    // realized, zero trades — and none of that is known until a key is unlocked.
+    // Same shape as the Pool panel opposite: what is missing, then the key that
+    // fixes it. The throwaway pubkey is never shown either; printing one invites
+    // somebody to fund a key that exists only to build the client.
+    if !bot.has_account {
+        p.line("");
+        p.line_toned("  No account", Tone::Normal);
+        p.line("");
+        p.line_toned("  [W] unlock or create an account", Tone::Info);
+        return p;
+    }
 
     // "Which account am I?" belongs with the balances, not in the header.
     p.spans(vec![lbl("Account"), Cell::toned(bot.trader().to_string(), Tone::Info)]);
@@ -1356,6 +1383,9 @@ pub async fn run(
     rpc_urls: Vec<String>,
     ws_override: Option<&str>,
     signer: Keypair,
+    // False when nobody unlocked a keystore: the signer is a throwaway and must
+    // never be asked to sign. Reads work; the order keys do not.
+    has_account: bool,
     rugcheck: &crate::config::RugCheck,
     net: &str,
 ) -> eyre::Result<crate::Exit> {
@@ -1382,6 +1412,10 @@ pub async fn run(
         ws_urls.len()
     ));
     let mut bot = SolBot::new(rpc, signer, rugcheck, net);
+    bot.has_account = has_account;
+    if !has_account {
+        bot.status = "no account — press [W] to unlock one".into();
+    }
     let mut exit = crate::Exit::Quit;
     // Header logo. Screens that take over clear images on entry, which marks
     // this stale, so it redraws on return without bookkeeping here.
@@ -1421,6 +1455,14 @@ pub async fn run(
                     if k.code == KeyCode::Char('?') {
                         continue;
                     }
+                }
+                // No account: nothing can be signed, and the throwaway key that
+                // built the client must never be asked to try. Reads carry on —
+                // watching the tape without a key on the machine is a reasonable
+                // thing to want.
+                if !bot.has_account && matches!(k.code, KeyCode::Char('b' | 's' | 'x')) {
+                    bot.status = "no account — press [W] to unlock one".into();
+                    continue;
                 }
                 match k.code {
                     // `q`/esc ask first; `Q` quits outright.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Trade engine: market snapshot, order placement with pre-flight gas
 //! protection, pending tracking, strategies, and a session log. Provider-
 //! generic so it works against remote RPC, a local Nitro node ws://, or IPC.

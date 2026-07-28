@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! High-level pump.fun trading: resolve a coin's on-chain state, quote it, build
 //! the instructions, sign, send, confirm.
 //!

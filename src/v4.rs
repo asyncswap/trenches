@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 AsyncSwap Labs
 //! Uniswap v4 calldata: swaps via Universal Router, add/close liquidity via
 //! PositionManager. Built with alloy ABI encoding (the sol! structs), so the
 //! encoding is correct by construction — no hand-templated bytes.

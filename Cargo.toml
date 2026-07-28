@@ -2,6 +2,11 @@
 name = "trenches"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
+description = "A terminal trading bot for memecoins on Robinhood Chain and Solana."
+repository = "https://github.com/asyncswap/trenches"
+homepage = "https://trenches.sh"
+authors = ["AsyncSwap Labs"]
 
 [features]
 # Testnets and local nodes. Off in a release: without this they are not
@@ -77,6 +82,7 @@ rand = "0.8"
 # WebSocket, for pump.fun logsSubscribe (launches are far too rare in the
 # signature stream to discover by polling). Already present via alloy-transport-ws.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+zeroize = "1.9.0"
 
 [profile.release]
 opt-level = 3

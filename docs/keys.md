@@ -90,6 +90,7 @@ L        PnL calendar — a month of trading at a time
 R        force a price refresh                 (EVM)
 T        theme picker
 D        these docs
+e        set RPC and API keys   (while the docs are open)
 ?        shortcuts overlay
 ```
 

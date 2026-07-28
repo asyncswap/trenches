@@ -1,0 +1,35 @@
+Trenches
+Copyright (C) 2026 AsyncSwap Labs
+
+This project is licensed under the GNU Affero General Public License v3.0.
+See the LICENSE file for the full terms.
+
+Official repository:
+https://github.com/asyncswap/trenches
+
+TRADEMARKS
+
+"Trenches", "AsyncSwap", and trenches.sh are trademarks of AsyncSwap Labs. The
+AGPL grants rights in the code; it grants no rights in the marks. You may fork,
+modify and redistribute this software, and you may say your work is derived from
+Trenches — but a fork may not present itself as Trenches, use the name or logo as
+its own identity, or imply that AsyncSwap Labs published or endorses it.
+
+COMMERCIAL SERVICES
+
+Commercial services offered by AsyncSwap Labs — hosted RPC endpoints, analytics,
+AI models and similar — are independent services that communicate with this
+software over a network API. They are separately licensed and are not covered by
+this repository's license unless explicitly stated.
+
+The AGPL covers the bot: this source and any modified version of it. It does not
+reach through an API boundary to cover an independent service on the other side.
+
+THIRD-PARTY CODE
+
+This software builds on other people's work, each under its own license, which
+applies to their code and not to this one. `cargo tree` lists the full set.
+
+Brand marks shown in the interface — Uniswap, Solana, pump.fun, Robinhood,
+pons.family — belong to their respective owners and are used only to identify
+the venue being traded.
