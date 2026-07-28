@@ -12,6 +12,7 @@ mod events;
 mod ledger;
 mod pnl;
 mod pricing;
+mod rpcstats;
 /// Solana / pump.fun adapter — compiled only with `--features solana`.
 #[cfg(feature = "solana")]
 mod sol;
@@ -478,6 +479,37 @@ fn compute_pool_id(token: alloy::primitives::Address, fee: u32, tick_spacing: i3
 /// from the chain at any time. Config is what a person decides; this is what the
 /// app found out. Keeping them together meant a file you were told to edit grew
 /// hundreds of entries you never wrote, and burying an RPC URL among them.
+/// Change a setting: say it on the status line AND record it.
+///
+/// These decide what the next keypress spends, so a change to one is an action
+/// worth keeping. It only ever reached the status line, which the next message
+/// overwrites — so the size you were trading at was unrecoverable ten seconds
+/// later, including from a log sent with a bug report.
+fn setting(bot: &mut engine::Bot, what: &str, value: String, sentence: String) {
+    events::action("Setting changed", &[("setting", what.to_string()), ("value", value)]);
+    bot.status = sentence;
+}
+
+/// The identifying facts of a pool, for an event line.
+///
+/// A label like "Uniswap V3 ETH/HOOD SpaceX FERRET 1%" names a pool to a human
+/// and to nobody else. The token and the pool's own address (v3) or id (v4) are
+/// what you paste into an explorer, match against a fill, or send to us.
+fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
+    let (key, val) = match p.kind {
+        engine::PoolKind::V3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
+        engine::PoolKind::V4 { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
+    };
+    vec![
+        ("sym", p.sym.clone()),
+        ("token", format!("{:#x}", p.token)),
+        (key, val),
+        ("proto", p.kind.proto().to_string()),
+        ("fee", format!("{}bp", p.fee / 100)),
+        ("quote", p.quote_sym.clone()),
+    ]
+}
+
 fn token_cache_path(network: &str) -> String {
     // Filesystem-safe: a network name comes from config and can hold anything.
     let safe: String = network
@@ -1179,6 +1211,21 @@ async fn chain_session_on(
         None => ("(no account)".to_string(), alloy::signers::local::LocalSigner::random()),
     };
     let trader = if no_account { alloy::primitives::Address::ZERO } else { signer.address() };
+    // Recorded here, where an account exists and has an address, rather than on
+    // the keypress that went looking for one. The zero address is the
+    // no-account placeholder, and writing it down says nothing.
+    if no_account {
+        events::info("Watching without an account", &[("chain", net.name.clone())]);
+    } else {
+        events::action(
+            "Account loaded",
+            &[
+                ("account", format!("{trader:#x}")),
+                ("keystore", account.clone()),
+                ("chain", net.name.clone()),
+            ],
+        );
+    }
     let wallet = EthereumWallet::from(signer);
     // with_recommended_fillers() adds the gas / nonce / chain-id fillers.
     // Without it the WalletFiller tries to sign a tx that has no nonce/gas/fee
@@ -1627,14 +1674,29 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 return Ok(Exit::Quit);
                             }
                         }
-                        KeyCode::Char('Q') => return Ok(Exit::Quit),
+                        KeyCode::Char('Q') => {
+                            events::action(
+                                "Quit",
+                                &[
+                                    ("chain", bot.net.clone()),
+                                    ("trades", bot.trades.to_string()),
+                                    ("fails", bot.fails.to_string()),
+                                    ("session_pnl", format!("{:+.6} {}", bot.pnl(), bot.pool.quote_sym)),
+                                ],
+                            );
+                            return Ok(Exit::Quit);
+                        }
                         KeyCode::Char('D') => {
                             events::action("Opened docs", &[]);
                             ui::docs(terminal)?
                         }
                         // Back to the account list on this same chain.
                         KeyCode::Char('W') => {
-                            events::action("Changing account", &[("from", events::short(&format!("{:#x}", bot.trader)))]);
+                            // No "from" when there is nothing loaded — the zero
+                            // address is a placeholder, not a wallet.
+                            let from =
+                                if bot.trader.is_zero() { String::new() } else { format!("{:#x}", bot.trader) };
+                            events::action("Opened the account picker", &[("current", from)]);
                             return Ok(Exit::ChangeAccount);
                         }
                         // Back to the chain picker without restarting.
@@ -1684,7 +1746,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 if !bot.copy_tiers.is_empty() { bot.copy_idx = (bot.copy_idx + 1).min(bot.copy_tiers.len() - 1); }
                                 bot.status = copy_status(bot);
                             } else {
-                                bot.buy_frac = (bot.buy_frac + 0.005).min(1.0); bot.status = format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0);
+                                bot.buy_frac = (bot.buy_frac + 0.005).min(1.0); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
                             }
                         }
                         KeyCode::Char('[') => {
@@ -1693,18 +1755,18 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.copy_idx = bot.copy_idx.saturating_sub(1);
                                 bot.status = copy_status(bot);
                             } else {
-                                bot.buy_frac = (bot.buy_frac - 0.005).max(0.005); bot.status = format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0);
+                                bot.buy_frac = (bot.buy_frac - 0.005).max(0.005); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
                             }
                         }
                         // Bracket family, paired with the header labels:
                         // [] buy · () sell · {} slippage · <> impact cap.
                         // `()` is sell again — slippage had taken it.
-                        KeyCode::Char(')') => { bot.sell_frac = (bot.sell_frac + 0.10).min(1.0); bot.status = format!("Sell size is now {:.0} percent of your {} balance", bot.sell_frac * 100.0, bot.pool.sym); }
-                        KeyCode::Char('(') => { bot.sell_frac = (bot.sell_frac - 0.10).max(0.10); bot.status = format!("Sell size is now {:.0} percent of your {} balance", bot.sell_frac * 100.0, bot.pool.sym); }
-                        KeyCode::Char('}') => { bot.slippage_pct = (bot.slippage_pct + 1.0).min(50.0); bot.status = format!("Slippage tolerance is now {:.0} percent", bot.slippage_pct); }
-                        KeyCode::Char('{') => { bot.slippage_pct = (bot.slippage_pct - 1.0).max(1.0); bot.status = format!("Slippage tolerance is now {:.0} percent", bot.slippage_pct); }
-                        KeyCode::Char('>') => { bot.max_price_move = (bot.max_price_move + 0.005).min(0.50); bot.status = format!("A single swap may now move the price at most {:.1} percent", bot.max_price_move * 100.0); }
-                        KeyCode::Char('<') => { bot.max_price_move = (bot.max_price_move - 0.005).max(0.0); bot.status = format!("A single swap may now move the price at most {:.1} percent", bot.max_price_move * 100.0); }
+                        KeyCode::Char(')') => { bot.sell_frac = (bot.sell_frac + 0.10).min(1.0); setting(bot, "Sell size", format!("{:.0}%", bot.sell_frac * 100.0), format!("Sell size is now {:.0} percent of your {} balance", bot.sell_frac * 100.0, bot.pool.sym)); }
+                        KeyCode::Char('(') => { bot.sell_frac = (bot.sell_frac - 0.10).max(0.10); setting(bot, "Sell size", format!("{:.0}%", bot.sell_frac * 100.0), format!("Sell size is now {:.0} percent of your {} balance", bot.sell_frac * 100.0, bot.pool.sym)); }
+                        KeyCode::Char('}') => { bot.slippage_pct = (bot.slippage_pct + 1.0).min(50.0); setting(bot, "Slippage tolerance", format!("{:.0}%", bot.slippage_pct), format!("Slippage tolerance is now {:.0} percent", bot.slippage_pct)); }
+                        KeyCode::Char('{') => { bot.slippage_pct = (bot.slippage_pct - 1.0).max(1.0); setting(bot, "Slippage tolerance", format!("{:.0}%", bot.slippage_pct), format!("Slippage tolerance is now {:.0} percent", bot.slippage_pct)); }
+                        KeyCode::Char('>') => { bot.max_price_move = (bot.max_price_move + 0.005).min(0.50); setting(bot, "Max price move", format!("{:.1}%", bot.max_price_move * 100.0), format!("A single swap may now move the price at most {:.1} percent", bot.max_price_move * 100.0)); }
+                        KeyCode::Char('<') => { bot.max_price_move = (bot.max_price_move - 0.005).max(0.0); setting(bot, "Max price move", format!("{:.1}%", bot.max_price_move * 100.0), format!("A single swap may now move the price at most {:.1} percent", bot.max_price_move * 100.0)); }
                         KeyCode::Char('0') => { bot.max_price_move = 0.0; bot.status = "Price impact limit is off, swaps now go out at full size".into(); }
                         // Toggle the profitability filter — off lets you force genuine buys/sells.
                         KeyCode::Char('g') => { bot.profit_guard = !bot.profit_guard; bot.status = if bot.profit_guard {
@@ -1742,7 +1804,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Delete => {
                             events::action("Cleared the selected pool", &[
                                 ("was", bot.pool.sym.clone()),
-                                ("token", events::short(&format!("{:#x}", bot.pool.token))),
+                                ("token", format!("{:#x}", bot.pool.token)),
                             ]);
                             let blank = blank_pool(&bot.net.clone());
                             bot.pool = to_poolcfg(&blank);
@@ -1993,9 +2055,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     *pool_cell.lock().unwrap() = bot.pool.as_ref();
                                     prices.clear();
                                     bot.status = format!("Now trading {}", pool_sentence(&p.label));
+                                    events::action("Loaded pool", &pool_facts(&bot.pool));
                                     match persist_pool(&network, &p) {
-                                        Ok(()) => bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label))),
-                                        Err(e) => bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label))),
+                                        Ok(()) => {
+                                            events::info("Saved pool to your list", &pool_facts(&bot.pool));
+                                            bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label)))
+                                        }
+                                        Err(e) => {
+                                            events::error("Could not save pool; keeping it for this session", &[("reason", e.to_string())]);
+                                            bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label)))
+                                        }
                                     }
                                     if !pools.iter().any(|q| q.label == p.label) {
                                         pools.push(p);
@@ -2130,12 +2199,19 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     *pool_cell.lock().unwrap() = bot.pool.as_ref();
                                     prices.clear();
                                     bot.status = format!("Now trading {}", pool_sentence(&p.label));
+                                    events::action("Loaded pool", &pool_facts(&bot.pool));
                                     if i < 3 {
                                         // Persist created/added pools to the registry so
                                         // they survive restarts (not just this session).
                                         match persist_pool(&network, &p) {
-                                            Ok(()) => bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label))),
-                                            Err(e) => bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label))),
+                                            Ok(()) => {
+                                                events::info("Saved pool to your list", &pool_facts(&bot.pool));
+                                                bot.note(format!("Saved {} to your pool list", pool_sentence(&p.label)))
+                                            }
+                                            Err(e) => {
+                                                events::error("Could not save pool; keeping it for this session", &[("reason", e.to_string())]);
+                                                bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label)))
+                                            }
                                         }
                                         pools.push(p);
                                     }

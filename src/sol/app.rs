@@ -681,7 +681,10 @@ impl SolBot {
             if let Some(o) = self.orders.get_mut(i) {
                 o.state = if ok { OrderState::Confirmed } else { OrderState::Failed };
             }
-            let short = short_sig(&sig);
+            // The WHOLE signature. A truncated one cannot be pasted into an
+            // explorer, matched against a fill, or quoted in a bug report —
+            // which is the entire reason it is written down.
+            let short = sig.clone();
             if !ok {
                 self.fails += 1;
                 self.note(format!("The {action} for {sol:.6} SOL reverted, signature {short}"));
@@ -763,10 +766,6 @@ fn poll_target(coin: &Coin, trader: &Pubkey, priority_level: Option<&'static str
 /// never loaded, without letting one row eat the menu width.
 fn short_mint(mint: &Pubkey) -> String {
     mint.to_string().chars().take(8).collect()
-}
-
-fn short_sig(sig: &str) -> String {
-    sig.chars().take(12).collect::<String>()
 }
 
 // ---- view models ---------------------------------------------------------
@@ -1669,7 +1668,7 @@ pub async fn run(
                             match sent {
                                 Ok(sig) => {
                                     bot.push_order("BUY", sol, OrderState::Pending, Some(sig.clone()));
-                                    bot.note(format!("Buy for {sol:.6} SOL sent, signature {}", short_sig(&sig)));
+                                    bot.note(format!("Buy for {sol:.6} SOL sent, signature {sig}"));
                                 }
                                 Err(e) => {
                                     bot.push_order("BUY", sol, OrderState::Failed, None);
@@ -1703,7 +1702,7 @@ pub async fn run(
                             match sent {
                                 Ok(sig) => {
                                     bot.push_order("SELL", est, OrderState::Pending, Some(sig.clone()));
-                                    bot.note(format!("Sell for about {est:.6} SOL sent, signature {}", short_sig(&sig)));
+                                    bot.note(format!("Sell for about {est:.6} SOL sent, signature {sig}"));
                                 }
                                 Err(e) => {
                                     bot.push_order("SELL", est, OrderState::Failed, None);

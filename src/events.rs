@@ -20,6 +20,11 @@
 //! Every event carries a timestamp, a level, what happened, and the details
 //! that make it actionable — the account, the pool, the token, the amount, the
 //! transaction. A line you cannot act on is a line not worth writing.
+//!
+//! Nothing is abbreviated. A hash with its middle elided cannot be pasted into
+//! an explorer, matched against a fill, or quoted in a bug report, which are
+//! the only three reasons it was written down. Width is the terminal's problem,
+//! not the record's.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -168,19 +173,6 @@ pub fn info(what: &str, details: &[(&str, String)]) {
     log(Level::Info, what, details);
 }
 
-/// Shorten an address for a log line: `0x1234…cdef`.
-///
-/// The full value goes in the file for the ones that matter (transactions), but
-/// a 42-character address repeated down a column is unreadable, and the ends are
-/// what anyone actually compares.
-pub fn short(addr: &str) -> String {
-    if addr.len() > 12 {
-        format!("{}…{}", &addr[..6], &addr[addr.len() - 4..])
-    } else {
-        addr.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,9 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn addresses_are_shortened_from_both_ends() {
-        assert_eq!(short("0xbF93d16A2A0BD298bb274ba8E824097BD1122671"), "0xbF93…2671");
-        // Short enough to read whole is left alone.
-        assert_eq!(short("ETH"), "ETH");
+    fn nothing_in_a_line_is_abbreviated() {
+        // A log exists to be pasted into an explorer, grepped, and quoted in a
+        // bug report. An elided middle defeats all three.
+        let tx = "0x7e9cb91d1231b4ceff370e94c8825af227db5d893afb0a2dcaf0000000000abcd";
+        let l = render(0, Level::Trade, "CONFIRMED BUY", &[("tx", tx.into())]);
+        assert!(l.contains(tx), "the hash was shortened: {l}");
+        assert!(!l.contains('…'), "something was elided: {l}");
     }
 }

@@ -580,6 +580,9 @@ impl Bot {
     /// Write a machine-parseable telemetry line to the session log, so a
     /// running session can be monitored live (`tail -f .bot/session-*.log`).
     pub fn telemetry(&mut self, block: u64, round_ms: f64) {
+        // Once a window, not once a call: a rate is not something anyone can
+        // see by watching individual calls scroll past.
+        crate::rpcstats::maybe_report();
         self.logline(&format!(
             "TELEMETRY block={} price={:.8} liq_eth={:.6} eth={:.6} {}={:.4} pnl={:+.6} trades={} fails={} skips={} pending={} round_ms={:.1}",
             block,
@@ -1053,7 +1056,7 @@ impl Bot {
                 let hash = *p.tx_hash();
                 self.last_side = side;
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
-                self.note(format!("SENT {}  tx {}", label, &hash.to_string()[..12]));
+                self.note(format!("SENT {}  tx {}", label, hash));
                 // Record fill for cost-basis accounting (applied on confirm).
                 let (eth_amt, tok_amt) = if buying { (amount_in, expected) } else { (expected, amount_in) };
                 self.pending.push(Pending { hash, label, side: Some(side), eth_amt, tok_amt, position_id: None });
@@ -1106,7 +1109,7 @@ impl Bot {
             Ok(p) => {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
-                self.note(format!("SENT {}  tx {}", label, &hash.to_string()[..12]));
+                self.note(format!("SENT {}  tx {}", label, hash));
                 self.pending.push(Pending { hash, label, side, eth_amt, tok_amt, position_id: None });
                 Some(hash)
             }
@@ -1506,7 +1509,7 @@ impl Bot {
             Ok(p) => {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
-                self.note(format!("PLACED {}  tx {}", label, &hash.to_string()[..12]));
+                self.note(format!("PLACED {}  tx {}", label, hash));
                 self.mint_liq.insert(hash, liquidity); // link tx -> minted L
                 self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
             }
@@ -1570,7 +1573,7 @@ impl Bot {
             Ok(p) => {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
-                self.note(format!("PLACED {}  tx {}", label, &hash.to_string()[..12]));
+                self.note(format!("PLACED {}  tx {}", label, hash));
                 self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
             }
             Err(e) => {
@@ -1730,7 +1733,7 @@ impl Bot {
                 let hash = *p.tx_hash();
                 self.last_side = Side::Sell;
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
-                self.note(format!("SENT {}  tx {}", label, &hash.to_string()[..12]));
+                self.note(format!("SENT {}  tx {}", label, hash));
                 self.pending.push(Pending { hash, label, side: Some(Side::Sell), eth_amt: expected, tok_amt: amount_in, position_id: None });
             }
             Err(e) => {
@@ -1767,7 +1770,7 @@ impl Bot {
             Ok(p) => {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
-                self.note(format!("PLACED {label}  tx {}", &hash.to_string()[..12]));
+                self.note(format!("PLACED {label}  tx {}", hash));
                 self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
             }
             Err(e) => {
@@ -1846,7 +1849,10 @@ pub async fn read_market<P: Provider>(
 
     // No pool selected (empty network) — still show ETH + gas, empty market.
     if pref.kind.is_empty() {
-        let eth = provider.get_balance(trader).await.map(wei_to_f64).ok();
+        let eth = crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader))
+            .await
+            .map(wei_to_f64)
+            .ok();
         let gas = provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0);
         return Ok(Market { eth, gas_price: gas, read_ms: t0.elapsed().as_secs_f64() * 1000.0, ..Default::default() });
     }
@@ -1876,10 +1882,10 @@ pub async fn read_market<P: Provider>(
     let cb_tok = erc.balanceOf(trader);
     let cb_sup = erc.totalSupply();
     let (eth_bal, tok_bal, gas, sup) = tokio::join!(
-        provider.get_balance(trader),
-        cb_tok.call(),
-        provider.get_gas_price(),
-        cb_sup.call(),
+        crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)),
+        crate::rpcstats::timed("balanceOf", cb_tok.call()),
+        crate::rpcstats::timed("eth_gasPrice", provider.get_gas_price()),
+        crate::rpcstats::timed("totalSupply", cb_sup.call()),
     );
     let gas_price = gas.map(|g| g as f64).unwrap_or(0.0);
     let td = pref.token_decimals;
