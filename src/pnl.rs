@@ -405,31 +405,31 @@ fn grid(
     today: Date,
 ) {
     const NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    // Every cell is the same width, so the columns line up under their headings
-    // without a table widget and its borders eating four rows of the box.
-    const W: usize = 11;
-    // The single column between two cells. The selection outline is drawn HERE
-    // rather than inside the cell: a border painted on the tile's own edges sits
-    // within the coloured block instead of around it, which reads as a box in a
-    // box. Everything below follows from wanting the outline outside the fill.
-    const EDGE: usize = 1;
+    // The figure's width. Nine columns holds the widest thing money() produces
+    // (`-$999.99`, `-$999.9K`) with a column to spare either side.
+    const W: usize = 9;
+    // The tile including its border. A box eleven columns wide and three rows
+    // tall is about 11:6 once the terminal's 1:2 cell is accounted for; at
+    // thirteen columns it read as a wide, flat slab.
+    const BOX: usize = W + 2;
+    // Between tiles. Boxes used to share their edge column, so two traded days
+    // side by side joined into what looked like one table rather than two days.
+    const GAP: usize = 2;
 
     // Centred in the panel. Seven fixed-width columns do not grow with the box,
     // so on a wide terminal the whole month sat against the left edge with half
-    // the panel empty beside it. The outer two edge columns are part of the grid
-    // now, because the outline needs somewhere to go on the first and last day
-    // of a week.
-    let grid_w = (W * 7 + EDGE * 8) as u16;
+    // the panel empty beside it.
+    let grid_w = (BOX * 7 + GAP * 6) as u16;
     let pad = " ".repeat(((area.width.saturating_sub(2).saturating_sub(grid_w)) / 2) as usize);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut head: Vec<Span> = vec![Span::raw(pad.clone()), Span::raw(" ".repeat(EDGE))];
+    let mut head: Vec<Span> = vec![Span::raw(pad.clone())];
     for (i, n) in NAMES.iter().enumerate() {
         if i > 0 {
-            head.push(Span::raw(" ".repeat(EDGE)));
+            head.push(Span::raw(" ".repeat(GAP)));
         }
         head.push(Span::styled(
-            format!("{n:^W$}"),
+            format!("{n:^BOX$}"),
             Style::default().fg(widgets::border_color()).add_modifier(Modifier::BOLD),
         ));
     }
@@ -446,8 +446,7 @@ fn grid(
     };
     let weeks = weeks_in(year, month);
 
-    // Where the cursor is, as a (week, weekday) pair. The outline is made of
-    // whole rows, so this has to be known before any of them are built.
+    // Where the cursor is, as a (week, weekday) pair.
     let cursor = sel.and_then(|d| {
         (1..=last as u32).contains(&d).then(|| {
             let idx = lead + d as usize - 1;
@@ -455,122 +454,68 @@ fn grid(
         })
     });
 
-    // The row that separates two weeks, and which carries the outline's top or
-    // bottom rule when the cursor is next to it.
-    //
-    // Every week gets one whether or not it is selected. Drawing them only
-    // around the cursor made the selected week two rows taller than the others,
-    // so the whole grid below it shifted every time the cursor changed row.
-    // Which days are drawn as an outline, and in what colour.
-    //
-    // The roles are inverted from the obvious arrangement: a day you traded gets
-    // a border in its own colour, and the CURSOR is the solid block. A filled
-    // rectangle is what the eye lands on first, so it belongs to the thing you
-    // are pointing at rather than to every day in the month at once.
-    let boxed = |w: usize, wd: usize| -> Option<Tone> {
-        if w >= weeks || cursor == Some((w, wd)) {
-            return None;
-        }
-        let day = summarise(&by_day[day_at(w, wd)? as usize]);
-        (day.trades > 0).then(|| pnl_tone(day.pnl_usd))
-    };
-
-    // The solid block a day gets when the cursor is on it. Its own colour where
-    // it traded, the accent where it did not.
-    let cursor_fill = |w: usize, wd: usize| -> Option<Style> {
-        if cursor != Some((w, wd)) {
-            return None;
-        }
-        let day = summarise(&by_day[day_at(w, wd)? as usize]);
-        let tone = if day.trades == 0 { Tone::Accent } else { pnl_tone(day.pnl_usd) };
-        Some(
-            Style::default()
-                .bg(tint(tone_color(tone), 0.85))
-                .fg(widgets::bg_panel())
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-
     for week in 0..weeks {
-        // A blank row between weeks. Without it the rule closing one week sits
-        // directly against the rule opening the next and reads as one thick line.
+        // A blank row between weeks, so one week's tiles do not sit against the
+        // next week's.
         if week > 0 {
             lines.push(Line::from(""));
         }
 
-        // Three rows per week, and the box lives INSIDE them rather than adding
-        // a row above and below. That is the whole difference: same tile height
-        // as an untraded day, so an outlined day is no bigger than any other.
+        // Three rows per week, and the box is drawn INSIDE them rather than
+        // around them — an outlined day is exactly as tall as a plain one.
         let mut top: Vec<Span> = vec![Span::raw(pad.clone())];
         let mut mid: Vec<Span> = vec![Span::raw(pad.clone())];
         let mut bot: Vec<Span> = vec![Span::raw(pad.clone())];
 
-        for wd in 0..8 {
-            // The column between two cells, shared by both. A cursor claims it
-            // so its block is the same width as a box; otherwise it carries an
-            // upright, joined where two boxes meet.
-            let l = (wd > 0).then(|| wd - 1);
-            let fill = l
-                .and_then(|l| cursor_fill(week, l))
-                .or_else(|| (wd < 7).then(|| cursor_fill(week, wd)).flatten());
-            let lb = l.and_then(|l| boxed(week, l));
-            let rb = (wd < 7).then(|| boxed(week, wd)).flatten();
-
-            if let Some(st) = fill {
-                top.push(Span::styled(" ".repeat(EDGE), st));
-                mid.push(Span::styled(" ".repeat(EDGE), st));
-                bot.push(Span::styled(" ".repeat(EDGE), st));
-            } else {
-                let tone = lb.or(rb).unwrap_or(Tone::Accent);
-                let st = Style::default().fg(tone_color(tone));
-                let pick = |both: &'static str, left: &'static str, right: &'static str| {
-                    match (lb.is_some(), rb.is_some()) {
-                        (true, true) => Span::styled(both, st),
-                        (true, false) => Span::styled(left, st),
-                        (false, true) => Span::styled(right, st),
-                        _ => Span::raw(" ".repeat(EDGE)),
-                    }
-                };
-                top.push(pick("┬", "┐", "┌"));
-                mid.push(pick("│", "│", "│"));
-                bot.push(pick("┴", "┘", "└"));
+        for wd in 0..7 {
+            if wd > 0 {
+                for row in [&mut top, &mut mid, &mut bot] {
+                    row.push(Span::raw(" ".repeat(GAP)));
+                }
             }
-            if wd == 7 {
-                break;
-            }
-
             let Some(d) = day_at(week, wd) else {
-                top.push(Span::raw(" ".repeat(W)));
-                mid.push(Span::raw(" ".repeat(W)));
-                bot.push(Span::raw(" ".repeat(W)));
+                for row in [&mut top, &mut mid, &mut bot] {
+                    row.push(Span::raw(" ".repeat(BOX)));
+                }
                 continue;
             };
             let day = summarise(&by_day[d as usize]);
             let is_today = today.y == year && today.m == month && today.d == d;
-            let text =
-                if day.trades == 0 { format!("{d}") } else { money(day.pnl_usd) };
+            let text = if day.trades == 0 { format!("{d}") } else { money(day.pnl_usd) };
 
-            if let Some(st) = cursor_fill(week, wd) {
-                top.push(Span::styled(" ".repeat(W), st));
-                mid.push(Span::styled(format!("{text:^W$}"), st));
-                bot.push(Span::styled(" ".repeat(W), st));
-            } else if let Some(tone) = boxed(week, wd) {
-                let st = Style::default().fg(tone_color(tone));
-                top.push(Span::styled("─".repeat(W), st));
+            if cursor == Some((week, wd)) {
+                // The cursor is the solid block. A filled rectangle is what the
+                // eye lands on first, so it belongs to the thing you are
+                // pointing at — its own colour where the day traded, the accent
+                // where it did not.
+                let tone = if day.trades == 0 { Tone::Accent } else { pnl_tone(day.pnl_usd) };
+                let st = Style::default()
+                    .bg(tint(tone_color(tone), 0.85))
+                    .fg(widgets::bg_panel())
+                    .add_modifier(Modifier::BOLD);
+                top.push(Span::styled(" ".repeat(BOX), st));
+                mid.push(Span::styled(format!("{text:^BOX$}"), st));
+                bot.push(Span::styled(" ".repeat(BOX), st));
+            } else if day.trades > 0 {
+                // A day you traded is an outline in its own colour.
+                let st = Style::default().fg(tone_color(pnl_tone(day.pnl_usd)));
+                top.push(Span::styled(format!("┌{}┐", "─".repeat(W)), st));
+                mid.push(Span::styled("│", st));
                 mid.push(Span::styled(
                     format!("{text:^W$}"),
                     st.add_modifier(Modifier::BOLD),
                 ));
-                bot.push(Span::styled("─".repeat(W), st));
+                mid.push(Span::styled("│", st));
+                bot.push(Span::styled(format!("└{}┘", "─".repeat(W)), st));
             } else {
                 let fg = if is_today { Tone::Accent } else { Tone::Dim };
                 let mut st = Style::default().fg(tone_color(fg));
                 if is_today {
                     st = st.add_modifier(Modifier::BOLD);
                 }
-                top.push(Span::raw(" ".repeat(W)));
-                mid.push(Span::styled(format!("{text:^W$}"), st));
-                bot.push(Span::raw(" ".repeat(W)));
+                top.push(Span::raw(" ".repeat(BOX)));
+                mid.push(Span::styled(format!("{text:^BOX$}"), st));
+                bot.push(Span::raw(" ".repeat(BOX)));
             }
         }
 
@@ -837,12 +782,12 @@ mod tests {
 
     #[test]
     fn money_stays_inside_a_calendar_cell() {
-        // Every cell is 11 columns; a figure that overflows would shove the
+        // The figure sits in 9 columns; one that overflows would shove the
         // whole week's columns out of alignment.
         // Three decimals below a dollar, two above: a day worth fractions of a
         // cent still has to read as a number rather than rounding to nothing.
         for v in [0.0, 0.42, -0.42, 9.0, -940.0, 1234.0, -98_765.0, 4_200_000.0] {
-            assert!(money(v).chars().count() <= 10, "{v} → {}", money(v));
+            assert!(money(v).chars().count() <= 9, "{v} → {}", money(v));
         }
         assert_eq!(money(0.0), "$0");
         assert_eq!(money(-940.0), "-$940.00");

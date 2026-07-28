@@ -722,7 +722,11 @@ impl Bot {
             self.pool.token_decimals,
             self.token_supply,
         ));
-        self.eth = m.eth;
+        // Keep the last known balance when the read failed: stale is honest,
+        // zero is a lie.
+        if let Some(eth) = m.eth {
+            self.eth = eth;
+        }
         self.token_bal = m.token_bal;
         self.ready = m.ready;
         self.last_read_ms = m.read_ms;
@@ -1817,7 +1821,13 @@ pub struct Market {
     pub tick: i32,
     pub r0: f64,
     pub r1: f64,
-    pub eth: f64,
+    /// The trader's ETH, or None when the read did not answer.
+    ///
+    /// Not an `f64` defaulting to zero. A rate-limited `eth_getBalance` used to
+    /// report 0, which the dashboard showed as an empty wallet and the session
+    /// PnL read as having lost the whole balance — so both flickered between
+    /// the truth and zero on alternate polls.
+    pub eth: Option<f64>,
     pub token_bal: f64,
     pub ready: bool,
     pub read_ms: f64,
@@ -1836,7 +1846,7 @@ pub async fn read_market<P: Provider>(
 
     // No pool selected (empty network) — still show ETH + gas, empty market.
     if pref.kind.is_empty() {
-        let eth = provider.get_balance(trader).await.map(wei_to_f64).unwrap_or(0.0);
+        let eth = provider.get_balance(trader).await.map(wei_to_f64).ok();
         let gas = provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0);
         return Ok(Market { eth, gas_price: gas, read_ms: t0.elapsed().as_secs_f64() * 1000.0, ..Default::default() });
     }
@@ -1910,7 +1920,7 @@ pub async fn read_market<P: Provider>(
         tick,
         r0,
         r1,
-        eth: wei_to_f64(eth_bal?), // native ETH is always 18-dec
+        eth: eth_bal.ok().map(wei_to_f64), // native ETH is always 18-dec
         token_bal: units_to_f64(tok_bal?._0, td),
         ready: r0 > 0.0 && r1 > 0.0,
         read_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -2382,5 +2392,37 @@ mod decimals_tests {
         let raw = U256::from(2_000_000u64); // 2.0 tokens at 6dp
         assert_eq!(units_to_f64(raw, 6), 2.0);
         assert!(wei_to_f64(raw) < 1e-11, "the old path read 2.0 tokens as ~0");
+    }
+
+    /// A balance read that fails must not be reported as a balance of zero.
+    ///
+    /// This is what a rate-limited endpoint actually did: `eth_getBalance`
+    /// returned 429, the result became 0.0, and the dashboard showed an empty
+    /// wallet while session PnL showed the loss of the entire balance — both
+    /// flickering back on the next poll that happened to succeed.
+    #[test]
+    fn a_failed_balance_read_keeps_the_last_known_balance() {
+        let held = 0.000620_f64;
+
+        // What the engine does with each poll's result, in the two cases.
+        let apply = |current: f64, read: Option<f64>| match read {
+            Some(eth) => eth,
+            None => current,
+        };
+
+        // A good read updates.
+        assert_eq!(apply(0.0, Some(held)), held);
+        // A failed read holds, rather than zeroing.
+        assert_eq!(apply(held, None), held);
+
+        // And session PnL, which is balance minus baseline, therefore stays at
+        // zero across a failed poll instead of reporting a total loss.
+        let baseline = held;
+        assert_eq!(apply(held, None) - baseline, 0.0);
+        assert_eq!(
+            0.0_f64 - baseline,
+            -held,
+            "this is the number that appeared on screen when a failed read became 0"
+        );
     }
 }

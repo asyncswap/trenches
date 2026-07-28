@@ -694,11 +694,19 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         None => return,
     };
     while !stop.load(Ordering::Relaxed) {
-        let head = tokio::time::timeout(RPC_TIMEOUT, provider.get_block_number())
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
+        // A head read that did not answer is not block zero. It used to fall
+        // back to 0, which made the window below `0..0` — a real getLogs call
+        // for the genesis block, issued every round, finding nothing and
+        // spending the rate limit that the balance and price reads need. Under
+        // a 429 that turned one failed request into a storm of them.
+        let head = match tokio::time::timeout(RPC_TIMEOUT, provider.get_block_number()).await {
+            Ok(Ok(h)) if h > 0 => h,
+            _ => {
+                crate::trace("discovery: no head block, skipping this round");
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                continue;
+            }
+        };
         let cands = scan_candidates(&logs, head.saturating_sub(LAUNCH_WINDOW), head).await;
 
         let mut acc: Vec<Row> = Vec::new();
@@ -902,11 +910,16 @@ pub async fn screen_clusters(term: &mut Term, pool: Address, weth0: bool, launch
         None => return Ok(()),
     };
     loop {
-        let head = tokio::time::timeout(RPC_TIMEOUT, logs.get_block_number())
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
+        // Same here: without a head there is no window to ask about, and
+        // asking anyway costs a request that buys nothing.
+        let head = match tokio::time::timeout(RPC_TIMEOUT, logs.get_block_number()).await {
+            Ok(Ok(h)) if h > 0 => h,
+            _ => {
+                crate::trace("chart: no head block, skipping this round");
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                continue;
+            }
+        };
         let from = launch_block.unwrap_or_else(|| head.saturating_sub(3_000));
         let swaps = pool_swaps(&logs, pool, weth0, from, head).await;
         // Split into market vs OURS (tx hash matches an order) × buy vs sell.

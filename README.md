@@ -1,77 +1,106 @@
-# trenches
+# Trenches
 
-Fast memecoin scalper for Robinhood Chain — buys freshly-graduated Pons
-launchpad tokens and sells them quickly. Terminal TUI (ratatui), Uniswap v3/v4
-via alloy.
+A terminal bot for trading memecoins.
 
-## Run (local)
+**[trenches.sh](https://trenches.sh)**
 
-```shell
-cargo build --release        # always release; the live bot runs the release binary
-./target/release/trenches
+## Install
+
+macOS and Linux:
+
+```sh
+curl -fsSL https://trenches.sh/install | sh
 ```
 
-Then pick **chain → account → pool**. On a keystore account you'll be prompted
-for the password (typed, never stored).
+Install fetches the build for your machine, checks it against the release's
+`SHA256SUMS`, and puts `trenches` in `~/.local/bin`.
 
-- **Config**: `deployments.json` in this directory (networks/RPC, accounts,
-  pools), read relative to the working directory. Uses the **raw public RPC** by
-  default. Contains a `mnemonics` field — keep it gitignored.
-- **Keys**: a Foundry keystore under `~/.foundry/keystores/<name>`, or an HD
-  mnemonic in the registry. Never a raw private key.
-- **Shortcuts**: the footer shows essentials (`b` buy · `s` sell · `x` sell-all ·
-  `p` pool · `l` view · `q` quit); press **`?`** for the full list (`h` holdings,
-  `Shift-S` liquidate all, size knobs, toggles, `f` graduation discovery…).
+Windows: download the `.zip` from [Releases](../../releases) and unzip it.
 
-Changes only go live on the **next restart** — a running session never
-hot-reloads.
+Prefer to do it yourself? Every binary is on the
+[releases page](../../releases) with its checksum. Verify before you run it —
+that is true of anything you download, and doubly so of something that holds
+keys.
 
-## Running in a datacenter / your own node
+### Pick a version
 
-Not needed for local use, and free RPCs rate-limit datacenter IPs. If you want
-the colocated-latency setup or your own node, see
-[docs/run-your-own-node.md](../docs/run-your-own-node.md).
+```sh
+TRENCHES_VERSION=v0.1.0 curl -fsSL https://trenches.sh/install | sh
+TRENCHES_BIN_DIR=/usr/local/bin curl -fsSL https://trenches.sh/install | sh
+```
 
-## Roadmap — venues to add
+## Public Beta
 
-Each of these is a separate venue behind the same dashboard: discovery, tape,
-and the `b`/`s`/`x` trade path, wired to that chain's own instruction format.
+Trenches is in beta. It signs real transactions against real chains with real
+money, and it has bugs we have not found yet.
 
-| Venue | Chain | Reference |
-|---|---|---|
-| **Four Meme** | BNB Chain | `pnpm add -g @four-meme/four-meme-ai@latest` |
-| **Clanker** | Base | launch-and-trade, same shape as Pons |
-| **Bankr** | Base | see [launchpad landscape](../src/pons/README.md) |
-| **Hyperliquid** | Hyperliquid L1 | [hyperliquid-rust-sdk](https://github.com/hyperliquid-dex/hyperliquid-rust-sdk) |
+## Issues and requests
 
-Notes for whoever picks these up:
+The tracker here is open and read. Please use it for:
 
-- **Hyperliquid is the odd one out** — a central limit order book, not an AMM or
-  a bonding curve. Price comes from the book rather than reserves, so the quote,
-  slippage and PnL paths all need an order-book variant; it has an official Rust
-  SDK, so it needs no hand-rolled instruction encoding.
-- **Clanker and Bankr are both Base**, so they share an EVM client and differ
-  only in factory and pool wiring — take them together, not separately.
-- **Four Meme** ships a CLI/agent package rather than a documented on-chain ABI;
-  budget time to derive the contract calls the way the pump.fun path was
-  verified (build a known-good trade with the official tooling, then diff our
-  encoding against it account by account).
+- **Bugs** — Your session log lives in `~/.trenches/` and is the single
+  most useful thing to attach.
+  Read it first: it records addresses and amounts, though NEVER keys or
+  passwords.
+- **Chains and venues** you want supported.
+- **Anything confusing** — a key that did not do what its name suggested is a
+  bug in the app, not in you.
 
-## License
+Include your OS, your architecture (`uname -m`), and the version (`trenches
+--version`).
 
-Trenches is licensed under the **GNU Affero General Public License v3.0**
-(AGPL-3.0-only). Copyright (C) 2026 AsyncSwap Labs. Full text in
-[LICENSE](LICENSE); the reasoning and the trademark and commercial-services
-carve-outs are in [NOTICE](NOTICE) and [docs/license.md](docs/license.md).
+### Security
 
-You may use, read, modify, redistribute and self-host it. If you modify Trenches
-and offer it to others as a network service, the AGPL asks you to publish your
+Found something that could cost somebody their funds? Do not open a public
+issue. Email **<meek10x@gmail.com>** and we will deal with it before it is
+described anywhere.
+
+## Source
+
+All of it is here. Trenches is licensed **AGPL-3.0-only** — read it, fork it,
+modify it, run it yourself.
+
+Trade execute through this software, so you should be able to see exactly what it
+signs and where it sends it. That is not a claim worth making about code nobody
+can read.
+
+Build it yourself:
+
+```sh
+git clone https://github.com/asyncswap/trenches
+cd trenches
+cargo build --release --features solana
+```
+
+Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commits are signed off
+under the DCO; there is no CLA and no copyright assignment.
+
+## What it does
+
+- **Robinhood Chain** — Uniswap V3 and V4, and [pons.family](https://pons.family)
+  launches
+- **Solana** — pump.fun bonding curves and PumpSwap AMM
+- **Base, BNB Chain, Hyperliquid** — next
+- Keys stay on your machine, in a password-encrypted keystore
+- One set of shortcuts, the same on every chain
+- A PnL calendar that remembers what each day made
+
+## Licence
+
+**AGPL-3.0-only.** Copyright (C) 2026 AsyncSwap Labs. Full text in
+[LICENSE](LICENSE).
+
+Use it, modify it, redistribute it, run it yourself. If you modify Trenches and
+offer it to other people as a network service, the AGPL asks you to publish your
 changes to those users — a hosted fork gives its improvements back rather than
-taking them private.
+taking them private. Running it on your own machine asks nothing of you.
 
-Independent services reached over an API — hosted RPCs, analytics, AI models —
-carry their own licenses. The AGPL covers the bot, not what is on the far side of
-a network call.
+Services built *around* Trenches — hosted RPCs, analytics, AI models — are
+independent services reached over an API. They carry their own licenses. The AGPL
+covers the bot, not what is on the other side of a network call.
 
-Contributions come in under the same license, signed off under the DCO. No CLA.
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+"Trenches" and trenches.sh are trademarks, held separately from the code license.
+Fork it and say so; do not ship your fork *as* Trenches.
+
+Trenches is a tool, not advice. What you trade with it is your decision and your
+risk.
