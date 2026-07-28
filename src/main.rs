@@ -1011,7 +1011,7 @@ async fn app(
                 Some(i) => {
                     save_last_chain(&reg.networks[i].name);
                     events::action("Resumed last chain", &[("chain", reg.networks[i].name.clone())]);
-                    chain_session_on(terminal, reg, &reg.networks[i], i, false).await?
+                    chain_session_on(terminal, reg, &reg.networks[i], i, false, None).await?
                 }
                 None => chain_session(terminal, reg, None).await?,
             };
@@ -1109,7 +1109,7 @@ async fn chain_session(
         // and it asks first.
         None => return Ok(Exit::Docs),
     };
-    chain_session_on(terminal, reg, net, net_idx, false).await
+    chain_session_on(terminal, reg, net, net_idx, false, None).await
 }
 
 /// The session for one already-chosen network.
@@ -1122,6 +1122,9 @@ async fn chain_session_on(
     // reach the dashboard without being asked for a password it may not need —
     // watching costs nothing and unlocking is one keypress away.
     ask_account: bool,
+    // The pool that was on screen before an account change, if this is one.
+    // None on a fresh session.
+    resume_pool: Option<SelPool>,
 ) -> eyre::Result<Exit> {
 
     // Solana networks take an entirely separate path: different signing curve,
@@ -1185,7 +1188,14 @@ async fn chain_session_on(
     // session one keypress away from buying whatever was open days ago — the
     // screen reads as blank-and-idle, and `b` does not care. Selecting a pool
     // is now always an explicit act.
-    let pool = blank_pool(&view::pretty_network(&net.name));
+    // Blank on the way in — restoring the pool used days ago put a fresh
+    // session one keypress away from buying it, and a blank-looking screen does
+    // not stop `b` from working. Changing account inside a session is the one
+    // exception: you were looking at that pool a second ago, and unlocking a
+    // wallet is not a request to forget it.
+    let pool = resume_pool
+        .clone()
+        .unwrap_or_else(|| blank_pool(&view::pretty_network(&net.name)));
     let strategy = Strategy::Manual; // default: manual — nothing preset, nothing automatic
 
     // Wallet-selectable assets: ETH (currency0) + every known token on this
@@ -1316,12 +1326,13 @@ async fn chain_session_on(
 
     // --- trading dashboard (same terminal), with live option switching ---
     let verified = build_verified(net);
-    let exit = run(terminal, &provider, &mut bot, pools, assets, net.name.clone(), net.discovery_rpc.clone(), verified).await?;
+    let mut carry: Option<SelPool> = None;
+    let exit = run(terminal, &provider, &mut bot, pools, assets, net.name.clone(), net.discovery_rpc.clone(), verified, &mut carry).await?;
     if exit == Exit::ChangeAccount {
         // Straight back to the account list on this same chain. Recursing
         // rebuilds the provider around the new signer, which is the whole
         // reason this cannot be swapped in place.
-        return Box::pin(chain_session_on(terminal, reg, net, _net_idx, true)).await;
+        return Box::pin(chain_session_on(terminal, reg, net, _net_idx, true, carry)).await;
     }
     Ok(exit)
 }
@@ -1434,6 +1445,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     network: String,
     discovery_rpc: Option<String>,
     verified: Vec<discover::VerifiedPool>,
+    // Set to whatever pool is on screen when this returns, so an account change
+    // can put it back. Unlocking a wallet is not a request to forget what you
+    // were looking at.
+    carry: &mut Option<SelPool>,
 ) -> eyre::Result<Exit> {
     use futures::StreamExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1731,6 +1746,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         }
                         // Back to the account list on this same chain.
                         KeyCode::Char('W') => {
+                            // Hand the current pool back so the rebuilt session
+                            // can restore it. Matched by token: `pools` holds
+                            // the selectable form, `bot.pool` the live one.
+                            *carry = pools
+                                .iter()
+                                .find(|q| q.token == bot.pool.token && !bot.pool.kind.is_empty())
+                                .cloned();
                             // No "from" when there is nothing loaded — the zero
                             // address is a placeholder, not a wallet.
                             let from =

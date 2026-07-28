@@ -139,13 +139,14 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     // logo when we return.
     crate::ui::image::clear();
 
-    let mut fills = ledger::load_all();
-    // Re-read on a timer, so a fill that lands while this screen is open shows
-    // up. It was loaded once at open, which meant trading in one window and
-    // watching in another showed yesterday's picture indefinitely. The ledger
-    // is a small local file — reading it costs nothing and never touches the
-    // network.
-    let mut reload = std::time::Instant::now();
+    // Read once, here, on the way in.
+    //
+    // On demand is the whole of it: this screen owns the terminal while it is
+    // open, so no trade can land underneath it and there is nothing to poll
+    // for. Every time you press `L` you get the ledger as it stands, today
+    // included; the days behind it were settled when they ended and do not
+    // change.
+    let fills = ledger::load_all();
     let today = ledger::date_of(ledger::now());
     let (mut year, mut month) = (today.y, today.m);
     // Which day the winners/losers list is showing. `None` = the whole month,
@@ -154,10 +155,6 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     let mut range = Range::Week;
 
     loop {
-        if reload.elapsed() >= Duration::from_secs(2) {
-            fills = ledger::load_all();
-            reload = std::time::Instant::now();
-        }
         term.draw(|f| draw(f, &fills, year, month, sel, range, today))?;
 
         if !event::poll(Duration::from_millis(250))? {
@@ -829,13 +826,16 @@ mod tests {
     fn day_selection_clamps_to_the_month_it_is_in() {
         // February 2024 has 29 days; stepping a week off the end must not
         // select the 32nd of February.
-        assert_eq!(step_day(Some(25), 7, 2024, 2), Some(29));
-        assert_eq!(step_day(Some(3), -7, 2024, 2), Some(1));
+        // A month other than the one we are in, so "start on today" does not
+        // apply and the ends are what a first press lands on.
+        let elsewhere = Date { y: 2026, m: 7, d: 28 };
+        assert_eq!(step_day(Some(25), 7, 2024, 2, elsewhere), Some(29));
+        assert_eq!(step_day(Some(3), -7, 2024, 2, elsewhere), Some(1));
         // From no selection, forward starts at the 1st and back at the last.
-        assert_eq!(step_day(None, 1, 2024, 2), Some(1));
-        assert_eq!(step_day(None, -1, 2024, 2), Some(29));
+        assert_eq!(step_day(None, 1, 2024, 2, elsewhere), Some(1));
+        assert_eq!(step_day(None, -1, 2024, 2, elsewhere), Some(29));
         // A non-leap February stops a day earlier.
-        assert_eq!(step_day(None, -1, 2023, 2), Some(28));
+        assert_eq!(step_day(None, -1, 2023, 2, elsewhere), Some(28));
     }
 
     #[test]
