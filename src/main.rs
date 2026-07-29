@@ -1890,12 +1890,67 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     let mut show_help = false;
     let mut orders_scroll: usize = 0;
     let mut reader = crossterm::event::EventStream::new();
-    // Live USD feed (CoinGecko) for quote currencies — fetched up front so ETH
-    // and any stablecoin quotes are valued correctly before the first render.
+    // Live USD feed (CoinGecko) for quote currencies. Fetched up front so ETH
+    // and any stablecoin quotes are valued correctly before the first render —
+    // but BOUNDED: this await is on the UI thread, and CoinGecko being slow
+    // used to hold the whole dashboard black for up to its 6s timeout. Past
+    // 1.5s the fetch moves to the background and lands via `feed_cell`.
     let feed_ids = price_ids(&pools);
-    let mut feed = pricing::fetch_usd(&feed_ids).await;
+    let feed_cell: Arc<Mutex<Option<std::collections::HashMap<String, f64>>>> = Default::default();
+    let mut feed = match tokio::time::timeout(Duration::from_millis(1500), pricing::fetch_usd(&feed_ids)).await {
+        Ok(f) => f,
+        Err(_) => {
+            let (ids, cell) = (feed_ids.clone(), feed_cell.clone());
+            tokio::spawn(async move {
+                let f = pricing::fetch_usd(&ids).await;
+                if !f.is_empty() {
+                    *cell.lock().unwrap() = Some(f);
+                }
+            });
+            Default::default()
+        }
+    };
     apply_prices(bot, &feed);
     let mut price_refresh: u32 = 0; // action-tick counter; refetch every ~60s
+
+    // The freeze detector. The render arm beats this heart every 100ms; a
+    // watcher task reports any gap — because EVERY await in the select arms
+    // below runs on the UI thread, and a slow one freezes rendering, the
+    // block counter, everything. "The app froze and came back" was
+    // undiagnosable without a line saying how long it froze and what held it.
+    let ui_start = std::time::Instant::now();
+    let ui_beat = Arc::new(AtomicU64::new(0));
+    let ui_phase: Arc<Mutex<String>> = Arc::new(Mutex::new("startup".into()));
+    let _watchdog = {
+        let (beat, phase) = (ui_beat.clone(), ui_phase.clone());
+        AbortOnDrop(tokio::spawn(async move {
+            let mut stalled: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let gap = (ui_start.elapsed().as_millis() as u64).saturating_sub(beat.load(Ordering::Relaxed));
+                if gap >= 1_000 {
+                    stalled = gap;
+                    continue;
+                }
+                if stalled >= 1_000 {
+                    // Logged on recovery, with the whole duration — one line
+                    // per freeze, not one per watchdog tick.
+                    let held = phase.lock().unwrap().clone();
+                    trace(&format!("ui: stalled {:.1}s in {held}", stalled as f64 / 1000.0));
+                    events::warn(
+                        "The screen froze because a slow operation held the UI thread",
+                        &[("for", format!("{:.1}s", stalled as f64 / 1000.0)), ("during", held)],
+                    );
+                }
+                stalled = 0;
+            }
+        }))
+    };
+    macro_rules! phase {
+        ($p:expr) => {
+            *ui_phase.lock().unwrap() = String::from($p);
+        };
+    }
 
     // Render on a fast fixed cadence — never does RPC, so it stays smooth even
     // when the node is slow. Actions run on their own slower tick.
@@ -1908,6 +1963,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         tokio::select! {
             // fast render — pulls the latest snapshot, no network I/O
             _ = render.tick() => {
+                ui_beat.store(ui_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                phase!("idle");
                 let m = *market.lock().unwrap();
                 bot.apply_market(m);
                 // Same rule as pool A: a light read has no reserves to give, so
@@ -2015,22 +2072,41 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     last_status = bot.status.clone();
                     status_since = std::time::Instant::now();
                 }
+                phase!("settling pending orders");
                 let _ = tokio::time::timeout(Duration::from_secs(3), bot.reap(provider)).await;
+                phase!("telemetry");
                 tele_ctr += 1;
                 if tele_ctr % 4 == 0 { bot.telemetry(block.load(Ordering::Relaxed), bot.last_read_ms); }
-                // Refresh the USD feed every ~60s (120 * 500ms) so quote values track.
+                // Refresh the USD feed every ~60s (120 * 500ms) so quote values
+                // track — in the BACKGROUND. This await used to sit on the UI
+                // thread, and a slow CoinGecko froze the whole screen for up to
+                // its 6s timeout, once a minute: exactly the "it freezes and
+                // then comes back" that was impossible to attribute.
                 price_refresh += 1;
                 if price_refresh >= 120 {
                     price_refresh = 0;
-                    let f = pricing::fetch_usd(&feed_ids).await;
-                    if !f.is_empty() { feed = f; apply_prices(bot, &feed); }
+                    let (ids, cell) = (feed_ids.clone(), feed_cell.clone());
+                    tokio::spawn(async move {
+                        let f = pricing::fetch_usd(&ids).await;
+                        if !f.is_empty() {
+                            *cell.lock().unwrap() = Some(f);
+                        }
+                    });
                 }
+                if let Some(f) = feed_cell.lock().unwrap().take() {
+                    feed = f;
+                    apply_prices(bot, &feed);
+                }
+                phase!("idle");
             }
             // key input — handled the instant it arrives
             ev = reader.next() => {
                 if let Some(Ok(Event::Key(k))) = ev {
 
                     if k.kind != crossterm::event::KeyEventKind::Press { continue; }
+                    // Any await a key arm does holds the UI; name the key so a
+                    // freeze report says which action was responsible.
+                    phase!(format!("the {:?} key's action", k.code));
                     // Help overlay: '?' opens it; any other key closes it.
                     if show_help {
                         show_help = false;

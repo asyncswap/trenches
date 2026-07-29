@@ -2162,7 +2162,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "sym", "src", "pooled ETH", "mkt cap", "meta", "tx/sec", "age", "mine", "pool",
+        "", "source", "symbol", "pooled ETH", "mkt cap", "metadata", "tx/sec", "age", "mine", "pool",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -2181,9 +2181,9 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
             let meta_full = r.grad.meta.score() >= 4;
             ratatui::widgets::Row::new(vec![
                 Cell::from(if fire { "🔥" } else { "" }),
-                Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(venue_tag(&r.grad))
                     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Dim))),
+                Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(format!("{:.4}", r.pooled_eth)),
                 Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
                 Cell::from(format!("{}/{}", r.grad.meta.score(), META_FIELDS))
@@ -2199,11 +2199,11 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
 
     let widths = [
         Constraint::Length(2),
+        Constraint::Length(6),
         Constraint::Length(12),
-        Constraint::Length(5),
         Constraint::Length(11),
         Constraint::Length(11),
-        Constraint::Length(5),
+        Constraint::Length(8),
         Constraint::Length(7),
         Constraint::Length(6),
         Constraint::Length(5),
