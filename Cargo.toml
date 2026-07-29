@@ -54,7 +54,10 @@ sha2 = "0.10"
 # `ratatui` feature: it pulls ratatui-core 0.1 for ratatui 0.30, and this bot is
 # on 0.29. We only need the token tables and map OpalineColor -> Color::Rgb
 # ourselves, which is a 3-field struct copy.
-opaline = { path = "../opaline", default-features = false, features = ["builtin-themes"] }
+# From crates.io, not a path. A path pointing outside the repository builds
+# only on a machine that happens to have a sibling checkout — CI has no such
+# sibling, and neither does anyone cloning the source, which is now everyone.
+opaline = { version = "0.4.1", default-features = false, features = ["builtin-themes"] }
 
 # --- solana (optional, behind the `solana` feature) ---
 # Targeted crates rather than the `solana-sdk` umbrella: we only need keys,

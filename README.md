@@ -4,6 +4,14 @@ A terminal bot for trading memecoins.
 
 **[trenches.sh](https://trenches.sh)**
 
+- **Robinhood Chain** — Uniswap V3 and V4, and [pons.family](https://pons.family)
+  launches
+- **Solana** — pump.fun bonding curves and PumpSwap AMM
+- **Base, BNB Chain, Hyperliquid** — next
+- Keys stay on your machine, in a password-encrypted keystore
+- One set of shortcuts, the same on every chain
+- A PnL calendar that remembers what each day made
+
 ## Install
 
 macOS and Linux:
@@ -55,35 +63,10 @@ Found something that could cost somebody their funds? Do not open a public
 issue. Email **<meek10x@gmail.com>** and we will deal with it before it is
 described anywhere.
 
-## Source
-
-All of it is here. Trenches is licensed **AGPL-3.0-only** — read it, fork it,
-modify it, run it yourself.
-
-Trade execute through this software, so you should be able to see exactly what it
-signs and where it sends it. That is not a claim worth making about code nobody
-can read.
-
-Build it yourself:
-
-```sh
-git clone https://github.com/asyncswap/trenches
-cd trenches
-cargo build --release --features solana
-```
-
 Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commits are signed off
 under the DCO; there is no CLA and no copyright assignment.
 
 ## What it does
-
-- **Robinhood Chain** — Uniswap V3 and V4, and [pons.family](https://pons.family)
-  launches
-- **Solana** — pump.fun bonding curves and PumpSwap AMM
-- **Base, BNB Chain, Hyperliquid** — next
-- Keys stay on your machine, in a password-encrypted keystore
-- One set of shortcuts, the same on every chain
-- A PnL calendar that remembers what each day made
 
 ## Licence
 
