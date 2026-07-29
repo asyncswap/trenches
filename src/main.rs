@@ -1789,12 +1789,21 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // Update, on purpose and never otherwise. The check runs
                         // at launch and only reports; this is the one path that
                         // installs anything, and it asks first.
-                        KeyCode::Char('U') => match update::available() {
-                            None => bot.note(format!(
+                        KeyCode::Char('U') => match update::status() {
+                            // Each of these is a different fact. Saying
+                            // "latest" for all three is what told someone on
+                            // 0.1.2 they were current while 0.1.3 was out.
+                            update::Status::Checking => {
+                                bot.note("Still checking for updates…".to_string())
+                            }
+                            update::Status::Unknown => bot.note(
+                                "Could not reach GitHub to check for updates.".to_string(),
+                            ),
+                            update::Status::Latest => bot.note(format!(
                                 "You are on the latest version ({}).",
                                 update::full()
                             )),
-                            Some(v) => {
+                            update::Status::Update(v) => {
                                 if ui::confirm(terminal, &format!("Update to {v}?"))? {
                                     events::action("Updating", &[("to", v.clone())]);
                                     bot.note(format!("Installing {v}…"));

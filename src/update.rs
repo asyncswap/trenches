@@ -16,9 +16,46 @@
 
 use std::sync::RwLock;
 
-/// The newest published version, once known. `None` until the check answers,
-/// and stays `None` if it never does.
-static LATEST: RwLock<Option<String>> = RwLock::new(None);
+/// What the check knows so far.
+///
+/// Three states, not two. "No newer version" and "never got an answer" are
+/// different facts, and collapsing them let the app tell someone on 0.1.2 that
+/// they were up to date while 0.1.3 sat published — the check had 404'd and
+/// nothing said so.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Check {
+    /// Still in flight, or not started.
+    Pending,
+    /// Asked and did not get an answer.
+    Failed,
+    /// The newest published tag.
+    Known(String),
+}
+
+static LATEST: RwLock<Check> = RwLock::new(Check::Pending);
+
+/// What to tell someone who asks about updates.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Status {
+    /// The check has not answered yet.
+    Checking,
+    /// The check failed. We do not know.
+    Unknown,
+    /// Checked, and this is the newest there is.
+    Latest,
+    /// Checked, and there is a newer one.
+    Update(String),
+}
+
+/// The current state of the update check.
+pub fn status() -> Status {
+    match LATEST.read().map(|s| s.clone()) {
+        Ok(Check::Known(v)) if is_newer(&v, current()) => Status::Update(v),
+        Ok(Check::Known(_)) => Status::Latest,
+        Ok(Check::Failed) => Status::Unknown,
+        _ => Status::Checking,
+    }
+}
 
 /// The version this binary was built as, without the build stamp.
 pub fn current() -> &'static str {
@@ -39,8 +76,10 @@ pub fn full() -> String {
 /// A newer version than this one, if the check found one. Cheap; safe to call
 /// every frame.
 pub fn available() -> Option<String> {
-    let latest = LATEST.read().ok()?.clone()?;
-    is_newer(&latest, current()).then_some(latest)
+    match status() {
+        Status::Update(v) => Some(v),
+        _ => None,
+    }
 }
 
 /// Start the check. Returns immediately.
@@ -50,10 +89,14 @@ pub fn available() -> Option<String> {
 /// this is not worth a second HTTP stack.
 pub fn spawn_check() {
     tokio::spawn(async {
-        if let Some(tag) = fetch_latest_tag().await {
-            if let Ok(mut w) = LATEST.write() {
-                *w = Some(tag);
-            }
+        let result = match fetch_latest_tag().await {
+            Some(tag) => Check::Known(tag),
+            // Recorded as a failure rather than left pending: an answer that
+            // never comes must not read as "nothing newer".
+            None => Check::Failed,
+        };
+        if let Ok(mut w) = LATEST.write() {
+            *w = result;
         }
     });
 }
@@ -66,8 +109,11 @@ async fn fetch_latest_tag() -> Option<String> {
         .user_agent(format!("trenches/{}", full()))
         .build()
         .ok()?;
+    // The list, newest first — not `/releases/latest`, which excludes
+    // pre-releases and 404s while every release is a beta. The installer and
+    // the website read the list for the same reason.
     let body = client
-        .get("https://api.github.com/repos/asyncswap/trenches/releases/latest")
+        .get("https://api.github.com/repos/asyncswap/trenches/releases?per_page=1")
         .send()
         .await
         .ok()?
@@ -77,7 +123,9 @@ async fn fetch_latest_tag() -> Option<String> {
         .await
         .ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let tag = v.get("tag_name")?.as_str()?.trim();
+    // An array now, so take the first entry.
+    let first = v.as_array().and_then(|a| a.first()).unwrap_or(&v);
+    let tag = first.get("tag_name")?.as_str()?.trim();
     (!tag.is_empty()).then(|| tag.to_string())
 }
 
@@ -119,9 +167,11 @@ fn is_newer(candidate: &str, running: &str) -> bool {
 /// nothing in the second case leaves you unable to tell a current build from
 /// one whose check never answered, which is the question the line exists for.
 pub fn footer_label() -> String {
-    match available() {
-        Some(v) => format!("{}  →  {v}", full()),
-        None => format!("{} (latest)", full()),
+    match status() {
+        Status::Update(v) => format!("{}  →  {v}", full()),
+        Status::Latest => format!("{} (latest)", full()),
+        // Neither claim is available yet, so it makes neither.
+        Status::Checking | Status::Unknown => full(),
     }
 }
 
@@ -156,6 +206,43 @@ pub fn install_latest() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three states must stay three.
+    ///
+    /// Collapsing "did not answer" into "nothing newer" is what told someone on
+    /// 0.1.2 they were on the latest while 0.1.3 was published — the check had
+    /// 404'd, because `/releases/latest` omits pre-releases and every release
+    /// here is one.
+    #[test]
+    fn not_knowing_is_not_the_same_as_being_up_to_date() {
+        let decide = |c: &Check| match c {
+            Check::Known(v) if is_newer(v, "0.1.2") => Status::Update(v.clone()),
+            Check::Known(_) => Status::Latest,
+            Check::Failed => Status::Unknown,
+            Check::Pending => Status::Checking,
+        };
+        assert_eq!(decide(&Check::Pending), Status::Checking);
+        assert_eq!(decide(&Check::Failed), Status::Unknown);
+        assert_eq!(decide(&Check::Known("v0.1.2".into())), Status::Latest);
+        assert_eq!(
+            decide(&Check::Known("v0.1.3".into())),
+            Status::Update("v0.1.3".into())
+        );
+    }
+
+    /// The endpoint has to be the one that includes pre-releases.
+    #[test]
+    fn the_check_reads_the_release_list_not_releases_latest() {
+        let src = include_str!("update.rs");
+        assert!(
+            src.contains("releases?per_page=1"),
+            "the check must read the release list"
+        );
+        assert!(
+            !src.contains("/releases/latest\""),
+            "/releases/latest omits pre-releases and 404s while every release is a beta"
+        );
+    }
 
     #[test]
     fn the_build_stamp_rides_along_without_confusing_the_comparison() {

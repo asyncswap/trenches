@@ -1532,12 +1532,18 @@ pub async fn run(
                     KeyCode::Char('Q') => break,
                     // Same as the EVM side: the only path that installs
                     // anything, and it asks first.
-                    KeyCode::Char('U') => match crate::update::available() {
-                        None => bot.note(format!(
+                    KeyCode::Char('U') => match crate::update::status() {
+                        crate::update::Status::Checking => {
+                            bot.note("Still checking for updates…".to_string())
+                        }
+                        crate::update::Status::Unknown => {
+                            bot.note("Could not reach GitHub to check for updates.".to_string())
+                        }
+                        crate::update::Status::Latest => bot.note(format!(
                             "You are on the latest version ({}).",
                             crate::update::full()
                         )),
-                        Some(v) => {
+                        crate::update::Status::Update(v) => {
                             if ui::confirm(term, &format!("Update to {v}?"))? {
                                 crate::events::action("Updating", &[("to", v.clone())]);
                                 bot.note(format!("Installing {v}…"));
