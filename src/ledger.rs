@@ -124,6 +124,24 @@ pub fn append(account: &str, f: &Fill) {
 /// The calendar is about a person's trading, not one keypair's: EVM and Solana
 /// sign with different keys and so write different files, but a Tuesday is one
 /// Tuesday. Each fill carries its own chain, so they stay tellable apart.
+/// What one account's fills add up to today, in the quote currency.
+///
+/// The same arithmetic the calendar does, from the same file, so the wallet's
+/// day figure and the calendar's cannot disagree. They used to: the wallet
+/// measured the balance against a baseline taken at the start of the day,
+/// which counts gas, and counts a deposit as profit.
+pub fn today_total(account: &str) -> f64 {
+    let today = date_of(now());
+    load(account)
+        .iter()
+        .filter(|f| {
+            let d = date_of(f.ts);
+            d.y == today.y && d.m == today.m && d.d == today.d
+        })
+        .map(|f| f.pnl)
+        .sum()
+}
+
 pub fn load_all() -> Vec<Fill> {
     let Ok(dir) = std::fs::read_dir(crate::state_dir()) else { return Vec::new() };
     let mut v: Vec<Fill> = dir

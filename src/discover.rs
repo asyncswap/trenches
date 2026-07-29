@@ -932,13 +932,17 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // The health light rides on the title, where it is visible whether the list
     // is empty or full. An empty list and a refused endpoint look identical
     // otherwise, and only one of them is worth waiting through.
-    Line::from(vec![
-        Span::raw(" "),
-        health_dot(),
-        Span::raw(format!(
-            " Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back "
-        )),
-    ])
+    //
+    // And with nothing found yet the title says so. "Trenches live (0)" reads
+    // as a finished search that came back empty, which is a different thing
+    // from one still running — and the keys it advertises do nothing until
+    // there is a row to press them on.
+    let text = if rows == 0 {
+        " Scanning Pons graduations… · Esc back ".to_string()
+    } else {
+        format!(" Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back ")
+    };
+    Line::from(vec![Span::raw(" "), health_dot(), Span::raw(text)])
 }
 
 /// Green answering, yellow refusing some, red nothing getting through.
@@ -952,12 +956,10 @@ fn health_dot() -> Span<'static> {
     Span::styled("●", Style::default().fg(crate::ui::widgets::tone_color(tone)))
 }
 
-/// A status screen with a health light in front of the message.
+/// A status screen: a spinner and a message.
 ///
-/// The dot is the endpoint, not the scan: green answering, yellow refusing
-/// some, red nothing getting through. A screen that sits there saying
-/// "scanning" tells you nothing about whether scanning is possible, which is
-/// the question you are actually asking when you stare at an empty list.
+/// The health light lives on the title, which this screen already draws, so
+/// repeating it beside the message said the same thing twice.
 fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyre::Result<()> {
     // Braille dots: one cell wide in every font that has them, and they turn
     // rather than blink, so a stalled screen is obvious — a frozen spinner
@@ -970,8 +972,6 @@ fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyr
         let body = vec![
             Line::from(""),
             Line::from(vec![
-                health_dot(),
-                Span::raw("  "),
                 Span::styled(
                     spin,
                     Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Accent)),
