@@ -150,15 +150,41 @@ const PUBLIC_RPC: &str = "https://rpc.mainnet.chain.robinhood.com/rpc";
 /// inside what the node will answer.
 const LOG_CHUNK: u64 = 2_000;
 
-async fn scan_candidates<P: Provider>(provider: &P, from: u64, to: u64) -> Vec<(Address, Address, u64)> {
+fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64)> {
+    let topics = lg.topics();
+    if topics.len() < 4 {
+        return None;
+    }
+    let token = Address::from_word(topics[1]);
+    let data = lg.data().data.clone();
+    let b = data.as_ref();
+    if b.len() < 64 {
+        return None;
+    }
+    let pair = Address::from_slice(&b[12..32]);
+    let pool = Address::from_slice(&b[44..64]);
+    (pair == WETH).then_some((token, pool, lg.block_number.unwrap_or(0)))
+}
+
+/// One chunked getLogs covers EVERY launchpad: both factory addresses, both
+/// event topics, dispatched by the emitting address. Scanning them separately
+/// doubled the widest, most rate-limited request the app makes, every round.
+async fn scan_launchpads<P: Provider>(
+    provider: &P,
+    from: u64,
+    to: u64,
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>) {
     let mut logs = Vec::new();
     let mut start = from;
     let (mut ok, mut failed) = (0u32, 0u32);
     while start <= to {
         let end = (start + LOG_CHUNK - 1).min(to);
         let filter = Filter::new()
-            .address(PONS_FACTORY)
-            .event_signature(IPonsFactory::TokenLaunched::SIGNATURE_HASH)
+            .address(vec![PONS_FACTORY, FLAUNCH_PM])
+            .event_signature(vec![
+                IPonsFactory::TokenLaunched::SIGNATURE_HASH,
+                IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
+            ])
             .from_block(start)
             .to_block(end);
         match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await {
@@ -188,33 +214,32 @@ async fn scan_candidates<P: Provider>(provider: &P, from: u64, to: u64) -> Vec<(
         }
         start = end + 1;
     }
-    crate::trace(&format!(
-        "launch scan {from}..{to}: {ok} chunks ok, {failed} failed, {} logs",
-        logs.len()
-    ));
     let mut seen = std::collections::HashSet::new();
-    let mut cands = Vec::new();
-    for lg in logs {
-        let topics = lg.topics();
-        if topics.len() < 4 {
-            continue;
+    let mut pons = Vec::new();
+    let mut fl = Vec::new();
+    for lg in &logs {
+        if lg.address() == PONS_FACTORY {
+            if let Some(c) = decode_pons_log(lg) {
+                if seen.insert(c.1.into_word()) {
+                    pons.push(c);
+                }
+            }
+        } else if let Some(c) = decode_flaunch_log(lg) {
+            if seen.insert(c.pool_id) {
+                fl.push(c);
+            }
         }
-        let token = Address::from_word(topics[1]);
-        let data = lg.data().data.clone();
-        let b = data.as_ref();
-        if b.len() < 64 {
-            continue;
-        }
-        let pair = Address::from_slice(&b[12..32]);
-        let pool = Address::from_slice(&b[44..64]);
-        if pair != WETH || !seen.insert(pool) {
-            continue;
-        }
-        cands.push((token, pool, lg.block_number.unwrap_or(0)));
     }
-    cands.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
-    cands.truncate(MAX_SCAN);
-    cands
+    crate::trace(&format!(
+        "launch scan {from}..{to}: {ok} chunks ok, {failed} failed, {} pons + {} flaunch",
+        pons.len(),
+        fl.len()
+    ));
+    pons.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+    pons.truncate(MAX_SCAN);
+    fl.sort_by(|a, b| b.block.cmp(&a.block));
+    fl.truncate(MAX_SCAN);
+    (pons, fl)
 }
 
 /// One row from cached facts + batch-read metrics. No RPC of its own: the
@@ -329,29 +354,31 @@ async fn scan_flaunch<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<FlCand> 
     let mut seen = std::collections::HashSet::new();
     let mut cands = Vec::new();
     for lg in raw {
-        // alloy decodes topics AND the dynamic FlaunchParams tuple — never
-        // hand-offset a log with dynamic fields.
-        let Ok(ev) = IFlaunchPositionManager::PoolCreated::decode_log(&lg.inner, true) else {
-            continue;
-        };
-        if !seen.insert(ev.data._poolId) {
-            continue;
+        let Some(c) = decode_flaunch_log(&lg) else { continue };
+        if seen.insert(c.pool_id) {
+            cands.push(c);
         }
-        cands.push(FlCand {
-            token: ev.data._memecoin,
-            pool_id: ev.data._poolId,
-            coin_is_0: ev.data._currencyFlipped,
-            block: lg.block_number.unwrap_or(0),
-            // On-chain names are attacker-controlled text — same trim the rest
-            // of the table gets from view rendering; length-cap here.
-            sym: ev.data._params.symbol.chars().take(12).collect(),
-            token_uri: ev.data._params.tokenUri.clone(),
-            flaunch_at: u64::try_from(ev.data._params.flaunchAt).unwrap_or(u64::MAX),
-        });
     }
     cands.sort_by(|a, b| b.block.cmp(&a.block)); // newest first
     cands.truncate(MAX_SCAN);
     cands
+}
+
+fn decode_flaunch_log(lg: &alloy::rpc::types::Log) -> Option<FlCand> {
+    // alloy decodes topics AND the dynamic FlaunchParams tuple — never
+    // hand-offset a log with dynamic fields.
+    let ev = IFlaunchPositionManager::PoolCreated::decode_log(&lg.inner, true).ok()?;
+    Some(FlCand {
+        token: ev.data._memecoin,
+        pool_id: ev.data._poolId,
+        coin_is_0: ev.data._currencyFlipped,
+        block: lg.block_number.unwrap_or(0),
+        // On-chain names are attacker-controlled text — same trim the rest
+        // of the table gets from view rendering; length-cap here.
+        sym: ev.data._params.symbol.chars().take(12).collect(),
+        token_uri: ev.data._params.tokenUri.clone(),
+        flaunch_at: u64::try_from(ev.data._params.flaunchAt).unwrap_or(u64::MAX),
+    })
 }
 
 /// Off-chain metadata cache for Flaunch coins, keyed by token. Filled by a
@@ -1103,22 +1130,32 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         let from = match scanned_to {
             None => head.saturating_sub(LAUNCH_WINDOW),
             Some(t) if head > t => t + 1,
-            Some(_) => head + 1, // nothing new; scan_candidates returns at once
+            Some(_) => head + 1, // nothing new; the scan returns at once
         };
-        if from <= head {
-            for c in scan_candidates(&provider, from, head).await {
+        // Only the public endpoint can serve wide log scans, and it rate
+        // limits. While it rests, SKIP the scan and leave the cursor alone —
+        // asking anyway is what kept it benched forever, and the unmoved
+        // cursor means the skipped blocks are scanned the moment it is back.
+        let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
+        if from <= head && wide_ok {
+            let (pons, fl) = scan_launchpads(&provider, from, head).await;
+            for c in pons {
                 crate::facts::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
                     known.push(c);
                 }
             }
-            for c in scan_flaunch(&provider, from, head).await {
+            for c in fl {
                 if !known_fl.iter().any(|k| k.token == c.token) {
                     known_fl.push(c);
                 }
             }
+            scanned_to = Some(head);
+        } else if !wide_ok {
+            crate::trace("discovery: wide-logs endpoint resting, scan deferred");
+        } else {
+            scanned_to = Some(head);
         }
-        scanned_to = Some(head);
         // Newest first, and bounded — but NOT aged out by the launch window.
         // Falling off the window means "no longer a new graduation", not "no
         // longer worth showing"; dropping it was what made a coin you were
@@ -1141,7 +1178,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             None => cutoff,
             Some(t) => (t + 1).max(cutoff),
         };
-        if sfrom <= head && !(pools.is_empty() && fl_ids.is_empty()) {
+        // Same deferral as the launch scan: a tape range that outgrew the
+        // narrow cap needs the wide endpoint, and hammering it mid-rest keeps
+        // it benched. The cursor waits, so nothing is missed.
+        let tape_wide = head.saturating_sub(sfrom) >= 10;
+        if sfrom <= head && !(pools.is_empty() && fl_ids.is_empty()) && (wide_ok || !tape_wide) {
             // The cursor only advances when EVERY tape read succeeded, so a
             // failed fetch never skips those blocks' swaps.
             let mut tape_ok = true;

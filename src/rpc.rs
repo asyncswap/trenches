@@ -176,6 +176,17 @@ impl Balanced {
         self.0.endpoints[i].url.to_string()
     }
 
+    /// True when an endpoint that can serve WIDE `eth_getLogs` is rested.
+    ///
+    /// Pollers that scan logs every round must check this and SKIP the round
+    /// when it is false. The transport's own fallback (try the benched
+    /// endpoint when it is the only candidate) is right for a one-off call —
+    /// but a loop that retries every second turns that mercy into a hammer,
+    /// guaranteeing the endpoint never gets to finish resting.
+    pub fn wide_ready(&self) -> bool {
+        self.0.endpoints.iter().any(|e| e.wide_logs && !e.cooling())
+    }
+
     /// Report the outcome of a raw call made against `pick_url`, so cooldowns
     /// and latency ordering learn from traffic that bypasses `call()`.
     pub fn report_raw(&self, url: &str, ok: bool, limited: bool, elapsed: Duration) {

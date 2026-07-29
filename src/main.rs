@@ -1740,9 +1740,21 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // them spends the rate budget the modal's own reads need.
     let poll_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Aborts its task when dropped. The poller used to be spawned and
+    // forgotten, so every wallet or chain switch left the old session's
+    // poller running forever — each one a full market read on its own clock.
+    // Three switches in, the "every 2.8s" full read was firing every ~1s and
+    // eating the rate budget three times over.
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     // Background polling task — the ONLY continuous RPC. Hard 1.5s timeouts so a
     // slow/broken RPC can never freeze the UI; the render loop keeps running.
-    {
+    let _poller = {
         let provider = provider.clone();
         let market = market.clone();
         let pool_cell = pool_cell.clone();
@@ -1753,7 +1765,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         let market_b = market_b.clone();
         let poll_paused = poll_paused.clone();
         let trader = bot.trader;
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(350));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_swap_block = 0u64; // last block scanned for the tape (pool A)
@@ -1836,6 +1848,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             while t.len() > 400 { t.pop_front(); }
                             drop(t);
                             last_swap_block = b;
+                        } else if last_swap_block == 0 {
+                            // The FIRST window is the wide one (200 blocks of
+                            // history), and only the rate-limited public
+                            // endpoint can serve wide ranges. While it rests,
+                            // this read failed every tick and the tape sat
+                            // empty. Give up the backfill and start narrow:
+                            // live trades matter more than 20s of history.
+                            last_swap_block = b.saturating_sub(9);
                         }
                     }
                     // Arb mode: merge the SECOND pool's swaps into the same tape
@@ -1857,8 +1877,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     }
                 }
             }
-        });
-    }
+        }))
+    };
 
     let mut prices: VecDeque<f64> = VecDeque::new();
     let mut sma = 0.0;
