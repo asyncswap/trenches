@@ -157,6 +157,8 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     loop {
         term.draw(|f| draw(f, &fills, year, month, sel, range, today))?;
 
+        crate::ui_alive();
+
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }

@@ -1461,6 +1461,8 @@ async fn screen_trenches(
             ui::widgets::table(f, f.area(), &table, Some(st));
         })?;
 
+        crate::ui_alive();
+
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
                 match cursor.on_key(k.code, n) {
@@ -1548,6 +1550,8 @@ pub async fn run(
         if let (Some(r), Some(png)) = (logo_box, ui::image::for_venue(venue, &bot.net)) {
             chain_logo.show(png, venue as usize, r.x, r.y, r.width, r.height, term_size);
         }
+
+        crate::ui_alive();
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(k) = event::read()? {

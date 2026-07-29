@@ -998,6 +998,8 @@ pub fn theme_picker(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> e
             f.render_widget(swatch, rows[1]);
         })?;
 
+        crate::ui_alive();
+
         if event::poll(std::time::Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {

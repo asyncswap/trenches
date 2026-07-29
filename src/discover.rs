@@ -1457,6 +1457,8 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
             term.draw(|f| render_table(f, &rows, sel, &mut state))?;
         }
 
+        crate::ui_alive();
+
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {
@@ -1758,6 +1760,7 @@ pub async fn screen_clusters<P: Provider>(term: &mut Term, provider: &P, pool: A
             ui::widgets::paint_bg(f);
             ui::widgets::scatter(f, f.area(), &sv);
         })?;
+        crate::ui_alive();
         if event::poll(Duration::from_millis(600))? {
             if let Event::Key(k) = event::read()? {
                 if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c')) {
@@ -1779,6 +1782,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
     if verified.is_empty() {
         draw_status(term, "\nNo verified pools configured (deployments.json → verified_pools).\n\nEsc to go back")?;
         loop {
+            crate::ui_alive();
             if event::poll(Duration::from_millis(200))? {
                 if let Event::Key(_) = event::read()? {
                     return Ok(None);
@@ -1839,6 +1843,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
             st.select(Some(sel));
             f.render_stateful_widget(table, f.area(), &mut st);
         })?;
+        crate::ui_alive();
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {
@@ -2123,6 +2128,7 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
                 .block(crate::ui::widgets::themed_block(title));
             f.render_stateful_widget(table, f.area(), &mut st);
         })?;
+        crate::ui_alive();
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {

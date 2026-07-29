@@ -166,6 +166,26 @@ fn save_last_chain(name: &str) {
     let _ = std::fs::write(last_chain_path(), name);
 }
 
+/// The UI heartbeat, process-wide: EVERY loop that draws a screen — the
+/// dashboard, discovery, docs, pickers, the Solana app — beats it each pass.
+/// The freeze watchdog reads it, so "the screen is not updating" means any
+/// screen, and a modal that is happily drawing itself is not a false alarm.
+static UI_BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn ui_epoch() -> &'static std::time::Instant {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+}
+
+/// Called from every screen's draw loop: "a frame just went out".
+pub fn ui_alive() {
+    UI_BEAT.store(ui_epoch().elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ui_beat_ms() -> u64 {
+    UI_BEAT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Delete all but the newest KEEP_LOGS of each per-session log family
 /// (`session-*.log`, `evm-trace-*.log`, `sol-trace-*.log`). The timestamps in
 /// the names sort lexically, so "newest" is a sort, not a stat.
@@ -1934,25 +1954,31 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // below runs on the UI thread, and a slow one freezes rendering, the
     // block counter, everything. "The app froze and came back" was
     // undiagnosable without a line saying how long it froze and what held it.
-    let ui_start = std::time::Instant::now();
-    let ui_beat = Arc::new(AtomicU64::new(0));
+    ui_alive();
     let ui_phase: Arc<Mutex<String>> = Arc::new(Mutex::new("startup".into()));
     let _watchdog = {
-        let (beat, phase) = (ui_beat.clone(), ui_phase.clone());
+        let phase = ui_phase.clone();
         AbortOnDrop(tokio::spawn(async move {
             let mut stalled: u64 = 0;
             let mut own_gap: u64 = 0;
-            let mut last_wake = ui_start.elapsed().as_millis() as u64;
+            // The phase is read WHILE stuck — the loop is holding whatever
+            // label it froze in. Reading it after recovery named whatever ran
+            // next instead (always "idle", which explained nothing).
+            let mut held = String::new();
+            let mut last_wake = ui_epoch().elapsed().as_millis() as u64;
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                let now = ui_start.elapsed().as_millis() as u64;
+                let now = ui_epoch().elapsed().as_millis() as u64;
                 // If the watchdog ITSELF skipped time, the whole process was
                 // paused — system sleep, a stopped terminal, a debugger — and
                 // no operation in the app is to blame.
                 own_gap = own_gap.max(now.saturating_sub(last_wake));
                 last_wake = now;
-                let gap = now.saturating_sub(beat.load(Ordering::Relaxed));
+                let gap = now.saturating_sub(ui_beat_ms());
                 if gap >= 1_000 {
+                    if stalled < 1_000 {
+                        held = phase.lock().unwrap().clone();
+                    }
                     stalled = gap;
                     continue;
                 }
@@ -1967,11 +1993,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             &[("for", secs)],
                         );
                     } else {
-                        let held = phase.lock().unwrap().clone();
                         trace(&format!("ui: stalled {secs} in {held}"));
                         events::warn(
                             "The screen froze because a slow operation held the UI thread",
-                            &[("for", secs), ("during", held)],
+                            &[("for", secs), ("during", held.clone())],
                         );
                     }
                 }
@@ -1997,7 +2022,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         tokio::select! {
             // fast render — pulls the latest snapshot, no network I/O
             _ = render.tick() => {
-                ui_beat.store(ui_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                ui_alive();
                 phase!("idle");
                 let m = *market.lock().unwrap();
                 bot.apply_market(m);

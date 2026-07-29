@@ -39,6 +39,7 @@ pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Op
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut state);
         })?;
+        crate::ui_alive();
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {
@@ -190,6 +191,8 @@ pub fn select_table(
                 }
             }
         }
+
+        crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
@@ -379,6 +382,8 @@ fn docs_inner(
             );
         })?;
 
+        crate::ui_alive();
+
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
                 let switch = |forward: bool, sel: &mut usize, scroll: &mut u16| {
@@ -464,6 +469,8 @@ pub fn confirm(term: &mut Term, question: &str) -> eyre::Result<bool> {
             f.render_widget(body, area);
         })?;
 
+        crate::ui_alive();
+
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {
@@ -518,6 +525,8 @@ pub fn multi_select(
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut state);
         })?;
+
+        crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
@@ -581,6 +590,8 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
             f.render_widget(Clear, area);
             f.render_widget(p, area);
         })?;
+
+        crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
@@ -647,6 +658,8 @@ pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
             f.render_widget(Clear, area);
             f.render_widget(p, area);
         })?;
+
+        crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
