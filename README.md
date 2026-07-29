@@ -1,10 +1,10 @@
-![Screenshot](./screenshot.png)
-
 # Trenches
 
 A terminal bot for trading memecoins.
 
 **[trenches.sh](https://trenches.sh)**
+
+![Trenches trading on Robinhood Chain: wallet and pool state above a live trade tape, with your own fills starred](./screenshot.png)
 
 - **Robinhood Chain** — Uniswap V3 and V4, and [pons.family](https://pons.family)
   launches
