@@ -44,6 +44,30 @@ TRENCHES_BIN_DIR=/usr/local/bin curl -fsSL https://trenches.sh/install | sh
 Trenches is in beta. It signs real transactions against real chains with real
 money, and it has bugs we have not found yet.
 
+## Verifying a download
+
+Every release is signed. The installer and `trenches --update` check the
+signature against a key built into the binary and refuse anything that does not
+match, so there is nothing to do by hand — but the key is here so you can.
+
+```
+RWT4IzhkR+s9ogBA7iYghVU2KONHSS2FPvRtGHzoRr6/dESB8D5U4lUU
+```
+
+```sh
+minisign -Vm SHA256SUMS -P RWT4IzhkR+s9ogBA7iYghVU2KONHSS2FPvRtGHzoRr6/dESB8D5U4lUU
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+`SHA256SUMS.asc` is a GPG signature over the same file, for anyone who prefers
+that path.
+
+## Security
+
+Found something that could cost somebody their funds? Do not open a public
+issue. Email **<m@asyncswap.org>** and it will be dealt with before it is
+described anywhere.
+
 ## Licence
 
 **AGPL-3.0-only.** Copyright (C) 2026 AsyncSwap Labs, Inc. Full text in

@@ -90,7 +90,7 @@ The release profile is what ships and what you should test against.
 
 ## Reporting a security issue
 
-Do not open a public issue. Email <meek.dev3@gmail.com> with what you found
+Do not open a public issue. Email <m@asyncswap.org> with what you found
 and how to reproduce it.
 
 ## Reporting a bug
