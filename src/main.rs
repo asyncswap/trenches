@@ -3282,11 +3282,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     if let Some(v) = update::available() {
         keys.push(Span::styled(
             "  [U]",
-            Style::default().fg(ui::widgets::tone_color(view::Tone::Good)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD),
         ));
         keys.push(Span::styled(
             format!(" update to {v}"),
-            Style::default().fg(ui::widgets::tone_color(view::Tone::Good)),
+            Style::default().fg(ui::widgets::tone_color(view::Tone::Info)),
         ));
     }
 

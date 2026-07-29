@@ -497,30 +497,29 @@ fn grid(
             let is_today = today.y == year && today.m == month && today.d == d;
             let text = if day.trades == 0 { format!("{d}") } else { money(day.pnl_usd) };
 
-            if cursor == Some((week, wd)) {
-                // The cursor is the solid block. A filled rectangle is what the
-                // eye lands on first, so it belongs to the thing you are
-                // pointing at — its own colour where the day traded, the accent
-                // where it did not.
+            let is_cursor = cursor == Some((week, wd));
+            if is_cursor || day.trades > 0 {
+                // One shape for every day worth looking at: a solid block in
+                // the day's own colour. Outlines for traded days and a fill for
+                // the cursor meant the grid used two languages to say one thing,
+                // and moving the cursor changed a day's shape as well as its
+                // brightness.
+                //
+                // The cursor is the same block, brighter — so it carries each
+                // day's colour with it as it moves rather than replacing it, and
+                // a day you never traded lights up in the accent because it has
+                // no colour of its own to keep.
                 let tone = if day.trades == 0 { Tone::Accent } else { pnl_tone(day.pnl_usd) };
+                let strength = if is_cursor { 0.85 } else { 0.42 };
                 let st = Style::default()
-                    .bg(tint(tone_color(tone), 0.85))
-                    .fg(widgets::bg_panel())
+                    .bg(tint(tone_color(tone), strength))
+                    // Dark type on the bright cursor, the day's own colour on
+                    // the quieter fill — both stay legible against their block.
+                    .fg(if is_cursor { widgets::bg_panel() } else { tone_color(tone) })
                     .add_modifier(Modifier::BOLD);
                 top.push(Span::styled(" ".repeat(BOX), st));
                 mid.push(Span::styled(format!("{text:^BOX$}"), st));
                 bot.push(Span::styled(" ".repeat(BOX), st));
-            } else if day.trades > 0 {
-                // A day you traded is an outline in its own colour.
-                let st = Style::default().fg(tone_color(pnl_tone(day.pnl_usd)));
-                top.push(Span::styled(format!("┌{}┐", "─".repeat(W)), st));
-                mid.push(Span::styled("│", st));
-                mid.push(Span::styled(
-                    format!("{text:^W$}"),
-                    st.add_modifier(Modifier::BOLD),
-                ));
-                mid.push(Span::styled("│", st));
-                bot.push(Span::styled(format!("└{}┘", "─".repeat(W)), st));
             } else {
                 let fg = if is_today { Tone::Accent } else { Tone::Dim };
                 let mut st = Style::default().fg(tone_color(fg));

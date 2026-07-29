@@ -1260,11 +1260,11 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
     if let Some(v) = crate::update::available() {
         keys.push(Span::styled(
             "  [U]",
-            Style::default().fg(ui::widgets::tone_color(Tone::Good)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ui::widgets::tone_color(Tone::Info)).add_modifier(Modifier::BOLD),
         ));
         keys.push(Span::styled(
             format!(" update to {v}"),
-            Style::default().fg(ui::widgets::tone_color(Tone::Good)),
+            Style::default().fg(ui::widgets::tone_color(Tone::Info)),
         ));
     }
     let build = crate::update::footer_label();

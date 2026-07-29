@@ -255,15 +255,17 @@ pub async fn check_now() -> Status {
 /// one whose check never answered, which is the question the line exists for.
 pub fn footer_label() -> String {
     match status() {
-        Status::Update(v) => format!("{}  →  {v}", full()),
+        // Nothing about the update here. The `[U] update to v0.1.4` on the left
+        // already says there is one and what to press; repeating it as an arrow
+        // on the right is the same news twice, and the corner's job is to answer
+        // "what am I running" — which stays true either way.
+        Status::Update(_) | Status::Checking | Status::Unknown => full(),
         Status::Latest => format!("{} (latest)", full()),
-        // Soaking is not something to act on, so it reads as current with a
-        // note rather than as a call to do anything.
+        // Not something to act on, so it reads as current with a note rather
+        // than as a call to do anything.
         Status::Soaking { tag, ready_in } => {
             format!("{} (latest) · {tag} in {}", full(), short_hours(ready_in))
         }
-        // Neither claim is available yet, so it makes neither.
-        Status::Checking | Status::Unknown => full(),
     }
 }
 
