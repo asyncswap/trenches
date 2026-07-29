@@ -429,6 +429,82 @@ impl Rpc {
         .await
     }
 
+    /// A whole round of transactions in ONE HTTP request, via JSON-RPC
+    /// batching. Fetching them one request each capped the tape at ~13 tx/s
+    /// on paper and far less under real latency — a busy launch outran the
+    /// fetcher, signatures scrolled past the window, and whole seconds of
+    /// trades were simply never seen. Index-aligned with `sigs`; a sub-answer
+    /// that failed (or a tx not yet visible) is `None`.
+    pub async fn transactions(&self, sigs: &[String]) -> Vec<Option<Value>> {
+        if sigs.is_empty() {
+            return Vec::new();
+        }
+        let body: Vec<Value> = sigs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                json!({
+                    "jsonrpc": "2.0", "id": i, "method": "getTransaction",
+                    "params": [s, {"maxSupportedTransactionVersion": 0, "encoding": "json", "commitment": "confirmed"}]
+                })
+            })
+            .collect();
+        let mut out: Vec<Option<Value>> = vec![None; sigs.len()];
+        // Fastest rested endpoint first, same ordering the single-call path
+        // uses; one retry on the next endpoint if the whole batch failed.
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut order: Vec<usize> = (0..self.urls.len()).collect();
+        order.sort_by_key(|&i| {
+            (self.ewma_us[i].load(std::sync::atomic::Ordering::Relaxed), (start + i) % self.urls.len())
+        });
+        for &i in &order {
+            if self.cooldown[i].load(std::sync::atomic::Ordering::Relaxed) > now_ms()
+                && order.iter().any(|&j| {
+                    self.cooldown[j].load(std::sync::atomic::Ordering::Relaxed) <= now_ms()
+                })
+            {
+                continue;
+            }
+            let url = &self.urls[i];
+            let t0 = std::time::Instant::now();
+            let resp = tokio::time::timeout(RPC_TIMEOUT, self.http.post(url).json(&body).send()).await;
+            let Ok(Ok(resp)) = resp else {
+                crate::rpcstats::record("getTransaction(batch)", false, t0.elapsed(), Some("send failed"));
+                continue;
+            };
+            if resp.status().as_u16() == 429 {
+                self.cooldown[i]
+                    .store(now_ms() + COOLDOWN_LIMITED_MS, std::sync::atomic::Ordering::Relaxed);
+                crate::rpcstats::record("getTransaction(batch)", false, t0.elapsed(), Some("http 429"));
+                continue;
+            }
+            let Ok(items) = resp.json::<Vec<Value>>().await else {
+                crate::rpcstats::record("getTransaction(batch)", false, t0.elapsed(), Some("bad batch body"));
+                continue;
+            };
+            for item in items {
+                let (Some(id), Some(res)) = (
+                    item.get("id").and_then(|v| v.as_u64()),
+                    item.get("result").filter(|r| !r.is_null()),
+                ) else {
+                    continue;
+                };
+                if let Some(slot) = out.get_mut(id as usize) {
+                    *slot = Some(res.clone());
+                }
+            }
+            crate::rpcstats::record("getTransaction(batch)", true, t0.elapsed(), None);
+            let us = t0.elapsed().as_micros() as u64;
+            let prev = self.ewma_us[i].load(std::sync::atomic::Ordering::Relaxed);
+            self.ewma_us[i].store(
+                if prev == 0 { us } else { (prev * 7 + us) / 8 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return out;
+        }
+        out
+    }
+
     /// Current slot — the Solana analogue of the EVM block height shown in the
     /// header, so "is the chain moving" is visible at a glance.
     pub async fn slot(&self) -> eyre::Result<u64> {

@@ -392,12 +392,19 @@ pub async fn launches_in_tx(rpc: &Rpc, sig: &str) -> Vec<Launch> {
     // answers once the tx reaches `confirmed`, a moment later. A few short
     // retries bridge exactly that gap — without them, subscribing earlier
     // would just trade latency for missed launches.
-    for wait_ms in [0u64, 250, 400, 600, 900] {
+    for wait_ms in [0u64, 250, 400, 600, 900, 1300] {
         if wait_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
         }
+        // A tx that has not reached `confirmed` answers `result: null` — a
+        // SUCCESS to the transport, nothing to the decoder. Only a non-null
+        // answer ends the ladder; treating null as "done" silently dropped
+        // 26 of 30 launches in a live measurement, because only creates that
+        // happened to confirm before the first fetch ever decoded.
         if let Ok(tx) = rpc.transaction(sig).await {
-            return decode_launches(&tx, sig);
+            if !tx.is_null() {
+                return decode_launches(&tx, sig);
+            }
         }
     }
     Vec::new()
@@ -968,13 +975,13 @@ fn decode_trade_event(data: &[u8]) -> Option<TradeEventHead> {
 /// Asking for 250 signatures is one cheap call, and a wide window is what stops
 /// trades being missed. Fetching 250 transactions is 250 calls — at 8 in flight
 /// on a 1.5s loop that is ~100 req/s, which rate-limited both providers into a
-/// 429 storm (430 rejections in 45s). Capping the fetch drains the backlog over
-/// a few rounds instead; nothing is lost, because unfetched signatures stay
-/// unseen and are picked up next round while still inside the window.
-const MAX_TX_PER_READ: usize = 20;
-
-/// How many transaction fetches run concurrently.
-const TX_CONCURRENCY: usize = 4;
+/// 429 storm (430 rejections in 45s). The whole round now travels as ONE
+/// JSON-RPC batch request, so this cap prices a single HTTP call — 50 fits
+/// every provider's batch limit and outruns the hottest launch (a 20-cap of
+/// singles could not: bursts outran the fetcher and whole seconds of trades
+/// scrolled past the window unfetched, which read as "we miss most
+/// transactions"). Unfetched stragglers still carry to the next round.
+const MAX_TX_PER_READ: usize = 50;
 
 /// One tape read: rows decoded, plus every signature inspected.
 ///
@@ -1021,13 +1028,13 @@ pub async fn pool_tape(
     // defers the older backlog to later rounds.
     sigs.truncate(MAX_TX_PER_READ);
     let scanned = sigs.clone();
-    use futures::stream::StreamExt;
-    let fetched: Vec<(String, serde_json::Value)> = futures::stream::iter(sigs)
-        .map(|sig| async move { rpc.transaction(&sig).await.ok().map(|tx| (sig, tx)) })
-        .buffered(TX_CONCURRENCY)
-        .filter_map(|r| async move { r })
-        .collect()
-        .await;
+    let fetched: Vec<(String, serde_json::Value)> = rpc
+        .transactions(&sigs)
+        .await
+        .into_iter()
+        .zip(sigs)
+        .filter_map(|(tx, sig)| tx.map(|t| (sig, t)))
+        .collect();
 
     let mut out = Vec::new();
     for (sig, tx) in fetched {
@@ -1270,14 +1277,14 @@ pub async fn amm_tape(
     // defers the older backlog to later rounds.
     sigs.truncate(MAX_TX_PER_READ);
     let scanned = sigs.clone();
-    use futures::stream::StreamExt;
     let amm_str = super::PUMP_AMM_PROGRAM.to_string();
-    let fetched: Vec<(String, serde_json::Value)> = futures::stream::iter(sigs)
-        .map(|sig| async move { rpc.transaction(&sig).await.ok().map(|tx| (sig, tx)) })
-        .buffered(TX_CONCURRENCY)
-        .filter_map(|r| async move { r })
-        .collect()
-        .await;
+    let fetched: Vec<(String, serde_json::Value)> = rpc
+        .transactions(&sigs)
+        .await
+        .into_iter()
+        .zip(sigs)
+        .filter_map(|(tx, sig)| tx.map(|t| (sig, t)))
+        .collect();
 
     let scale = 10f64.powi(token_decimals as i32);
     let mut out = Vec::new();
@@ -1592,6 +1599,70 @@ mod live_tape_tests {
             assert!(s.sol > 0.0, "a decoded trade must have a real SOL amount");
             assert!(s.tokens > 0.0, "and a real token amount");
         }
+    }
+}
+
+#[cfg(test)]
+mod live_launch_latency {
+    use super::*;
+
+    /// Live: run the real launch feed for a while and measure how far behind
+    /// the chain each discovery is (detect time vs the tx's own blockTime),
+    /// then seed the tape from each launch tx and report whether the dev buy
+    /// decoded. The two numbers the trenches live or die on.
+    ///   cargo test --features solana live_launch_latency -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_launch_latency_and_dev_buy() {
+        let reg = crate::config::Registry::load_or_create().expect("registry").0;
+        let net = reg.networks.iter().find(|n| n.kind.is_solana()).expect("solana net");
+        let rpc = crate::sol::rpc::Rpc::new_pool(net.rpc_pool());
+        let ws = net.ws_pool();
+        let mut urls = ws.clone();
+        for u in net.rpc_pool() {
+            let d = ws_url_from_http(&u);
+            if !d.is_empty() && !urls.contains(&d) {
+                urls.push(d);
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rpc2 = rpc.clone();
+        let feed = tokio::spawn(async move {
+            let _ = watch_launches_ha(
+                &rpc2,
+                &urls,
+                |l| {
+                    let _ = tx.send((l, std::time::SystemTime::now()));
+                    true
+                },
+                |m| println!("  feed: {m}"),
+            )
+            .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut n = 0u32;
+        while let Ok(Some((l, seen))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            n += 1;
+            let seen_unix = seen.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+            let lag = l.block_time.map(|bt| seen_unix - bt as f64);
+            let seed = tape_seed(&rpc, &l.signature, &l.mint, &Pubkey::default()).await;
+            let dev_buy = seed.iter().any(|s| matches!(s.kind, SwapKind::Buy));
+            println!(
+                "  {} {:<12} lag={} dev_buy={} seed_rows={}",
+                l.mint,
+                l.symbol.chars().take(12).collect::<String>(),
+                lag.map(|s| format!("{s:+.2}s")).unwrap_or_else(|| "?".into()),
+                dev_buy,
+                seed.len(),
+            );
+            if n >= 12 {
+                break;
+            }
+        }
+        feed.abort();
+        println!("  saw {n} launches");
+        assert!(n > 0, "no launches in 60s — feed dead or market asleep");
     }
 }
 
