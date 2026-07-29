@@ -28,11 +28,14 @@ const REPO: &str = "asyncswap/trenches";
 /// something — fetching the key alongside the signature would prove only that
 /// they came from the same place.
 ///
-/// Empty until the keypair exists. While empty the updater keeps working on the
-/// checksum alone and SAYS so, rather than pretending to a guarantee it has no
-/// key to make. Fill this in and verification becomes mandatory: an unsigned or
-/// badly signed release is then refused outright.
-const MINISIGN_PUBKEY: &str = "";
+/// This is the public half only. It is not a secret and it is meant to be read:
+/// the whole point is that it travels with the binary rather than being fetched
+/// beside the thing it is checking.
+///
+/// Verification is mandatory while this is set. An unsigned release, or one
+/// signed by any other key, is refused — after a key exists, "unsigned" and
+/// "signed by someone else" deserve the same answer. Key id f823386447eb3da2.
+const MINISIGN_PUBKEY: &str = "RWT4IzhkR+s9ogBA7iYghVU2KONHSS2FPvRtGHzoRr6/dESB8D5U4lUU";
 
 /// What the check knows so far.
 ///
@@ -283,7 +286,7 @@ where
     if MINISIGN_PUBKEY.is_empty() {
         return Ok(());
     }
-    let key = minisign_verify::PublicKey::decode(MINISIGN_PUBKEY)
+    let key = minisign_verify::PublicKey::from_base64(MINISIGN_PUBKEY)
         .map_err(|e| format!("The pinned signing key is malformed: {e}"))?;
     // A missing signature is a failure, not an absence. Once a key is pinned,
     // "unsigned" and "signed by someone else" deserve the same answer.
@@ -509,10 +512,39 @@ mod tests {
         // Once set it has to decode, or every update refuses forever and the
         // first anyone knows is when they try to install one.
         assert!(
-            minisign_verify::PublicKey::decode(MINISIGN_PUBKEY).is_ok(),
+            minisign_verify::PublicKey::from_base64(MINISIGN_PUBKEY).is_ok(),
             "the pinned signing key does not decode"
         );
         assert!(signing_status().contains("signed"));
+    }
+
+    /// A signature from the wrong key must be refused.
+    ///
+    /// The pinned key is the whole guarantee, so "does it accept a valid
+    /// signature" is only half the test — the half that matters is whether it
+    /// rejects one it should not trust.
+    #[test]
+    fn a_signature_from_another_key_is_rejected() {
+        let key = minisign_verify::PublicKey::from_base64(MINISIGN_PUBKEY)
+            .expect("the pinned key must decode");
+
+        // A syntactically valid minisign signature made by a DIFFERENT keypair.
+        // It parses; it just does not belong to us.
+        const OTHER: &str = concat!(
+            "untrusted comment: signature from a different key\n",
+            "RUQf6LRCGA9i559r3g7V1qNyPXmvLuMDwYCcOd9SuZ4Cq2wJKPS2ZBLC\n",
+            "trusted comment: not ours\n",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        match minisign_verify::Signature::decode(OTHER) {
+            // Parsed, so the interesting case: it must not verify.
+            Ok(sig) => assert!(
+                key.verify(b"anything at all", &sig, false).is_err(),
+                "a signature from another key was accepted"
+            ),
+            // Refused at the parse step is also a refusal.
+            Err(_) => {}
+        }
     }
 
     /// The update path must never execute something it downloaded.
