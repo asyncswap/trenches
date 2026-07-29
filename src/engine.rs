@@ -56,6 +56,9 @@ pub struct Order {
     pub pooled: f64, // pooled ETH at order time
     pub eth: f64,    // ETH value of this order (tape-parity amount column)
     pub is_v4: bool, // venue at order time (v4 vs v3), for the pool column
+    /// The token this order traded — so a confirmed order can be matched to
+    /// (or injected into) the CURRENT pool's tape, and never someone else's.
+    pub token: Address,
 }
 
 /// Protocol-specific pool identity. A v4 pool is identified by its pool id +
@@ -279,6 +282,10 @@ pub struct Bot {
     pub last_read_ms: f64,
     pub lp_permit2_done: bool,
     pub v3_covered: bool, // SwapRouter02 allowance covers the full position (exact-amount, v3 sells)
+    /// Every transaction hash this account ever sent from this app —
+    /// persisted (mytx-<address>.txt), so the tape's "your trade" mark
+    /// survives a restart instead of living and dying with the order list.
+    pub own_txs: std::collections::HashSet<TxHash>,
     // Permit2 + UniversalRouter allowances cover the full position (Flaunch
     // sells settle the coin through Permit2, which needs both grants).
     pub ur_permit2_done: bool,
@@ -833,6 +840,21 @@ impl Bot {
     }
 
     /// Append an entry to the orders queue (capped).
+    /// Where an account's own-transaction marks live.
+    fn own_tx_path_of(trader: Address) -> String {
+        format!("{}/mytx-{trader:#x}.txt", crate::state_dir())
+    }
+
+    /// The persisted own-transaction set for one account. Bounded on load —
+    /// the newest keep their marks, ancient history ages out of the tape
+    /// anyway.
+    pub fn load_own_txs(trader: Address) -> std::collections::HashSet<TxHash> {
+        let Ok(text) = std::fs::read_to_string(Self::own_tx_path_of(trader)) else {
+            return Default::default();
+        };
+        text.lines().rev().take(2_000).filter_map(|l| l.trim().parse().ok()).collect()
+    }
+
     fn push_order(&mut self, label: String, status: OrderStatus, hash: Option<TxHash>) {
         let price = self.price();
         let mc = if price > 0.0 { self.token_supply / price } else { 0.0 };
@@ -842,9 +864,30 @@ impl Bot {
         let eth = eth_of_label(&label)
             .unwrap_or_else(|| if price > 0.0 { self.token_bal / price } else { 0.0 });
         let is_v4 = matches!(self.pool.kind, PoolKind::V4 { .. } | PoolKind::FlaunchV4 { .. });
-        self.orders.push_back(Order { label, status, hash, mc, pooled: self.r0, eth, is_v4 });
+        if let Some(h) = hash {
+            self.remember_own_tx(h);
+        }
+        self.orders.push_back(Order { label, status, hash, mc, pooled: self.r0, eth, is_v4, token: self.pool.token });
         while self.orders.len() > 200 {
             self.orders.pop_front();
+        }
+    }
+
+    /// Record a transaction as OURS, in memory and on disk. The tape's "your
+    /// trade" mark used to come from the in-memory order list alone, so a
+    /// restart unmarked every trade made before it — a buy from the last
+    /// session showed as just another trade next to its highlighted sell.
+    fn remember_own_tx(&mut self, hash: TxHash) {
+        if !self.own_txs.insert(hash) {
+            return;
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(Self::own_tx_path_of(self.trader))
+        {
+            let _ = writeln!(f, "{hash:#x}");
         }
     }
 

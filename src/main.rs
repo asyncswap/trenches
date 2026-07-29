@@ -1562,6 +1562,7 @@ async fn chain_session_on(
         last_read_ms: 0.0,
         lp_permit2_done: false,
         v3_covered: false,
+        own_txs: engine::Bot::load_own_txs(trader),
         ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
         meta: engine::Meta::default(),
@@ -1739,6 +1740,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // terminal. The dashboard's numbers are not on screen then, so polling for
     // them spends the rate budget the modal's own reads need.
     let poll_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Set by the R key: the next poll does a FULL read, and the tape cursor
+    // re-anchors — one keypress recovers from any hiccup without a restart.
+    let force_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tape_relive = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Aborts its task when dropped. The poller used to be spawned and
     // forgotten, so every wallet or chain switch left the old session's
@@ -1764,6 +1769,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         let pool_b_cell = pool_b_cell.clone();
         let market_b = market_b.clone();
         let poll_paused = poll_paused.clone();
+        let force_full = force_full.clone();
+        let tape_relive = tape_relive.clone();
         let trader = bot.trader;
         AbortOnDrop(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(350));
@@ -1794,7 +1801,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // which read as the app being slow rather than the poll being
                 // scheduled.
                 let switched = pref.token != full_pref_token || !had_full;
-                let full = poll % 8 == 1 || switched;
+                let full = poll % 8 == 1 || switched || force_full.swap(false, Ordering::Relaxed);
                 if full {
                     full_pref_token = pref.token;
                     had_full = true;
@@ -1837,6 +1844,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     block.store(b, Ordering::Relaxed);
                     // Pool switched? reset the tape scan window.
                     if pref.token != tape_pref.token { tape.lock().unwrap().clear(); last_swap_block = 0; tape_pref = pref; }
+                    // R pressed? re-anchor both tape cursors — the rows stay,
+                    // the next read starts from a window that can succeed.
+                    if tape_relive.swap(false, Ordering::Relaxed) { last_swap_block = 0; last_swap_block_b = 0; }
                     // Scan a recent window for new swaps on this pool (cap range).
                     let from = if last_swap_block == 0 { b.saturating_sub(200) } else { last_swap_block + 1 };
                     if b >= from {
@@ -1848,13 +1858,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             while t.len() > 400 { t.pop_front(); }
                             drop(t);
                             last_swap_block = b;
-                        } else if last_swap_block == 0 {
-                            // The FIRST window is the wide one (200 blocks of
-                            // history), and only the rate-limited public
-                            // endpoint can serve wide ranges. While it rests,
-                            // this read failed every tick and the tape sat
-                            // empty. Give up the backfill and start narrow:
-                            // live trades matter more than 20s of history.
+                        } else if last_swap_block == 0 || b.saturating_sub(from) > 40 {
+                            // Wide ranges are only served by the rate-limited
+                            // public endpoint. The FIRST window (200 blocks of
+                            // history) needs it — and so does a cursor that
+                            // fell behind while that endpoint rested, whose
+                            // catch-up range then GREW every failed tick: the
+                            // tape froze minutes in the past while new trades
+                            // rolled on. Once the gap passes ~4s of chain,
+                            // give up the backfill and re-anchor to LIVE —
+                            // the next narrow read succeeds on any endpoint.
                             last_swap_block = b.saturating_sub(9);
                         }
                     }
@@ -1870,6 +1883,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 while t.len() > 400 { t.pop_front(); }
                                 drop(t);
                                 last_swap_block_b = b;
+                            } else if last_swap_block_b == 0 || b.saturating_sub(from_b) > 40 {
+                                // Same re-anchor as pool A: live beats backfill.
+                                last_swap_block_b = b.saturating_sub(9);
                             }
                         }
                     } else {
@@ -1925,9 +1941,17 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         let (beat, phase) = (ui_beat.clone(), ui_phase.clone());
         AbortOnDrop(tokio::spawn(async move {
             let mut stalled: u64 = 0;
+            let mut own_gap: u64 = 0;
+            let mut last_wake = ui_start.elapsed().as_millis() as u64;
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                let gap = (ui_start.elapsed().as_millis() as u64).saturating_sub(beat.load(Ordering::Relaxed));
+                let now = ui_start.elapsed().as_millis() as u64;
+                // If the watchdog ITSELF skipped time, the whole process was
+                // paused — system sleep, a stopped terminal, a debugger — and
+                // no operation in the app is to blame.
+                own_gap = own_gap.max(now.saturating_sub(last_wake));
+                last_wake = now;
+                let gap = now.saturating_sub(beat.load(Ordering::Relaxed));
                 if gap >= 1_000 {
                     stalled = gap;
                     continue;
@@ -1935,14 +1959,24 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 if stalled >= 1_000 {
                     // Logged on recovery, with the whole duration — one line
                     // per freeze, not one per watchdog tick.
-                    let held = phase.lock().unwrap().clone();
-                    trace(&format!("ui: stalled {:.1}s in {held}", stalled as f64 / 1000.0));
-                    events::warn(
-                        "The screen froze because a slow operation held the UI thread",
-                        &[("for", format!("{:.1}s", stalled as f64 / 1000.0)), ("during", held)],
-                    );
+                    let secs = format!("{:.1}s", stalled as f64 / 1000.0);
+                    if own_gap * 2 >= stalled {
+                        trace(&format!("ui: whole process paused {secs} (sleep/suspend)"));
+                        events::info(
+                            "The whole app was paused — system sleep or a suspended terminal, not a slow operation",
+                            &[("for", secs)],
+                        );
+                    } else {
+                        let held = phase.lock().unwrap().clone();
+                        trace(&format!("ui: stalled {secs} in {held}"));
+                        events::warn(
+                            "The screen froze because a slow operation held the UI thread",
+                            &[("for", secs), ("during", held)],
+                        );
+                    }
                 }
                 stalled = 0;
+                own_gap = 0;
             }
         }))
     };
@@ -1990,8 +2024,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // selected rung. Auto-snaps to the modal rung until the user steps
                 // it with [ ]; then holds the manual pick.
                 if bot.is_copy() {
-                    let ours: std::collections::HashSet<alloy::primitives::TxHash> =
-                        bot.orders.iter().filter_map(|o| o.hash).collect();
+                    // Persisted set, not the session's order list — marks survive restarts.
+                    let ours = &bot.own_txs;
                     let buys: Vec<u128> = tape_snap.iter()
                         .filter(|s| matches!(s.action, engine::TapeAction::Buy) && s.eth_wei > 0 && !ours.contains(&s.tx))
                         .map(|s| s.eth_wei)
@@ -2011,9 +2045,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     }
                 }
                 let mut logo_box = None;
+                // Named so a freeze here is attributable: a draw blocks when
+                // the TERMINAL stops consuming output — scrollback, a dragged
+                // window, a busy tab — not because of anything in the app.
+                phase!("drawing (a stalled draw usually means the terminal itself was busy)");
                 terminal.draw(|f| {
                     logo_box = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, &tape_snap, show_help);
                 })?;
+                phase!("idle");
                 // After the frame, so ratatui's own output cannot cover it. The
                 // placement only redraws when its key changes, so adjusting a
                 // value does not make it blink.
@@ -2074,6 +2113,46 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 }
                 phase!("settling pending orders");
                 let _ = tokio::time::timeout(Duration::from_secs(3), bot.reap(provider)).await;
+                // YOUR confirmed trades are guaranteed a tape row. The tape is
+                // built from getLogs, and this chain's public endpoint can
+                // answer a window thinly while rate limited — when that window
+                // held your buy, the tape showed everyone's trades but yours.
+                // Whatever the logs said, a confirmed order of the current
+                // pool that the tape lacks is injected from what the order
+                // already knows.
+                {
+                    let mut t = tape.lock().unwrap();
+                    let have: std::collections::HashSet<_> = t.iter().map(|s| s.tx).collect();
+                    for o in bot.orders.iter() {
+                        let (Some(h), engine::OrderStatus::Confirmed) = (o.hash, o.status) else { continue };
+                        if o.token != bot.pool.token || have.contains(&h) {
+                            continue;
+                        }
+                        let action = if o.label.starts_with("BUY") {
+                            engine::TapeAction::Buy
+                        } else if o.label.starts_with("SELL") {
+                            engine::TapeAction::Sell
+                        } else {
+                            continue;
+                        };
+                        // Reconstructed from order-time facts: price from the
+                        // recorded market cap, depth from recorded pooled ETH.
+                        let price = if o.mc > 0.0 { bot.token_supply / o.mc } else { 0.0 };
+                        t.push_back(engine::Swap {
+                            action,
+                            eth: o.eth,
+                            eth_wei: 0,
+                            price,
+                            liq_eth: o.pooled,
+                            block: block.load(Ordering::Relaxed),
+                            tx: h,
+                            trader: bot.trader,
+                            tick_lo: 0,
+                            tick_hi: 0,
+                            is_v4: o.is_v4,
+                        });
+                    }
+                }
                 phase!("telemetry");
                 tele_ctr += 1;
                 if tele_ctr % 4 == 0 { bot.telemetry(block.load(Ordering::Relaxed), bot.last_read_ms); }
@@ -2234,13 +2313,25 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Down => { orders_scroll = orders_scroll.saturating_sub(1); }
                         // Refresh the live USD feed (ETH + stablecoin quotes) now.
                         KeyCode::Char('R') => {
-                            bot.status = "refreshing prices…".into();
-                            let f = pricing::fetch_usd(&feed_ids).await;
-                            if !f.is_empty() { feed = f; apply_prices(bot, &feed); }
-                            bot.status = format!(
-                                "prices: ETH ${:.0}   {} ${:.4}",
-                                bot.eth_usd, bot.pool.quote_sym, bot.pool.quote_usd
-                            );
+                            // The recovery key: one press re-fetches everything
+                            // that can go stale — a full market read on the next
+                            // poll, tape cursors re-anchored so trades resume,
+                            // fresh USD prices (in the background), and the
+                            // pool's metadata. For when a hiccup leaves any
+                            // panel behind and waiting feels wrong.
+                            bot.status = "refreshing everything…".into();
+                            force_full.store(true, Ordering::Relaxed);
+                            tape_relive.store(true, Ordering::Relaxed);
+                            let (ids, cell) = (feed_ids.clone(), feed_cell.clone());
+                            tokio::spawn(async move {
+                                let f = pricing::fetch_usd(&ids).await;
+                                if !f.is_empty() {
+                                    *cell.lock().unwrap() = Some(f);
+                                }
+                            });
+                            refresh_token_decimals(provider, bot).await;
+                            refresh_venue_meta(provider, bot).await;
+                            bot.status = "refreshed — full read + tape re-anchor queued".into();
                         }
                         // Live knobs, shown as percentages:
                         //   [ ]  BUY size (% of ETH balance)    — 0.5% steps
@@ -2517,8 +2608,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 _ => None,
                             };
                             let lb = bot.pons_launch();
-                            let ours: std::collections::HashSet<alloy::primitives::TxHash> =
-                                bot.orders.iter().filter_map(|o| o.hash).collect();
+                            let ours = bot.own_txs.clone();
                             if let Some((pa, w0)) = v3 {
                                 poll_paused.store(true, Ordering::Relaxed);
                                 let r = discover::screen_clusters(terminal, provider, pa, w0, lb, ours).await;
@@ -3364,8 +3454,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Panel::Tape => {
             // Live tape: every trader's swaps on the current pool, newest first.
             // Our own trades (tx hash matches an order) get a ★ marker.
-            let ours: std::collections::HashSet<alloy::primitives::TxHash> =
-                bot.orders.iter().filter_map(|o| o.hash).collect();
+            // The persisted own-transaction set: a buy made LAST session keeps
+            // its mark next to this session's sell.
+            let ours = &bot.own_txs;
             let h = mid_area.height.saturating_sub(3).max(1) as usize;
             // ~10 blocks/sec on Robinhood Chain — estimate age from block delta.
             let age = |blk: u64| -> String {

@@ -50,6 +50,11 @@ const PER_ENDPOINT_CONCURRENCY: usize = 8;
 const COOLDOWN_LIMITED: Duration = Duration::from_secs(15);
 /// Cooldown for a connection error or 5xx — broken is usually brief.
 const COOLDOWN_BROKEN: Duration = Duration::from_secs(3);
+/// While EVERY eligible endpoint is benched, one is still probed — but at
+/// most this often. Trying on every call kept a rate-limited endpoint's
+/// quota window permanently saturated: pollers retried every 350ms, each
+/// retry spent quota, and the "resets in 60 seconds" reset never came.
+const PROBE_EVERY: Duration = Duration::from_secs(3);
 /// The longest cooldown any reply can talk us into.
 const COOLDOWN_MAX: Duration = Duration::from_secs(120);
 /// Alchemy's free-tier `eth_getLogs` block-range cap. A scan wider than this
@@ -79,6 +84,8 @@ struct Endpoint {
     wide_logs: bool,
     /// Unix millis until which this endpoint is benched. 0 = available.
     cooldown_until: AtomicU64,
+    /// Unix millis before which a BENCHED endpoint may not even be probed.
+    next_probe: AtomicU64,
     /// Exponentially-weighted round-trip in micros, for ordering. Starts at 0,
     /// which sorts new endpoints first so each gets measured once.
     ewma_us: AtomicU64,
@@ -153,6 +160,7 @@ impl Balanced {
                 host,
                 url,
                 cooldown_until: AtomicU64::new(0),
+                next_probe: AtomicU64::new(0),
                 ewma_us: AtomicU64::new(0),
                 sem: tokio::sync::Semaphore::new(PER_ENDPOINT_CONCURRENCY),
             });
@@ -270,8 +278,21 @@ impl Inner {
         let mut last_err: Option<TransportError> = None;
         for (attempt, &i) in plan.iter().enumerate() {
             let ep = &self.endpoints[i];
-            // Never block a request behind a bench — a benched endpoint is only
-            // tried because everything better already failed this request.
+            // A benched endpoint is only in the plan because everything better
+            // already failed — and even then it takes one PROBE per few
+            // seconds, not one per call. Pollers retry constantly; letting
+            // each retry through kept the endpoint's quota window saturated
+            // for as long as the poller ran.
+            if ep.cooling() {
+                let now = now_ms();
+                if now < ep.next_probe.load(Ordering::Relaxed) {
+                    last_err = Some(TransportErrorKind::custom_str(
+                        "endpoint resting after a rate limit; retry shortly",
+                    ));
+                    continue;
+                }
+                ep.next_probe.store(now + PROBE_EVERY.as_millis() as u64, Ordering::Relaxed);
+            }
             let _permit = ep.sem.acquire().await;
             let t0 = Instant::now();
             let resp = self
