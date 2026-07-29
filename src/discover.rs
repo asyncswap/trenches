@@ -882,6 +882,9 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // the best-ranked pool) for quick Enter, rather than following a pick down.
     let mut sel: usize = 0;
     let mut state = TableState::default();
+    // Advances once per poll (~120ms), which is about the right speed to read
+    // as motion rather than a flicker.
+    let mut spinner: usize = 0;
     let result: eyre::Result<Option<Grad>> = loop {
         let rows = {
             let mut r = shared.lock().unwrap().clone();
@@ -890,7 +893,8 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
             r
         };
         if rows.is_empty() {
-            draw_status(term, "\nScanning Pons graduations… results appear as they load.\n\nEsc to go back")?;
+            draw_scan_status(term, "Scanning Pons graduations…", "Esc to go back", spinner)?;
+            spinner = spinner.wrapping_add(1);
         } else {
             sel = sel.min(rows.len() - 1);
             state.select(Some(sel));
@@ -926,6 +930,50 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
 /// look like it jumped.
 fn trenches_title(rows: usize) -> String {
     format!(" Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back ")
+}
+
+/// A status screen with a health light in front of the message.
+///
+/// The dot is the endpoint, not the scan: green answering, yellow refusing
+/// some, red nothing getting through. A screen that sits there saying
+/// "scanning" tells you nothing about whether scanning is possible, which is
+/// the question you are actually asking when you stare at an empty list.
+fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyre::Result<()> {
+    use crate::rpcstats::Health;
+    // Braille dots: one cell wide in every font that has them, and they turn
+    // rather than blink, so a stalled screen is obvious — a frozen spinner
+    // looks different from a slow one, which a static "Scanning…" never did.
+    const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let spin = SPIN[frame % SPIN.len()];
+    let (dot, tone) = match crate::rpcstats::health() {
+        Health::Ok => ("●", crate::view::Tone::Good),
+        Health::Degraded => ("●", crate::view::Tone::Warn),
+        Health::Down => ("●", crate::view::Tone::Bad),
+    };
+    term.draw(|f| {
+        crate::ui::image::clear();
+        let block = crate::ui::widgets::themed_block(trenches_title(0));
+        let body = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(dot, Style::default().fg(crate::ui::widgets::tone_color(tone))),
+                Span::raw("  "),
+                Span::styled(
+                    spin,
+                    Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Accent)),
+                ),
+                Span::raw(format!(" {msg}")),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                foot.to_string(),
+                Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Dim)),
+            )),
+        ];
+        let p = Paragraph::new(body).block(block).alignment(Alignment::Center);
+        f.render_widget(p, f.area());
+    })?;
+    Ok(())
 }
 
 fn draw_status(term: &mut Term, msg: &str) -> eyre::Result<()> {

@@ -9,9 +9,10 @@
 //!    nothing but a missing banner.
 //! 2. **It cannot fail loudly.** Every error path ends in "no answer". Nobody
 //!    should see a stack trace because GitHub was slow.
-//! 3. **It reports, it does not act.** No self-update, no download, no
-//!    execution. A trading binary that rewrites itself is a supply-chain
-//!    problem wearing a convenience costume.
+//! 3. **It never acts on its own.** The check reports; installing happens only
+//!    when someone presses `U` and confirms. Nothing downloads or runs in the
+//!    background — a trading binary that quietly rewrites itself is a
+//!    supply-chain problem wearing a convenience costume.
 
 use std::sync::RwLock;
 
@@ -110,6 +111,34 @@ fn is_newer(candidate: &str, running: &str) -> bool {
         }
     }
     false
+}
+
+/// Run the published installer. Returns what to tell the user.
+///
+/// This shells out to the same one-liner the docs give you rather than
+/// downloading and swapping the binary itself, and that is the point: the
+/// installer verifies the release's SHA256SUMS before it writes anything. A
+/// bespoke update path inside a program that holds keys would be a second,
+/// less-examined way to put a new binary on the machine.
+///
+/// It replaces the file on disk. The running process keeps its own inode on
+/// Unix, so nothing changes underneath you — which is why this reports that a
+/// restart is needed rather than pretending to have done it.
+pub fn install_latest() -> Result<String, String> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://trenches.sh/install | sh")
+        .output()
+        .map_err(|e| format!("Could not run the installer: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let why = err.trim().lines().last().unwrap_or("no reason given").to_string();
+        return Err(format!("The installer failed. {why}"));
+    }
+    // The installer prints where it put things; the last line is the useful one.
+    let tail = stdout.trim().lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    Ok(format!("Updated. Restart Trenches to run it. {}", tail.trim()))
 }
 
 #[cfg(test)]

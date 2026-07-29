@@ -1780,6 +1780,31 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             );
                             return Ok(Exit::Quit);
                         }
+                        // Update, on purpose and never otherwise. The check runs
+                        // at launch and only reports; this is the one path that
+                        // installs anything, and it asks first.
+                        KeyCode::Char('U') => match update::available() {
+                            None => bot.note(format!(
+                                "You are on the latest version ({}).",
+                                update::full()
+                            )),
+                            Some(v) => {
+                                if ui::confirm(terminal, &format!("Update to {v}?"))? {
+                                    events::action("Updating", &[("to", v.clone())]);
+                                    bot.note(format!("Installing {v}…"));
+                                    match update::install_latest() {
+                                        Ok(msg) => {
+                                            events::action("Update installed", &[("version", v)]);
+                                            bot.note(msg);
+                                        }
+                                        Err(why) => {
+                                            events::error("Update failed", &[("reason", why.clone())]);
+                                            bot.note(why);
+                                        }
+                                    }
+                                }
+                            }
+                        },
                         KeyCode::Char('D') => {
                             events::action("Opened docs", &[]);
                             ui::docs(terminal)?
@@ -2925,7 +2950,20 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Col::min("tx", 12),
                 ],
             );
-            t.empty_note = "no trades on this pool yet\nthey stream in as they happen".into();
+            // With no pool there is nothing to stream, so saying trades "stream
+            // in as they happen" reads as waiting for something that is never
+            // coming. Say what is actually missing, in the order it is needed.
+            t.empty_note = if bot.pool.kind.is_empty() {
+                if bot.trader.is_zero() {
+                    "press [W] to unlock an account, then [f] or [t] to pick a token\nnothing trades until you do both".into()
+                } else {
+                    "press [f] or [t] to pick a token and start trading".into()
+                }
+            } else if bot.trader.is_zero() {
+                "press [W] to unlock an account before you can trade this pool".into()
+            } else {
+                "no trades on this pool yet\nthey stream in as they happen".into()
+            };
             for s in shown.iter().rev().skip(scroll).take(h) {
                 let (lbl, atone) = match s.action {
                     engine::TapeAction::Buy => ("BUY", view::Tone::Good),
@@ -3081,6 +3119,19 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Span::styled("[q]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
     ];
+
+    // Only when there is one. A key advertising an update that does not exist
+    // is a key that trains you to ignore it.
+    if let Some(v) = update::available() {
+        keys.push(Span::styled(
+            "  [U]",
+            Style::default().fg(ui::widgets::tone_color(view::Tone::Good)).add_modifier(Modifier::BOLD),
+        ));
+        keys.push(Span::styled(
+            format!(" update to {v}"),
+            Style::default().fg(ui::widgets::tone_color(view::Tone::Good)),
+        ));
+    }
 
     // The build, against the right edge. Dim, because it is not something to
     // read — it is something to quote when a bug report needs to name what was

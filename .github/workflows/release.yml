@@ -1,0 +1,114 @@
+# Build the binaries a release ships, and publish them.
+#
+# Triggered by pushing a tag (`v0.1.0`). The installer at trenches.sh/install
+# fetches `trenches-<target>.tar.gz` from the release and checks it against
+# SHA256SUMS, so the asset names here are load-bearing — they are Rust target
+# triples because that is what the installer derives from `uname`.
+#
+# Solana is NOT compiled in. This is the Robinhood Chain release; the Solana
+# side is behind a cargo feature and ships separately when it is ready. A build
+# that offers a chain it cannot trade is worse than one that does not mention it.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Buildable without publishing, to check the matrix still works.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One broken target should not deny the others a release.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs stamps the binary with its commit, and a shallow clone has
+          # no ref for it to read.
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup update stable && rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          tar -czf "trenches-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" trenches
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/trenches.exe" `
+            -DestinationPath "trenches-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            trenches-*.tar.gz
+            trenches-*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    # Only a tag publishes. A manual run is for checking the build.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The installer refuses an asset whose checksum does not match, so this
+      # file is the only thing standing between a tampered download and a
+      # binary that holds keys.
+      - name: Checksums
+        run: |
+          set -eu
+          cd dist
+          shasum -a 256 trenches-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # Beta until it is not. The installer takes whatever is marked latest,
+          # and a prerelease is not.
+          prerelease: true
+          body: |
+            Trenches — a terminal bot for trading memecoins on Robinhood Chain.
+
+            ```sh
+            curl -fsSL https://trenches.sh/install | sh
+            ```
+
+            Verify what you downloaded against `SHA256SUMS` before running it.
+            That is worth doing for anything off the internet, and more so for
+            something that holds keys.
+
+            Beta: it signs real transactions against real chains with real
+            money. Start with a size you would shrug at.

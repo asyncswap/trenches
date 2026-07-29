@@ -114,6 +114,34 @@ pub fn maybe_report() {
     }
 }
 
+/// How the endpoint is behaving right now, for a screen that wants to show it
+/// rather than wait for the next rollup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Health {
+    /// Answering.
+    Ok,
+    /// Answering, but refusing some — usually a rate limit.
+    Degraded,
+    /// Nothing is getting through.
+    Down,
+}
+
+/// Read the counters without clearing them. Cheap enough to call per frame.
+pub fn health() -> Health {
+    let ok = OK.load(Ordering::Relaxed);
+    let failed = FAILED.load(Ordering::Relaxed);
+    // Nothing attempted yet is not a fault. A screen that opens red before it
+    // has asked anything teaches you to distrust the light.
+    if failed == 0 {
+        return Health::Ok;
+    }
+    if ok == 0 {
+        Health::Down
+    } else {
+        Health::Degraded
+    }
+}
+
 /// Time a call and record it. The value comes back untouched.
 ///
 /// Takes `IntoFuture` rather than `Future`: alloy's builders (`get_balance`,
