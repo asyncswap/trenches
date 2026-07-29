@@ -84,6 +84,9 @@ jobs:
       MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
       GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      # The public half, so the signing step can check its own work. Not a
+      # secret — it is compiled into every binary we ship.
+      MINISIGN_PUBKEY: RWT4IzhkR+s9ogBA7iYghVU2KONHSS2FPvRtGHzoRr6/dESB8D5U4lUU
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -115,10 +118,23 @@ jobs:
         if: env.MINISIGN_SECRET_KEY != ''
         run: |
           set -eu
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          # minisign is not in the runner's package lists, so it comes from its
+          # own release — pinned by hash, because a signing step that fetches an
+          # unverified binary to do the signing is worth nothing.
+          curl -fsSL -o ms.tgz \
+            https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+          echo "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  ms.tgz" | sha256sum -c -
+          tar -xzf ms.tgz
+          MS=./minisign-linux/x86_64/minisign
+          chmod +x "$MS"
+
           printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
-          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m dist/SHA256SUMS
+          printf '%s\n' "$MINISIGN_PASSWORD" | "$MS" -S -s minisign.key -m dist/SHA256SUMS
           shred -u minisign.key
+
+          # Verified here as well as by the app: a signature nobody checks at
+          # the point of making it is a signature that can be silently wrong.
+          "$MS" -Vm dist/SHA256SUMS -P "$MINISIGN_PUBKEY"
           ls -la dist/SHA256SUMS.minisig
 
       - name: Sign checksums (GPG)
