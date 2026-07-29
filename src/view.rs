@@ -186,6 +186,29 @@ pub struct ScatterView {
 /// else collapses onto the bottom row, leaving a mostly-empty rectangle.
 /// Callers scale their points through this and set the axis bounds to match. Values at or below the
 /// floor land on 0 rather than diverging to negative infinity.
+/// An ETH amount, with the precision the number actually needs.
+///
+/// A fixed four decimals renders anything under a ten-thousandth of an ETH as
+/// "0.0000" — which is most of what a small account holds, and reads as
+/// nothing at all. Precision scales instead: whole numbers do not need six
+/// decimals, and dust needs every one it can get.
+pub fn eth(v: f64) -> String {
+    let a = v.abs();
+    if a == 0.0 {
+        "0".to_string()
+    } else if a >= 1_000.0 {
+        format!("{v:.2}")
+    } else if a >= 1.0 {
+        format!("{v:.4}")
+    } else if a >= 0.000_001 {
+        format!("{v:.6}")
+    } else {
+        // Below a millionth, six decimals is "0.000000" again. Eight is where
+        // this stops: past that it is closer to a rounding error than a balance.
+        format!("{v:.8}")
+    }
+}
+
 pub fn log_scale(v: f64, min: f64) -> f64 {
     if v <= min || min <= 0.0 {
         0.0
@@ -348,5 +371,34 @@ mod log_scale_tests {
         assert_eq!(log_scale(0.0, 1e-4), 0.0);
         assert_eq!(log_scale(-5.0, 1e-4), 0.0);
         assert_eq!(log_scale(1.0, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod eth_format_tests {
+    use super::eth;
+
+    #[test]
+    fn small_amounts_keep_their_digits() {
+        // The case that started this: four decimals called it nothing.
+        assert_eq!(eth(0.000_062), "0.000062");
+        assert_eq!(eth(0.000_001), "0.000001");
+        assert_eq!(eth(0.000_000_5), "0.00000050");
+    }
+
+    #[test]
+    fn large_amounts_do_not_carry_noise() {
+        assert_eq!(eth(1_234.5), "1234.50");
+        assert_eq!(eth(2.5), "2.5000");
+    }
+
+    #[test]
+    fn zero_is_zero_rather_than_a_row_of_noughts() {
+        assert_eq!(eth(0.0), "0");
+    }
+
+    #[test]
+    fn the_sign_survives() {
+        assert_eq!(eth(-0.000_062), "-0.000062");
     }
 }

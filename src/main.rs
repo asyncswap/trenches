@@ -2627,7 +2627,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // token's entire supply, which is the giveaway. Flag it when that happens
     // rather than presenting a number that cannot be true as exit liquidity.
     let notional = bot.token_supply > 0.0 && bot.r1 > bot.token_supply;
-    mkt.push(Line::from(vec![mlbl("Pooled"), Span::raw(format!("{:.3} {}", bot.r0, bot.pool.quote_sym))]));
+    mkt.push(Line::from(vec![mlbl("Pooled"), Span::raw(format!("{} {}", view::eth(bot.r0), bot.pool.quote_sym))]));
     mkt.push(Line::from(vec![
         mlbl("Pooled"),
         Span::styled(
@@ -2704,7 +2704,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             mb.push(Line::from(format!("{:<9}{}", "Tick", bot.mkt_b.tick)));
             let mcap_b = if pbp > 0.0 { bot.mkt_b.supply / pbp * pb.quote_usd } else { 0.0 };
             mb.push(Line::from(format!("{:<9}~${:.2}M", "Mkt Cap", mcap_b / 1e6)));
-            mb.push(Line::from(format!("{:<9}{:.3} {}", "Pooled", bot.mkt_b.r0, pb.quote_sym)));
+            mb.push(Line::from(format!("{:<9}{} {}", "Pooled", view::eth(bot.mkt_b.r0), pb.quote_sym)));
             mb.push(Line::from(format!("{:<9}{:.0} {}", "Pooled", bot.mkt_b.r1, pb.sym)));
             let gap = bot.arb_gap_pct();
             mb.push(Line::from(vec![
@@ -2798,11 +2798,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 )
             },
         ]),
-        Line::from(vec![lbl("ETH"), Span::raw(format!("{:.6}", bot.eth))]),
+        Line::from(vec![lbl("ETH"), Span::raw(view::eth(bot.eth))]),
         Line::from(vec![lbl(&bot.pool.sym), Span::raw(format!("{:.4}", bot.token_bal))]),
         Line::from(vec![
             lbl("Our Liq"),
-            Span::raw(format!("{:.4} {} ({} pos)", bot.our_liq_eth(), bot.pool.quote_sym, bot.positions.len())),
+            Span::raw(format!("{} {} ({} pos)", view::eth(bot.our_liq_eth()), bot.pool.quote_sym, bot.positions.len())),
         ]),
         Line::from(vec![
             lbl("Basis"),
@@ -3077,12 +3077,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // Amount always in ETH numeraire (cost in ether).
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
                 view::Cell::new(price),
-                view::Cell::new(if o.pooled > 0.0 { format!("{:.4}", o.pooled) } else { String::new() }),
+                view::Cell::new(if o.pooled > 0.0 { view::eth(o.pooled) } else { String::new() }),
                 view::Cell::new(if o.mc > 0.0 {
                     if bot.eth_usd > 0.0 {
                         view::usd_compact(o.mc * bot.eth_usd)
                     } else {
-                        format!("{:.3} ETH", o.mc)
+                        format!("{} ETH", view::eth(o.mc))
                     }
                 } else {
                     String::new()
