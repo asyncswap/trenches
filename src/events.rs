@@ -93,23 +93,7 @@ pub fn log(level: Level, what: &str, details: &[(&str, String)]) {
     let line = render(now, level, what, details);
 
     if let Ok(mut r) = ring().lock() {
-        // A condition that persists repeats every round. Ten identical lines
-        // are not ten facts — they are one fact and a duration, so the repeat
-        // is counted onto the existing line instead of stacking beneath it.
-        // The timestamp advances to the latest occurrence, which is the one a
-        // reader wants: when did this last happen, not when did it start.
-        let body = body_of(&line);
-        let repeat = r.back().map(|last| body_of(last) == body).unwrap_or(false);
-        if repeat {
-            let n = r.back().and_then(|l| count_of(l)).unwrap_or(1) + 1;
-            r.pop_back();
-            r.push_back(format!("{line}  (×{n})"));
-        } else {
-            r.push_back(line.clone());
-        }
-        while r.len() > 500 {
-            r.pop_front();
-        }
+        push_collapsed(&mut r, line.clone());
     }
     // The same line to the session file, so the record outlives the process.
     // This is what someone attaches to a bug report.
@@ -130,6 +114,30 @@ fn render(now: u64, level: Level, what: &str, details: &[(&str, String)]) -> Str
         }
     }
     line
+}
+
+/// Append a line, folding it into the one before it if they say the same thing.
+///
+/// A condition that persists repeats every round. Ten identical lines are not
+/// ten facts — they are one fact and a duration, so the repeat is counted onto
+/// the existing line instead of stacking beneath it. The timestamp advances to
+/// the latest occurrence, which is the one a reader wants: when did this last
+/// happen, not when did it start.
+///
+/// Takes the ring rather than reaching for the global, so it can be tested
+/// without racing every other test that logs.
+fn push_collapsed(r: &mut std::collections::VecDeque<String>, line: String) {
+    let repeat = r.back().map(|last| body_of(last) == body_of(&line)).unwrap_or(false);
+    if repeat {
+        let n = r.back().and_then(|l| count_of(l)).unwrap_or(1) + 1;
+        r.pop_back();
+        r.push_back(format!("{line}  (×{n})"));
+    } else {
+        r.push_back(line);
+    }
+    while r.len() > 500 {
+        r.pop_front();
+    }
 }
 
 /// A line without its timestamp or repeat count, for comparing one to the next.
@@ -242,13 +250,24 @@ mod tests {
 
     #[test]
     fn a_repeated_condition_is_counted_rather_than_stacked() {
-        let what = "a condition that keeps happening";
-        for _ in 0..5 {
-            log(Level::Warn, what, &[]);
+        let mut r = std::collections::VecDeque::new();
+        for i in 0..5 {
+            // A different timestamp each time, as it would be in practice.
+            push_collapsed(&mut r, render(i, Level::Warn, "keeps happening", &[]));
         }
-        let lines: Vec<String> = recent().into_iter().filter(|l| l.contains(what)).collect();
-        assert_eq!(lines.len(), 1, "the same fact was written {} times", lines.len());
-        assert!(lines[0].ends_with("(×5)"), "the repeats were not counted: {}", lines[0]);
+        assert_eq!(r.len(), 1, "the same fact was written {} times", r.len());
+        assert!(r[0].ends_with("(×5)"), "the repeats were not counted: {}", r[0]);
+        // And the newest timestamp won, not the first.
+        assert!(r[0].starts_with("[00:00:04]"), "kept the wrong time: {}", r[0]);
+    }
+
+    #[test]
+    fn a_different_line_starts_a_new_entry() {
+        let mut r = std::collections::VecDeque::new();
+        push_collapsed(&mut r, render(0, Level::Warn, "one thing", &[]));
+        push_collapsed(&mut r, render(1, Level::Warn, "another thing", &[]));
+        push_collapsed(&mut r, render(2, Level::Warn, "one thing", &[]));
+        assert_eq!(r.len(), 3, "unrelated lines were folded together");
     }
 
     #[test]

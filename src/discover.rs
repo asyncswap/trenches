@@ -928,8 +928,28 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
 /// The loading state used a different title entirely, so the whole header
 /// changed the moment results arrived — which is the shift that made the screen
 /// look like it jumped.
-fn trenches_title(rows: usize) -> String {
-    format!(" Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back ")
+fn trenches_title(rows: usize) -> Line<'static> {
+    // The health light rides on the title, where it is visible whether the list
+    // is empty or full. An empty list and a refused endpoint look identical
+    // otherwise, and only one of them is worth waiting through.
+    Line::from(vec![
+        Span::raw(" "),
+        health_dot(),
+        Span::raw(format!(
+            " Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back "
+        )),
+    ])
+}
+
+/// Green answering, yellow refusing some, red nothing getting through.
+fn health_dot() -> Span<'static> {
+    use crate::rpcstats::Health;
+    let tone = match crate::rpcstats::health() {
+        Health::Ok => crate::view::Tone::Good,
+        Health::Degraded => crate::view::Tone::Warn,
+        Health::Down => crate::view::Tone::Bad,
+    };
+    Span::styled("●", Style::default().fg(crate::ui::widgets::tone_color(tone)))
 }
 
 /// A status screen with a health light in front of the message.
@@ -939,24 +959,18 @@ fn trenches_title(rows: usize) -> String {
 /// "scanning" tells you nothing about whether scanning is possible, which is
 /// the question you are actually asking when you stare at an empty list.
 fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyre::Result<()> {
-    use crate::rpcstats::Health;
     // Braille dots: one cell wide in every font that has them, and they turn
     // rather than blink, so a stalled screen is obvious — a frozen spinner
     // looks different from a slow one, which a static "Scanning…" never did.
     const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let spin = SPIN[frame % SPIN.len()];
-    let (dot, tone) = match crate::rpcstats::health() {
-        Health::Ok => ("●", crate::view::Tone::Good),
-        Health::Degraded => ("●", crate::view::Tone::Warn),
-        Health::Down => ("●", crate::view::Tone::Bad),
-    };
     term.draw(|f| {
         crate::ui::image::clear();
-        let block = crate::ui::widgets::themed_block(trenches_title(0));
+        let block = crate::ui::widgets::themed_block_line(trenches_title(0));
         let body = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled(dot, Style::default().fg(crate::ui::widgets::tone_color(tone))),
+                health_dot(),
                 Span::raw("  "),
                 Span::styled(
                     spin,
@@ -979,7 +993,7 @@ fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyr
 fn draw_status(term: &mut Term, msg: &str) -> eyre::Result<()> {
     term.draw(|f| {
         crate::ui::image::clear();
-        let block = crate::ui::widgets::themed_block(trenches_title(0));
+        let block = crate::ui::widgets::themed_block_line(trenches_title(0));
         let p = Paragraph::new(msg).block(block).alignment(Alignment::Center);
         f.render_widget(p, f.area());
     })?;
@@ -1615,7 +1629,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
         .column_spacing(1)
         // Fixed-width count: a title that grows from "(1)" to "(12)" shifts
         // every word after it, so the header appears to jitter as launches land.
-        .block(crate::ui::widgets::themed_block(trenches_title(rows.len())));
+        .block(crate::ui::widgets::themed_block_line(trenches_title(rows.len())));
     f.render_stateful_widget(table, chunks[0], state);
 
     // Details box for the selected pool — the actual X / telegram / website.
