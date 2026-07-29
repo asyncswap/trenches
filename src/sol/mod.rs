@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Solana / pump.fun chain adapter. Behind the `solana` cargo feature so the
 //! EVM-only build stays fast (the solana crate tree is heavy).
 //!

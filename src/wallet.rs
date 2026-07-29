@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Signing: unlock a keystore by password, or derive an account from a registry
 //! mnemonic — never a raw private key input.
 //!

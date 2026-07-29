@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! What the RPC is doing for us, counted.
 //!
 //! Every network call is recorded here and every one is written to the trace

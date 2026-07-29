@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Markdown rendered into themed ratatui lines, for in-app docs and tutorials.
 //!
 //! Modelled on steer's TUI renderer: parse with `pulldown-cmark` and map the

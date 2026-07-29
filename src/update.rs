@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Is there a newer release than the one running?
 //!
 //! Checked once at launch, detached, against the public releases API. Three rules govern everything here:

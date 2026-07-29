@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Three-row block typography for panel headers.
 //!
 //! A logo says *which* venue at a glance but not *what* it is; spelling the

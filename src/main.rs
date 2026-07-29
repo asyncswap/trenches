@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Robinhood Chain speed bot (Rust). Full feature port of the Zig engine,
 //! built speed-first: concurrent reads, pre-flight gas protection, and ready
 //! for a local Nitro node over ws:// or IPC (remote ~380ms -> local ~1ms).

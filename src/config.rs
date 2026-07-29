@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Deployment registry (networks -> tokens -> pools) + accounts, loaded from
 //! deployments.json — the same hierarchical format as the Zig engine.
 //!

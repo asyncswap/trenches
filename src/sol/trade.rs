@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! pump.fun bonding-curve trade instructions, hand-encoded.
 //!
 //! We build the instructions ourselves rather than routing through an aggregator

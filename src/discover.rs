@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Pons-graduation pool discovery. A background task scans the Pons launch
 //! factory's `TokenLaunched` events, then fetches each WETH-paired pool's live
 //! metrics concurrently and publishes rows AS THEY ARRIVE — so the screen fills

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Token names and symbols from Metaplex metadata.
 //!
 //! Coins found in the trenches carry their name inline in the `create`

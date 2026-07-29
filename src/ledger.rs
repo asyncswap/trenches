@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! The fill ledger: every closed trade, on disk, forever.
 //!
 //! Everything else the app knows about profit dies with the process — realized

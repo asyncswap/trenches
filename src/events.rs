@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! The event log: what happened, when, and with what.
 //!
 //! This is the record a person reads — in the app with `l`, or in

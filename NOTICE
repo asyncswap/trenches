@@ -1,5 +1,5 @@
 Trenches
-Copyright (C) 2026 AsyncSwap Labs
+Copyright (C) 2026 AsyncSwap Labs, Inc.
 
 This project is licensed under the GNU Affero General Public License v3.0.
 See the LICENSE file for the full terms.
@@ -9,15 +9,15 @@ https://github.com/asyncswap/trenches
 
 TRADEMARKS
 
-"Trenches", "AsyncSwap", and trenches.sh are trademarks of AsyncSwap Labs. The
+"Trenches", "AsyncSwap", and trenches.sh are trademarks of AsyncSwap Labs, Inc. The
 AGPL grants rights in the code; it grants no rights in the marks. You may fork,
 modify and redistribute this software, and you may say your work is derived from
 Trenches — but a fork may not present itself as Trenches, use the name or logo as
-its own identity, or imply that AsyncSwap Labs published or endorses it.
+its own identity, or imply that AsyncSwap Labs, Inc. published or endorses it.
 
 COMMERCIAL SERVICES
 
-Commercial services offered by AsyncSwap Labs — hosted RPC endpoints, analytics,
+Commercial services offered by AsyncSwap Labs, Inc. — hosted RPC endpoints, analytics,
 AI models and similar — are independent services that communicate with this
 software over a network API. They are separately licensed and are not covered by
 this repository's license unless explicitly stated.

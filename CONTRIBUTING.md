@@ -48,7 +48,7 @@ Every source file starts with:
 
 ```rust
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 ```
 
 Keep it on files you edit, add it to files you create. If you are contributing

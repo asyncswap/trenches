@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Uniswap v3 swap calldata via SwapRouter02. v3 pairs WETH (not native ETH):
 //! - BUY (ETH->token): send native ETH as value; the router wraps to WETH.
 //! - SELL (token->ETH): multicall(exactInputSingle -> router, unwrapWETH9 -> us).

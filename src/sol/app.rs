@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! The Solana dashboard — the pump.fun counterpart to the EVM trading screen.
 //!
 //! Deliberately mirrors the EVM layout field-for-field: same header (account /

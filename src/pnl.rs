@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! The PnL calendar (`L`).
 //!
 //! A month of trading as a grid, one cell per day, coloured by whether that day

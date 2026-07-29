@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Live USD price feed (CoinGecko). Used to value quote currencies — ETH for
 //! native pools, and stablecoins for stable-quoted pools. Stables are NOT
 //! assumed to be $1: USDG, for instance, drifts, so we fetch it like any other

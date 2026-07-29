@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Generic, chain-agnostic renderers. Everything here draws a `view::*` model
 //! and knows nothing about EVM or Solana — that's what lets both chains share
 //! one dashboard. The semantic `Tone` → palette mapping lives here too, so a

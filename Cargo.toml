@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 description = "A terminal trading bot for memecoins on Robinhood Chain and Solana."
 repository = "https://github.com/asyncswap/trenches"
 homepage = "https://trenches.sh"
-authors = ["AsyncSwap Labs"]
+authors = ["AsyncSwap Labs, Inc."]
 
 [features]
 # Testnets and local nodes. Off in a release: without this they are not

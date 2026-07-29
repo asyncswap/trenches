@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! RugCheck token risk scoring.
 //!
 //! Answers the question the trenches can't: *is this coin's creator a serial

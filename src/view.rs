@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Chain-agnostic view models: the shape the UI renders, with NO chain types in
 //! it — no `Address`, no `TxHash`, no `Pubkey`, no `Bot`. Every chain adapter
 //! (EVM today, Solana next) formats its native state into these plain structs,

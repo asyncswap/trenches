@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Minimal Solana JSON-RPC client over the `reqwest` client the EVM side already
 //! uses — no `solana-client` dependency (it drags in the whole agave tree).
 //!

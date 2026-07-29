@@ -70,7 +70,7 @@ under the DCO; there is no CLA and no copyright assignment.
 
 ## Licence
 
-**AGPL-3.0-only.** Copyright (C) 2026 AsyncSwap Labs. Full text in
+**AGPL-3.0-only.** Copyright (C) 2026 AsyncSwap Labs, Inc. Full text in
 [LICENSE](LICENSE).
 
 Use it, modify it, redistribute it, run it yourself. If you modify Trenches and

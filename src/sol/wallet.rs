@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Solana key derivation from the SAME registry mnemonic the EVM side uses, so
 //! one seed phrase drives both chains and nothing new has to be stored.
 //!

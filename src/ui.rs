@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Native ratatui selection screens — arrow-key list menus and a masked
 //! password field — so the whole bot (selection + trading) is one TUI app.
 //!

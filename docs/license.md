@@ -1,7 +1,7 @@
 # License
 
 Trenches
-Copyright (C) 2026 AsyncSwap Labs
+Copyright (C) 2026 AsyncSwap Labs, Inc.
 
 Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0-only).
 The full text ships with every release as `LICENSE`, and is at
@@ -51,12 +51,12 @@ calls is not.
 
 ## Trademarks
 
-"Trenches", "AsyncSwap" and trenches.sh are trademarks of AsyncSwap Labs, held
+"Trenches", "AsyncSwap" and trenches.sh are trademarks of AsyncSwap Labs, Inc., held
 separately from the code license. The AGPL grants rights in the software; it
 grants none in the name.
 
 Fork it freely, and say your fork is based on Trenches. Do not ship it *as*
-Trenches, or imply AsyncSwap Labs published it.
+Trenches, or imply AsyncSwap Labs, Inc. published it.
 
 ## Contributing
 

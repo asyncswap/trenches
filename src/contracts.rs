@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 AsyncSwap Labs
+// Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! On-chain contract interfaces for Robinhood Chain (Uniswap v4 stack) via
 //! alloy's `sol!` macro — real ABI encoding, no hand-rolled calldata.
 
