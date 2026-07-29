@@ -377,10 +377,22 @@ fn palette() -> &'static std::sync::RwLock<Palette> {
     })
 }
 
-const THEME_PATH: &str = concat!(".trenches", "/theme.txt");
+/// Where the chosen theme is remembered.
+///
+/// Derived from `state_dir()`, not hardcoded. It used to be the literal
+/// `.trenches/theme.txt`, relative to whatever directory the binary was
+/// launched from — so the save created the real state directory and then wrote
+/// the file somewhere else entirely, and the next launch from a different
+/// directory found nothing. The theme silently reverted every time.
+fn theme_path() -> std::path::PathBuf {
+    std::path::Path::new(crate::state_dir()).join("theme.txt")
+}
 
 fn load_saved_theme() -> Option<String> {
-    std::fs::read_to_string(THEME_PATH).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(theme_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// All builtin themes as `(id, display name)`, sorted by id.
@@ -407,7 +419,7 @@ pub fn set_theme(name: &str, persist: bool) -> bool {
     }
     if persist {
         let _ = std::fs::create_dir_all(crate::state_dir());
-        let _ = std::fs::write(THEME_PATH, name);
+        let _ = std::fs::write(theme_path(), name);
     }
     true
 }

@@ -510,12 +510,14 @@ fn grid(
                 // a day you never traded lights up in the accent because it has
                 // no colour of its own to keep.
                 let tone = if day.trades == 0 { Tone::Accent } else { pnl_tone(day.pnl_usd) };
-                let strength = if is_cursor { 0.85 } else { 0.42 };
+                let strength = if is_cursor { 0.55 } else { 0.22 };
                 let st = Style::default()
                     .bg(tint(tone_color(tone), strength))
-                    // Dark type on the bright cursor, the day's own colour on
-                    // the quieter fill — both stay legible against their block.
-                    .fg(if is_cursor { widgets::bg_panel() } else { tone_color(tone) })
+                    // The day's colour at full strength on a muted block. Dark
+                    // type worked when the fill was near-solid; against a
+                    // quieter one it is the figure that should carry the colour
+                    // and the fill that should recede.
+                    .fg(tone_color(tone))
                     .add_modifier(Modifier::BOLD);
                 top.push(Span::styled(" ".repeat(BOX), st));
                 mid.push(Span::styled(format!("{text:^BOX$}"), st));
@@ -665,13 +667,14 @@ mod tests {
         }
     }
 
-    /// Render the grid to a test backend and read the roles back off it.
+    /// Render the grid to a test backend and read the tiles back off it.
     ///
-    /// The arrangement is deliberately inverted — a day you traded is an
-    /// outline, the cursor is a solid block — and which is which is exactly the
-    /// thing that has been wrong at every step of getting here.
+    /// Every day worth looking at is the same shape — a solid block in its own
+    /// colour — and the cursor is that block, brighter. It used to be outlines
+    /// for traded days and a fill for the cursor, which meant moving the cursor
+    /// changed a day's shape as well as its brightness.
     #[test]
-    fn traded_days_are_outlined_and_the_cursor_is_solid() {
+    fn traded_days_and_the_cursor_are_both_solid_blocks() {
         use ratatui::backend::TestBackend;
 
         // Two traded days: one the cursor sits on, one it does not.
@@ -685,57 +688,41 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
         term.draw(|fr| grid(fr, fr.area(), &by_day, 2026, 7, Some(selected), today)).unwrap();
         let buf = term.backend().buffer().clone();
-        let at = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
 
-        // Exactly one box, and it is the day the cursor is NOT on. Corners are
-        // counted inside the panel frame, whose own corner is the same glyph.
-        let mut corners = Vec::new();
+        // No box drawing anywhere inside the panel: one language, not two.
         for y in 1..buf.area.height - 1 {
             for x in 1..buf.area.width - 1 {
-                if at(x, y) == "┌" {
-                    corners.push((x, y));
+                let ch = buf[(x, y)].symbol();
+                assert!(
+                    !"┌┐└┘─│".contains(ch),
+                    "an outline survives at {x},{y}"
+                );
+            }
+        }
+
+        // Two filled blocks, three rows each, in two different colours — the
+        // cursor's brighter than the day it is not on.
+        let mut fills: std::collections::BTreeMap<String, usize> = Default::default();
+        for y in 1..buf.area.height - 1 {
+            for x in 1..buf.area.width - 1 {
+                if let Some(bg) = buf[(x, y)].style().bg.filter(|b| *b != widgets::bg_panel()) {
+                    *fills.entry(format!("{bg:?}")).or_default() += 1;
                 }
             }
         }
-        assert_eq!(corners.len(), 1, "expected one outlined day, got {corners:?}");
-        let (x0, y0) = corners[0];
-        let x1 = (x0..buf.area.width)
-            .find(|&x| at(x, y0) == "┐")
-            .expect("top rule never closes");
-        let y1 = y0 + 2; // three rows: rule, figure, rule
-        assert_eq!(at(x0, y1), "└");
-        assert_eq!(at(x1, y1), "┘");
-        for x in (x0 + 1)..x1 {
-            assert_eq!(at(x, y0), "─", "gap in the top rule at {x}");
-        }
-        for y in (y0 + 1)..y1 {
-            assert_eq!(at(x0, y), "│", "gap in the left upright at {y}");
-            assert_eq!(at(x1, y), "│", "gap in the right upright at {y}");
-        }
-        let inside: String = ((x0 + 1)..x1).map(|x| at(x, y0 + 1)).collect();
-        assert!(inside.contains("$1.00"), "the outline is around the wrong day: {inside:?}");
-
-        // The cursor is solid: a run of cells carrying a background, three rows
-        // tall, and never outlined.
-        let solid: Vec<(u16, u16)> = (1..buf.area.height - 1)
-            .flat_map(|y| (1..buf.area.width - 1).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].style().bg.is_some_and(|b| b != widgets::bg_panel()))
-            .collect();
-        assert!(!solid.is_empty(), "the cursor has no fill");
-        let rows: std::collections::BTreeSet<u16> = solid.iter().map(|&(_, y)| y).collect();
-        assert_eq!(rows.len(), 3, "the cursor's block is not three rows tall: {rows:?}");
-        for &(x, y) in &solid {
-            assert_ne!(at(x, y), "│", "the cursor should be filled, not outlined");
+        assert_eq!(fills.len(), 2, "expected two tile colours, got {fills:?}");
+        for (colour, cells) in &fills {
+            assert!(*cells >= 3, "{colour} covers only {cells} cells");
         }
     }
 
-    /// An outlined day occupies exactly the rows an untraded one does.
+    /// A filled day occupies exactly the rows an untraded one does.
     ///
-    /// The border used to be drawn AROUND the tile, adding a row above and
-    /// below, which made every traded day two rows taller than its neighbours.
-    /// It is drawn inside the tile now, so the grid keeps one rhythm.
+    /// The tile used to be drawn AROUND the day, adding a row above and below,
+    /// which made every traded day two rows taller than its neighbours. The
+    /// grid keeps one rhythm now.
     #[test]
-    fn an_outlined_day_is_no_taller_than_a_plain_one() {
+    fn a_filled_day_is_no_taller_than_a_plain_one() {
         use ratatui::backend::TestBackend;
 
         let f = fill(0, 1.0, 1.0);
