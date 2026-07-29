@@ -71,7 +71,7 @@ apply to their code, not to this. Run `cargo tree` for the full list, and check
 licenses before redistributing binaries.
 
 Brand marks shown in the interface — Uniswap, Solana, pump.fun, Robinhood,
-pons.family — belong to their respective owners and are used here only to
+pons.family, Flaunch — belong to their respective owners and are used here only to
 identify the venue being traded.
 
 ## No warranty

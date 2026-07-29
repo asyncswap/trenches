@@ -292,6 +292,40 @@ pub const SOLANA: Logo = Logo {
     ],
 };
 
+/// The Flaunch "F" logomark, downsampled from the official mark at flaunch.gg
+/// (a single flat hot pink, so one palette entry).
+pub const FLAUNCH: Logo = Logo {
+    rows: &[
+        "...........AAAAAAAAAAAA.",
+        ".AA.......AAAAAAAAAAAAA.",
+        ".AAA......AAAAAAAAAAAAA.",
+        ".AAAA....AAAAAAAAAAAAAA.",
+        ".AAAAA..AAAAAAAAAAAAAAA.",
+        ".AAAAAA.AAAAAAAAAAAAAA..",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAAAAAAAAAAAA.......",
+        ".AAAAAAAAAAAAAAAAA......",
+        ".AAAAAAAAAAAAAAAAAA.....",
+        ".AAAAAAAAAAAAAAAAAAA....",
+        ".AAAAAAAAAAAAAAAAAAA....",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        ".AAAAAA.................",
+        "..AAAA..................",
+    ],
+    palette: &[
+        ('A', 0xFF, 0x48, 0xB4),
+    ],
+};
+
 /// Block art for a venue, falling back to the network's own mark. Mirrors
 /// `image::for_venue`, but as a widget rather than a graphics placement.
 pub fn for_venue(venue: crate::ui::image::Venue, network: &str) -> Option<&'static Logo> {
@@ -299,6 +333,7 @@ pub fn for_venue(venue: crate::ui::image::Venue, network: &str) -> Option<&'stat
     match venue {
         Venue::PumpFun => Some(&PUMP_FUN),
         Venue::Pons => Some(&PONS),
+        Venue::Flaunch => Some(&FLAUNCH),
         Venue::Uniswap => Some(&UNISWAP),
         Venue::Chain => for_network(network),
     }
@@ -333,7 +368,7 @@ mod tests {
     #[test]
     fn every_row_is_the_same_width() {
         // A short row would silently shift pixels left on that line.
-        for logo in [&ROBINHOOD, &SOLANA] {
+        for logo in [&ROBINHOOD, &SOLANA, &PONS, &UNISWAP, &PUMP_FUN, &FLAUNCH] {
             let w = logo.width() as usize;
             for (i, r) in logo.rows.iter().enumerate() {
                 assert_eq!(r.chars().count(), w, "row {i} is ragged");
@@ -345,7 +380,7 @@ mod tests {
     fn every_key_used_has_a_colour() {
         // A missing palette entry renders as an invisible hole, which is much
         // harder to spot than a compile error.
-        for logo in [&ROBINHOOD, &SOLANA] {
+        for logo in [&ROBINHOOD, &SOLANA, &PONS, &UNISWAP, &PUMP_FUN, &FLAUNCH] {
             for r in logo.rows {
                 for c in r.chars().filter(|c| *c != '.') {
                     assert!(logo.color(c).is_some(), "no palette entry for {c:?}");

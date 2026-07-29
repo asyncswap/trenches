@@ -16,6 +16,21 @@ pub const PERMIT2: Address = address!("000000000022D473030F116dDEE9F6B43aC78BA3"
 // Pons launch factory — emits TokenLaunched on graduation (token + its v3 pool).
 pub const PONS_FACTORY: Address = address!("A5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB");
 
+// Flaunch launchpad (flaunch.gg). FLAUNCH_PM is the v4 hook and the launch
+// factory in one: it emits PoolCreated per coin, and every coin trades in a
+// PoolManager pool keyed { flETH, coin, fee: 0, tickSpacing: 60, hooks: this }.
+pub const FLAUNCH_PM: Address = address!("5Cf8e499C7c466C7E2cf127BDF129F57151E65Dc");
+// flETH — 18-decimal wrapped ETH, redeemable 1:1, so flETH amounts ARE ETH
+// amounts everywhere prices and reserves are read.
+pub const FLETH: Address = address!("00000000043C1117DAFA3A3D0C7148Eb48B30130");
+// The ETH/flETH conversion pool's hook (first hop of every Flaunch swap).
+pub const FLETH_HOOKS: Address = address!("EA22Ae03085CAf74Ac3393f9902539fbE9786888");
+pub const FLAUNCH_TICK_SPACING: i32 = 60;
+// The Flaunch swap fee is charged by the hook, not the pool (lpFee reads 0),
+// so quotes need it supplied out-of-band: ~1% standard, in hundredths of a bip.
+// Display/estimate only — PoolKey and PathKey carry the real on-chain fee, 0.
+pub const FLAUNCH_FEE_EST: u32 = 10_000;
+
 // Uniswap v3 (mainnet only). WETH is the ETH side of v3 pools.
 pub const V3_FACTORY: Address = address!("1f7d7550b1b028f7571e69a784071f0205fd2efa");
 pub const SWAP_ROUTER_02: Address = address!("caf681a66d020601342297493863e78c959e5cb2");
@@ -70,6 +85,37 @@ sol! {
         function socials() external view returns (string twitter, string telegram, string discord, string website, string farcaster);
     }
 
+    // ---- Flaunch launchpad ----
+    // Launch parameters echoed in PoolCreated. Robinhood's multichain deploy
+    // has no fair-launch phase, so a pool trades as soon as it exists (unless
+    // flaunchAt schedules it later).
+    struct FlaunchParams {
+        string name;
+        string symbol;
+        string tokenUri;
+        uint256 premineAmount;
+        address creator;
+        uint24 creatorFeeAllocation;
+        uint256 flaunchAt;
+        bytes initialPriceParams;
+        bytes feeCalculatorParams;
+    }
+
+    #[sol(rpc)]
+    interface IFlaunchPositionManager {
+        event PoolCreated(
+            bytes32 indexed _poolId,
+            address _memecoin,
+            address _memecoinTreasury,
+            uint256 _tokenId,
+            bool _currencyFlipped,
+            uint256 _flaunchFee,
+            FlaunchParams _params
+        );
+        // Empty answer (a token Flaunch never launched) reads tickSpacing == 0.
+        function poolKey(address _token) external view returns (PoolKey key);
+    }
+
     // ---- Uniswap v3 ----
     #[sol(rpc)]
     interface IV3Factory {
@@ -105,6 +151,7 @@ sol! {
     #[sol(rpc)]
     interface IPermit2 {
         function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+        function allowance(address user, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce);
     }
 
     #[sol(rpc)]
@@ -138,6 +185,25 @@ sol! {
         bytes hookData;
     }
 
+    // Multi-hop exact-in (SWAP_EXACT_IN). Each PathKey names the currency the
+    // hop lands on plus the pool that gets it there. minHopPriceX36 is the
+    // Robinhood router's per-hop limit extension; empty means no limits.
+    struct PathKey {
+        address intermediateCurrency;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+        bytes hookData;
+    }
+
+    struct ExactInputParams {
+        address currencyIn;
+        PathKey[] path;
+        uint256[] minHopPriceX36;
+        uint128 amountIn;
+        uint128 amountOutMinimum;
+    }
+
     struct MintPositionParams {
         PoolKey poolKey;
         int24 tickLower;
@@ -153,6 +219,7 @@ sol! {
 // Universal Router command + v4 planner action bytes.
 pub const V4_SWAP: u8 = 0x10;
 pub const SWAP_EXACT_IN_SINGLE: u8 = 0x06;
+pub const SWAP_EXACT_IN: u8 = 0x07; // multi-hop exact-in (PathKey route)
 pub const SETTLE_ALL: u8 = 0x0c;
 pub const TAKE_ALL: u8 = 0x0f;
 pub const MINT_POSITION: u8 = 0x02;

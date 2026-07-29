@@ -701,14 +701,21 @@ mod tests {
         }
 
         // Two filled blocks, three rows each, in two different colours — the
-        // cursor's brighter than the day it is not on.
+        // cursor's brighter than the day it is not on. The panel background is
+        // read off the buffer (its dominant colour), NOT from the live theme:
+        // other tests switch the global theme in parallel, so by the time this
+        // assertion runs `widgets::bg_panel()` can name a different colour
+        // than the one the draw above actually painted.
         let mut fills: std::collections::BTreeMap<String, usize> = Default::default();
         for y in 1..buf.area.height - 1 {
             for x in 1..buf.area.width - 1 {
-                if let Some(bg) = buf[(x, y)].style().bg.filter(|b| *b != widgets::bg_panel()) {
+                if let Some(bg) = buf[(x, y)].style().bg {
                     *fills.entry(format!("{bg:?}")).or_default() += 1;
                 }
             }
+        }
+        if let Some(panel) = fills.iter().max_by_key(|(_, n)| **n).map(|(c, _)| c.clone()) {
+            fills.remove(&panel);
         }
         assert_eq!(fills.len(), 2, "expected two tile colours, got {fills:?}");
         for (colour, cells) in &fills {

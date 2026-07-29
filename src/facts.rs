@@ -208,6 +208,37 @@ pub fn record_launch(token: Address, block: u64) {
     }
 }
 
+/// Merge facts a caller already has — a symbol carried in a launch event, a
+/// metadata blob fetched from IPFS — without asking the chain for anything.
+/// Flaunch launches use this: their PoolCreated event and tokenUri carry what
+/// Pons tokens need contract calls for.
+pub fn merge(token: Address, apply: impl FnOnce(&mut Facts)) {
+    let mut f = get(token).unwrap_or_default();
+    apply(&mut f);
+    put(token, f);
+}
+
+/// Just the total supply, cached forever after the first successful read.
+/// For tokens whose OTHER facts don't come from contract calls (Flaunch:
+/// symbol and socials arrive with the launch event), `ensure` would spend
+/// three doomed calls probing Pons metadata that isn't there.
+pub async fn ensure_supply<P: Provider>(provider: &P, token: Address) -> f64 {
+    let mut f = get(token).unwrap_or_default();
+    if f.supply > 0.0 {
+        return f.supply;
+    }
+    f.supply = crate::contracts::IERC20::new(token, provider)
+        .totalSupply()
+        .call()
+        .await
+        .map(|s| s._0.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)
+        .unwrap_or(0.0);
+    if f.supply > 0.0 {
+        put(token, f.clone());
+    }
+    f.supply
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,6 +7,8 @@ What each venue actually lets you do, since it is not the same everywhere:
 - **Uniswap V3** — trade only
 - **Uniswap V4** — trade, and add or remove liquidity
 - **pons.family** — launch discovery, and graduations into Uniswap
+- **Flaunch** — launch discovery, and trading via Uniswap V4 (fees charged by
+  the Flaunch hook)
 - **pump.fun** — bonding curves, live launches
 - **PumpSwap AMM** — graduated coins
 
