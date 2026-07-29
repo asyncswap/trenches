@@ -69,6 +69,11 @@ impl Rpc {
         for pass in 0..2 {
             for hop in 0..self.urls.len() {
                 let url = &self.urls[(start + hop) % self.urls.len()];
+                // Timed into the same counters the EVM side uses, so the health
+                // light and the RPC rollup read this chain when it is the one
+                // running. Only one chain is live at a time, so one set of
+                // counters is the whole picture.
+                let t0 = std::time::Instant::now();
                 let attempt = async {
                     let resp = tokio::time::timeout(RPC_TIMEOUT, self.http.post(url).json(&body).send())
                         .await
@@ -130,8 +135,14 @@ impl Rpc {
                 }
                 .await;
                 match attempt {
-                    Ok(v) => return Ok(v),
-                    Err(e) => last_err = Some(e),
+                    Ok(v) => {
+                        crate::rpcstats::record(method, true, t0.elapsed(), None);
+                        return Ok(v);
+                    }
+                    Err(e) => {
+                        crate::rpcstats::record(method, false, t0.elapsed(), Some(&e.to_string()));
+                        last_err = Some(e);
+                    }
                 }
             }
             if pass == 0 {

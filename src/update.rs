@@ -113,6 +113,18 @@ fn is_newer(candidate: &str, running: &str) -> bool {
     false
 }
 
+/// What the footer says about this build.
+///
+/// Either "there is a newer one, press U" or "you are on the latest". Saying
+/// nothing in the second case leaves you unable to tell a current build from
+/// one whose check never answered, which is the question the line exists for.
+pub fn footer_label() -> String {
+    match available() {
+        Some(v) => format!("{}  →  {v}", full()),
+        None => format!("{} (latest)", full()),
+    }
+}
+
 /// Run the published installer. Returns what to tell the user.
 ///
 /// This shells out to the same one-liner the docs give you rather than

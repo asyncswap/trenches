@@ -556,6 +556,8 @@ pub fn table_view(
             Col::min("mint", 20),
         ],
     );
+    // The screen you sit and wait on, so it carries the light.
+    t.health = true;
     t.empty_note = "watching pump.fun for new launches…\nthey appear the moment they are created  ·  esc to go back".into();
     for r in rows {
         let mc = r.mkt_cap_sol();

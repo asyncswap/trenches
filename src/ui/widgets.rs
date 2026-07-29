@@ -521,11 +521,31 @@ fn mine_style() -> Style {
 
 /// Draw a `TableView`. Pass `state` to show a selection cursor (discovery
 /// screens); pass `None` for read-only tables (orders, tape).
+/// The title, with a health light in front of it when the view asks for one.
+///
+/// Green answering, amber refusing some, red nothing getting through — read
+/// off the shared RPC counters, which whichever chain is running feeds.
+fn table_title(t: &TableView) -> Line<'static> {
+    if !t.health {
+        return Line::from(t.title.clone());
+    }
+    let tone = match crate::rpcstats::health() {
+        crate::rpcstats::Health::Ok => Tone::Good,
+        crate::rpcstats::Health::Degraded => Tone::Warn,
+        crate::rpcstats::Health::Down => Tone::Bad,
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("●", Style::default().fg(tone_color(tone))),
+        Span::raw(t.title.clone()),
+    ])
+}
+
 pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableState>) {
     // Empty state gets the WHOLE area, centred — putting it in the first cell
     // truncates it to that column's width ("scanning pum").
     if t.rows.is_empty() {
-        let block = themed_block(t.title.clone());
+        let block = themed_block_line(table_title(t));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let note = if t.empty_note.is_empty() { "nothing yet" } else { &t.empty_note };
@@ -560,7 +580,7 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
             })
             .collect()
     };
-    let block = themed_block(t.title.clone());
+    let block = themed_block_line(table_title(t));
     let widths = constraints_of(t);
     match state {
         Some(st) => {

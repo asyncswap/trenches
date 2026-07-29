@@ -3133,7 +3133,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     ];
 
     // Only when there is one. A key advertising an update that does not exist
-    // is a key that trains you to ignore it.
+    // is a key that trains you to ignore it — so when there is nothing to
+    // install the footer says so on the right instead, rather than here.
     if let Some(v) = update::available() {
         keys.push(Span::styled(
             "  [U]",
@@ -3148,7 +3149,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // The build, against the right edge. Dim, because it is not something to
     // read — it is something to quote when a bug report needs to name what was
     // running, and it should be on screen without asking.
-    let build = update::full();
+    let build = update::footer_label();
     let used: usize = keys.iter().map(|s| s.content.chars().count()).sum();
     let inner = foot_area.width.saturating_sub(2) as usize;
     // Dropped rather than wrapped when the terminal is narrow: the keys are

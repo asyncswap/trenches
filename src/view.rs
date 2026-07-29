@@ -87,6 +87,12 @@ pub struct TableView {
     pub row_mine: Vec<bool>,
     /// Shown centred when `rows` is empty (e.g. "scanning…").
     pub empty_note: String,
+    /// Draw a health light before the title.
+    ///
+    /// For the screens you sit and wait on. An empty list and a refused
+    /// endpoint look identical without it, and only one of them is worth
+    /// waiting through.
+    pub health: bool,
 }
 
 impl TableView {

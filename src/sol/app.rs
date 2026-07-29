@@ -687,6 +687,10 @@ impl SolBot {
             let short = sig.clone();
             if !ok {
                 self.fails += 1;
+                crate::events::error(
+                    "Trade reverted",
+                    &[("side", action.to_string()), ("sol", format!("{sol:.6}")), ("sig", short.clone())],
+                );
                 self.note(format!("The {action} for {sol:.6} SOL reverted, signature {short}"));
                 continue;
             }
@@ -699,6 +703,14 @@ impl SolBot {
                 if self.entry_at.is_none() {
                     self.entry_at = Some(crate::ledger::now());
                 }
+                crate::events::trade(
+                    "CONFIRMED BUY",
+                    &[
+                        ("sol", format!("{sol:.6}")),
+                        ("coin", self.meta.as_ref().map(|m| m.symbol.clone()).unwrap_or_default()),
+                        ("sig", short.clone()),
+                    ],
+                );
                 self.note(format!("Buy for {sol:.6} SOL confirmed, signature {short}"));
             } else {
                 let pnl = sol - self.bought_cost;
@@ -728,6 +740,15 @@ impl SolBot {
                 self.bought_cost = 0.0;
                 self.bought_qty = 0.0;
                 self.entry_at = None;
+                crate::events::trade(
+                    "CONFIRMED SELL",
+                    &[
+                        ("sol", format!("{sol:.6}")),
+                        ("pnl", format!("{pnl:+.6} SOL")),
+                        ("coin", self.meta.as_ref().map(|m| m.symbol.clone()).unwrap_or_default()),
+                        ("sig", short.clone()),
+                    ],
+                );
                 self.note(format!("Sell for {sol:.6} SOL confirmed with profit {pnl:+.6}, signature {short}"));
             }
         }
@@ -989,19 +1010,31 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
 
 fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
     let mut p = PanelView::new(" Logs [l] ");
-    if bot.logs.is_empty() {
+
+    // Both streams, as on the EVM side: what the bot did, and what the
+    // machinery reported. Both carry an [HH:MM:SS] stamp, so a stable sort on
+    // the first ten characters puts them back in the order they happened.
+    let mut all: Vec<String> = bot.logs.iter().cloned().collect();
+    all.extend(crate::events::recent());
+    all.sort_by(|a, b| a.chars().take(10).cmp(b.chars().take(10)));
+
+    if all.is_empty() {
         p.line_toned("no activity yet", Tone::Dim);
         return p;
     }
-    for l in bot.logs.iter().rev().skip(scroll).take(h).rev() {
-        let tone = if l.contains("REVERTED") || l.contains("failed") {
-            Tone::Bad
-        } else if l.contains("CONFIRMED") {
-            Tone::Good
-        } else if l.contains("SENT") {
-            Tone::Warn
-        } else {
-            Tone::Normal
+    for l in all.iter().rev().skip(scroll).take(h).rev() {
+        // Levelled lines carry their own tone; the engine's own wording is
+        // matched for the rest.
+        let tone = match crate::events::Level::of(l) {
+            Some(crate::events::Level::Error) => Tone::Bad,
+            Some(crate::events::Level::Warn) => Tone::Warn,
+            Some(crate::events::Level::Trade) => Tone::Good,
+            Some(crate::events::Level::Action) => Tone::Info,
+            Some(crate::events::Level::Info) => Tone::Normal,
+            None if l.contains("REVERTED") || l.contains("failed") => Tone::Bad,
+            None if l.contains("CONFIRMED") => Tone::Good,
+            None if l.contains("SENT") => Tone::Warn,
+            None => Tone::Normal,
         };
         p.line_toned(l.clone(), tone);
     }
@@ -1194,7 +1227,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
     let key = |k: &'static str, t: Tone| {
         Span::styled(k, Style::default().fg(ui::widgets::tone_color(t)).add_modifier(Modifier::BOLD))
     };
-    let footer = Paragraph::new(Line::from(vec![
+    let mut keys: Vec<Span> = vec![
         key("[b]", Tone::Good),
         Span::raw(" buy  "),
         key("[s]", Tone::Bad),
@@ -1217,8 +1250,34 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         Span::raw(" docs  "),
         key("[q]", Tone::Info),
         Span::raw(" quit"),
-    ]))
-    .block(ui::widgets::themed_block(""));
+    ];
+
+    // The build, against the right edge — the same as the EVM dashboard, so a
+    // bug report from either chain can name what was running. Dropped rather
+    // than wrapped on a narrow terminal: the keys are what the footer is for.
+    // Same prompt as the EVM footer: the key on the left when there is
+    // something to install, and "(latest)" on the right when there is not.
+    if let Some(v) = crate::update::available() {
+        keys.push(Span::styled(
+            "  [U]",
+            Style::default().fg(ui::widgets::tone_color(Tone::Good)).add_modifier(Modifier::BOLD),
+        ));
+        keys.push(Span::styled(
+            format!(" update to {v}"),
+            Style::default().fg(ui::widgets::tone_color(Tone::Good)),
+        ));
+    }
+    let build = crate::update::footer_label();
+    let used: usize = keys.iter().map(|s| s.content.chars().count()).sum();
+    let inner = c[4].width.saturating_sub(2) as usize;
+    if inner > used + build.chars().count() + 2 {
+        keys.push(Span::raw(" ".repeat(inner - used - build.chars().count())));
+        keys.push(Span::styled(
+            build,
+            Style::default().fg(ui::widgets::tone_color(Tone::Dim)),
+        ));
+    }
+    let footer = Paragraph::new(Line::from(keys)).block(ui::widgets::themed_block(""));
     f.render_widget(footer, c[4]);
 
     if show_help {
@@ -1471,7 +1530,34 @@ pub async fn run(
                         }
                     }
                     KeyCode::Char('Q') => break,
-                    KeyCode::Char('D') => ui::docs(term)?,
+                    // Same as the EVM side: the only path that installs
+                    // anything, and it asks first.
+                    KeyCode::Char('U') => match crate::update::available() {
+                        None => bot.note(format!(
+                            "You are on the latest version ({}).",
+                            crate::update::full()
+                        )),
+                        Some(v) => {
+                            if ui::confirm(term, &format!("Update to {v}?"))? {
+                                crate::events::action("Updating", &[("to", v.clone())]);
+                                bot.note(format!("Installing {v}…"));
+                                match crate::update::install_latest() {
+                                    Ok(msg) => {
+                                        crate::events::action("Update installed", &[("version", v)]);
+                                        bot.note(msg);
+                                    }
+                                    Err(why) => {
+                                        crate::events::error("Update failed", &[("reason", why.clone())]);
+                                        bot.note(why);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    KeyCode::Char('D') => {
+                        crate::events::action("Opened docs", &[("chain", "solana".to_string())]);
+                        ui::docs(term)?
+                    }
                     // Back to the wallet list on this same chain, as on EVM.
                     KeyCode::Char('W') => {
                         exit = crate::Exit::ChangeAccount;
