@@ -216,25 +216,74 @@ pub struct Registry {
     pub start_on_docs: Option<bool>,
 }
 
-/// Has the user been through the docs at least once?
+fn onboarded_path() -> std::path::PathBuf {
+    std::path::Path::new(crate::state_dir()).join("onboarded")
+}
+
+/// Has the user been through the docs for THIS version?
+///
+/// Not merely "at some point". An update can move a key, rename a screen or add
+/// a chain, and someone who read the docs three releases ago has read a
+/// different set of docs. The version that was read is recorded, so the first
+/// launch after an update opens on them once and then stops.
 ///
 /// A marker in the CACHE, not the config: it is something that happened, not
 /// something anyone decided, and the app writing to a file it tells you to edit
 /// is exactly what the config/cache split exists to avoid.
 pub fn onboarded() -> bool {
-    std::path::Path::new(crate::state_dir()).join("onboarded").exists()
+    let Ok(text) = std::fs::read_to_string(onboarded_path()) else {
+        return false;
+    };
+    // The version is the first line. An older marker has prose there instead,
+    // which will not match — so an existing install sees the docs once on the
+    // release that introduces this, which is the right answer anyway.
+    text.lines().next().map(str::trim) == Some(env!("CARGO_PKG_VERSION"))
 }
 
-/// Remember that they have. Failures are ignored — the cost is seeing the docs
-/// once more, which is not worth failing a startup over.
+/// Remember that they have, and for which version. Failures are ignored — the
+/// cost is seeing the docs once more, which is not worth failing a startup over.
 pub fn mark_onboarded() {
     let _ = std::fs::create_dir_all(crate::state_dir());
     let _ = std::fs::write(
-        std::path::Path::new(crate::state_dir()).join("onboarded"),
-        "The docs have been read once, so the app no longer opens on them.\n\
-         Delete this file to get them back on start, or set start_on_docs in\n\
-         your config to decide it outright.\n",
+        onboarded_path(),
+        format!(
+            "{}\n\n\
+             The version whose docs have been read. The app opens on the docs\n\
+             again after an update, then stops. Delete this file to see them on\n\
+             the next start, or set start_on_docs in your config to decide it\n\
+             outright.\n",
+            env!("CARGO_PKG_VERSION")
+        ),
     );
+}
+
+#[cfg(test)]
+mod onboarding_tests {
+    /// The rule the marker encodes, without touching the real state directory.
+    fn read_docs_for(marker: Option<&str>, running: &str) -> bool {
+        match marker {
+            None => false,
+            Some(text) => text.lines().next().map(str::trim) == Some(running),
+        }
+    }
+
+    #[test]
+    fn an_update_shows_the_docs_once_more() {
+        // Same version: already read, stay out of the way.
+        assert!(read_docs_for(Some("0.1.4\n\nsome prose"), "0.1.4"));
+        // Updated since: the docs are a different set now.
+        assert!(!read_docs_for(Some("0.1.3\n\nsome prose"), "0.1.4"));
+        // Never read.
+        assert!(!read_docs_for(None, "0.1.4"));
+    }
+
+    #[test]
+    fn a_marker_from_before_this_existed_counts_as_unread() {
+        // Older builds wrote prose on the first line. It cannot match a
+        // version, so those installs see the docs once — which is correct, as
+        // they are on a new release.
+        assert!(!read_docs_for(Some("The docs have been read once, so the app…"), "0.1.4"));
+    }
 }
 
 /// Where the registry lives, in the order it is looked for.

@@ -97,8 +97,10 @@ one is for.
 
 ## Opening on the docs
 
-The app shows these pages on the way in until you have been through them once,
-then goes straight to the chain picker. `D` opens them from anywhere regardless.
+The app shows these pages on the way in until you have been through them, then
+goes straight to the chain picker — and once more after an update, since a
+release can move a key or add a chain and the docs you read three versions ago
+were a different set. `D` opens them from anywhere regardless.
 
 To decide it outright:
 
@@ -107,7 +109,8 @@ To decide it outright:
 ```
 
 `true` keeps them on every start, `false` never shows them. Leave it out for the
-default. The "have they been read" marker is `~/.trenches/onboarded` — delete it
+default. The marker is `~/.trenches/onboarded` and holds the version whose docs
+were read — delete it
 to get them back on start.
 
 ## Where it opens
