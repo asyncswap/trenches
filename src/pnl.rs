@@ -569,7 +569,7 @@ fn breakdown(f: &mut Frame, area: Rect, by_day: &[Vec<&Fill>], year: i32, month:
                 Style::default().fg(tone_color(pnl_tone(fl.pnl))).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:>8}  ", format!("{:+.0}%", fl.ret_pct())),
+                format!("{:>8}  ", fl.ret_col()),
                 Style::default().fg(tone_color(pnl_tone(fl.pnl))),
             ),
             Span::styled(
@@ -577,7 +577,10 @@ fn breakdown(f: &mut Frame, area: Rect, by_day: &[Vec<&Fill>], year: i32, month:
                 Style::default().fg(tone_color(Tone::Info)),
             ),
             Span::styled(
-                format!("{:.4} {}", fl.pnl, fl.quote_sym),
+                // Scaled, like everywhere else: at four decimals a winning
+                // trade and a losing one both read "0.0000", which is the one
+                // thing this column exists to tell apart.
+                format!("{} {}", crate::view::eth(fl.pnl), fl.quote_sym),
                 Style::default().fg(tone_color(Tone::Dim)),
             ),
         ])

@@ -80,6 +80,20 @@ impl Fill {
             0.0
         }
     }
+
+    /// The return as a column, or `—` when there is nothing to divide by.
+    ///
+    /// A sell with no recorded buy — tokens that arrived some other way, or
+    /// were bought before the ledger existed — has no basis, so its return is
+    /// undefined rather than zero. Printing "+0%" beside a $1.72 profit says
+    /// the trade broke even, which is the opposite of what happened.
+    pub fn ret_col(&self) -> String {
+        if self.cost > 1e-12 {
+            format!("{:+.0}%", self.ret_pct())
+        } else {
+            "—".to_string()
+        }
+    }
 }
 
 /// Where one account's fills live. Per account, because PnL is per wallet —
@@ -337,4 +351,30 @@ mod tests {
         assert_eq!(path("../../etc/passwd"), format!("{}/fills-------etc-passwd.jsonl", crate::state_dir()));
         assert_eq!(path("main"), format!("{}/fills-main.jsonl", crate::state_dir()));
     }
+
+#[cfg(test)]
+mod ret_col_tests {
+    use super::*;
+
+    fn fill(pnl: f64, cost: f64) -> Fill {
+        Fill {
+            ts: 0, chain: "t".into(), sym: "A".into(), token: "0x1".into(),
+            pnl, cost, proceeds: cost + pnl, quote_sym: "ETH".into(),
+            quote_usd: 1.0, tx: "0x0".into(), held_secs: None,
+        }
+    }
+
+    #[test]
+    fn a_sell_with_no_basis_reports_no_return() {
+        // Sold for a profit with nothing recorded as paid: the return is
+        // undefined, and saying "+0%" would call it break-even.
+        assert_eq!(fill(0.000_931, 0.0).ret_col(), "—");
+    }
+
+    #[test]
+    fn an_ordinary_trade_still_reports_a_percentage() {
+        assert_eq!(fill(0.5, 1.0).ret_col(), "+50%");
+        assert_eq!(fill(-0.5, 1.0).ret_col(), "-50%");
+    }
+}
 }
