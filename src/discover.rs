@@ -1408,7 +1408,7 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
             r
         };
         if rows.is_empty() {
-            draw_scan_status(term, "Scanning Pons + Flaunch launches…", "Esc to go back", spinner)?;
+            draw_scan_status(term, "Discovering token launches…", "Esc to go back", spinner)?;
             spinner = spinner.wrapping_add(1);
         } else {
             sel = sel.min(rows.len() - 1);
@@ -1453,7 +1453,7 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // from one still running — and the keys it advertises do nothing until
     // there is a row to press them on.
     let text = if rows == 0 {
-        " Scanning Pons + Flaunch launches… · Esc back ".to_string()
+        " Discovering token launches… · Esc back ".to_string()
     } else {
         format!(" Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back ")
     };

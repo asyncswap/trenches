@@ -2446,7 +2446,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.status = "loading top tokens…".into();
                                 discover::screen_top_tokens(terminal, provider, discovery_rpc.clone()).await?
                             } else {
-                                bot.status = "scanning Pons + Flaunch launches…".into();
+                                bot.status = "discovering token launches…".into();
                                 discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?
                             };
                             poll_paused.store(false, Ordering::Relaxed);
