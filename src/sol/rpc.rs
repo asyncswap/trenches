@@ -24,6 +24,11 @@ pub struct Rpc {
     urls: Vec<String>,
     /// Rotates per request. Shared across clones so the whole app spreads evenly.
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Smoothed round-trip per endpoint (micros). Requests try the fastest
+    /// rested endpoint first — pure round-robin meant every Nth request ate
+    /// the slowest endpoint's multi-second latency even while a fast one sat
+    /// idle, which showed up as 2–4s poller rounds.
+    ewma_us: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
     /// Unix millis until which each endpoint is benched (429 or broken).
     /// Shared across clones: one clone learning an endpoint is limited
     /// spares every other clone the same refusal.
@@ -57,6 +62,9 @@ impl Rpc {
             cooldown: std::sync::Arc::new(
                 urls.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             ),
+            ewma_us: std::sync::Arc::new(
+                urls.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            ),
             urls,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             http: reqwest::Client::new(),
@@ -84,7 +92,14 @@ impl Rpc {
         }
 
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        // Fastest first (unmeasured endpoints sort first so each gets timed
+        // once); the round-robin cursor only breaks ties, so equal endpoints
+        // still share load.
         let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut order: Vec<usize> = (0..self.urls.len()).collect();
+        order.sort_by_key(|&i| {
+            (self.ewma_us[i].load(std::sync::atomic::Ordering::Relaxed), (start + i) % self.urls.len())
+        });
         let mut last_err = None;
 
         // Two passes over the endpoints. One pass is not enough: providers
@@ -92,8 +107,8 @@ impl Rpc {
         // the round returns nothing — which the tape cannot distinguish from
         // "no trades happened". A brief pause is usually all it takes.
         for pass in 0..2 {
-            for hop in 0..self.urls.len() {
-                let i = (start + hop) % self.urls.len();
+            for hop in 0..order.len() {
+                let i = order[hop];
                 let url = &self.urls[i];
                 // Skip an endpoint that recently answered 429 — asking again
                 // inside its window converts one refusal into a stream of
@@ -180,6 +195,10 @@ impl Rpc {
                 match attempt {
                     Ok(v) => {
                         crate::rpcstats::record(method, true, t0.elapsed(), None);
+                        let us = t0.elapsed().as_micros() as u64;
+                        let prev = self.ewma_us[i].load(std::sync::atomic::Ordering::Relaxed);
+                        let next = if prev == 0 { us } else { (prev * 7 + us) / 8 };
+                        self.ewma_us[i].store(next, std::sync::atomic::Ordering::Relaxed);
                         return Ok(v);
                     }
                     Err(e) => {

@@ -112,6 +112,10 @@ pub struct RugCheck {
     enabled: bool,
     http: reqwest::Client,
     cache: Arc<Mutex<HashMap<String, Slot>>>,
+    /// Mints with a fetch in the air right now — so the UI can say
+    /// "checking…" only when something IS checking, and callers can retrigger
+    /// without stacking duplicate requests.
+    inflight: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl RugCheck {
@@ -123,7 +127,13 @@ impl RugCheck {
             enabled: cfg.enabled,
             http: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(Mutex::new(Default::default())),
         }
+    }
+
+    /// A fetch for this mint is in the air right now.
+    pub fn pending(&self, mint: &str) -> bool {
+        self.inflight.lock().map(|s| s.contains(mint)).unwrap_or(false)
     }
 
     /// A cached report, or `None` if unknown/disabled. Never fetches.
@@ -167,6 +177,11 @@ impl RugCheck {
         if self.known(mint) {
             return self.cached(mint);
         }
+        // One fetch per mint at a time — a second caller backs off and reads
+        // the cache once the first lands.
+        if !self.inflight.lock().map(|mut s| s.insert(mint.to_string())).unwrap_or(false) {
+            return None;
+        }
         let fetch = async {
             let mut url = format!("{}/v1/tokens/{mint}/report/summary", self.base_url);
             if let Some(k) = &self.key {
@@ -181,7 +196,7 @@ impl RugCheck {
             }
             resp.json::<Report>().await.ok()
         };
-        match fetch.await {
+        let out = match fetch.await {
             Some(report) => {
                 self.remember(mint, Slot::Report(report.clone()));
                 Some(report)
@@ -190,7 +205,11 @@ impl RugCheck {
                 self.remember(mint, Slot::FailedAt(std::time::Instant::now()));
                 None
             }
+        };
+        if let Ok(mut s) = self.inflight.lock() {
+            s.remove(mint);
         }
+        out
     }
 }
 

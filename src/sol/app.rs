@@ -931,14 +931,31 @@ fn market_panel(bot: &SolBot) -> PanelView {
             if let Some(pair) = c.pair_address() {
                 p.spans(vec![lbl("Pair"), Cell::new(pair.to_string())]);
             }
-            match bot.risk.cached(&c.mint.to_string()) {
+            let mint_s = c.mint.to_string();
+            match bot.risk.cached(&mint_s) {
                 Some(rep) => {
                     p.spans(vec![lbl("Risk"), Cell::bold(rep.summary(), rep.tone(bot.warn_score))]);
                     if rep.lp_locked_pct > 0.0 {
                         p.spans(vec![lbl("LP Locked"), Cell::new(format!("{:.0}%", rep.lp_locked_pct))]);
                     }
                 }
-                None => p.spans(vec![lbl("Risk"), Cell::toned("checking…", Tone::Dim)]),
+                // Honest states instead of an eternal "checking…": a fetch in
+                // the air says so; a recent failure says so; and a failure
+                // whose retry window has passed RETRIES, right here — nothing
+                // else re-asks for the selected coin.
+                None if bot.risk.pending(&mint_s) => {
+                    p.spans(vec![lbl("Risk"), Cell::toned("checking…", Tone::Dim)])
+                }
+                None if bot.risk.known(&mint_s) => {
+                    p.spans(vec![lbl("Risk"), Cell::toned("unavailable — retrying soon", Tone::Dim)])
+                }
+                None => {
+                    let (rk, m2) = (bot.risk.clone(), mint_s.clone());
+                    tokio::spawn(async move {
+                        let _ = rk.report(&m2).await;
+                    });
+                    p.spans(vec![lbl("Risk"), Cell::toned("checking…", Tone::Dim)])
+                }
             }
             p.spans(vec![lbl("Price"), Cell::new(format!("{:.9} SOL", c.price_sol()))]);
             let mc = c.market_cap_sol();
