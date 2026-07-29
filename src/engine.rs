@@ -2054,10 +2054,11 @@ pub struct Swap {
     pub price: f64,     // token per ETH (0 for LP events)
     /// Who the swap is attributed to — the person, not the router.
     ///
-    /// v3 indexes the RECIPIENT, which for a router swap is already the user.
-    /// v4 indexes the SENDER, which is the Universal Router, so those are
-    /// resolved to the transaction's signer before this is shown. Without that
-    /// step every v4 trade appears to come from the same few addresses.
+    /// Always the transaction's signer, resolved per tx. Neither event field
+    /// can be trusted for this: v4 indexes the sender, which is the Universal
+    /// Router, and v3 indexes the recipient, which is SwapRouter02 whenever the
+    /// output is unwrapped ETH. Read either directly and a whole side of the
+    /// tape shows the router's address instead of a trader's.
     pub trader: Address,
     pub liq_eth: f64,   // pooled ETH (r0) at this event, from L/√P (0 for LP events)
     pub block: u64,
@@ -2266,11 +2267,18 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             continue;
         }
     }
-    // v4 attributes to the router; resolve those to the signer so the trader
-    // column and any per-trader analysis mean what they say.
-    if v4 {
-        attribute_to_senders(provider, &mut out).await;
-    }
+    // Resolve every swap to the account that signed it.
+    //
+    // This used to run for v4 only, on the assumption that v3 indexes the
+    // recipient and "for a router swap that is already the user". It is not:
+    // selling token for ETH routes through SwapRouter02, which takes the WETH
+    // itself before unwrapping and forwarding, so the recipient is the router.
+    // Buys came out right and sells were attributed to 0xcaf6…5cb2 — the
+    // router's own address, on every sell in the pool.
+    //
+    // Per-tx, cached, so a busy pool costs one lookup per transaction and never
+    // the same one twice.
+    attribute_to_senders(provider, &mut out).await;
     Ok(out)
 }
 

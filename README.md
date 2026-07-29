@@ -1,3 +1,5 @@
+![Screenshot](./screenshot.png)
+
 # Trenches
 
 A terminal bot for trading memecoins.
@@ -41,32 +43,6 @@ TRENCHES_BIN_DIR=/usr/local/bin curl -fsSL https://trenches.sh/install | sh
 
 Trenches is in beta. It signs real transactions against real chains with real
 money, and it has bugs we have not found yet.
-
-## Issues and requests
-
-The tracker here is open and read. Please use it for:
-
-- **Bugs** — Your session log lives in `~/.trenches/` and is the single
-  most useful thing to attach.
-  Read it first: it records addresses and amounts, though NEVER keys or
-  passwords.
-- **Chains and venues** you want supported.
-- **Anything confusing** — a key that did not do what its name suggested is a
-  bug in the app, not in you.
-
-Include your OS, your architecture (`uname -m`), and the version (`trenches
---version`).
-
-### Security
-
-Found something that could cost somebody their funds? Do not open a public
-issue. Email **<meek10x@gmail.com>** and we will deal with it before it is
-described anywhere.
-
-Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commits are signed off
-under the DCO; there is no CLA and no copyright assignment.
-
-## What it does
 
 ## Licence
 
