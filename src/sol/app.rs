@@ -1377,7 +1377,7 @@ async fn screen_trenches(
     sol_usd: f64,
     risk: &super::rugcheck::RugCheck,
     warn_score: u32,
-) -> eyre::Result<Option<(Pubkey, Option<i64>)>> {
+) -> eyre::Result<Option<(Pubkey, Option<i64>, String)>> {
     // This screen owns the terminal now: take down the dashboard's image, which
     // also marks it stale so it redraws when we come back.
     ui::image::clear();
@@ -1519,7 +1519,9 @@ async fn screen_trenches(
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
                 match cursor.on_key(k.code, n) {
-                    ui::widgets::Nav::Enter => break rows.get(cursor.sel).map(|r| (r.launch.mint, r.launch.block_time)),
+                    ui::widgets::Nav::Enter => break rows
+                        .get(cursor.sel)
+                        .map(|r| (r.launch.mint, r.launch.block_time, r.launch.signature.clone())),
                     ui::widgets::Nav::Back => break None,
                     _ => {}
                 }
@@ -1827,7 +1829,7 @@ pub async fn run(
                     }
                     KeyCode::Char('f') => {
                         bot.note("Watching for new launches");
-                        if let Some((mint, launched)) = screen_trenches(term, &bot.rpc, &ws_urls, bot.sol_usd, &bot.risk, bot.warn_score).await? {
+                        if let Some((mint, launched, launch_sig)) = screen_trenches(term, &bot.rpc, &ws_urls, bot.sol_usd, &bot.risk, bot.warn_score).await? {
                             match engine::load_coin(&bot.rpc, &mint).await {
                                 Ok(c) => {
                                     let tgt = poll_target(&c, &bot.trader(), bot.priority_auto.then(|| bot.priority_level.key()));
@@ -1840,6 +1842,11 @@ pub async fn run(
                                     bot.bought_qty = 0.0;
                                     bot.bought_cost = 0.0;
                                     bot.tape.clear();
+                                    // Seed the tape with the LAUNCH transaction — the dev's
+                                    // first buy lives in it, and on a hot snipe it scrolls
+                                    // past the signature window before the coin is selected.
+                                    let seed = discover::tape_seed(&bot.rpc, &launch_sig, &mint, &bot.trader()).await;
+                                    discover::merge_tape(&mut bot.tape, seed);
                                     // Land on the Tape: after picking a coin the
                                     // first thing you want is its live flow.
                                     view = Panel::Tape;

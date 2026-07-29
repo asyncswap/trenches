@@ -332,7 +332,11 @@ where
     // Only pump-program logs, and only confirmed ones.
     let sub = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-        "params": [{"mentions": [PUMP_PROGRAM.to_string()]}, {"commitment": "confirmed"}]
+        // `processed`: the earliest the chain will whisper a create — this is
+        // where pump.fun's own site lives, and `confirmed` gave it a full
+        // optimistic-confirmation head start on every launch. The tx fetch
+        // below retries the moment gap away.
+        "params": [{"mentions": [PUMP_PROGRAM.to_string()]}, {"commitment": "processed"}]
     });
     ws.send(Message::Text(sub.to_string())).await?;
 
@@ -384,11 +388,19 @@ where
 /// Decode every `create` instruction in one transaction into a `Launch`.
 /// Shared by the polling scan and the live feed.
 pub async fn launches_in_tx(rpc: &Rpc, sig: &str) -> Vec<Launch> {
-    let tx = match rpc.transaction(sig).await {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    decode_launches(&tx, sig)
+    // The subscription hears the create at `processed`; getTransaction only
+    // answers once the tx reaches `confirmed`, a moment later. A few short
+    // retries bridge exactly that gap — without them, subscribing earlier
+    // would just trade latency for missed launches.
+    for wait_ms in [0u64, 250, 400, 600, 900] {
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+        if let Ok(tx) = rpc.transaction(sig).await {
+            return decode_launches(&tx, sig);
+        }
+    }
+    Vec::new()
 }
 
 /// Pure decoder: pull `create` launches out of a `getTransaction` response.
@@ -1010,7 +1022,6 @@ pub async fn pool_tape(
     sigs.truncate(MAX_TX_PER_READ);
     let scanned = sigs.clone();
     use futures::stream::StreamExt;
-    let pump_str = PUMP_PROGRAM.to_string();
     let fetched: Vec<(String, serde_json::Value)> = futures::stream::iter(sigs)
         .map(|sig| async move { rpc.transaction(&sig).await.ok().map(|tx| (sig, tx)) })
         .buffered(TX_CONCURRENCY)
@@ -1020,51 +1031,76 @@ pub async fn pool_tape(
 
     let mut out = Vec::new();
     for (sig, tx) in fetched {
-        let block_time = tx.get("blockTime").and_then(|b| b.as_i64());
-        let slot = tx.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
-        let keys = all_account_keys(&tx);
-        let mut event_idx = 0usize;
-
-        // Events are emitted via CPI, so they are inner instructions.
-        let inners = tx
-            .get("meta")
-            .and_then(|m| m.get("innerInstructions"))
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for group in inners {
-            for ix in group.get("instructions").and_then(|i| i.as_array()).into_iter().flatten() {
-                let pi = ix.get("programIdIndex").and_then(|p| p.as_u64()).unwrap_or(u64::MAX) as usize;
-                if keys.get(pi).map(String::as_str) != Some(pump_str.as_str()) {
-                    continue;
-                }
-                let Some(data) = ix.get("data").and_then(|d| d.as_str()).and_then(b58_decode) else { continue };
-                let Some(ev) = decode_trade_event(&data) else { continue };
-                if ev.mint != *mint {
-                    continue;
-                }
-                let vt = super::units_to_tokens(ev.virtual_token_reserves);
-                let vq = super::lamports_to_sol(ev.virtual_quote());
-                let price = if vt > 0.0 { vq / vt } else { 0.0 };
-                out.push(SolSwap {
-                    kind: if ev.is_buy { SwapKind::Buy } else { SwapKind::Sell },
-                    sol: super::lamports_to_sol(ev.quote_in()),
-                    tokens: super::units_to_tokens(ev.token_amount),
-                    pooled_sol: super::lamports_to_sol(ev.real_quote()),
-                    // Total supply is fixed at 1B for pump coins; cap = supply x price.
-                    mkt_cap_sol: PUMP_TOTAL_SUPPLY * price,
-                    mine: ev.user == *trader,
-                    user: ev.user,
-                    signature: sig.clone(),
-                    event_idx,
-                    block_time,
-                    slot,
-                });
-                event_idx += 1;
-            }
-        }
+        out.extend(curve_swaps_in_tx(&tx, &sig, mint, trader));
     }
     TapeBatch { rows: out, scanned, fresh_total }
+}
+
+/// Every curve TradeEvent for `mint` inside ONE transaction. Pure, so both
+/// the rolling tape and the launch-tx seed share the exact same decode.
+pub fn curve_swaps_in_tx(
+    tx: &serde_json::Value,
+    sig: &str,
+    mint: &Pubkey,
+    trader: &Pubkey,
+) -> Vec<SolSwap> {
+    let pump_str = PUMP_PROGRAM.to_string();
+    let block_time = tx.get("blockTime").and_then(|b| b.as_i64());
+    let slot = tx.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
+    let keys = all_account_keys(tx);
+    let mut event_idx = 0usize;
+    let mut out = Vec::new();
+
+    // Events are emitted via CPI, so they are inner instructions.
+    let inners = tx
+        .get("meta")
+        .and_then(|m| m.get("innerInstructions"))
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for group in inners {
+        for ix in group.get("instructions").and_then(|i| i.as_array()).into_iter().flatten() {
+            let pi = ix.get("programIdIndex").and_then(|p| p.as_u64()).unwrap_or(u64::MAX) as usize;
+            if keys.get(pi).map(String::as_str) != Some(pump_str.as_str()) {
+                continue;
+            }
+            let Some(data) = ix.get("data").and_then(|d| d.as_str()).and_then(b58_decode) else { continue };
+            let Some(ev) = decode_trade_event(&data) else { continue };
+            if ev.mint != *mint {
+                continue;
+            }
+            let vt = super::units_to_tokens(ev.virtual_token_reserves);
+            let vq = super::lamports_to_sol(ev.virtual_quote());
+            let price = if vt > 0.0 { vq / vt } else { 0.0 };
+            out.push(SolSwap {
+                kind: if ev.is_buy { SwapKind::Buy } else { SwapKind::Sell },
+                sol: super::lamports_to_sol(ev.quote_in()),
+                tokens: super::units_to_tokens(ev.token_amount),
+                pooled_sol: super::lamports_to_sol(ev.real_quote()),
+                // Total supply is fixed at 1B for pump coins; cap = supply x price.
+                mkt_cap_sol: PUMP_TOTAL_SUPPLY * price,
+                mine: ev.user == *trader,
+                user: ev.user,
+                signature: sig.to_string(),
+                event_idx,
+                block_time,
+                slot,
+            });
+            event_idx += 1;
+        }
+    }
+    out
+}
+
+/// The tape rows hiding in the LAUNCH transaction itself — the creator's dev
+/// buy above all. On a hot snipe the create scrolls past the signature window
+/// before the coin is even selected, so the tape showed everyone's trades
+/// except the first and most telling one.
+pub async fn tape_seed(rpc: &Rpc, launch_sig: &str, mint: &Pubkey, trader: &Pubkey) -> Vec<SolSwap> {
+    match rpc.transaction(launch_sig).await {
+        Ok(tx) => curve_swaps_in_tx(&tx, launch_sig, mint, trader),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ---- AMM tape ------------------------------------------------------------
