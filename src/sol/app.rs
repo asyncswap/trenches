@@ -466,7 +466,10 @@ impl SolBot {
             sell_frac: 1.00,
             cu_price_micro: 10_000,
             coins: Vec::new(),
-            priority_auto: false,
+            // ON by default: a launch-sniping buy without a priority fee lands
+            // slots late, and by then the price has left the slippage floor
+            // behind. [P] still toggles it off for quiet markets.
+            priority_auto: true,
             priority_level: PriorityLevel::High,
             bought_qty: 0.0,
             has_account: true,
@@ -1680,6 +1683,12 @@ pub async fn run(
                         Some(name) => bot.note(format!("Changed theme to {name}")),
                         None => bot.note("theme unchanged"),
                     },
+                    // The PnL calendar. Solana sells were already writing the
+                    // ledger — the key to LOOK at it only existed on the EVM
+                    // dashboard, which read as "Solana has no PnL".
+                    KeyCode::Char('L') => {
+                        crate::pnl::screen(term)?;
+                    }
                     KeyCode::Char('l') | KeyCode::Right => {
                         view = match view {
                             Panel::Orders => Panel::Tape,
@@ -1859,6 +1868,18 @@ pub async fn run(
                             bot.note(format!("Not enough SOL. You have {:.6} and need {sol:.6}", bot.sol));
                         } else {
                             bot.note(format!("Sending a buy for {sol:.6} SOL"));
+                            // Re-read the venue's reserves FIRST: the poller's
+                            // snapshot is up to 1.5s old, a launch moves >5%/s,
+                            // and a floor computed on a stale price fails
+                            // preflight with BuySlippageBelowMinTokensOut. One
+                            // bounded read prices the trade on the present.
+                            if let Some(c) = bot.coin.as_mut() {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_millis(900),
+                                    engine::refresh_venue(&bot.rpc, c),
+                                )
+                                .await;
+                            }
                             let sent = {
                                 let coin = bot.coin.as_ref().expect("checked above");
                                 engine::buy(&bot.rpc, &bot.signer, coin, sol, slip, cu).await
