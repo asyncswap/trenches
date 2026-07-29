@@ -5,9 +5,10 @@
 # SHA256SUMS, so the asset names here are load-bearing — they are Rust target
 # triples because that is what the installer derives from `uname`.
 #
-# Solana is NOT compiled in. This is the Robinhood Chain release; the Solana
-# side is behind a cargo feature and ships separately when it is ready. A build
-# that offers a chain it cannot trade is worse than one that does not mention it.
+# Solana IS compiled in. It rides behind a cargo feature, and a build without it
+# hides the Solana chains entirely rather than offering a door onto a wall — so
+# shipping it is what puts pump.fun and PumpSwap in front of anyone. It is beta,
+# like the rest of this, and bug reports are the point.
 name: release
 
 on:
@@ -47,7 +48,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --features solana --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'

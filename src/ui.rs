@@ -109,8 +109,19 @@ pub fn select_table(
         term.draw(|f| {
             widgets::paint_bg(f);
             term_size = (f.area().width, f.area().height);
-            let h = rows.len() as u16 + if headers.is_empty() { 4 } else { 5 };
-            // Cells are about twice as tall as wide, so a square panel needs
+            // The mark's height in rows, chosen rather than inherited.
+            //
+            // This used to fall out of the list length: two chains meant a
+            // six-row panel meant a four-row logo, so the better the list got
+            // the smaller the artwork became. Twelve rows is about three times
+            // that, and it is what makes the chain picker feel like a choice
+            // rather than a form.
+            const ART: u16 = 12;
+            let list_h = rows.len() as u16 + if headers.is_empty() { 4 } else { 5 };
+            // Never taller than the terminal — a panel that overflows is
+            // centred off the top and loses its first row.
+            let h = list_h.max(ART + 2).min(f.area().height.saturating_sub(2).max(6));
+            // Cells are about twice as tall as wide, so a square mark needs
             // roughly twice as many columns as rows.
             let art_w = h.saturating_sub(2) * 2;
             let table_w: u16 = widths.iter().sum::<u16>() + widths.len() as u16 + 4;
