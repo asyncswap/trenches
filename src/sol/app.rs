@@ -1586,6 +1586,35 @@ pub async fn run(
     // Background poller owns all timed RPC; the UI thread only reads snapshots.
     let snap: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Snapshot::default()));
     let target: Arc<Mutex<Option<PollTarget>>> = Arc::new(Mutex::new(None));
+    // A coin being resolved in the BACKGROUND. Pasting an address used to
+    // await load_coin + metadata on the UI thread — five to ten round trips
+    // of frozen screen. Now the keypress spawns the work and the loop adopts
+    // the coin the pass after it lands; the screen never stops.
+    struct PendingCoin {
+        mint: Pubkey,
+        launched: Option<i64>,
+        seed: Vec<discover::SolSwap>,
+        meta: Option<super::metadata::TokenMeta>,
+        coin: eyre::Result<engine::Coin>,
+    }
+    let pending_coin: Arc<Mutex<Option<PendingCoin>>> = Default::default();
+    let spawn_resolve = {
+        let rpc = bot.rpc.clone();
+        let cell = pending_coin.clone();
+        let trader = bot.trader();
+        move |mint: Pubkey, launched: Option<i64>, launch_sig: Option<String>| {
+            let (rpc, cell) = (rpc.clone(), cell.clone());
+            tokio::spawn(async move {
+                let coin = engine::load_coin(&rpc, &mint).await;
+                let meta = super::metadata::token_meta(&rpc, &mint).await;
+                let seed = match &launch_sig {
+                    Some(sig) => discover::tape_seed(&rpc, sig, &mint, &trader).await,
+                    None => Vec::new(),
+                };
+                *cell.lock().unwrap() = Some(PendingCoin { mint, launched, seed, meta, coin });
+            });
+        }
+    };
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let poll_handle = tokio::spawn(poller(
         bot.rpc.clone(),
@@ -1795,34 +1824,11 @@ pub async fn run(
                                 ),
                                 Err(_) => bot.note(format!("That is not a valid Solana address. It has {} characters", txt.len())),
                                 Ok(mint) => {
-                                    bot.note(format!("loading {mint}…"));
-                                    match engine::load_coin(&bot.rpc, &mint).await {
-                                        Ok(c) => {
-                                            let tgt = poll_target(&c, &bot.trader(), bot.priority_auto.then(|| bot.priority_level.key()));
-                                            let graduated = c.graduated();
-                                            bot.meta = super::metadata::token_meta(&bot.rpc, &mint).await;
-                                            bot.remember_coin(&c);
-                                            bot.coin = Some(c);
-                                            bot.launched_at = None;
-                                            bot.token_bal = 0.0;
-                                            bot.bought_qty = 0.0;
-                                            bot.bought_cost = 0.0;
-                                            bot.tape.clear();
-                                            *target.lock().unwrap() = Some(tgt);
-                                            view = Panel::Tape;
-                                            scroll = 0;
-                                            // Warm the risk cache in the background — the report is
-                                            // only ever read from cache, so there is nothing to wait for.
-                                            let (rk, m2) = (bot.risk.clone(), mint.to_string());
-                                            tokio::spawn(async move { let _ = rk.report(&m2).await; });
-                                            bot.note(if graduated {
-                                                format!("Loaded {mint}, trading on the Pump AMM")
-                                            } else {
-                                                format!("Loaded {mint}, trading on the bonding curve")
-                                            });
-                                        }
-                                        Err(e) => bot.note(format!("Could not load that coin. {e}")),
-                                    }
+                                    // Resolution runs in the BACKGROUND; the
+                                    // loop adopts the coin when it lands. The
+                                    // screen keeps drawing the whole time.
+                                    bot.note(format!("resolving {mint}…"));
+                                    spawn_resolve(mint, None, None);
                                 }
                             }
                         }
@@ -1830,37 +1836,10 @@ pub async fn run(
                     KeyCode::Char('f') => {
                         bot.note("Watching for new launches");
                         if let Some((mint, launched, launch_sig)) = screen_trenches(term, &bot.rpc, &ws_urls, bot.sol_usd, &bot.risk, bot.warn_score).await? {
-                            match engine::load_coin(&bot.rpc, &mint).await {
-                                Ok(c) => {
-                                    let tgt = poll_target(&c, &bot.trader(), bot.priority_auto.then(|| bot.priority_level.key()));
-                                    bot.meta = super::metadata::token_meta(&bot.rpc, &mint).await;
-                                    bot.remember_coin(&c);
-                                            bot.coin = Some(c);
-                                    bot.launched_at = launched;
-                                    // New coin -> fresh cost basis, as on the EVM side.
-                                    bot.token_bal = 0.0;
-                                    bot.bought_qty = 0.0;
-                                    bot.bought_cost = 0.0;
-                                    bot.tape.clear();
-                                    // Seed the tape with the LAUNCH transaction — the dev's
-                                    // first buy lives in it, and on a hot snipe it scrolls
-                                    // past the signature window before the coin is selected.
-                                    let seed = discover::tape_seed(&bot.rpc, &launch_sig, &mint, &bot.trader()).await;
-                                    discover::merge_tape(&mut bot.tape, seed);
-                                    // Land on the Tape: after picking a coin the
-                                    // first thing you want is its live flow.
-                                    view = Panel::Tape;
-                                    scroll = 0;
-                                    // Hand the poller the new target; it fills in
-                                    // curve/balance/tape on its own thread.
-                                    *target.lock().unwrap() = Some(tgt);
-                                    // Same as the paste path: warm the cache off-loop.
-                                    let (rk, m2) = (bot.risk.clone(), mint.to_string());
-                                    tokio::spawn(async move { let _ = rk.report(&m2).await; });
-                                    bot.note(format!("Loaded {mint}"));
-                                }
-                                Err(e) => bot.note(format!("Could not load that coin. {e}")),
-                            }
+                            // Background resolution, launch-tx tape seed
+                            // included; the loop adopts it when it lands.
+                            bot.note(format!("resolving {mint}…"));
+                            spawn_resolve(mint, launched, Some(launch_sig));
                         } else {
                             bot.note("cancelled");
                         }
@@ -1946,6 +1925,38 @@ pub async fn run(
         // Absorb the poller's latest snapshot — memory only, never blocks.
         let latest = snap.lock().map(|s| s.clone()).unwrap_or_default();
         bot.absorb(&latest);
+
+        // Adopt a coin whose background resolution just landed.
+        let landed = pending_coin.lock().unwrap().take();
+        if let Some(p) = landed {
+            match p.coin {
+                Ok(c) => {
+                    let tgt = poll_target(&c, &bot.trader(), bot.priority_auto.then(|| bot.priority_level.key()));
+                    let graduated = c.graduated();
+                    bot.meta = p.meta;
+                    bot.remember_coin(&c);
+                    bot.coin = Some(c);
+                    bot.launched_at = p.launched;
+                    bot.token_bal = 0.0;
+                    bot.bought_qty = 0.0;
+                    bot.bought_cost = 0.0;
+                    bot.tape.clear();
+                    discover::merge_tape(&mut bot.tape, p.seed);
+                    *target.lock().unwrap() = Some(tgt);
+                    view = Panel::Tape;
+                    scroll = 0;
+                    // Warm the risk cache in the background, as always.
+                    let (rk, m2) = (bot.risk.clone(), p.mint.to_string());
+                    tokio::spawn(async move { let _ = rk.report(&m2).await; });
+                    bot.note(if graduated {
+                        format!("Loaded {}, trading on the Pump AMM", p.mint)
+                    } else {
+                        format!("Loaded {}, trading on the bonding curve", p.mint)
+                    });
+                }
+                Err(e) => bot.note(format!("Could not load {}. {e}", p.mint)),
+            }
+        }
 
         // A coin that fills its curve MIGRATES to the AMM. The venue was only
         // resolved when the coin was selected, so a coin that graduated while

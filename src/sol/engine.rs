@@ -314,6 +314,8 @@ pub async fn load_coin(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<Coin> {
         pool_quote_ta: pool.pool_quote_token_account,
         coin_creator: pool.coin_creator,
         fee_recipient: cfg.fee_recipient(),
+        is_cashback_coin: pool.is_cashback_coin,
+        buyback_recipient: pumpswap::GlobalConfigHead::buyback_recipient(&cfg_data),
     };
     // Decimals and supply come from the mint, never assumed.
     let coin_mint = pool.coin_mint().unwrap_or(*mint);
@@ -575,7 +577,9 @@ mod tests {
                     pool_base_ta: Pubkey::new_from_array([3u8; 32]),
                     pool_quote_ta: Pubkey::new_from_array([4u8; 32]),
                     coin_creator: Pubkey::new_from_array([5u8; 32]),
-                    fee_recipient: Pubkey::new_from_array([6u8; 32]),
+                    is_cashback_coin: true,
+            buyback_recipient: Some(Pubkey::new_from_array([7u8; 32])),
+            fee_recipient: Pubkey::new_from_array([6u8; 32]),
                 },
                 sol_res,
                 token_res,
@@ -674,6 +678,8 @@ mod tests {
             pool_base_ta: Pubkey::new_unique(),
             pool_quote_ta: Pubkey::new_unique(),
             coin_creator: Pubkey::new_unique(),
+            is_cashback_coin: true,
+            buyback_recipient: Some(Pubkey::new_from_array([7u8; 32])),
             fee_recipient: Pubkey::new_unique(),
         }
     }

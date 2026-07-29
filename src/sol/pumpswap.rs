@@ -130,6 +130,28 @@ impl GlobalConfigHead {
     pub fn fee_frac(&self) -> f64 {
         (self.lp_fee_basis_points + self.protocol_fee_basis_points) as f64 / 10_000.0
     }
+
+    /// A buyback fee recipient — any non-default of the eight is valid, same
+    /// rule as the protocol recipients. Read by OFFSET (not by widening the
+    /// borsh head) so a future appended field cannot break loading every
+    /// pool; the offsets were verified against the live GlobalConfig
+    /// (recipients at 643, buyback_basis_points 5000 right behind them).
+    pub fn buyback_recipient(data: &[u8]) -> Option<Pubkey> {
+        const OFF: usize = 8      // discriminator
+            + 32 + 8 + 8 + 1      // admin, lp_fee, protocol_fee, disable_flags
+            + 32 * 8              // protocol_fee_recipients
+            + 8                   // coin_creator_fee_basis_points
+            + 32 + 32 + 32 + 1    // admin_set_creator, whitelist, reserved_recipient, mayhem
+            + 32 * 7              // reserved_fee_recipients
+            + 1; // is_cashback_enabled
+        if data.len() < 8 || data[..8] != DISC_GLOBAL_CONFIG {
+            return None;
+        }
+        data.get(OFF..OFF + 32 * 8)?
+            .chunks_exact(32)
+            .filter_map(|c| Pubkey::try_from(c).ok())
+            .find(|p| *p != Pubkey::default())
+    }
 }
 
 // ---- PDAs ----------------------------------------------------------------
@@ -150,6 +172,13 @@ pub fn user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
 /// bonding curve's hyphenated `"creator-vault"`. Easy to conflate; they differ.
 pub fn coin_creator_vault_authority(coin_creator: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"creator_vault", coin_creator.as_ref()], &PUMP_AMM_PROGRAM).0
+}
+
+/// `["pool-v2", base_mint]` — note the HYPHEN, unlike every underscore seed
+/// around it. The v2 pool state the swap instructions verify via a remaining
+/// account whenever the pool has a coin creator.
+pub fn pool_v2_pda(base_mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &PUMP_AMM_PROGRAM).0
 }
 pub fn fee_config_pda() -> Pubkey {
     Pubkey::find_program_address(&[b"fee_config", &FEE_CONFIG_SEED], &PUMP_FEES_PROGRAM).0
@@ -276,6 +305,13 @@ pub struct SwapKeys {
     pub pool_quote_ta: Pubkey,
     pub coin_creator: Pubkey,
     pub fee_recipient: Pubkey,
+    /// The pool's `is_cashback_coin` flag: decides whether the cashback
+    /// remaining accounts ride along (mandatory on such pools, 6059 without).
+    pub is_cashback_coin: bool,
+    /// A buyback fee recipient from GlobalConfig. The SDK appends the pair on
+    /// every swap; None (config unreadable) sends none and lets preflight say
+    /// so rather than inventing an address.
+    pub buyback_recipient: Option<Pubkey>,
 }
 
 /// The 21 accounts shared by both sides, in IDL order. Buy appends two more.
@@ -334,12 +370,7 @@ pub fn buy_ix(
     accounts.push(AccountMeta::new_readonly(global_volume_accumulator_pda(), false)); // 20
     accounts.push(AccountMeta::new(user_volume_accumulator_pda(user), false));        // 21
     accounts.extend(tail);                                                            // 22, 23
-    // Cashback (Feb 2026): a cashback coin's buy REVERTS with
-    // MissingCashbackAccounts (6059) unless the WSOL ATA of the user's volume
-    // accumulator rides as the 0th remaining account. The program creates the
-    // ATA if missing (rent paid by the user) and pays the would-be creator
-    // fee into it; on a non-cashback coin the extra account is ignored.
-    accounts.push(AccountMeta::new(uva_quote_ata(k, user), false));
+    accounts.extend(remaining_accounts(k, user, false));
 
     Instruction { program_id: PUMP_AMM_PROGRAM, accounts, data }
 }
@@ -350,6 +381,32 @@ fn uva_quote_ata(k: &SwapKeys, user: &Pubkey) -> Pubkey {
     ata(&user_volume_accumulator_pda(user), &k.quote_mint, &k.quote_token_program)
 }
 
+/// The remaining accounts both swap sides carry, in the SDK's exact order —
+/// the program addresses them by position, so order IS correctness:
+///   1. cashback coins: the accumulator's quote ATA (and on sells, the
+///      accumulator itself) — 6059 without them;
+///   2. pools with a coin creator: the `pool_v2` PDA — 6062 without it
+///      ("pool_v2 remaining account is missing or invalid", which is how a
+///      live ansem buy failed);
+///   3. always: a buyback fee recipient and its quote ATA.
+fn remaining_accounts(k: &SwapKeys, user: &Pubkey, sell: bool) -> Vec<AccountMeta> {
+    let mut v = Vec::new();
+    if k.is_cashback_coin {
+        v.push(AccountMeta::new(uva_quote_ata(k, user), false));
+        if sell {
+            v.push(AccountMeta::new(user_volume_accumulator_pda(user), false));
+        }
+    }
+    if k.coin_creator != Pubkey::default() {
+        v.push(AccountMeta::new_readonly(pool_v2_pda(&k.base_mint), false));
+    }
+    if let Some(b) = k.buyback_recipient {
+        v.push(AccountMeta::new_readonly(b, false));
+        v.push(AccountMeta::new(ata(&b, &k.quote_mint, &k.quote_token_program), false));
+    }
+    v
+}
+
 /// `sell`: sell `base_amount_in` token base units for at least
 /// `min_quote_amount_out` lamports.
 pub fn sell_ix(k: &SwapKeys, user: &Pubkey, base_amount_in: u64, min_quote_amount_out: u64) -> Instruction {
@@ -358,11 +415,7 @@ pub fn sell_ix(k: &SwapKeys, user: &Pubkey, base_amount_in: u64, min_quote_amoun
     data.extend_from_slice(&base_amount_in.to_le_bytes());
     data.extend_from_slice(&min_quote_amount_out.to_le_bytes());
     let mut accounts = base_accounts(k, user);
-    // Cashback remaining accounts, same rule as the buy — sell wants the
-    // accumulator itself as well (index 1), per pump-public-docs
-    // PUMP_CASHBACK_README.
-    accounts.push(AccountMeta::new(uva_quote_ata(k, user), false));
-    accounts.push(AccountMeta::new(user_volume_accumulator_pda(user), false));
+    accounts.extend(remaining_accounts(k, user, true));
     Instruction { program_id: PUMP_AMM_PROGRAM, accounts, data }
 }
 
@@ -399,23 +452,50 @@ mod tests {
             pool_base_ta: Pubkey::new_from_array([3u8; 32]),
             pool_quote_ta: Pubkey::new_from_array([4u8; 32]),
             coin_creator: Pubkey::new_from_array([5u8; 32]),
+            is_cashback_coin: true,
+            buyback_recipient: Some(Pubkey::new_from_array([7u8; 32])),
             fee_recipient: Pubkey::new_from_array([6u8; 32]),
         }
     }
 
     #[test]
     fn account_counts_match_the_idl() {
+        // The test keys are a cashback coin WITH a creator AND a buyback
+        // recipient, so every remaining-account group rides: 23 named +
+        // cashback ATA + pool_v2 + buyback pair on the buy; 21 named +
+        // [ATA, accumulator] + pool_v2 + buyback pair on the sell.
         let user = Pubkey::new_from_array([9u8; 32]);
-        // 23 named + the cashback remaining account (the accumulator's WSOL
-        // ATA); sell carries two — the ATA and the accumulator itself.
-        let buy = buy_ix(&keys(), &user, 1, 1);
-        assert_eq!(buy.accounts.len(), 24, "AMM buy takes 23 named + 1 cashback");
-        assert_eq!(buy.accounts[23].pubkey, uva_quote_ata(&keys(), &user));
+        let k = keys();
+        let buy = buy_ix(&k, &user, 1, 1);
+        assert_eq!(buy.accounts.len(), 27, "AMM buy: 23 named + 4 remaining");
+        assert_eq!(buy.accounts[23].pubkey, uva_quote_ata(&k, &user));
         assert!(buy.accounts[23].is_writable, "cashback accrues INTO the ATA");
-        let sell = sell_ix(&keys(), &user, 1, 1);
-        assert_eq!(sell.accounts.len(), 23, "AMM sell takes 21 named + 2 cashback");
-        assert_eq!(sell.accounts[21].pubkey, uva_quote_ata(&keys(), &user));
+        assert_eq!(buy.accounts[24].pubkey, pool_v2_pda(&k.base_mint));
+        assert!(!buy.accounts[24].is_writable, "pool_v2 is verified, not written");
+        assert_eq!(buy.accounts[25].pubkey, k.buyback_recipient.unwrap());
+        assert_eq!(
+            buy.accounts[26].pubkey,
+            ata(&k.buyback_recipient.unwrap(), &k.quote_mint, &k.quote_token_program)
+        );
+        assert!(buy.accounts[26].is_writable);
+
+        let sell = sell_ix(&k, &user, 1, 1);
+        assert_eq!(sell.accounts.len(), 26, "AMM sell: 21 named + 5 remaining");
+        assert_eq!(sell.accounts[21].pubkey, uva_quote_ata(&k, &user));
         assert_eq!(sell.accounts[22].pubkey, user_volume_accumulator_pda(&user));
+        assert_eq!(sell.accounts[23].pubkey, pool_v2_pda(&k.base_mint));
+        assert_eq!(sell.accounts[24].pubkey, k.buyback_recipient.unwrap());
+
+        // A plain pool — no cashback, no creator, no buyback readable — sends
+        // exactly the named accounts, nothing invented.
+        let plain = SwapKeys {
+            is_cashback_coin: false,
+            buyback_recipient: None,
+            coin_creator: Pubkey::default(),
+            ..k
+        };
+        assert_eq!(buy_ix(&plain, &user, 1, 1).accounts.len(), 23);
+        assert_eq!(sell_ix(&plain, &user, 1, 1).accounts.len(), 21);
     }
 
     #[test]
@@ -581,6 +661,8 @@ mod lp_tests {
             pool_base_ta: Pubkey::new_from_array([3u8; 32]),
             pool_quote_ta: Pubkey::new_from_array([4u8; 32]),
             coin_creator: Pubkey::new_from_array([5u8; 32]),
+            is_cashback_coin: true,
+            buyback_recipient: Some(Pubkey::new_from_array([7u8; 32])),
             fee_recipient: Pubkey::new_from_array([6u8; 32]),
         }
     }
