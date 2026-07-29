@@ -490,6 +490,10 @@ fn setting(bot: &mut engine::Bot, what: &str, value: String, sentence: String) {
     bot.status = sentence;
 }
 
+/// The two states the status line falls back to once its news has gone stale.
+const ILLIQUID: &str = "This pool has no active liquidity. Press a to add liquidity.";
+const HEALTHY: &str = "Healthy — pool is live.";
+
 /// The identifying facts of a pool, for an event line.
 ///
 /// A label like "Uniswap V3 ETH/HOOD SpaceX FERRET 1%" names a pool to a human
@@ -1584,6 +1588,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     let mut prices: VecDeque<f64> = VecDeque::new();
     let mut sma = 0.0;
     let mut tele_ctr: u64 = 0;
+    // For ageing the status line out; see the act tick.
+    let mut last_status = String::new();
+    let mut status_since = std::time::Instant::now();
     let mut view = Panel::Tape; // default to the live tape
     let mut show_help = false;
     let mut orders_scroll: usize = 0;
@@ -1667,6 +1674,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             // slower action tick — auto-strategy + reap, each timeout-bounded
             _ = act.tick() => {
                 if bot.ready {
+                    // The condition that wrote this has passed, so the sentence
+                    // has to go with it. It was set once and never cleared, so a
+                    // pool that filled up seconds later still read as empty —
+                    // under a tape of live trades, which is worse than saying
+                    // nothing at all.
+                    if bot.status == ILLIQUID {
+                        bot.status = HEALTHY.into();
+                    }
                     prices.push_back(bot.price());
                     if prices.len() > 60 { prices.pop_front(); }
                     if bot.strategy != Strategy::Manual {
@@ -1680,7 +1695,30 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     // so the empty state was being told to add liquidity to a
                     // pool it did not have — and the line overwrote whatever the
                     // last action had said.
-                    bot.status = "This pool has no active liquidity. Press a to add liquidity.".into();
+                    bot.status = ILLIQUID.into();
+                }
+                // Everything on this line was true when it was written; most of
+                // it stops being true. Anything that has sat unchanged for a
+                // while gives way to the state of things, so the line answers
+                // "how are we now" rather than "what happened once".
+                if bot.status != last_status {
+                    last_status = bot.status.clone();
+                    status_since = std::time::Instant::now();
+                } else if status_since.elapsed() > Duration::from_secs(20)
+                    && !bot.status.is_empty()
+                    && bot.status != HEALTHY
+                {
+                    bot.status = if !rpc_ok.load(Ordering::Relaxed) {
+                        "Waiting on the RPC.".into()
+                    } else if bot.pool.kind.is_empty() {
+                        String::new()
+                    } else if bot.ready {
+                        HEALTHY.into()
+                    } else {
+                        ILLIQUID.into()
+                    };
+                    last_status = bot.status.clone();
+                    status_since = std::time::Instant::now();
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(3), bot.reap(provider)).await;
                 tele_ctr += 1;
