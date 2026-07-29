@@ -31,8 +31,33 @@ enum Check {
     Pending,
     /// Asked and did not get an answer.
     Failed,
-    /// The newest published tag.
-    Known(String),
+    /// The newest published tag, and when it was published.
+    Known(String, u64),
+}
+
+/// How long a release has to have been public before this offers it.
+///
+/// A bad release — broken, or worse, one published by someone who should not
+/// have been able to — reaches nobody during this window. It is the difference
+/// between yanking a release and chasing it. Anyone who wants it sooner can say
+/// so; the point is that the default does not rush.
+pub const SOAK: u64 = 24 * 60 * 60;
+
+/// Seconds since the epoch, from an ISO-8601 stamp like `2026-07-29T05:31:43Z`.
+///
+/// GitHub emits exactly this shape and always in UTC, so this parses that shape
+/// and nothing else — a half-written date parser is worse than one that admits
+/// it does not recognise the input.
+fn parse_iso8601(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || !s.ends_with('Z') {
+        return None;
+    }
+    let n = |a: usize, z: usize| s.get(a..z)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
+    let (h, mi, sec) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let days = crate::ledger::days_from_civil(y as i32, mo as u32, d as u32);
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
 }
 
 static LATEST: RwLock<Check> = RwLock::new(Check::Pending);
@@ -48,13 +73,30 @@ pub enum Status {
     Latest,
     /// Checked, and there is a newer one.
     Update(String),
+    /// A newer one exists, but it is too fresh to offer yet.
+    Soaking { tag: String, ready_in: u64 },
 }
 
 /// The current state of the update check.
 pub fn status() -> Status {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     match LATEST.read().map(|s| s.clone()) {
-        Ok(Check::Known(v)) if is_newer(&v, current()) => Status::Update(v),
-        Ok(Check::Known(_)) => Status::Latest,
+        Ok(Check::Known(v, at)) if is_newer(&v, current()) => {
+            let age = now.saturating_sub(at);
+            // Someone can opt out of the wait deliberately. An env var rather
+            // than a flag, so the same choice covers the key, the flag and the
+            // launch banner without three ways to say it.
+            let forced = std::env::var_os("TRENCHES_UPDATE_NOW").is_some();
+            if forced || at == 0 || age >= SOAK {
+                Status::Update(v)
+            } else {
+                Status::Soaking { tag: v, ready_in: SOAK - age }
+            }
+        }
+        Ok(Check::Known(..)) => Status::Latest,
         Ok(Check::Failed) => Status::Unknown,
         _ => Status::Checking,
     }
@@ -93,7 +135,7 @@ pub fn available() -> Option<String> {
 pub fn spawn_check() {
     tokio::spawn(async {
         let result = match fetch_latest_tag().await {
-            Some(tag) => Check::Known(tag),
+            Some((tag, at)) => Check::Known(tag, at),
             // Recorded as a failure rather than left pending: an answer that
             // never comes must not read as "nothing newer".
             None => Check::Failed,
@@ -105,7 +147,7 @@ pub fn spawn_check() {
 }
 
 /// Ask the releases API for the newest tag. Every failure is "no answer".
-async fn fetch_latest_tag() -> Option<String> {
+async fn fetch_latest_tag() -> Option<(String, u64)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         // GitHub rejects requests without one.
@@ -129,7 +171,14 @@ async fn fetch_latest_tag() -> Option<String> {
     // An array now, so take the first entry.
     let first = v.as_array().and_then(|a| a.first()).unwrap_or(&v);
     let tag = first.get("tag_name")?.as_str()?.trim();
-    (!tag.is_empty()).then(|| tag.to_string())
+    // Unparseable or absent becomes 0, which `status` reads as "no soak" — a
+    // release whose age cannot be established is not held back on a guess.
+    let at = first
+        .get("published_at")
+        .and_then(|v| v.as_str())
+        .and_then(parse_iso8601)
+        .unwrap_or(0);
+    (!tag.is_empty()).then(|| (tag.to_string(), at))
 }
 
 /// Split a version into numbers, ignoring a leading `v` and any `-beta.1` tail.
@@ -172,7 +221,7 @@ fn is_newer(candidate: &str, running: &str) -> bool {
 /// reads.
 pub async fn check_now() -> Status {
     let result = match fetch_latest_tag().await {
-        Some(tag) => Check::Known(tag),
+        Some((tag, at)) => Check::Known(tag, at),
         None => Check::Failed,
     };
     if let Ok(mut w) = LATEST.write() {
@@ -190,9 +239,20 @@ pub fn footer_label() -> String {
     match status() {
         Status::Update(v) => format!("{}  →  {v}", full()),
         Status::Latest => format!("{} (latest)", full()),
+        // Soaking is not something to act on, so it reads as current with a
+        // note rather than as a call to do anything.
+        Status::Soaking { tag, ready_in } => {
+            format!("{} (latest) · {tag} in {}", full(), short_hours(ready_in))
+        }
         // Neither claim is available yet, so it makes neither.
         Status::Checking | Status::Unknown => full(),
     }
+}
+
+/// A coarse "in about 18h" — nobody is timing this to the minute.
+pub fn short_hours(secs: u64) -> String {
+    let h = secs.div_ceil(3600);
+    if h <= 1 { "under an hour".to_string() } else { format!("{h}h") }
 }
 
 /// The release asset for the machine this is running on.
@@ -327,22 +387,55 @@ mod tests {
     /// here is one.
     #[test]
     fn not_knowing_is_not_the_same_as_being_up_to_date() {
+        // Published long enough ago that the soak window is not the thing under
+        // test here.
         let decide = |c: &Check| match c {
-            Check::Known(v) if is_newer(v, "0.1.2") => Status::Update(v.clone()),
-            Check::Known(_) => Status::Latest,
+            Check::Known(v, _) if is_newer(v, "0.1.2") => Status::Update(v.clone()),
+            Check::Known(..) => Status::Latest,
             Check::Failed => Status::Unknown,
             Check::Pending => Status::Checking,
         };
         assert_eq!(decide(&Check::Pending), Status::Checking);
         assert_eq!(decide(&Check::Failed), Status::Unknown);
-        assert_eq!(decide(&Check::Known("v0.1.2".into())), Status::Latest);
+        assert_eq!(decide(&Check::Known("v0.1.2".into(), 0)), Status::Latest);
         assert_eq!(
-            decide(&Check::Known("v0.1.3".into())),
+            decide(&Check::Known("v0.1.3".into(), 0)),
             Status::Update("v0.1.3".into())
         );
     }
 
     /// The endpoint has to be the one that includes pre-releases.
+    #[test]
+    fn github_timestamps_parse_and_anything_else_does_not() {
+        // The exact shape GitHub emits.
+        assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso8601("1970-01-02T00:00:00Z"), Some(86_400));
+        assert_eq!(parse_iso8601("2026-07-29T05:31:43Z"), Some(1_785_303_103));
+        // Anything else is refused rather than guessed at. A misparse here
+        // would either hold a release back forever or wave it straight through.
+        assert_eq!(parse_iso8601(""), None);
+        assert_eq!(parse_iso8601("2026-07-29"), None);
+        assert_eq!(parse_iso8601("2026-07-29T05:31:43+02:00"), None);
+        assert_eq!(parse_iso8601("not a date at all!!"), None);
+    }
+
+    #[test]
+    fn a_fresh_release_waits_and_an_aged_one_does_not() {
+        let now = 1_000_000u64;
+        // The decision `status` makes, without touching the global state a
+        // parallel test could be writing to.
+        let decide = |published: u64| {
+            let age = now.saturating_sub(published);
+            if published == 0 || age >= SOAK { "offer" } else { "wait" }
+        };
+        assert_eq!(decide(now), "wait", "a release published this second");
+        assert_eq!(decide(now - SOAK + 1), "wait", "an hour short of the window");
+        assert_eq!(decide(now - SOAK), "offer", "exactly at the window");
+        assert_eq!(decide(now - SOAK * 3), "offer", "long past it");
+        // An unknown publish date is not held back on a guess.
+        assert_eq!(decide(0), "offer");
+    }
+
     /// The update path must never execute something it downloaded.
     ///
     /// It used to pipe our own install script into a shell, which made

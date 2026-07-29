@@ -1539,6 +1539,10 @@ pub async fn run(
                         crate::update::Status::Unknown => {
                             bot.note("Could not reach GitHub to check for updates.".to_string())
                         }
+                        crate::update::Status::Soaking { tag, ready_in } => bot.note(format!(
+                            "{tag} was published recently. It will be offered in {} — set TRENCHES_UPDATE_NOW=1 to take it now.",
+                            crate::update::short_hours(ready_in)
+                        )),
                         crate::update::Status::Latest => bot.note(format!(
                             "You are on the latest version ({}).",
                             crate::update::full()

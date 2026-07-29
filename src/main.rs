@@ -716,6 +716,17 @@ async fn main() -> eyre::Result<()> {
                             }
                         }
                     }
+                    update::Status::Soaking { tag, ready_in } => {
+                        println!("  {dim}Latest{off}   {tag}");
+                        println!();
+                        println!(
+                            "  Published recently, so it is not offered yet — a release gets {} to",
+                            update::short_hours(update::SOAK)
+                        );
+                        println!("  be pulled if something is wrong with it. Ready in {}.", update::short_hours(ready_in));
+                        println!();
+                        println!("  {dim}TRENCHES_UPDATE_NOW=1 trenches --update{off}  takes it now.");
+                    }
                     update::Status::Latest => {
                         println!();
                         println!("  Already on the latest release.");
@@ -1883,6 +1894,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             update::Status::Unknown => bot.note(
                                 "Could not reach GitHub to check for updates.".to_string(),
                             ),
+                            update::Status::Soaking { tag, ready_in } => bot.note(format!(
+                                "{tag} was published recently. It will be offered in {} — set TRENCHES_UPDATE_NOW=1 to take it now.",
+                                update::short_hours(ready_in)
+                            )),
                             update::Status::Latest => bot.note(format!(
                                 "You are on the latest version ({}).",
                                 update::full()
