@@ -77,6 +77,13 @@ jobs:
     runs-on: ubuntu-22.04
     # Only a tag publishes. A manual run is for checking the build.
     if: startsWith(github.ref, 'refs/tags/v')
+    # Job level, not step level: a step's `if` is evaluated before its own `env`
+    # exists, so a guard written there never sees the secret and never fires.
+    env:
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -92,6 +99,36 @@ jobs:
           cd dist
           shasum -a 256 trenches-* > SHA256SUMS
           cat SHA256SUMS
+
+      # Two signatures over the same file, for two different readers.
+      #
+      # minisign is what the app and the installer check: Ed25519, verifiable in
+      # a few lines against a key compiled into the binary, no tooling required
+      # on the machine being updated. GPG is for people verifying by hand, and
+      # matches how solidity-language-server signs, so the instructions are the
+      # same across our repos.
+      #
+      # Both steps are skipped when their secret is absent, so a release still
+      # goes out before the keys exist — and the app treats an unsigned release
+      # as unsigned rather than as verified.
+      - name: Sign checksums (minisign)
+        if: env.MINISIGN_SECRET_KEY != ''
+        run: |
+          set -eu
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m dist/SHA256SUMS
+          shred -u minisign.key
+          ls -la dist/SHA256SUMS.minisig
+
+      - name: Sign checksums (GPG)
+        if: env.GPG_PRIVATE_KEY != ''
+        run: |
+          set -eu
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+            --detach-sign --armor dist/SHA256SUMS
+          ls -la dist/SHA256SUMS.asc
 
       - uses: softprops/action-gh-release@v2
         with:

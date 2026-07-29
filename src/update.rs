@@ -19,6 +19,21 @@ use std::sync::RwLock;
 /// The one repository this trusts for releases.
 const REPO: &str = "asyncswap/trenches";
 
+/// The public half of the release signing key, pinned into the binary.
+///
+/// A checksum proves a download arrived intact. It cannot prove who published
+/// it: SHA256SUMS lives in the same release as the files it describes, so
+/// anything able to replace one can replace both. A signature is what makes the
+/// release answer for itself, and pinning the key here is what makes it mean
+/// something — fetching the key alongside the signature would prove only that
+/// they came from the same place.
+///
+/// Empty until the keypair exists. While empty the updater keeps working on the
+/// checksum alone and SAYS so, rather than pretending to a guarantee it has no
+/// key to make. Fill this in and verification becomes mandatory: an unsigned or
+/// badly signed release is then refused outright.
+const MINISIGN_PUBKEY: &str = "";
+
 /// What the check knows so far.
 ///
 /// Three states, not two. "No newer version" and "never got an answer" are
@@ -255,6 +270,43 @@ pub fn short_hours(secs: u64) -> String {
     if h <= 1 { "under an hour".to_string() } else { format!("{h}h") }
 }
 
+/// Check the release's signature over its checksums file.
+///
+/// Silent when no key is pinned — that case is reported by `signing_status` so
+/// it appears where someone will read it, rather than as a warning buried in an
+/// update they are already committed to.
+async fn verify_signature<F, Fut>(sums: &str, base: &str, get: &F) -> Result<(), String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    if MINISIGN_PUBKEY.is_empty() {
+        return Ok(());
+    }
+    let key = minisign_verify::PublicKey::decode(MINISIGN_PUBKEY)
+        .map_err(|e| format!("The pinned signing key is malformed: {e}"))?;
+    // A missing signature is a failure, not an absence. Once a key is pinned,
+    // "unsigned" and "signed by someone else" deserve the same answer.
+    let raw = get(format!("{base}/SHA256SUMS.minisig"))
+        .await
+        .map_err(|_| "This release is not signed. Refusing to install it.".to_string())?;
+    let text = String::from_utf8(raw).map_err(|_| "The signature is not text.".to_string())?;
+    let sig = minisign_verify::Signature::decode(&text)
+        .map_err(|e| format!("The signature is malformed: {e}"))?;
+    key.verify(sums.as_bytes(), &sig, false)
+        .map_err(|_| "The signature does not match this release. Refusing to install it.".to_string())
+}
+
+/// Whether releases are signature-checked, for the places that tell someone
+/// what they are trusting.
+pub fn signing_status() -> &'static str {
+    if MINISIGN_PUBKEY.is_empty() {
+        "checksum only — releases are not signed yet"
+    } else {
+        "signed, and the signature is checked against a key built into this binary"
+    }
+}
+
 /// The release asset for the machine this is running on.
 ///
 /// Rust target triples, because that is what the release workflow names its
@@ -327,6 +379,13 @@ pub async fn install_latest() -> Result<String, String> {
             (f.trim() == asset).then(|| h.trim().to_lowercase())
         })
         .ok_or_else(|| format!("{asset} is not listed in SHA256SUMS."))?;
+
+    // Who published it, before what it contains.
+    //
+    // Checked against the checksums file, because that is what the signature
+    // covers and what every asset's hash is read from — one signature vouching
+    // for the whole release.
+    verify_signature(&sums, &base, &get).await?;
 
     let bytes = get(format!("{base}/{asset}")).await?;
     let got = format!("{:x}", Sha256::digest(&bytes));
@@ -434,6 +493,26 @@ mod tests {
         assert_eq!(decide(now - SOAK * 3), "offer", "long past it");
         // An unknown publish date is not held back on a guess.
         assert_eq!(decide(0), "offer");
+    }
+
+    /// A pinned key must be a real one, and its absence must be admitted.
+    #[test]
+    fn the_signing_key_is_either_valid_or_honestly_empty() {
+        if MINISIGN_PUBKEY.is_empty() {
+            // Nothing to verify against, so nothing may claim otherwise.
+            assert!(
+                signing_status().contains("not signed"),
+                "with no key pinned the app must say releases are unsigned"
+            );
+            return;
+        }
+        // Once set it has to decode, or every update refuses forever and the
+        // first anyone knows is when they try to install one.
+        assert!(
+            minisign_verify::PublicKey::decode(MINISIGN_PUBKEY).is_ok(),
+            "the pinned signing key does not decode"
+        );
+        assert!(signing_status().contains("signed"));
     }
 
     /// The update path must never execute something it downloaded.

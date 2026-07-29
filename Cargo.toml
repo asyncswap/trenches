@@ -86,6 +86,7 @@ rand = "0.8"
 # signature stream to discover by polling). Already present via alloy-transport-ws.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 zeroize = "1.9.0"
+minisign-verify = "0.2"
 
 [profile.release]
 opt-level = 3
