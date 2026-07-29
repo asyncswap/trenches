@@ -1566,10 +1566,7 @@ mod live_ws_probe {
             .find(|n| n.kind.is_solana())
             .expect("a solana network");
 
-        let mut cands: Vec<String> = Vec::new();
-        if let Some(w) = &net.ws {
-            cands.push(w.clone());
-        }
+        let mut cands: Vec<String> = net.ws_pool();
         for u in net.rpc_pool() {
             cands.push(super::ws_url_from_http(&u));
         }

@@ -321,6 +321,10 @@ async fn poller(
             snap.sol_usd = sol_usd;
             snap.round_ms = t0.elapsed().as_secs_f64() * 1000.0;
         }
+        // The 30s RPC rollup. The EVM side writes it from its telemetry tick;
+        // nothing on this path ever called it, so a whole Solana session went
+        // by with the calls counted but the summary never written.
+        crate::rpcstats::maybe_report();
         tokio::time::sleep(REFRESH).await;
     }
 }
@@ -672,8 +676,12 @@ impl SolBot {
             .filter(|(_, o)| o.state == OrderState::Pending)
             .filter_map(|(i, o)| o.sig.clone().map(|s| (i, s)))
             .collect();
-        for (i, sig) in pending {
-            let Ok(Some(ok)) = self.rpc.signature_ok(&sig).await else { continue };
+        // ONE getSignatureStatuses for every pending order — the method takes
+        // an array; asking per order multiplied the poll by the queue depth.
+        let sigs: Vec<String> = pending.iter().map(|(_, s)| s.clone()).collect();
+        let Ok(statuses) = self.rpc.signatures_ok(&sigs).await else { return };
+        for ((i, sig), status) in pending.into_iter().zip(statuses) {
+            let Some(ok) = status else { continue };
             let (action, sol) = match self.orders.get(i) {
                 Some(o) => (o.action, o.sol),
                 None => continue,
@@ -1298,6 +1306,17 @@ fn header_venue(bot: &SolBot) -> ui::image::Venue {
 
 // ---- trenches screen -----------------------------------------------------
 
+/// The most launches the trenches cache holds. Newest win: a launchpad list
+/// is about what is happening now, not an archive.
+const TRENCH_MAX: usize = 150;
+
+/// The discovered launches, alive for the whole process so leaving the screen
+/// and coming back does not start from an empty feed.
+fn trench_cache() -> Arc<Mutex<Vec<TrenchRow>>> {
+    static CACHE: std::sync::OnceLock<Arc<Mutex<Vec<TrenchRow>>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default).clone()
+}
+
 async fn screen_trenches(
     term: &mut Term,
     rpc: &Rpc,
@@ -1309,7 +1328,13 @@ async fn screen_trenches(
     // This screen owns the terminal now: take down the dashboard's image, which
     // also marks it stale so it redraws when we come back.
     ui::image::clear();
-    let found: Arc<Mutex<Vec<TrenchRow>>> = Arc::new(Mutex::new(Vec::new()));
+    // The launches live in a process-wide cache, NOT on this screen's stack
+    // frame. They used to die with the screen: pick a coin, trade it, come
+    // back — and everything the feed had found was gone, unrecoverable until
+    // a brand-new mint happened to launch, because the websocket feed only
+    // reports launches that happen AFTER it subscribes. Now returning shows
+    // everything found before, instantly.
+    let found: Arc<Mutex<Vec<TrenchRow>>> = trench_cache();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // What the feed is doing right now. Shown in the empty state so a stalled
     // websocket reads as a stalled websocket instead of as a quiet market.
@@ -1328,8 +1353,21 @@ async fn screen_trenches(
                 tokio::spawn(async move {
                     let rows = discover::enrich(&rpc3, vec![launch]).await;
                     super::trace(&format!("enrich -> {} row(s)", rows.len()));
+                    let mut cur = f3.lock().unwrap();
                     for row in rows {
-                        f3.lock().unwrap().push(row);
+                        // The cache survives re-entry, so the same mint can
+                        // arrive again — refresh it in place, don't double it.
+                        match cur.iter_mut().find(|r| r.launch.mint == row.launch.mint) {
+                            Some(slot) => *slot = row,
+                            None => cur.push(row),
+                        }
+                    }
+                    // Bounded: the list only ever grew, and the 3s refresher
+                    // re-reads every row it holds — an afternoon of launches
+                    // made each sweep cost more than the last, forever.
+                    if cur.len() > TRENCH_MAX {
+                        discover::sort_newest_first(&mut cur);
+                        cur.truncate(TRENCH_MAX);
                     }
                 });
                 !s2.load(std::sync::atomic::Ordering::Relaxed)
@@ -1399,10 +1437,16 @@ async fn screen_trenches(
     let result = loop {
         let mut rows = found.lock().unwrap().clone();
         discover::sort_newest_first(&mut rows);
-        // Warm one uncached report per pass: keeps the list filling in without
-        // hammering the free tier or stalling the loop.
-        if let Some(r) = rows.iter().find(|r| risk.cached(&r.launch.mint.to_string()).is_none()) {
-            let _ = risk.report(&r.launch.mint.to_string()).await;
+        // Warm one unknown report per pass — SPAWNED, because this is the draw
+        // loop: awaiting the HTTP fetch here held the whole screen (keys,
+        // rendering, everything) hostage to RugCheck's latency, up to 6s per
+        // new row. "Unknown", not "uncached": a recent failure counts as an
+        // answer, so one broken mint cannot pin the warm slot forever.
+        if let Some(r) = rows.iter().find(|r| !risk.known(&r.launch.mint.to_string())) {
+            let (rk, mint) = (risk.clone(), r.launch.mint.to_string());
+            tokio::spawn(async move {
+                let _ = rk.report(&mint).await;
+            });
         }
         let mut table = discover::table_view(&rows, sol_usd, Some(risk), warn_score);
         // Replace the generic note with what the feed is actually doing.
@@ -1439,7 +1483,8 @@ async fn screen_trenches(
 pub async fn run(
     term: &mut Term,
     rpc_urls: Vec<String>,
-    ws_override: Option<&str>,
+    // Every explicitly-configured WS endpoint (`ws` + `wss`), primary first.
+    ws_explicit: Vec<String>,
     signer: Keypair,
     // False when nobody unlocked a keystore: the signer is a throwaway and must
     // never be asked to sign. Reads work; the order keys do not.
@@ -1448,16 +1493,14 @@ pub async fn run(
     net: &str,
 ) -> eyre::Result<crate::Exit> {
     let rpc = Rpc::new_pool(rpc_urls.clone());
-    // Providers frequently host WS on a separate domain, so an explicit setting
-    // wins over deriving it from the HTTP URL.
-    // Candidates in preference order: the explicit setting first, then one
-    // derived from each RPC endpoint. Providers host WS on a separate domain
-    // often enough that deriving alone isn't reliable, but having the derived
-    // ones as fallbacks means a single provider outage can't blind the feed.
-    let mut ws_urls: Vec<String> = Vec::new();
-    if let Some(w) = ws_override {
-        ws_urls.push(w.to_string());
-    }
+    // Providers frequently host WS on a separate domain, so explicit settings
+    // win over deriving from the HTTP URLs.
+    // Candidates in preference order: every explicit endpoint first (the feed
+    // rotates through them on a drop or error), then one derived from each RPC
+    // endpoint. Providers host WS on a separate domain often enough that
+    // deriving alone isn't reliable, but having the derived ones as fallbacks
+    // means a single provider outage can't blind the feed.
+    let mut ws_urls: Vec<String> = ws_explicit;
     for u in &rpc_urls {
         let d = discover::ws_url_from_http(u);
         if !d.is_empty() && !ws_urls.contains(&d) {
@@ -1703,7 +1746,10 @@ pub async fn run(
                                             *target.lock().unwrap() = Some(tgt);
                                             view = Panel::Tape;
                                             scroll = 0;
-                                            let _ = bot.risk.report(&mint.to_string()).await;
+                                            // Warm the risk cache in the background — the report is
+                                            // only ever read from cache, so there is nothing to wait for.
+                                            let (rk, m2) = (bot.risk.clone(), mint.to_string());
+                                            tokio::spawn(async move { let _ = rk.report(&m2).await; });
                                             bot.note(if graduated {
                                                 format!("Loaded {mint}, trading on the Pump AMM")
                                             } else {
@@ -1738,7 +1784,9 @@ pub async fn run(
                                     // Hand the poller the new target; it fills in
                                     // curve/balance/tape on its own thread.
                                     *target.lock().unwrap() = Some(tgt);
-                                    let _ = bot.risk.report(&mint.to_string()).await;
+                                    // Same as the paste path: warm the cache off-loop.
+                                    let (rk, m2) = (bot.risk.clone(), mint.to_string());
+                                    tokio::spawn(async move { let _ = rk.report(&m2).await; });
                                     bot.note(format!("Loaded {mint}"));
                                 }
                                 Err(e) => bot.note(format!("Could not load that coin. {e}")),

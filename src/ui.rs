@@ -259,17 +259,16 @@ pub fn endpoints_screen(term: &mut Term) -> eyre::Result<()> {
         let solana = net.to_lowercase().starts_with("solana");
         let mut fields: Vec<(&str, &str, &str)> = vec![(
             "rpc",
-            "Trading RPC URL",
-            "Enter your RPC endpoint",
+            "RPC URL(s)",
+            "One URL, or several separated by commas — requests rotate across all of them.",
         )];
         if solana {
-            fields.push(("ws", "Websocket URL", "Optional. Often a different host than the RPC."));
+            fields.push((
+                "ws",
+                "Websocket URL(s)",
+                "Optional. One or several, comma-separated. Often a different host than the RPC.",
+            ));
         }
-        fields.push((
-            "discovery_rpc",
-            "Discovery RPC URL",
-            "Optional. For log-heavy scans — new pools, charts. Public endpoints refuse these.",
-        ));
 
         for (field, title, hint) in fields {
             // Esc on any prompt stops the walk rather than skipping to the next

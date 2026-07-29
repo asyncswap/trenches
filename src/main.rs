@@ -9,9 +9,11 @@ mod contracts;
 mod discover;
 mod engine;
 mod events;
+mod facts;
 mod ledger;
 mod pnl;
 mod pricing;
+mod rpc;
 mod rpcstats;
 /// Solana / pump.fun adapter — compiled only with `--features solana`.
 #[cfg(feature = "solana")]
@@ -164,6 +166,31 @@ fn save_last_chain(name: &str) {
     let _ = std::fs::write(last_chain_path(), name);
 }
 
+/// Delete all but the newest KEEP_LOGS of each per-session log family
+/// (`session-*.log`, `evm-trace-*.log`, `sol-trace-*.log`). The timestamps in
+/// the names sort lexically, so "newest" is a sort, not a stat.
+fn prune_session_logs() {
+    const KEEP_LOGS: usize = 20;
+    let Ok(dir) = std::fs::read_dir(state_dir()) else { return };
+    let mut families: std::collections::HashMap<&str, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        for fam in ["session-", "evm-trace-", "sol-trace-"] {
+            if name.starts_with(fam) && name.ends_with(".log") {
+                families.entry(fam).or_default().push(entry.path());
+            }
+        }
+    }
+    for (_, mut paths) in families {
+        paths.sort();
+        for p in paths.iter().rev().skip(KEEP_LOGS) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Append a diagnostic line to this session's trace.
 ///
 /// Separate from the trading log: that records what was traded, this records
@@ -173,7 +200,11 @@ fn save_last_chain(name: &str) {
 pub fn trace(msg: &str) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
-    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    struct Trace {
+        w: std::io::BufWriter<std::fs::File>,
+        last_flush: std::time::Instant,
+    }
+    static FILE: OnceLock<Option<Mutex<Trace>>> = OnceLock::new();
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
     let f = FILE.get_or_init(|| {
@@ -187,12 +218,20 @@ pub fn trace(msg: &str) {
             .append(true)
             .open(format!("{}/evm-trace-{ts}.log", state_dir()))
             .ok()
-            .map(Mutex::new)
+            .map(|f| Mutex::new(Trace { w: std::io::BufWriter::new(f), last_flush: std::time::Instant::now() }))
     });
     if let Some(f) = f {
-        if let Ok(mut f) = f.lock() {
-            let _ = writeln!(f, "{:8.3}  {msg}", start.elapsed().as_secs_f64());
-            let _ = f.flush();
+        if let Ok(mut t) = f.lock() {
+            let _ = writeln!(t.w, "{:8.3}  {msg}", start.elapsed().as_secs_f64());
+            // Flush at most every 250ms. This used to flush on EVERY line,
+            // under a global lock, from the hottest loops in the app — a
+            // synchronous disk write per RPC call, dominating the very
+            // latencies the trace was recording. A quarter-second tail is an
+            // acceptable price; a crash loses at most that much history.
+            if t.last_flush.elapsed().as_millis() >= 250 {
+                t.last_flush = std::time::Instant::now();
+                let _ = t.w.flush();
+            }
         }
     }
 
@@ -430,19 +469,16 @@ async fn refresh_token_decimals<P: Provider>(provider: &P, bot: &mut engine::Bot
     if bot.pool.token == alloy::primitives::Address::ZERO {
         return;
     }
-    match contracts::IERC20::new(bot.pool.token, provider).decimals().call().await {
-        Ok(d) => {
-            let d = d._0;
-            // Sanity-bound it: a nonsense value would corrupt every amount.
-            if (1..=36).contains(&d) {
-                if d != bot.pool.token_decimals {
-                    bot.note(format!("{} uses {d} decimals", bot.pool.sym));
-                }
-                bot.pool.token_decimals = d;
+    match facts::decimals(provider, bot.pool.token).await {
+        Some(d) => {
+            if d != bot.pool.token_decimals {
+                bot.note(format!("{} uses {d} decimals", bot.pool.sym));
             }
+            bot.pool.token_decimals = d;
         }
         // Non-standard tokens may omit decimals(); 18 is the sane default.
-        Err(_) => bot.pool.token_decimals = 18,
+        // Not cached, so a transient read failure is retried next switch.
+        None => bot.pool.token_decimals = 18,
     }
 }
 
@@ -803,6 +839,9 @@ async fn main() -> eyre::Result<()> {
     // the top, so it has answered by the time anything is drawn — and detached,
     // so a slow or absent network delays nothing. It only ever reports.
     update::spawn_check();
+    // Old per-session logs pile up forever otherwise — a state dir was found
+    // in the wild holding 500+ trace files. Keep the newest handful of each.
+    prune_session_logs();
     events::info(
         "Trenches started",
         &[("version", update::full())],
@@ -911,7 +950,7 @@ async fn solana_app(
     let exit = sol::app::run(
         terminal,
         net.rpc_pool(),
-        net.ws.as_deref(),
+        net.ws_pool(),
         signer,
         has_account,
         &reg.rugcheck,
@@ -1374,14 +1413,23 @@ async fn chain_session_on(
         );
     }
     let wallet = EthereumWallet::from(signer);
+    // Every request goes through the balanced transport: rotation across all
+    // configured endpoints (rpc + rpcs + discovery_rpc), 429 cooldowns, and a
+    // micro-cache for the head-block/gas chatter. See src/rpc.rs.
+    let balanced = rpc::Balanced::new(&rpc::urls_for(net))?;
+    rpc::set_shared(&balanced);
     // with_recommended_fillers() adds the gas / nonce / chain-id fillers.
     // Without it the WalletFiller tries to sign a tx that has no nonce/gas/fee
     // set → "missing properties [nonce, gas_limit, max_fee_per_gas]" on send.
+    // Boxed because every `P: Provider` bound in this codebase means
+    // `Provider<BoxTransport>` (the default type parameter).
     let provider = ProviderBuilder::new()
         .with_recommended_fillers()
         .wallet(wallet)
-        .on_builtin(&net.rpc)
-        .await?;
+        .on_client(alloy::rpc::client::RpcClient::new(
+            alloy::transports::Transport::boxed(balanced.clone()),
+            false,
+        ));
 
     // Per-session log in a .bot/ folder (created if missing).
     std::fs::create_dir_all(state_dir())?;
@@ -1397,6 +1445,7 @@ async fn chain_session_on(
         account: account.clone(),
         pool: to_poolcfg(&pool),
         strategy,
+        last_market_trace: None,
         arb_mode: false,
         pool_b: None,
         mkt_b: engine::Market::default(),
@@ -1464,8 +1513,8 @@ async fn chain_session_on(
     // first render — otherwise the wallet shows zero for a day that already
     // has trades in it, and disagrees with the calendar until you make another.
     bot.refresh_day_realized();
-    bot.meta = engine::fetch_token_meta(&provider, bot.pool.token).await; // socials for the start pool
-    bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await; // pool age
+    bot.meta = facts::ensure(&provider, bot.pool.token, None).await.meta; // socials for the start pool (cached)
+    bot.pool_launch_block = facts::launch_block(&provider, bot.pool.token).await; // pool age (cached)
 
     // --- trading dashboard (same terminal), with live option switching ---
     let verified = build_verified(net);
@@ -1619,6 +1668,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // Arb mode: second pool ref + its market snapshot.
     let pool_b_cell: Arc<Mutex<Option<engine::PoolRef>>> = Arc::new(Mutex::new(None));
     let market_b = Arc::new(Mutex::new(engine::Market::default()));
+    // Set while a full-screen modal (discovery, clusters, top tokens) owns the
+    // terminal. The dashboard's numbers are not on screen then, so polling for
+    // them spends the rate budget the modal's own reads need.
+    let poll_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Background polling task — the ONLY continuous RPC. Hard 1.5s timeouts so a
     // slow/broken RPC can never freeze the UI; the render loop keeps running.
@@ -1631,6 +1684,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         let tape = tape.clone();
         let pool_b_cell = pool_b_cell.clone();
         let market_b = market_b.clone();
+        let poll_paused = poll_paused.clone();
         let trader = bot.trader;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(350));
@@ -1646,11 +1700,26 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             // when you trade — and it earned a 429 on the public endpoint, which
             // then delayed the one read that does have to be current.
             let mut poll: u64 = 0;
+            let mut full_pref_token = alloy::primitives::Address::ZERO;
+            let mut had_full = false;
             loop {
                 tick.tick().await;
+                if poll_paused.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let pref = *pool_cell.lock().unwrap();
                 poll += 1;
-                let full = poll % 8 == 1;
+                // Full on schedule — and IMMEDIATELY on a pool switch. Waiting
+                // for the next scheduled full read left the new pool's balance
+                // and supply empty for up to 2.8 seconds after selecting it,
+                // which read as the app being slow rather than the poll being
+                // scheduled.
+                let switched = pref.token != full_pref_token || !had_full;
+                let full = poll % 8 == 1 || switched;
+                if full {
+                    full_pref_token = pref.token;
+                    had_full = true;
+                }
                 match tokio::time::timeout(
                     Duration::from_millis(1500),
                     async {
@@ -2228,8 +2297,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     refresh_token_decimals(provider, bot).await;
                                     *pool_cell.lock().unwrap() = bot.pool.as_ref();
                                     prices.clear();
-                                    bot.meta = engine::fetch_token_meta(provider, bot.pool.token).await;
-                                    bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await;
+                                    bot.meta = facts::ensure(provider, bot.pool.token, None).await.meta;
+                                    bot.pool_launch_block = facts::launch_block(provider, bot.pool.token).await;
                                     bot.status = format!("Now trading {}", pool_sentence(&p.label));
                                     bot.routes = routes_for(&pools, bot.pool.token);
                                 }
@@ -2284,7 +2353,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let ours: std::collections::HashSet<alloy::primitives::TxHash> =
                                 bot.orders.iter().filter_map(|o| o.hash).collect();
                             if let Some((pa, w0)) = v3 {
-                                discover::screen_clusters(terminal, pa, w0, lb, ours).await?;
+                                poll_paused.store(true, Ordering::Relaxed);
+                                let r = discover::screen_clusters(terminal, provider, pa, w0, lb, ours).await;
+                                poll_paused.store(false, Ordering::Relaxed);
+                                r?;
                             } else {
                                 bot.status = "The cluster view supports Uniswap V3 pools only for now".into();
                             }
@@ -2292,6 +2364,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('t') => {
                             // 'f' = live Pons v3 trenches; Shift-'F' = static Verified pools;
                             // 't' = top tokens (leaderboard + big-fish, established tokens).
+                            // Pause the dashboard poll while a modal owns the
+                            // screen — its numbers are invisible, and discovery
+                            // needs the requests more.
+                            poll_paused.store(true, Ordering::Relaxed);
                             let grad = if k.code == KeyCode::Char('F') {
                                 bot.status = "Loading verified tokens".into();
                                 discover::screen_verified(terminal, verified.clone()).await?
@@ -2302,6 +2378,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.status = "scanning Pons graduations…".into();
                                 discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?
                             };
+                            poll_paused.store(false, Ordering::Relaxed);
                             match grad {
                                 Some(g) => {
                                     let quote_sym = match &g.quote {
@@ -2318,6 +2395,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     trace_pool("switch", &bot.pool);
                                     bot.meta = g.meta.clone(); // socials already read during discovery
                                     bot.pool_launch_block = Some(g.launch_block); // for the age display
+                                    // A picked token stays on the discovery list even after it
+                                    // stops being a fresh graduation — so it is still there
+                                    // when you come back from trading it.
+                                    if let engine::PoolKind::V3 { pool_addr, .. } = g.kind {
+                                        discover::remember(g.token, pool_addr, g.launch_block);
+                                    }
                                     bot.bought_qty = 0.0; // reset cost basis — realized is per-token, not cross-token
                                     bot.bought_cost = 0.0;
                                     bot.lp_permit2_done = false;
@@ -2492,8 +2575,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     // Refresh venues AFTER the new pool is in `pools`, so a
                                     // freshly-added pool is itself a routing candidate.
                                     bot.routes = routes_for(&pools, bot.pool.token);
-                                    bot.meta = engine::fetch_token_meta(provider, bot.pool.token).await;
-                                    bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await;
+                                    bot.meta = facts::ensure(provider, bot.pool.token, None).await.meta;
+                                    bot.pool_launch_block = facts::launch_block(provider, bot.pool.token).await;
                                 }
                             }
                         }

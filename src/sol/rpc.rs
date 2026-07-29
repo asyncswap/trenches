@@ -24,8 +24,25 @@ pub struct Rpc {
     urls: Vec<String>,
     /// Rotates per request. Shared across clones so the whole app spreads evenly.
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Unix millis until which each endpoint is benched (429 or broken).
+    /// Shared across clones: one clone learning an endpoint is limited
+    /// spares every other clone the same refusal.
+    cooldown: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
     http: reqwest::Client,
 }
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long a 429 benches an endpoint. Solana public endpoints throttle in
+/// ~10s windows; parsing a reset hint is not possible (there is none).
+const COOLDOWN_LIMITED_MS: u64 = 10_000;
+/// How long a connection error / 5xx benches one — broken is usually brief.
+const COOLDOWN_BROKEN_MS: u64 = 3_000;
 
 impl Rpc {
     pub fn new(url: impl Into<String>) -> Rpc {
@@ -37,10 +54,18 @@ impl Rpc {
     pub fn new_pool(urls: Vec<String>) -> Rpc {
         let urls = if urls.is_empty() { vec![String::new()] } else { urls };
         Rpc {
+            cooldown: std::sync::Arc::new(
+                urls.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            ),
             urls,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Any endpoint in the pool speaks Helius's extended API.
+    fn has_helius(&self) -> bool {
+        self.urls.iter().any(|u| u.contains("helius"))
     }
 
     /// How many endpoints are in rotation.
@@ -68,7 +93,16 @@ impl Rpc {
         // "no trades happened". A brief pause is usually all it takes.
         for pass in 0..2 {
             for hop in 0..self.urls.len() {
-                let url = &self.urls[(start + hop) % self.urls.len()];
+                let i = (start + hop) % self.urls.len();
+                let url = &self.urls[i];
+                // Skip an endpoint that recently answered 429 — asking again
+                // inside its window converts one refusal into a stream of
+                // them. Unless it is the last hope this pass, in which case
+                // trying beats returning nothing.
+                let benched = self.cooldown[i].load(std::sync::atomic::Ordering::Relaxed) > now_ms();
+                if benched && hop + 1 < self.urls.len() {
+                    continue;
+                }
                 // Timed into the same counters the EVM side uses, so the health
                 // light and the RPC rollup read this chain when it is the one
                 // running. Only one chain is live at a time, so one set of
@@ -87,6 +121,15 @@ impl Rpc {
                     if !status.is_success() {
                         if status.as_u16() == 429 {
                             super::trace(&format!("rpc 429 from {}", safe_host(url)));
+                            self.cooldown[i].store(
+                                now_ms() + COOLDOWN_LIMITED_MS,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        } else if status.is_server_error() {
+                            self.cooldown[i].store(
+                                now_ms() + COOLDOWN_BROKEN_MS,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                         eyre::bail!("{method}: http {status}");
                     }
@@ -299,16 +342,23 @@ impl Rpc {
             "accountKeys": keys,
             "options": { "includeAllPriorityFeeLevels": true },
         }]);
-        if let Ok(v) = self.call("getPriorityFeeEstimate", params).await {
-            if let Some(f) = v
-                .get("priorityFeeLevels")
-                .and_then(|l| l.get(level))
-                .and_then(|f| f.as_f64())
-            {
-                // The levels are floats and `unsafeMax` reaches 4.6e10 — cast
-                // through f64 deliberately, and let the caller's cap decide.
-                if f.is_finite() && f >= 0.0 {
-                    return Some(f as u64);
+        // Only ask for the Helius method when a Helius endpoint is in the
+        // pool. Asking everyone anyway meant, every 1.5s poll, two full passes
+        // over endpoints that can only answer "method not found" — plus the
+        // 250ms between-pass sleep — before falling back. Four doomed requests
+        // per poll, forever, out of the same budget the tape needs.
+        if self.has_helius() {
+            if let Ok(v) = self.call("getPriorityFeeEstimate", params).await {
+                if let Some(f) = v
+                    .get("priorityFeeLevels")
+                    .and_then(|l| l.get(level))
+                    .and_then(|f| f.as_f64())
+                {
+                    // The levels are floats and `unsafeMax` reaches 4.6e10 —
+                    // cast through f64 deliberately; the caller's cap decides.
+                    if f.is_finite() && f >= 0.0 {
+                        return Some(f as u64);
+                    }
                 }
             }
         }
@@ -479,24 +529,42 @@ impl Rpc {
     /// successful, `Ok(Some(false))` = landed but failed, `Ok(None)` = still
     /// pending / unknown.
     pub async fn signature_ok(&self, sig: &str) -> eyre::Result<Option<bool>> {
+        Ok(self.signatures_ok(std::slice::from_ref(&sig.to_string())).await?.pop().flatten())
+    }
+
+    /// Statuses for a whole batch of signatures in ONE request — the method
+    /// takes an array natively. Polling per signature was N requests every
+    /// 800ms where one carries them all.
+    ///
+    /// Result is index-aligned with `sigs`: `None` = not landed (yet),
+    /// `Some(true)` = landed clean, `Some(false)` = landed but reverted.
+    pub async fn signatures_ok(&self, sigs: &[String]) -> eyre::Result<Vec<Option<bool>>> {
+        if sigs.is_empty() {
+            return Ok(Vec::new());
+        }
         let res = self
-            .call("getSignatureStatuses", json!([[sig], {"searchTransactionHistory": false}]))
+            .call("getSignatureStatuses", json!([sigs, {"searchTransactionHistory": false}]))
             .await?;
-        let entry = res.get("value").and_then(|v| v.get(0)).cloned().unwrap_or(Value::Null);
-        if entry.is_null() {
-            return Ok(None);
-        }
-        // `confirmationStatus` reaching processed/confirmed/finalized means it
-        // landed; `err` non-null means it landed but reverted.
-        let landed = entry
-            .get("confirmationStatus")
-            .and_then(|c| c.as_str())
-            .map(|s| matches!(s, "processed" | "confirmed" | "finalized"))
-            .unwrap_or(false);
-        if !landed {
-            return Ok(None);
-        }
-        Ok(Some(entry.get("err").map(|e| e.is_null()).unwrap_or(true)))
+        let vals = res.get("value").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        Ok((0..sigs.len())
+            .map(|k| {
+                let entry = vals.get(k).cloned().unwrap_or(Value::Null);
+                if entry.is_null() {
+                    return None;
+                }
+                // `confirmationStatus` reaching processed/confirmed/finalized
+                // means it landed; `err` non-null means it landed but reverted.
+                let landed = entry
+                    .get("confirmationStatus")
+                    .and_then(|c| c.as_str())
+                    .map(|s| matches!(s, "processed" | "confirmed" | "finalized"))
+                    .unwrap_or(false);
+                if !landed {
+                    return None;
+                }
+                Some(entry.get("err").map(|e| e.is_null()).unwrap_or(true))
+            })
+            .collect())
     }
 }
 

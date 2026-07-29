@@ -21,7 +21,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::{SolCall, SolEvent};
 use crossterm::event::{self, Event, KeyCode};
-use futures::stream::StreamExt;
 use ratatui::{prelude::*, widgets::*};
 
 use crate::contracts::{IERC20, IPonsFactory, IV3Factory, IV3Pool, PONS_FACTORY, POOL_MANAGER, STATE_VIEW, V3_FACTORY, WETH};
@@ -129,30 +128,12 @@ fn sort_rows(rows: &mut [Row]) {
     });
 }
 
-/// The trading provider is Alchemy, whose free tier caps `eth_getLogs` at a
-/// 10-block range — far too small for graduation scans (6k blocks, or from
-/// genesis). So EVERY getLogs in discovery goes through the PUBLIC RPC via this
-/// dedicated read-only provider instead. Regular traffic is on Alchemy, so these
-/// occasional wide scans no longer trip the public RPC's rate limit. eth_calls
-/// (symbol/slot0/liquidity/…) still use the passed-in (Alchemy) provider.
+/// The chain's public RPC, kept only as the last-resort URL for the raw batch
+/// caller when no balanced pool is live (tests, odd startup orders). All
+/// routed traffic — including wide `eth_getLogs`, which Alchemy's free tier
+/// caps at 10 blocks — now flows through `src/rpc.rs`, which steers each
+/// request to an endpoint that can answer it.
 const PUBLIC_RPC: &str = "https://rpc.mainnet.chain.robinhood.com/rpc";
-
-async fn logs_provider() -> Option<impl Provider + Send + Sync> {
-    alloy::providers::ProviderBuilder::new().on_builtin(PUBLIC_RPC).await.ok()
-}
-
-/// The Pons graduation (launch) block for one token, via its TokenLaunched
-/// event (topic-filtered, so the result set is tiny). None if not found/erroring.
-pub async fn fetch_launch_block(token: Address) -> Option<u64> {
-    let lp = logs_provider().await?;
-    let filter = Filter::new()
-        .address(PONS_FACTORY)
-        .event_signature(IPonsFactory::TokenLaunched::SIGNATURE_HASH)
-        .topic1(token.into_word())
-        .from_block(0);
-    let logs = tokio::time::timeout(RPC_TIMEOUT, lp.get_logs(&filter)).await.ok()?.ok()?;
-    logs.first().and_then(|l| l.block_number)
-}
 
 /// Fast first pass: just the (token, pool, block) list from TokenLaunched —
 /// one getLogs, no per-token reads, so it returns immediately.
@@ -231,52 +212,29 @@ async fn scan_candidates<P: Provider>(provider: &P, from: u64, to: u64) -> Vec<(
     cands
 }
 
-/// Everything for one pool: symbol, fee, metadata score, and live metrics.
-/// Sequential awaits (temporaries drop cleanly); concurrency is across pools.
-async fn full_row<P: Provider, L: Provider>(
-    provider: &P,
-    logs: &L,
+/// One row from cached facts + batch-read metrics. No RPC of its own: the
+/// facts were fetched once ever, the metrics arrive from the round's single
+/// batched `eth_call`, and the swap count from the round's single tape scan.
+#[allow(clippy::too_many_arguments)]
+fn build_row(
     token: Address,
     pool_addr: Address,
     block: u64,
-    trader: Address,
+    f: &crate::facts::Facts,
+    sqrt: f64,
+    liq: f64,
+    my_bal: f64,
+    swaps_in_window: usize,
     head: u64,
 ) -> Row {
-    let sym = engine::read_symbol(provider, token).await;
-    let fee = IV3Pool::new(pool_addr, provider)
-        .fee()
-        .call()
-        .await
-        .map(|f| uf(f._0) as u32)
-        .unwrap_or(10_000);
-    // on-chain socials/metadata (shared fetcher with the market view)
-    let meta = engine::fetch_token_meta(provider, token).await;
     let grad = Grad {
         token,
         kind: engine::PoolKind::V3 { pool_addr, weth_is_token0: WETH < token },
         quote: engine::Quote::Eth,
-        sym,
-        fee,
+        sym: f.sym.clone(),
+        fee: if f.fee > 0 { f.fee } else { 10_000 },
         launch_block: block,
-        meta,
-    };
-
-    // live metrics
-    let tok = IERC20::new(token, provider);
-    let pool = IV3Pool::new(pool_addr, provider);
-    let from = head.saturating_sub(ACTIVITY_WINDOW);
-    let swaps_filter = Filter::new()
-        .address(pool_addr)
-        .event_signature(SWAP_V3)
-        .from_block(from)
-        .to_block(head);
-    let supply_f = tok.totalSupply().call().await.map(|s| uf(s._0) / 1e18).unwrap_or(0.0);
-    let my_bal = tok.balanceOf(trader).call().await.map(|b| uf(b._0) / 1e18).unwrap_or(0.0);
-    let sqrt = pool.slot0().call().await.map(|s| uf(s.sqrtPriceX96) / 2f64.powi(96)).unwrap_or(0.0);
-    let liq = pool.liquidity().call().await.map(|l| uf(l._0)).unwrap_or(0.0);
-    let n = match tokio::time::timeout(RPC_TIMEOUT, logs.get_logs(&swaps_filter)).await {
-        Ok(Ok(l)) => l.len(),
-        _ => 0,
+        meta: f.meta.clone(),
     };
     // Pooled ETH = ETH virtual reserve of the active liquidity (L/√P) — the SAME
     // measure as the tape/telemetry liq_eth, so Discovery reconciles with them.
@@ -288,9 +246,9 @@ async fn full_row<P: Provider, L: Provider>(
     let p_raw = sqrt * sqrt;
     let tokens_per_eth = if grad.weth0() { p_raw } else if p_raw > 0.0 { 1.0 / p_raw } else { 0.0 };
     let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
-    let mkt_cap_eth = supply_f * eth_per_token;
+    let mkt_cap_eth = f.supply * eth_per_token;
     let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
-    let tx_per_sec = if secs > 0.0 { n as f64 / secs } else { 0.0 };
+    let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
 
     Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, head_block: head, verified: false }
 }
@@ -333,6 +291,8 @@ fn parse_string(d: &[u8]) -> String {
 
 /// Batched `eth_call`: one HTTP request carries up to BATCH_SIZE calls. Results
 /// returned by index (None on error). Hits `url` (the Discovery endpoint).
+/// Outcomes are reported back to the balanced pool (when one is live) so a
+/// rate-limited batch endpoint gets benched exactly like a rotated one.
 async fn batch_call(client: &reqwest::Client, url: &str, calls: &[(Address, Vec<u8>)]) -> Vec<Option<Vec<u8>>> {
     let mut out: Vec<Option<Vec<u8>>> = vec![None; calls.len()];
     let mut i = 0;
@@ -347,21 +307,35 @@ async fn batch_call(client: &reqwest::Client, url: &str, calls: &[(Address, Vec<
                 })
             })
             .collect();
-        if let Ok(resp) = client.post(url).json(&body).send().await {
-            if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
-                for item in arr {
-                    let id = item.get("id").and_then(|v| v.as_u64());
-                    let res = item.get("result").and_then(|v| v.as_str());
-                    if let (Some(id), Some(res)) = (id, res) {
-                        if let Ok(b) = alloy::hex::decode(res.trim_start_matches("0x")) {
-                            if (id as usize) < out.len() { out[id as usize] = Some(b); }
+        let t0 = std::time::Instant::now();
+        match client.post(url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if let Some(b) = crate::rpc::shared() {
+                    b.report_raw(url, status.is_success(), status.as_u16() == 429, t0.elapsed());
+                }
+                if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                    for item in arr {
+                        let id = item.get("id").and_then(|v| v.as_u64());
+                        let res = item.get("result").and_then(|v| v.as_str());
+                        if let (Some(id), Some(res)) = (id, res) {
+                            if let Ok(b) = alloy::hex::decode(res.trim_start_matches("0x")) {
+                                if (id as usize) < out.len() { out[id as usize] = Some(b); }
+                            }
                         }
                     }
                 }
             }
+            Err(_) => {
+                if let Some(b) = crate::rpc::shared() {
+                    b.report_raw(url, false, false, t0.elapsed());
+                }
+            }
         }
         i = end;
-        tokio::time::sleep(Duration::from_millis(200)).await; // spread CU under free-tier limit
+        if end < calls.len() {
+            tokio::time::sleep(Duration::from_millis(200)).await; // spread CU under free-tier limit
+        }
     }
     out
 }
@@ -674,6 +648,13 @@ async fn verified_rows(
     rows
 }
 
+/// The discovery rows, alive for the whole process so leaving the screen and
+/// coming back does not start from nothing.
+fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
+    static CACHE: std::sync::OnceLock<Arc<Mutex<Vec<Row>>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default).clone()
+}
+
 /// Merge fresh rows + big fish (dedup by pool, fresh wins), sort, publish.
 fn merge_publish(shared: &Arc<Mutex<Vec<Row>>>, fresh: &[Row], big: &[Row]) {
     let mut seen = std::collections::HashSet::new();
@@ -745,29 +726,53 @@ pub fn remember(token: Address, pool: Address, block: u64) {
     save_recents(&rows);
 }
 
-/// Background loop: rescan launches, fetch each pool concurrently, and publish
-/// rows into `shared` AS EACH RESOLVES so the UI fills in live. Ends when `stop`.
+/// How many of the older (non-fresh) candidates get their metrics refreshed
+/// per round, round-robin. The newest MAX_SCAN refresh every round; the rest
+/// take turns, so the whole remembered list stays current within ~10s without
+/// costing a full sweep every round.
+const SWEEP_CHUNK: usize = 24;
+/// New tokens whose immutable facts are fetched per round. Facts are 6 calls
+/// each, once ever — the bound only smooths the burst when a fresh install
+/// meets 150 remembered tokens at once.
+const FACTS_PER_ROUND: usize = 4;
+
+/// Background loop: rescan launches, refresh metrics, and publish rows into
+/// `shared`. Ends when `stop`.
+///
+/// A round used to stream `full_row` over every remembered token — 10
+/// sequential RPC calls each, most of them re-reading values that cannot
+/// change, up to 1,500 calls every 1.2 seconds. A round is now:
+///
+///   1. one head-block read (micro-cached in the transport),
+///   2. one incremental `getLogs` for new graduations,
+///   3. one incremental `getLogs` across ALL candidate pools for the swap
+///      tape (tx/sec) — the per-pool scans collapsed into a single query,
+///   4. one batched `eth_call` for slot0/liquidity/balance of the rows that
+///      are due a refresh,
+///   5. immutable facts for tokens seen for the FIRST time (bounded, cached
+///      to disk by src/facts.rs, never asked again).
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     provider: P,
     trader: Address,
     shared: Arc<Mutex<Vec<Row>>>,
     stop: Arc<AtomicBool>,
-    _disc_url: Option<String>,
+    disc_url: Option<String>,
     _eth_usd: f64,
     _verified: Vec<VerifiedPool>,
 ) {
-    // Dedicated public-RPC provider for ALL getLogs in discovery (Alchemy free
-    // tier caps getLogs at 10 blocks). Built once and reused across scans.
-    let logs = match logs_provider().await {
-        Some(l) => l,
-        None => return,
-    };
+    let client = reqwest::Client::new();
     // How far the launch log has been read. Everything below hangs off this:
     // the window is scanned once, and after that only the blocks that are new.
     let mut scanned_to: Option<u64> = None;
     // Seeded from disk, so the screen has something to show the instant it
     // opens rather than an empty table waiting on a scan.
     let mut known: Vec<(Address, Address, u64)> = load_recents();
+    // The rolling swap tape: (block, pool) per swap, across every candidate
+    // pool at once, trimmed to the activity window. Feeds tx/sec.
+    let mut swaps: std::collections::VecDeque<(u64, Address)> = Default::default();
+    let mut swaps_to: Option<u64> = None;
+    // Round-robin cursor over the non-fresh tail of `known`.
+    let mut sweep_at: usize = 0;
 
     while !stop.load(Ordering::Relaxed) {
         // A head read that did not answer is not block zero. It used to fall
@@ -802,7 +807,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             Some(_) => head + 1, // nothing new; scan_candidates returns at once
         };
         if from <= head {
-            for c in scan_candidates(&logs, from, head).await {
+            for c in scan_candidates(&provider, from, head).await {
+                crate::facts::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
                     known.push(c);
                 }
@@ -816,26 +822,118 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known.sort_by(|a, b| b.2.cmp(&a.2));
         known.truncate(RECENTS_MAX);
         save_recents(&known);
-        let cands = known.clone();
 
-        // Rows survive between rounds, keyed by token, and keep their place.
-        //
-        // Every arriving row used to re-sort and republish the entire list, so
-        // the table reshuffled under the cursor as results trickled in — and
-        // each round started from an empty accumulator, so everything already
-        // on screen was thrown away and rebuilt. What you had selected moved,
-        // or briefly stopped existing.
-        //
-        // Now a resolved row replaces its previous self in place, and the
-        // ranking is applied once the round is done rather than on every
-        // arrival.
-        let mut stream = futures::stream::iter(cands)
-            .map(|(t, p, b)| full_row(&provider, &logs, t, p, b, trader, head))
-            .buffer_unordered(CONCURRENCY);
-        while let Some(row) = stream.next().await {
+        // The swap tape, incrementally: one getLogs over every candidate pool
+        // at once. This replaces a per-pool history scan that asked the same
+        // blocks about the same pools every round.
+        let pools: Vec<Address> = known.iter().map(|(_, p, _)| *p).collect();
+        let cutoff = head.saturating_sub(ACTIVITY_WINDOW);
+        let sfrom = match swaps_to {
+            None => cutoff,
+            Some(t) => (t + 1).max(cutoff),
+        };
+        if !pools.is_empty() && sfrom <= head {
+            let filter = Filter::new()
+                .address(pools)
+                .event_signature(SWAP_V3)
+                .from_block(sfrom)
+                .to_block(head);
+            match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await {
+                Ok(Ok(lgs)) => {
+                    for l in lgs {
+                        if let Some(b) = l.block_number {
+                            swaps.push_back((b, l.address()));
+                        }
+                    }
+                    swaps_to = Some(head);
+                }
+                Ok(Err(e)) => crate::trace(&format!("discovery: swap tape failed: {e}")),
+                Err(_) => crate::trace("discovery: swap tape timed out"),
+            }
+        }
+        while swaps.front().is_some_and(|(b, _)| *b < cutoff) {
+            swaps.pop_front();
+        }
+
+        // Immutable facts for tokens met for the first time — once, ever.
+        let mut fetched = 0usize;
+        for (t, p, _) in known.iter() {
+            if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let have = crate::facts::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0);
+            if !have {
+                crate::facts::ensure(&provider, *t, Some(*p)).await;
+                fetched += 1;
+            }
+        }
+
+        // Who is due a metrics refresh: every fresh candidate, plus the next
+        // round-robin slice of the older tail.
+        let fresh: Vec<(Address, Address, u64)> = known.iter().take(MAX_SCAN).cloned().collect();
+        let tail: Vec<(Address, Address, u64)> = known.iter().skip(MAX_SCAN).cloned().collect();
+        let mut due = fresh;
+        if !tail.is_empty() {
+            for k in 0..SWEEP_CHUNK.min(tail.len()) {
+                due.push(tail[(sweep_at + k) % tail.len()]);
+            }
+            sweep_at = (sweep_at + SWEEP_CHUNK) % tail.len();
+        }
+        // Skip rows whose facts have not arrived yet — a row with no symbol
+        // and no supply renders as garbage and re-sorts to nowhere.
+        due.retain(|(t, _, _)| {
+            crate::facts::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
+        });
+
+        // One batched eth_call for the whole refresh set: slot0 + liquidity
+        // per pool, plus my balance per token when an account is loaded.
+        use alloy::sol_types::SolCall;
+        let with_bal = trader != Address::ZERO;
+        let per = if with_bal { 3 } else { 2 };
+        let mut calls: Vec<(Address, Vec<u8>)> = Vec::with_capacity(due.len() * per);
+        for (t, p, _) in &due {
+            calls.push((*p, IV3Pool::slot0Call {}.abi_encode()));
+            calls.push((*p, IV3Pool::liquidityCall {}.abi_encode()));
+            if with_bal {
+                calls.push((*t, IERC20::balanceOfCall { owner: trader }.abi_encode()));
+            }
+        }
+        let url = crate::rpc::shared()
+            .map(|b| b.pick_url(false))
+            .or_else(|| disc_url.clone().filter(|u| !u.trim().is_empty() && !u.contains("YOUR_")))
+            .unwrap_or_else(|| PUBLIC_RPC.to_string());
+        let res = batch_call(&client, &url, &calls).await;
+
+        let mut swap_count: std::collections::HashMap<Address, usize> = Default::default();
+        for (_, p) in &swaps {
+            *swap_count.entry(*p).or_default() += 1;
+        }
+        // Rows survive between rounds, keyed by token, and keep their place:
+        // a refreshed row replaces its previous self, everything else stays
+        // untouched, and the ranking is applied once per round.
+        for (i, (t, p, b)) in due.iter().enumerate() {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
+            let sqrt = res
+                .get(i * per)
+                .and_then(|o| o.as_ref())
+                .map(|d| uf(u256_of(d)) / 2f64.powi(96))
+                .unwrap_or(0.0);
+            let liq = res.get(i * per + 1).and_then(|o| o.as_ref()).map(|d| uf(u256_of(d))).unwrap_or(0.0);
+            let my_bal = if with_bal {
+                res.get(i * per + 2).and_then(|o| o.as_ref()).map(|d| uf(u256_of(d)) / 1e18).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            // A batch that failed outright answers None for everything; keep
+            // the previous row rather than publishing zeros over it.
+            if sqrt <= 0.0 && liq <= 0.0 {
+                continue;
+            }
+            let Some(f) = crate::facts::get(*t) else { continue };
+            let n = swap_count.get(p).copied().unwrap_or(0);
+            let row = build_row(*t, *p, *b, &f, sqrt, liq, my_bal, n, head);
             let mut cur = shared.lock().unwrap();
             match cur.iter_mut().find(|r| r.grad.token == row.grad.token) {
                 Some(slot) => *slot = row, // refresh, same position
@@ -866,7 +964,12 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // Clearing also marks every placement stale, so the dashboard redraws its
     // logo when we return — no screen has to know about any other.
     crate::ui::image::clear();
-    let shared: Arc<Mutex<Vec<Row>>> = Arc::new(Mutex::new(Vec::new()));
+    // The rows live in a process-wide cache, NOT on this screen's stack frame.
+    // They used to die with the screen: leave to trade the coin you found,
+    // come back, and everything you had discovered was gone until it was
+    // re-fetched from scratch. Now returning shows the last list instantly
+    // and the background task refreshes it in place.
+    let shared: Arc<Mutex<Vec<Row>>> = rows_cache();
     let stop = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(run_discovery(
         provider.clone(),
@@ -1023,7 +1126,10 @@ fn i256_to_f64(d: &[u8]) -> f64 {
 }
 
 /// Recent v3 Swaps on a pool → (secs since `from`, ETH size, buyer, is_buy).
-async fn pool_swaps<L: Provider>(logs: &L, pool: Address, weth0: bool, from: u64, head: u64) -> Vec<(f64, f64, Address, bool, B256)> {
+/// Swaps for one pool in [from, head]. `base` anchors the time axis (seconds
+/// since THAT block), so incremental fetches line up with earlier ones —
+/// `from` moves forward each round, the anchor must not.
+async fn pool_swaps<L: Provider>(logs: &L, pool: Address, weth0: bool, from: u64, head: u64, base: u64) -> Vec<(f64, f64, Address, bool, B256)> {
     let filter = Filter::new().address(pool).event_signature(SWAP_V3).from_block(from).to_block(head);
     let lg = match tokio::time::timeout(RPC_TIMEOUT, logs.get_logs(&filter)).await {
         Ok(Ok(l)) => l,
@@ -1044,7 +1150,7 @@ async fn pool_swaps<L: Provider>(logs: &L, pool: Address, weth0: bool, from: u64
         let weth_amt = if weth0 { i256_to_f64(&d[0..32]) } else { i256_to_f64(&d[32..64]) };
         let is_buy = weth_amt > 0.0; // WETH INTO the pool = a buy
         let eth = weth_amt.abs() / 1e18;
-        let secs = l.block_number.unwrap_or(from).saturating_sub(from) as f64 * SECS_PER_BLOCK;
+        let secs = l.block_number.unwrap_or(base).saturating_sub(base) as f64 * SECS_PER_BLOCK;
         out.push((secs, eth, recipient, is_buy, l.transaction_hash.unwrap_or_default()));
     }
     out
@@ -1087,19 +1193,22 @@ fn ring(x: f64, y: f64, size_frac: f64, cx: f64, cy: f64, out: &mut Vec<(f64, f6
 /// (seconds-since-launch × ETH size). Green = buys, red = sells. A tight early
 /// clump of same-size green dots = a coordinated swarm; a spread = organic.
 /// Refreshes ~every 0.6s. Esc to exit. Self-contained — never touches the loop.
-pub async fn screen_clusters(term: &mut Term, pool: Address, weth0: bool, launch_block: Option<u64>, ours: std::collections::HashSet<B256>) -> eyre::Result<()> {
+pub async fn screen_clusters<P: Provider>(term: &mut Term, provider: &P, pool: Address, weth0: bool, launch_block: Option<u64>, ours: std::collections::HashSet<B256>) -> eyre::Result<()> {
     // This screen owns the terminal now: take down any image the last one left.
     // Clearing also marks every placement stale, so the dashboard redraws its
     // logo when we return — no screen has to know about any other.
     crate::ui::image::clear();
-    let logs = match logs_provider().await {
-        Some(l) => l,
-        None => return Ok(()),
-    };
+    // Incremental: the full history is fetched ONCE, then each refresh asks
+    // only for the blocks mined since. This used to re-read everything from
+    // the launch block every 0.6s — on an hour-old pool, a growing full-history
+    // getLogs per frame, forever.
+    let mut acc: Vec<(f64, f64, Address, bool, B256)> = Vec::new();
+    let mut base: Option<u64> = None;
+    let mut scanned: Option<u64> = None;
     loop {
         // Same here: without a head there is no window to ask about, and
         // asking anyway costs a request that buys nothing.
-        let head = match tokio::time::timeout(RPC_TIMEOUT, logs.get_block_number()).await {
+        let head = match tokio::time::timeout(RPC_TIMEOUT, provider.get_block_number()).await {
             Ok(Ok(h)) if h > 0 => h,
             _ => {
                 crate::trace("chart: no head block, skipping this round");
@@ -1107,8 +1216,13 @@ pub async fn screen_clusters(term: &mut Term, pool: Address, weth0: bool, launch
                 continue;
             }
         };
-        let from = launch_block.unwrap_or_else(|| head.saturating_sub(3_000));
-        let swaps = pool_swaps(&logs, pool, weth0, from, head).await;
+        let anchor = *base.get_or_insert_with(|| launch_block.unwrap_or_else(|| head.saturating_sub(3_000)));
+        let from = scanned.map(|t| t + 1).unwrap_or(anchor);
+        if from <= head {
+            acc.extend(pool_swaps(provider, pool, weth0, from, head, anchor).await);
+            scanned = Some(head);
+        }
+        let swaps = &acc;
         // Split into market vs OURS (tx hash matches an order) × buy vs sell.
         // Log y: sizes run from a ten-thousandth of an ETH to several ETH, so a
         // linear axis puts almost every trade on the bottom row.
@@ -1116,7 +1230,7 @@ pub async fn screen_clusters(term: &mut Term, pool: Address, weth0: bool, launch
         // trade seen would shift the whole axis the moment a smaller one lands.
         let y_floor = 1e-4;
         let (mut mbuy, mut msell, mut obuy, mut osell) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for s in &swaps {
+        for s in swaps.iter() {
             let pt = (s.0, view::log_scale(s.1, y_floor));
             match (ours.contains(&s.4), s.3) {
                 (false, true) => mbuy.push(pt),
@@ -1499,7 +1613,14 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
     crate::ui::image::clear();
     draw_status(term, "\nLoading top tokens…\n\nEsc to go back")?;
     let client = reqwest::Client::new();
-    let url = disc_url.unwrap_or_else(|| PUBLIC_RPC.to_string());
+    // A configured-but-empty discovery_rpc used to win over the fallback here:
+    // `Some("")` is not `None`, so the batch POSTed to "" and every row's
+    // pooled depth silently read as zero — which emptied the whole screen.
+    // Prefer the balanced pool's pick; it already knows what is healthy.
+    let url = crate::rpc::shared()
+        .map(|b| b.pick_url(false))
+        .or_else(|| disc_url.filter(|u| !u.trim().is_empty() && !u.contains("YOUR_")))
+        .unwrap_or_else(|| PUBLIC_RPC.to_string());
     let mut leader = blockscout_top(&client).await;
     enrich_pooled(&client, &url, &mut leader).await; // fill pooled ETH depth
 

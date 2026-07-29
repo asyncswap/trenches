@@ -32,7 +32,10 @@ solana = [
 ]
 
 [dependencies]
-alloy = { version = "0.8", features = ["full", "node-bindings", "signer-keystore", "signer-mnemonic"] }
+# `json-rpc` + `rpc-client` expose the packet/client types the balanced
+# transport (src/rpc.rs) is built from; they are already compiled as part of
+# the provider stack, the features only un-gate the re-exports.
+alloy = { version = "0.8", features = ["full", "node-bindings", "signer-keystore", "signer-mnemonic", "json-rpc", "rpc-client"] }
 tokio = { version = "1", features = ["full"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -41,6 +44,10 @@ eyre = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Already in the tree via alloy's transports. Named directly because the
+# balanced RPC transport (src/rpc.rs) implements tower::Service so alloy will
+# accept it as a drop-in transport.
+tower = "0.5"
 # Already in the tree via alloy — reused for Solana key derivation (BIP39 seed +
 # SLIP-0010 ed25519) and base58, so they cost no extra build time.
 bs58 = "0.5"

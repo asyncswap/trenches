@@ -26,6 +26,12 @@ static MICROS: AtomicU64 = AtomicU64::new(0);
 static SLOWEST: AtomicU64 = AtomicU64::new(0);
 /// Unix seconds of the last rollup. Zero until the first call.
 static SINCE: AtomicU64 = AtomicU64::new(0);
+/// Unix seconds of the most recent success / failure, for `health()`. The
+/// counters above reset only at the rollup, which made the health light
+/// sticky: one failure kept it amber for up to the whole window, no matter
+/// how many clean answers followed.
+static LAST_OK: AtomicU64 = AtomicU64::new(0);
+static LAST_FAIL: AtomicU64 = AtomicU64::new(0);
 
 /// How often the rollup is written.
 const WINDOW_SECS: u64 = 30;
@@ -49,11 +55,13 @@ pub fn record(label: &str, ok: bool, elapsed: std::time::Duration, err: Option<&
 
     if ok {
         OK.fetch_add(1, Ordering::Relaxed);
+        LAST_OK.store(now(), Ordering::Relaxed);
         crate::trace(&format!("rpc: {label} ok in {:.1}ms", micros as f64 / 1000.0));
         return;
     }
 
     FAILED.fetch_add(1, Ordering::Relaxed);
+    LAST_FAIL.store(now(), Ordering::Relaxed);
     let msg = err.unwrap_or("no reason given");
     // A rate limit is a different problem from a broken endpoint: one wants
     // patience or a paid key, the other wants a different URL. Counting them
@@ -126,19 +134,24 @@ pub enum Health {
     Down,
 }
 
-/// Read the counters without clearing them. Cheap enough to call per frame.
+/// What the last RECENT_SECS of traffic looked like. Cheap; call per frame.
+///
+/// Time-windowed rather than counter-based: the counters reset only at the
+/// 30s rollup, so a single failure pinned the light amber for the rest of the
+/// window even while every call succeeded — and on screens that never ran the
+/// rollup, forever.
+const RECENT_SECS: u64 = 10;
+
 pub fn health() -> Health {
-    let ok = OK.load(Ordering::Relaxed);
-    let failed = FAILED.load(Ordering::Relaxed);
+    let t = now();
+    let ok_recent = t.saturating_sub(LAST_OK.load(Ordering::Relaxed)) <= RECENT_SECS;
+    let fail_recent = t.saturating_sub(LAST_FAIL.load(Ordering::Relaxed)) <= RECENT_SECS;
     // Nothing attempted yet is not a fault. A screen that opens red before it
     // has asked anything teaches you to distrust the light.
-    if failed == 0 {
-        return Health::Ok;
-    }
-    if ok == 0 {
-        Health::Down
-    } else {
-        Health::Degraded
+    match (ok_recent, fail_recent) {
+        (_, false) => Health::Ok,
+        (true, true) => Health::Degraded,
+        (false, true) => Health::Down,
     }
 }
 

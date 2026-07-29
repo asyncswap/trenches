@@ -92,13 +92,26 @@ impl Report {
 /// Reports change slowly (creator history, LP locks) but the trenches re-render
 /// several times a second, so results are cached per mint. Without that the free
 /// tier would be exhausted in seconds.
+/// One cache slot: a real report, or the time a fetch last failed. Failures
+/// are remembered too — without that, a mint whose report kept erroring was
+/// re-fetched on every UI pass forever, and being always "the first uncached
+/// row" it also blocked every other mint's report from ever being warmed.
+#[derive(Clone)]
+enum Slot {
+    Report(Report),
+    FailedAt(std::time::Instant),
+}
+
+/// How long a failed fetch is believed before it is worth retrying.
+const RETRY_FAILED: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct RugCheck {
     base_url: String,
     key: Option<String>,
     enabled: bool,
     http: reqwest::Client,
-    cache: Arc<Mutex<HashMap<String, Report>>>,
+    cache: Arc<Mutex<HashMap<String, Slot>>>,
 }
 
 impl RugCheck {
@@ -115,7 +128,32 @@ impl RugCheck {
 
     /// A cached report, or `None` if unknown/disabled. Never fetches.
     pub fn cached(&self, mint: &str) -> Option<Report> {
-        self.cache.lock().ok()?.get(mint).cloned()
+        match self.cache.lock().ok()?.get(mint)? {
+            Slot::Report(r) => Some(r.clone()),
+            Slot::FailedAt(_) => None,
+        }
+    }
+
+    /// True when asking again right now would not help: a report is cached, or
+    /// a fetch failed recently. The warm loop uses this to move on to the next
+    /// mint instead of retrying the same broken one every pass.
+    pub fn known(&self, mint: &str) -> bool {
+        let Ok(c) = self.cache.lock() else { return false };
+        match c.get(mint) {
+            Some(Slot::Report(_)) => true,
+            Some(Slot::FailedAt(at)) => at.elapsed() < RETRY_FAILED,
+            None => false,
+        }
+    }
+
+    fn remember(&self, mint: &str, slot: Slot) {
+        if let Ok(mut c) = self.cache.lock() {
+            // Bound the cache — the trenches stream new mints indefinitely.
+            if c.len() > 500 {
+                c.clear();
+            }
+            c.insert(mint.to_string(), slot);
+        }
     }
 
     /// Fetch (or return cached) a report for `mint`.
@@ -126,29 +164,33 @@ impl RugCheck {
         if !self.enabled {
             return None;
         }
-        if let Some(hit) = self.cached(mint) {
-            return Some(hit);
+        if self.known(mint) {
+            return self.cached(mint);
         }
-        let mut url = format!("{}/v1/tokens/{mint}/report/summary", self.base_url);
-        if let Some(k) = &self.key {
-            url.push_str(&format!("?key={k}"));
-        }
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(6), self.http.get(&url).send())
-            .await
-            .ok()?
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let report: Report = resp.json().await.ok()?;
-        if let Ok(mut c) = self.cache.lock() {
-            // Bound the cache — the trenches stream new mints indefinitely.
-            if c.len() > 500 {
-                c.clear();
+        let fetch = async {
+            let mut url = format!("{}/v1/tokens/{mint}/report/summary", self.base_url);
+            if let Some(k) = &self.key {
+                url.push_str(&format!("?key={k}"));
             }
-            c.insert(mint.to_string(), report.clone());
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(6), self.http.get(&url).send())
+                .await
+                .ok()?
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json::<Report>().await.ok()
+        };
+        match fetch.await {
+            Some(report) => {
+                self.remember(mint, Slot::Report(report.clone()));
+                Some(report)
+            }
+            None => {
+                self.remember(mint, Slot::FailedAt(std::time::Instant::now()));
+                None
+            }
         }
-        Some(report)
     }
 }
 

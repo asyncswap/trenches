@@ -80,6 +80,23 @@ impl ChainKind {
     }
 }
 
+/// `"url"`, `["url", …]`, or absent — all become a `Vec`. One endpoint is a
+/// string, several are a list, and no second field name is needed to grow
+/// from one to many. Old configs (string) and new ones (list) both parse.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(s)) => vec![s],
+        Some(OneOrMany::Many(v)) => v,
+    })
+}
+
 #[derive(Default, Debug, Deserialize, Clone)]
 pub struct Network {
     pub name: String,
@@ -90,19 +107,26 @@ pub struct Network {
     /// Chain family — `"evm"` (default) or `"solana"`.
     #[serde(default)]
     pub kind: ChainKind,
-    pub rpc: String,
-    /// Extra RPC endpoints. Requests round-robin across `rpc` + these, with
-    /// failover, so no single provider's rate limit caps throughput.
+    /// RPC endpoint(s): one URL as a string, or several as a list, first is
+    /// primary. Requests rotate across all of them with failover, and the
+    /// transport steers each request to an endpoint that can answer it — so
+    /// one field covers what used to be `rpc` + `rpcs` + `discovery_rpc`.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub rpc: Vec<String>,
+    /// LEGACY — extra RPC endpoints from older configs. Still read, merged
+    /// into the pool by `rpc_pool()`. New configs put a list in `rpc`.
     #[serde(default)]
     pub rpcs: Vec<String>,
-    /// WebSocket endpoint. Solana providers often host WS on a DIFFERENT domain
-    /// (e.g. `wss://ws.us.fluxrpc.com` for `https://us.fluxrpc.com`), so it can't
-    /// reliably be derived from `rpc` — set it explicitly when they differ.
-    #[serde(default)]
-    pub ws: Option<String>,
-    /// Optional separate endpoint for Discovery's batched pool-metric reads, kept
-    /// off the trading `rpc` so a graduation scan never starves the trade loop.
-    /// Best a batch-capable provider (e.g. Alchemy). Falls back to `rpc` if unset.
+    /// WebSocket endpoint(s): a string or a list, same union as `rpc`. The
+    /// launch feed rotates across them on a drop or error. Providers often
+    /// host WS on a DIFFERENT domain (e.g. `wss://ws.us.fluxrpc.com` for
+    /// `https://us.fluxrpc.com`), so it can't be derived from `rpc` alone.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub ws: Vec<String>,
+    /// LEGACY — the old separate discovery endpoint. Still read, merged into
+    /// the pool by `rpc_pool()`; the balanced transport now decides per
+    /// request which endpoint serves a log-heavy scan, so the distinction
+    /// no longer needs to live in the config.
     #[serde(default)]
     pub discovery_rpc: Option<String>,
     /// Hand-curated "verified" pools (e.g. Robinhood stock tokens). Resolved ONCE
@@ -258,6 +282,53 @@ pub fn mark_onboarded() {
 }
 
 #[cfg(test)]
+mod endpoint_union_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_and_ws_accept_a_string_or_a_list() {
+        let one: Network =
+            serde_json::from_str(r#"{"name":"x","rpc":"https://a/rpc","ws":"wss://w"}"#).unwrap();
+        assert_eq!(one.rpc, vec!["https://a/rpc"]);
+        assert_eq!(one.ws, vec!["wss://w"]);
+
+        let many: Network = serde_json::from_str(
+            r#"{"name":"x","rpc":["https://a/rpc","https://b/rpc"],"ws":["wss://w1","wss://w2"]}"#,
+        )
+        .unwrap();
+        assert_eq!(many.rpc.len(), 2);
+        assert_eq!(many.ws_pool(), vec!["wss://w1", "wss://w2"]);
+    }
+
+    #[test]
+    fn a_previous_versions_config_still_forms_the_same_pool() {
+        // The exact shape older releases wrote: string rpc, extras in `rpcs`,
+        // the Alchemy key parked in `discovery_rpc`. All of it must land in
+        // one pool, primary first, nothing lost.
+        let old: Network = serde_json::from_str(
+            r#"{"name":"robinhood-mainnet","rpc":"https://public/rpc",
+                "rpcs":["https://extra/rpc"],
+                "discovery_rpc":"https://alchemy/v2/realkey"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.rpc_pool(),
+            vec!["https://public/rpc", "https://extra/rpc", "https://alchemy/v2/realkey"]
+        );
+    }
+
+    #[test]
+    fn the_starter_config_parses_and_pools_cleanly() {
+        let reg: Registry = serde_json::from_str(&starter_json()).unwrap();
+        for net in &reg.networks {
+            let pool = net.rpc_pool();
+            assert!(!pool.is_empty(), "{} has no usable endpoint", net.name);
+            assert!(pool.iter().all(|u| !u.contains("YOUR_")), "placeholder leaked into {}", net.name);
+        }
+    }
+}
+
+#[cfg(test)]
 mod onboarding_tests {
     /// The rule the marker encodes, without touching the real state directory.
     fn read_docs_for(marker: Option<&str>, running: &str) -> bool {
@@ -396,18 +467,20 @@ pub fn starter_json() -> String {
             "",
             "chain_id       EVM only. Solana has no equivalent, so the field is simply absent",
             "               there — networks are identified by name.",
-            "rpc            The endpoint the app trades through. The defaults are public and",
-            "               rate-limited; for anything serious put your own key-bearing URL here.",
-            "discovery_rpc  Optional. Used for log-heavy scans (new pools, buyer charts). Public",
-            "               endpoints usually refuse these, so discovery stays quiet without one.",
+            "rpc            One URL, or a LIST of URLs — requests rotate across all of them,",
+            "               with failover, and a rate-limited endpoint is rested while the",
+            "               others carry on. The defaults are public and rate-limited; for",
+            "               anything serious add your own key-bearing URL to the list.",
             "               Alchemy, Helius, QuickNode and Ankr all work.",
-            "ws             Websocket, Solana only. Often a different host than the RPC.",
+            "ws             Websocket, Solana only. Also one URL or a list. Often a different",
+            "               host than the RPC, which is why it is not derived.",
             "accounts       Added from inside the app — press W. Nothing to write by hand.",
             "",
             "The *_example keys are placeholders showing each provider's URL shape. Copy one",
-            "over the real field (rpc / ws / discovery_rpc), paste your key, and delete the",
-            "example — the app ignores any field it does not recognise, so they cost nothing",
-            "if you leave them.",
+            "into the real field (rpc / ws), paste your key, and delete the example — the",
+            "app ignores any field it does not recognise, so they cost nothing if you",
+            "leave them. Older configs with `rpcs` / `discovery_rpc` still work: those",
+            "fields are read and merged into the same pool.",
             "",
             "This file holds API keys. It is yours, it stays on this machine, and nothing here",
             "is sent anywhere except the endpoints you name. Never put a seed phrase in it: the",
@@ -420,11 +493,10 @@ pub fn starter_json() -> String {
                 "name": "robinhood-mainnet",
                 "kind": "evm",
                 "chain_id": 4663,
-                "rpc": "https://rpc.mainnet.chain.robinhood.com/rpc",
-                // Log-heavy scans only — new pools, buyer charts. The public
-                // endpoint refuses these, so discovery stays quiet until set.
-                "discovery_rpc": "",
-                "discovery_rpc_alchemy_example": "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+                // One URL or a list. Add a keyed endpoint (shape below) next
+                // to the public one and requests spread across both.
+                "rpc": ["https://rpc.mainnet.chain.robinhood.com/rpc"],
+                "rpc_alchemy_example": "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
                 "tokens": [],
                 "public_pools": []
             },
@@ -435,16 +507,16 @@ pub fn starter_json() -> String {
                 // rather than wonder whether a line went missing.
                 "chain_id": null,
                 "kind": "solana",
-                // The public endpoint works and is slow. Swap the whole URL for
-                // a keyed one — the placeholders below are the shape each
-                // provider expects, so a key can be dropped straight in.
-                "rpc": "https://api.mainnet-beta.solana.com",
+                // One URL or a list; the public endpoint works and is slow.
+                // Add a keyed one (shape below) and requests spread across
+                // both, resting whichever is rate limited.
+                "rpc": ["https://api.mainnet-beta.solana.com"],
                 "rpc_helius_example": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
-                // Websocket. Providers usually serve it on a different host than
+                // Websocket, one URL or a list — the launch feed rotates on a
+                // drop. Providers usually serve WS on a different host than
                 // HTTP, which is why it is a separate field rather than derived.
-                "ws": "",
+                "ws": [],
                 "ws_flux_example": "wss://ws.us.fluxrpc.com?key=YOUR_FLUX_KEY",
-                "discovery_rpc": "",
                 "tokens": [],
                 "public_pools": []
             }
@@ -473,10 +545,7 @@ pub fn dev_networks() -> Vec<Network> {
         name: name.to_string(),
         chain_id,
         kind: ChainKind::Evm,
-        rpc: rpc.to_string(),
-        rpcs: Vec::new(),
-        ws: None,
-        discovery_rpc: None,
+        rpc: vec![rpc.to_string()],
         ..Default::default()
     };
     vec![
@@ -523,7 +592,17 @@ pub fn set_network_field(network: &str, field: &str, value: &str) -> eyre::Resul
     if value.trim().is_empty() {
         obj.remove(field);
     } else {
-        obj.insert(field.to_string(), serde_json::Value::String(value.trim().to_string()));
+        // Several URLs separated by commas become a list; one stays a string.
+        // Both parse — `rpc` and `ws` accept either shape.
+        let parts: Vec<&str> = value.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let v = if parts.len() > 1 {
+            serde_json::Value::Array(
+                parts.into_iter().map(|s| serde_json::Value::String(s.to_string())).collect(),
+            )
+        } else {
+            serde_json::Value::String(value.trim().to_string())
+        };
+        obj.insert(field.to_string(), v);
     }
 
     if let Some(dir) = path.parent() {
@@ -592,13 +671,33 @@ impl Registry {
     }
 }
 
+/// Drop blanks, unfilled placeholders (`YOUR_…`), and duplicates — a config
+/// value that was never filled in must be skipped, not dialed.
+fn clean_urls(mut v: Vec<String>, scheme: &str) -> Vec<String> {
+    v.retain(|u| {
+        let u = u.trim();
+        !u.is_empty() && !u.contains("YOUR_") && u.starts_with(scheme)
+    });
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|u| seen.insert(u.clone()));
+    v
+}
+
 impl Network {
-    /// Every RPC endpoint for this network, primary first.
+    /// Every RPC endpoint for this network, primary first — the `rpc` union
+    /// plus the legacy `rpcs` and `discovery_rpc` fields, cleaned and deduped.
+    /// One pool: the transport decides per request who answers.
     pub fn rpc_pool(&self) -> Vec<String> {
-        let mut v = vec![self.rpc.clone()];
+        let mut v = self.rpc.clone();
         v.extend(self.rpcs.iter().cloned());
-        v.retain(|u| !u.trim().is_empty());
-        v
+        v.extend(self.discovery_rpc.iter().cloned());
+        clean_urls(v, "http")
+    }
+
+    /// Every configured WebSocket endpoint, primary first, cleaned the same
+    /// way as the HTTP pool.
+    pub fn ws_pool(&self) -> Vec<String> {
+        clean_urls(self.ws.clone(), "ws")
     }
 }
 

@@ -57,29 +57,34 @@ went.
 
 Open `~/.config/trenches/config.json` in any editor. Two fields matter.
 
-**`rpc`** — the endpoint every trade goes through. This is the one that decides
-how fast you are. The defaults are public and rate limited; under real load they
-will refuse you.
+**`rpc`** — where every request goes. One URL as a string, or several as a
+list; either shape parses. All of them form one pool: requests go to whichever
+answers fastest, a rate-limited endpoint is rested for exactly as long as its
+reply says the window needs to reset, and wide log scans are steered to
+endpoints that allow them (Alchemy's free tier caps `eth_getLogs` at 10
+blocks, so those scans go elsewhere automatically).
 
 ```json
 {
-  "name": "solana-mainnet",
-  "chain_id": 900,
-  "rpc": "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY",
-  "ws": "wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+  "name": "robinhood-mainnet",
+  "chain_id": 4663,
+  "rpc": [
+    "https://rpc.mainnet.chain.robinhood.com/rpc",
+    "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  ]
 }
 ```
 
-**`discovery_rpc`** — a separate endpoint for log-heavy scans: new pools, buyer
-charts, leaderboards. These ask for logs across wide block ranges, which public
-endpoints almost always refuse, so discovery stays quiet until you set one.
+Alchemy, Helius, QuickNode and Ankr all work. One paid endpoint in the list is
+the single biggest speed upgrade: the public default's per-minute quota is the
+thing that makes discovery stall.
 
-```json
-"discovery_rpc": "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY"
-```
+**`ws`** — websocket, Solana only, for the live launch feed. Also a string or
+a list; the feed rotates to the next on a drop. Providers often serve WS on a
+different host than HTTP, which is why it is its own field.
 
-Alchemy, Helius, QuickNode and Ankr all work. Worth keeping separate: a scan that
-gets rate limited should never be able to slow down a trade.
+Older configs with `rpcs` and `discovery_rpc` still work — those fields are
+read and merged into the same pool, so there is nothing to migrate by hand.
 
 **`rugcheck.api_key`** — optional. Token risk scoring works without one; the key
 only raises the rate limit.
@@ -166,14 +171,14 @@ a different host than HTTP:
 {
   "name": "solana-mainnet",
   "chain_id": 900,
-  "rpc": "https://your-endpoint/?api-key=…",
-  "rpcs": ["https://a-second-endpoint/?api-key=…"],
-  "ws": "wss://your-endpoint/?api-key=…"
+  "rpc": ["https://your-endpoint/?api-key=…", "https://a-second-endpoint/?api-key=…"],
+  "ws": ["wss://your-endpoint/?api-key=…", "wss://a-second-ws/?api-key=…"]
 }
 ```
 
-`rpcs` is optional — requests fail over across `rpc` plus that list, so one
-provider's rate limit does not cap you.
+Both fields take one URL or a list — requests rotate across the whole `rpc`
+pool, and the launch feed hops to the next `ws` entry when a socket drops, so
+one provider's rate limit or outage does not cap you.
 
 The name drives the label: `robinhood-mainnet` shows as **Robinhood Chain**, and
 anything not `-mainnet` is suffixed, so `robinhood-testnet` reads as **Robinhood

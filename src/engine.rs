@@ -183,6 +183,9 @@ pub struct Bot {
     pub account: String,
     pub pool: PoolCfg,
     pub strategy: Strategy,
+    /// When the market line last went to the trace, and at what tick — so the
+    /// line is written on change, not ten times a second forever.
+    pub last_market_trace: Option<(std::time::Instant, i32)>,
 
     // arb mode: a second pool for the same token, side-by-side + gap.
     pub arb_mode: bool,
@@ -277,7 +280,8 @@ pub struct Bot {
 }
 
 /// On-chain socials/metadata for a Pons launch token (all empty for non-Pons).
-#[derive(Clone, Default)]
+/// Serde because the facts cache (src/facts.rs) mirrors it to disk.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Meta {
     pub logo: String,
     pub description: String,
@@ -744,24 +748,35 @@ impl Bot {
         let was_ready = self.ready;
         self.sqrt_price = m.sqrt_price;
         self.tick = m.tick;
-        // Reserves come only from a full read. A light one returns zero for
-        // them because it did not ask — assigning that made price, pooled depth
-        // and market cap flip to nothing between full reads, which on screen is
-        // a panel that blinks.
-        if m.full {
+        // Both read paths now compute the reserves (a light read still asks
+        // for price and liquidity, which is all they take), so price, pooled
+        // depth and market cap move at full poll rate instead of every 8th
+        // tick. Zeros are still not applied over known values: a read that
+        // answered zero liquidity flows through `ready` below instead.
+        if m.r0 > 0.0 || m.r1 > 0.0 || m.full {
             self.r0 = m.r0;
             self.r1 = m.r1;
         }
-        crate::trace(&format!(
-            "market: price={:.10} r0={:.6} r1={:.6} tick={} quote_dec={} token_dec={} supply={:.4}",
-            self.price(),
-            self.r0,
-            self.r1,
-            self.tick,
-            self.pool.quote.decimals(),
-            self.pool.token_decimals,
-            self.token_supply,
-        ));
+        // Trace on CHANGE (or once per few seconds), not on every render tick.
+        // This line used to be written — and flushed — ten times a second
+        // whether or not anything moved, which made the trace file a metronome
+        // and put a synchronous disk write inside the hot loop.
+        let due = self
+            .last_market_trace
+            .is_none_or(|(at, tick)| tick != self.tick || at.elapsed().as_secs() >= 5);
+        if due {
+            self.last_market_trace = Some((std::time::Instant::now(), self.tick));
+            crate::trace(&format!(
+                "market: price={:.10} r0={:.6} r1={:.6} tick={} quote_dec={} token_dec={} supply={:.4}",
+                self.price(),
+                self.r0,
+                self.r1,
+                self.tick,
+                self.pool.quote.decimals(),
+                self.pool.token_decimals,
+                self.token_supply,
+            ));
+        }
         // Keep the last known balance when the read failed: stale is honest,
         // zero is a lie.
         if let Some(eth) = m.eth {
@@ -771,9 +786,9 @@ impl Bot {
             self.token_bal = t;
         }
         self.last_read_ms = m.read_ms;
-        // Liquidity and reserves come only from a full read. A light one did
-        // not ask, and "did not ask" is not "there is none".
-        if m.full {
+        // Ready tracks the same rule as the reserves above: any read that
+        // actually asked about liquidity gets to say whether there is any.
+        if m.full || m.sqrt_price > 0.0 {
             self.ready = m.ready;
         }
         if m.gas_price > 0.0 {
@@ -842,7 +857,11 @@ impl Bot {
                 quote: Quote::Eth,
                 token_decimals: self.pool.token_decimals,
             };
-            let m = match read_market(provider, pref, self.trader).await {
+            // The light read: slot0 + liquidity, which is all the quote below
+            // uses. The full read here re-fetched balance, gas price and total
+            // supply PER ROUTE — three identical answers per candidate, spent
+            // from the same rate budget the trade itself is about to need.
+            let m = match read_price_only(provider, pref, self.trader).await {
                 Ok(m) => m,
                 Err(e) => { self.logline(&format!("route {venue}: read failed {}", short_err(&e.to_string()))); continue; }
             };
@@ -1963,33 +1982,28 @@ async fn read_market_inner<P: Provider>(
 
     let cb_tok = erc.balanceOf(trader);
     let cb_sup = erc.totalSupply();
-    if !full {
-        // The cheap path. Everything left None or zero is carried over from the
-        // last full read by `apply_market`, which never overwrites a known value
-        // with an absent one.
-        return Ok(Market {
-            sqrt_price: sqrt_p,
-            tick,
-            r0: 0.0,
-            r1: 0.0,
-            eth: None,
-            token_bal: None,
-            ready: false,
-            read_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            gas_price: 0.0,
-            supply: 0.0,
-            full: false,
-        });
-    }
-    let (eth_bal, tok_bal, gas, sup) = tokio::join!(
-        crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)),
-        crate::rpcstats::timed("balanceOf", cb_tok.call()),
-        crate::rpcstats::timed("eth_gasPrice", provider.get_gas_price()),
-        crate::rpcstats::timed("totalSupply", cb_sup.call()),
-    );
-    let gas_price = gas.map(|g| g as f64).unwrap_or(0.0);
-    let td = pref.token_decimals;
-    let supply = sup.map(|s| units_to_f64(s._0, td)).unwrap_or(0.0);
+    let (eth_bal, tok_bal, gas_price, supply) = if full {
+        let (eth_bal, tok_bal, gas, sup) = tokio::join!(
+            crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)),
+            crate::rpcstats::timed("balanceOf", cb_tok.call()),
+            crate::rpcstats::timed("eth_gasPrice", provider.get_gas_price()),
+            crate::rpcstats::timed("totalSupply", cb_sup.call()),
+        );
+        let td = pref.token_decimals;
+        (
+            eth_bal.ok(),
+            tok_bal.ok().map(|b| b._0),
+            gas.map(|g| g as f64).unwrap_or(0.0),
+            sup.map(|s| units_to_f64(s._0, td)).unwrap_or(0.0),
+        )
+    } else {
+        // The cheap path skips the four balance/gas/supply reads — but it DID
+        // read the price and liquidity, so the reserves below are computed for
+        // both paths. They used to be zeroed on light reads, which meant price
+        // depth and market cap only moved on every 8th poll; now the one
+        // number that has to feel live updates at full poll rate.
+        (None, None, 0.0, 0.0)
+    };
 
     // Normalize reserves to (quote-side r0, token-side r1) in HUMAN units, using
     // each side's real decimals. The raw virtual reserves are a=token0, b=token1;
@@ -2000,7 +2014,7 @@ async fn read_market_inner<P: Provider>(
 
     let b_raw = l * sqrt_p; // token1 raw reserve
     let qd = pref.quote.decimals() as i32;
-    let tdi = td as i32; // tracked-token decimals — read on-chain, NOT assumed
+    let tdi = pref.token_decimals as i32; // tracked-token decimals — read on-chain, NOT assumed
     let (r0, r1) = match pref.kind {
         // token0 = min(token, quote). If the tracked token sorts below the quote
         // it's token0 (a); the quote is token1 (b) → quote-side r0 = b.
@@ -2027,13 +2041,13 @@ async fn read_market_inner<P: Provider>(
         tick,
         r0,
         r1,
-        eth: eth_bal.ok().map(wei_to_f64), // native ETH is always 18-dec
-        token_bal: tok_bal.ok().map(|t| units_to_f64(t._0, td)),
+        eth: eth_bal.map(wei_to_f64), // native ETH is always 18-dec
+        token_bal: tok_bal.map(|t| units_to_f64(t, pref.token_decimals)),
         ready: r0 > 0.0 && r1 > 0.0,
         read_ms: t0.elapsed().as_secs_f64() * 1000.0,
         gas_price,
         supply,
-        full: true,
+        full,
     })
 }
 
