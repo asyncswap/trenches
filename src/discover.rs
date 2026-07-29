@@ -1462,6 +1462,8 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // Advances once per poll (~120ms), which is about the right speed to read
     // as motion rather than a flicker.
     let mut spinner: usize = 0;
+    let mut msel = crate::ui::mouse::Selection::default();
+    let mut copy_armed = false;
     let result: eyre::Result<Option<Grad>> = loop {
         let rows = {
             let mut r = shared.lock().unwrap().clone();
@@ -1475,13 +1477,35 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
         } else {
             sel = sel.min(rows.len() - 1);
             state.select(Some(sel));
-            term.draw(|f| render_table(f, &rows, sel, &mut state))?;
+            let mut grabbed: Option<String> = None;
+            term.draw(|f| {
+                render_table(f, &rows, sel, &mut state);
+                crate::ui::mouse::paint(f, &msel);
+                if copy_armed {
+                    if let Some((a, b)) = msel.region() {
+                        grabbed = Some(crate::ui::mouse::selected_text(f.buffer_mut(), a, b));
+                    }
+                }
+            })?;
+            if let Some(t) = grabbed {
+                copy_armed = false;
+                msel.clear();
+                if !t.is_empty() {
+                    crate::ui::mouse::copy(&t);
+                }
+            }
         }
 
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(120))? {
-            if let Event::Key(k) = event::read()? {
+            let evt = event::read()?;
+            if let Event::Mouse(m) = evt {
+                if msel.on_mouse(m) {
+                    copy_armed = true;
+                }
+            }
+            if let Event::Key(k) = evt {
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
                     KeyCode::Down | KeyCode::Char('j') => {

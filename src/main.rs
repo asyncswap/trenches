@@ -965,18 +965,24 @@ async fn main() -> eyre::Result<()> {
     // One native ratatui app: selection screens, then the trading dashboard.
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;
+    // Mouse capture: highlighting text copies it (see ui::mouse). The
+    // terminal's own selection stops working under capture, so the app
+    // provides the same gesture itself.
+    let _ = std::io::stdout().execute(crossterm::event::EnableMouseCapture);
     // Raw mode + alternate screen are global terminal state. A panic unwinds
     // past the teardown below and would leave the user with a shell that shows
     // no typing and no prompt, so restore it first and let the panic through.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
         default_hook(info);
     }));
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let res = app(&mut terminal, &reg).await;
     disable_raw_mode()?;
+    let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
     std::io::stdout().execute(LeaveAlternateScreen)?;
     res
 }
@@ -1949,6 +1955,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     let mut show_help = false;
     let mut orders_scroll: usize = 0;
     let mut reader = crossterm::event::EventStream::new();
+    // Highlight-to-copy (see ui::mouse): drag paints, release copies. The
+    // text is read off the NEXT rendered frame, where the full buffer is in
+    // hand and the inversion has already been dropped.
+    let mut msel = ui::mouse::Selection::default();
+    let mut copy_armed = false;
     // Live USD feed (CoinGecko) for quote currencies. Fetched up front so ETH
     // and any stablecoin quotes are valued correctly before the first render —
     // but BOUNDED: this await is on the UI thread, and CoinGecko being slow
@@ -2093,14 +2104,29 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     }
                 }
                 let mut logo_box = None;
+                let mut grabbed: Option<String> = None;
                 // Named so a freeze here is attributable: a draw blocks when
                 // the TERMINAL stops consuming output — scrollback, a dragged
                 // window, a busy tab — not because of anything in the app.
                 phase!("drawing (a stalled draw usually means the terminal itself was busy)");
                 terminal.draw(|f| {
                     logo_box = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, &tape_snap, show_help);
+                    ui::mouse::paint(f, &msel);
+                    if copy_armed {
+                        if let Some((a, b)) = msel.region() {
+                            grabbed = Some(ui::mouse::selected_text(f.buffer_mut(), a, b));
+                        }
+                    }
                 })?;
                 phase!("idle");
+                if let Some(t) = grabbed {
+                    copy_armed = false;
+                    msel.clear();
+                    if !t.is_empty() {
+                        ui::mouse::copy(&t);
+                        bot.status = format!("copied {} characters", t.chars().count());
+                    }
+                }
                 // After the frame, so ratatui's own output cannot cover it. The
                 // placement only redraws when its key changes, so adjusting a
                 // value does not make it blink.
@@ -2228,6 +2254,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             }
             // key input — handled the instant it arrives
             ev = reader.next() => {
+                if let Some(Ok(Event::Mouse(m))) = ev {
+                    if msel.on_mouse(m) {
+                        copy_armed = true; // extracted on the next frame
+                    }
+                }
                 if let Some(Ok(Event::Key(k))) = ev {
 
                     if k.kind != crossterm::event::KeyEventKind::Press { continue; }

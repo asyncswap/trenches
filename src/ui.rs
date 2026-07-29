@@ -10,6 +10,7 @@ pub mod bigtext;
 pub mod image;
 pub mod logo;
 pub mod markdown;
+pub mod mouse;
 pub mod widgets;
 
 use std::io::Stdout;

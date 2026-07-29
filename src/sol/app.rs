@@ -1487,6 +1487,8 @@ async fn screen_trenches(
     });
 
     let mut cursor = ui::widgets::Cursor::new();
+    let mut msel = ui::mouse::Selection::default();
+    let mut copy_armed = false;
     let result = loop {
         let mut rows = found.lock().unwrap().clone();
         discover::sort_newest_first(&mut rows);
@@ -1508,16 +1510,36 @@ async fn screen_trenches(
             table.empty_note = format!("{status}\nnew launches appear the moment they are created  ·  esc to go back");
         }
         let n = rows.len();
+        let mut grabbed: Option<String> = None;
         term.draw(|f| {
             ui::widgets::paint_bg(f);
             let st = cursor.state_for(n);
             ui::widgets::table(f, f.area(), &table, Some(st));
+            ui::mouse::paint(f, &msel);
+            if copy_armed {
+                if let Some((a, b)) = msel.region() {
+                    grabbed = Some(ui::mouse::selected_text(f.buffer_mut(), a, b));
+                }
+            }
         })?;
+        if let Some(t) = grabbed {
+            copy_armed = false;
+            msel.clear();
+            if !t.is_empty() {
+                ui::mouse::copy(&t);
+            }
+        }
 
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(150))? {
-            if let Event::Key(k) = event::read()? {
+            let evt = event::read()?;
+            if let Event::Mouse(m) = evt {
+                if msel.on_mouse(m) {
+                    copy_armed = true;
+                }
+            }
+            if let Event::Key(k) = evt {
                 match cursor.on_key(k.code, n) {
                     ui::widgets::Nav::Enter => break rows
                         .get(cursor.sel)
@@ -1624,11 +1646,28 @@ pub async fn run(
         stop.clone(),
     ));
 
+    let mut msel = ui::mouse::Selection::default();
+    let mut copy_armed = false;
     loop {
         let mut logo_box = None;
+        let mut grabbed: Option<String> = None;
         term.draw(|f| {
             logo_box = draw(f, &bot, view, scroll, show_help);
+            ui::mouse::paint(f, &msel);
+            if copy_armed {
+                if let Some((a, b)) = msel.region() {
+                    grabbed = Some(ui::mouse::selected_text(f.buffer_mut(), a, b));
+                }
+            }
         })?;
+        if let Some(t) = grabbed {
+            copy_armed = false;
+            msel.clear();
+            if !t.is_empty() {
+                ui::mouse::copy(&t);
+                bot.note(format!("copied {} characters", t.chars().count()));
+            }
+        }
         let venue = header_venue(&bot);
         let term_size = term.size().map(|s| (s.width, s.height)).unwrap_or((0, 0));
         if let (Some(r), Some(png)) = (logo_box, ui::image::for_venue(venue, &bot.net)) {
@@ -1638,7 +1677,13 @@ pub async fn run(
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(k) = event::read()? {
+            let evt = event::read()?;
+            if let Event::Mouse(m) = evt {
+                if msel.on_mouse(m) {
+                    copy_armed = true; // extracted on the next frame
+                }
+            }
+            if let Event::Key(k) = evt {
                 if show_help {
                     show_help = false;
                     if k.code == KeyCode::Char('?') {
