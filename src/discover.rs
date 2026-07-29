@@ -1099,6 +1099,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let mut swaps_to: Option<u64> = None;
     // Round-robin cursor over the non-fresh tail of the candidate lists.
     let mut sweep_at: usize = 0;
+    // When the head-block warning last reached the event log.
+    let mut last_head_warn: Option<std::time::Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // A head read that did not answer is not block zero. It used to fall
@@ -1110,10 +1112,16 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             Ok(Ok(h)) if h > 0 => h,
             _ => {
                 crate::trace("discovery: no head block, skipping this round");
-                crate::events::warn(
-                    "Could not read the latest block number, so this discovery round was skipped",
-                    &[("retry_in", "1.5s".to_string())],
-                );
+                // Once per quiet spell, not once per retry: during a rate-limit
+                // rest this fires every 1.5s, and a wall of the same warning
+                // buries the log entries worth reading.
+                if last_head_warn.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 30) {
+                    last_head_warn = Some(std::time::Instant::now());
+                    crate::events::warn(
+                        "Could not read the latest block number; discovery will keep retrying quietly",
+                        &[("retry_in", "1.5s".to_string())],
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 continue;
             }
@@ -1333,10 +1341,23 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 }
             }
         }
-        let url = crate::rpc::shared()
-            .map(|b| b.pick_url(false))
-            .or_else(|| disc_url.clone().filter(|u| !u.trim().is_empty() && !u.contains("YOUR_")))
-            .unwrap_or_else(|| PUBLIC_RPC.to_string());
+        // An honest pick: when every endpoint is resting, SKIP this round's
+        // metrics instead of spending the recovering quota — rows keep their
+        // previous values, which beats freshly-fetched refusals.
+        let url = match crate::rpc::shared() {
+            Some(b) => match b.ready_url(false) {
+                Some(u) => u,
+                None => {
+                    crate::trace("discovery: all endpoints resting, metrics deferred");
+                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                    continue;
+                }
+            },
+            None => disc_url
+                .clone()
+                .filter(|u| !u.trim().is_empty() && !u.contains("YOUR_"))
+                .unwrap_or_else(|| PUBLIC_RPC.to_string()),
+        };
         let res = batch_call(&client, &url, &calls).await;
 
         let mut swap_count: std::collections::HashMap<B256, usize> = Default::default();
@@ -1398,7 +1419,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             let mut cur = shared.lock().unwrap();
             sort_rows(&mut cur);
         }
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
     }
 }
 

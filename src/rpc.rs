@@ -184,6 +184,18 @@ impl Balanced {
         self.0.endpoints[i].url.to_string()
     }
 
+    /// Like `pick_url`, but honest: `None` when every candidate is benched.
+    /// A polling loop must SKIP its round then — the fallback URL pick_url
+    /// returns is for one-off calls, and a poller using it kept the whole
+    /// pool saturated for as long as it ran.
+    pub fn ready_url(&self, wide_logs: bool) -> Option<String> {
+        let plan = self.0.plan(wide_logs);
+        plan.iter()
+            .map(|&i| &self.0.endpoints[i])
+            .find(|e| !e.cooling())
+            .map(|e| e.url.to_string())
+    }
+
     /// True when an endpoint that can serve WIDE `eth_getLogs` is rested.
     ///
     /// Pollers that scan logs every round must check this and SKIP the round
@@ -410,13 +422,16 @@ fn packet_rate_limited(packet: &ResponsePacket) -> bool {
 /// else "reset in N seconds" parsed from the body, else the default. Capped —
 /// no reply gets to bench an endpoint for five minutes.
 fn limited_cooldown(body: &str, retry_after: Option<u64>) -> Duration {
-    let secs = retry_after.or_else(|| {
+    // A zero is not a hint, it is a shrug — this chain's endpoint sends
+    // `Retry-After: 0` WITH a 429, which parsed into a zero-second bench:
+    // no bench at all, and the hammering it was meant to stop continued.
+    let secs = retry_after.filter(|s| *s > 0).or_else(|| {
         let lower = body.to_lowercase();
         let tail = lower.split("reset in ").nth(1)?;
         let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
+        digits.parse().ok().filter(|s| *s > 0)
     });
-    secs.map(Duration::from_secs).unwrap_or(COOLDOWN_LIMITED).min(COOLDOWN_MAX)
+    secs.map(Duration::from_secs).unwrap_or(COOLDOWN_LIMITED).clamp(Duration::from_secs(2), COOLDOWN_MAX)
 }
 
 /// The block span of an `eth_getLogs`, if both ends are concrete numbers.

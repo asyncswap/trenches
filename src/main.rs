@@ -1873,11 +1873,26 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // Only advance the scan cursor when the fetch SUCCEEDS —
                         // otherwise a timeout/error would skip those blocks' events.
                         if let Ok(Ok(sw)) = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pref, from, b)).await {
+                            // The head `b` and these logs can come from DIFFERENT
+                            // endpoints, and their views of the chain differ by
+                            // ~10 blocks here. Trusting `b` skipped the blocks
+                            // the slower endpoint had not indexed yet — trades
+                            // lost silently, forever: pool numbers moved while
+                            // the tape showed nothing. Advance only to what was
+                            // OBSERVED, or head-minus-a-guard when quiet, and
+                            // let the overlap dedup below absorb the re-asks.
+                            let observed = sw.iter().map(|s| s.block).max().unwrap_or(0);
                             let mut t = tape.lock().unwrap();
-                            for s in sw { t.push_back(s); }
+                            let have: std::collections::HashSet<_> =
+                                t.iter().map(|s| (s.tx, s.block, s.eth_wei)).collect();
+                            for s in sw {
+                                if !have.contains(&(s.tx, s.block, s.eth_wei)) {
+                                    t.push_back(s);
+                                }
+                            }
                             while t.len() > 400 { t.pop_front(); }
                             drop(t);
-                            last_swap_block = b;
+                            last_swap_block = observed.max(b.saturating_sub(5)).max(last_swap_block);
                         } else if last_swap_block == 0 || b.saturating_sub(from) > 40 {
                             // Wide ranges are only served by the rate-limited
                             // public endpoint. The FIRST window (200 blocks of
@@ -1898,11 +1913,19 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         let from_b = if last_swap_block_b == 0 { b.saturating_sub(200) } else { last_swap_block_b + 1 };
                         if b >= from_b {
                             if let Ok(Ok(sw)) = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pb, from_b, b)).await {
+                                // Same observed-block rule + dedup as pool A.
+                                let observed = sw.iter().map(|s| s.block).max().unwrap_or(0);
                                 let mut t = tape.lock().unwrap();
-                                for s in sw { t.push_back(s); }
+                                let have: std::collections::HashSet<_> =
+                                    t.iter().map(|s| (s.tx, s.block, s.eth_wei)).collect();
+                                for s in sw {
+                                    if !have.contains(&(s.tx, s.block, s.eth_wei)) {
+                                        t.push_back(s);
+                                    }
+                                }
                                 while t.len() > 400 { t.pop_front(); }
                                 drop(t);
-                                last_swap_block_b = b;
+                                last_swap_block_b = observed.max(b.saturating_sub(5)).max(last_swap_block_b);
                             } else if last_swap_block_b == 0 || b.saturating_sub(from_b) > 40 {
                                 // Same re-anchor as pool A: live beats backfill.
                                 last_swap_block_b = b.saturating_sub(9);
