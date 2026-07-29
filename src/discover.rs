@@ -458,11 +458,22 @@ pub async fn fetch_flaunch_pool<P: Provider>(provider: &P, token: Address) -> Op
     if key.tickSpacing.as_i32() == 0 {
         return None;
     }
-    let coin_is_0 = key.currency0 == token;
     let pool_id: B256 = alloy::primitives::keccak256(key.abi_encode());
-    // Launch block + metadata URI from the PoolCreated log (topic1 = pool id,
-    // so the result set is one log). The balanced transport steers this wide
-    // scan to an endpoint that can answer it.
+    fetch_flaunch_by_id(provider, pool_id).await.map(|(_, fl)| fl)
+}
+
+/// The reverse lookup: a pasted 32-byte Flaunch POOL ID back to its coin.
+/// Flaunch listings show the pool id as often as the coin's address, and the
+/// launch event is indexed by it — one topic-filtered getLogs answers with
+/// the coin, its side, the launch block and the metadata URI. `None` for an
+/// id Flaunch never launched (including plain v4 pool ids, which have no
+/// PoolCreated log to find).
+pub async fn fetch_flaunch_by_id<P: Provider>(
+    provider: &P,
+    pool_id: B256,
+) -> Option<(Address, FlaunchPool)> {
+    // The balanced transport steers this wide scan to an endpoint that can
+    // answer it.
     let filter = Filter::new()
         .address(FLAUNCH_PM)
         .event_signature(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH)
@@ -471,12 +482,15 @@ pub async fn fetch_flaunch_pool<P: Provider>(provider: &P, token: Address) -> Op
     let logs = tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await.ok()?.ok()?;
     let lg = logs.first()?;
     let ev = IFlaunchPositionManager::PoolCreated::decode_log(&lg.inner, true).ok()?;
-    Some(FlaunchPool {
-        pool_id,
-        coin_is_0,
-        launch_block: lg.block_number.unwrap_or(0),
-        token_uri: ev.data._params.tokenUri.clone(),
-    })
+    Some((
+        ev.data._memecoin,
+        FlaunchPool {
+            pool_id,
+            coin_is_0: ev.data._currencyFlipped,
+            launch_block: lg.block_number.unwrap_or(0),
+            token_uri: ev.data._params.tokenUri.clone(),
+        },
+    ))
 }
 
 // ---- Big-fish sweep: find larger-cap graduations at ANY age ----

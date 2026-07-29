@@ -2550,7 +2550,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     0 => {
                                         // Paste a token address → auto-find its liquid WETH
                                         // v3 pool. Fast path for tokens found in the wild.
-                                        match ui::input(terminal, "Add token by contract address", "paste the CA (0x…, 20 bytes) — a 32-byte v4 pool id will not work here")? {
+                                        match ui::input(terminal, "Add token by contract address", "paste the CA (0x…, 20 bytes), or a 32-byte Flaunch pool id")? {
                                             Some(s) => match s.trim().parse::<alloy::primitives::Address>() {
                                                 Ok(token) => {
                                                     let sym = read_symbol(provider, token).await;
@@ -2577,7 +2577,31 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                         None
                                                     }
                                                 }
-                                                Err(_) => { bot.status = "invalid address".into(); None }
+                                                // Not a 20-byte address. Flaunch listings show the
+                                                // 32-byte POOL ID as often as the coin's CA, and the
+                                                // launch event is indexed by it — so a pool id
+                                                // resolves too, back to the coin it belongs to.
+                                                Err(_) => match s.trim().parse::<B256>() {
+                                                    Ok(id) => {
+                                                        if let Some((token, fl)) = discover::fetch_flaunch_by_id(provider, id).await {
+                                                            let sym = read_symbol(provider, token).await;
+                                                            bot.status = format!("found Flaunch pool for {sym}");
+                                                            Some(SelPool {
+                                                                label: pool_label(false, "flaunch", "ETH", &sym, contracts::FLAUNCH_FEE_EST, ""),
+                                                                kind: engine::PoolKind::FlaunchV4 { pool_id: fl.pool_id, coin_is_0: fl.coin_is_0 },
+                                                                token, sym, fee: contracts::FLAUNCH_FEE_EST, owned: false,
+                                                                quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                            })
+                                                        } else {
+                                                            // A plain v4 pool id has no launch log to
+                                                            // find — the key can't be recovered from a
+                                                            // hash, so those still need the pair picker.
+                                                            bot.status = "No Flaunch launch has that pool id. For a plain v4 pool, add it by pair instead".into();
+                                                            None
+                                                        }
+                                                    }
+                                                    Err(_) => { bot.status = "invalid address".into(); None }
+                                                },
                                             },
                                             None => None,
                                         }
