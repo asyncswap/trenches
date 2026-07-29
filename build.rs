@@ -26,12 +26,31 @@ fn main() {
 
     println!("cargo:rustc-env=TRENCHES_COMMIT={hash}{}", if dirty { "-dirty" } else { "" });
 
-    // Rebuild when HEAD moves, so the stamp cannot go stale across a checkout.
-    // Both paths, because HEAD is a ref and the ref is what actually changes on
-    // a commit.
+    // Rebuild when HEAD moves, so the stamp cannot go stale.
+    //
+    // Watching .git/HEAD alone is not enough and was the bug: HEAD holds a
+    // *reference* ("ref: refs/heads/dev") and that file only changes when you
+    // switch branch. Committing rewrites the ref it points at, so that is the
+    // file to watch — without it a binary kept reporting the commit it was
+    // first built at, which is worse than reporting nothing.
     for p in ["../.git/HEAD", ".git/HEAD"] {
         if std::path::Path::new(p).exists() {
             println!("cargo:rerun-if-changed={p}");
+        }
+    }
+    if let Some(r) = git(&["rev-parse", "--symbolic-full-name", "HEAD"]) {
+        for base in ["../.git", ".git"] {
+            let p = format!("{base}/{r}");
+            if std::path::Path::new(&p).exists() {
+                println!("cargo:rerun-if-changed={p}");
+            }
+        }
+        // Packed refs: a freshly cloned repo has no loose ref file at all.
+        for base in ["../.git", ".git"] {
+            let p = format!("{base}/packed-refs");
+            if std::path::Path::new(&p).exists() {
+                println!("cargo:rerun-if-changed={p}");
+            }
         }
     }
 }

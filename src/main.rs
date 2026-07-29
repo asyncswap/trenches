@@ -490,6 +490,11 @@ fn setting(bot: &mut engine::Bot, what: &str, value: String, sentence: String) {
     bot.status = sentence;
 }
 
+/// How long a message holds the status line before it gives way to the current
+/// state. Long enough to read a confirmation, short enough that nothing sits
+/// there being wrong.
+const STATUS_TTL: Duration = Duration::from_secs(10);
+
 /// The two states the status line falls back to once its news has gone stale.
 const ILLIQUID: &str = "This pool has no active liquidity. Press a to add liquidity.";
 const HEALTHY: &str = "Healthy — pool is live.";
@@ -606,7 +611,7 @@ async fn main() -> eyre::Result<()> {
             "--version" | "-V" => {
                 // Version AND commit: a rebuilt release carries the same tag,
                 // and a bug report needs to name the build, not the label.
-                println!("trenches {} ({})", env!("CARGO_PKG_VERSION"), env!("TRENCHES_COMMIT"));
+                println!("trenches {}", update::full());
                 return Ok(());
             }
             // Create the config and state directories, then stop. The
@@ -643,7 +648,7 @@ async fn main() -> eyre::Result<()> {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("trenches {} ({})", env!("CARGO_PKG_VERSION"), env!("TRENCHES_COMMIT"));
+                println!("trenches {}", update::full());
                 println!();
                 println!("A terminal for trading memecoins on Robinhood Chain and Solana.");
                 println!();
@@ -669,10 +674,7 @@ async fn main() -> eyre::Result<()> {
     update::spawn_check();
     events::info(
         "Trenches started",
-        &[
-            ("version", env!("CARGO_PKG_VERSION").to_string()),
-            ("commit", env!("TRENCHES_COMMIT").to_string()),
-        ],
+        &[("version", update::full())],
     );
 
     // Loads what is there, or writes a starter file and says so. A first run
@@ -1698,13 +1700,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     bot.status = ILLIQUID.into();
                 }
                 // Everything on this line was true when it was written; most of
-                // it stops being true. Anything that has sat unchanged for a
-                // while gives way to the state of things, so the line answers
-                // "how are we now" rather than "what happened once".
+                // it stops being true. Anything that has sat unchanged for
+                // STATUS_TTL gives way to the state of things, so the line
+                // answers "how are we now" rather than "what happened once".
                 if bot.status != last_status {
                     last_status = bot.status.clone();
                     status_since = std::time::Instant::now();
-                } else if status_since.elapsed() > Duration::from_secs(20)
+                } else if status_since.elapsed() > STATUS_TTL
                     && !bot.status.is_empty()
                     && bot.status != HEALTHY
                 {
@@ -3058,7 +3060,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     }
 
     // Trimmed footer — essentials only; '?' opens the full shortcut list.
-    let footer = Paragraph::new(Line::from(vec![
+    let mut keys: Vec<Span> = vec![
         Span::styled("[b]", Style::default().fg(ui::widgets::tone_color(view::Tone::Good)).add_modifier(Modifier::BOLD)),
         Span::raw(" buy  "),
         Span::styled("[s]", Style::default().fg(ui::widgets::tone_color(view::Tone::Bad)).add_modifier(Modifier::BOLD)),
@@ -3078,8 +3080,24 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Span::raw(" docs  "),
         Span::styled("[q]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
-    ]))
-    .block(ui::widgets::themed_block(""));
+    ];
+
+    // The build, against the right edge. Dim, because it is not something to
+    // read — it is something to quote when a bug report needs to name what was
+    // running, and it should be on screen without asking.
+    let build = update::full();
+    let used: usize = keys.iter().map(|s| s.content.chars().count()).sum();
+    let inner = foot_area.width.saturating_sub(2) as usize;
+    // Dropped rather than wrapped when the terminal is narrow: the keys are
+    // what the footer is for.
+    if inner > used + build.chars().count() + 2 {
+        keys.push(Span::raw(" ".repeat(inner - used - build.chars().count())));
+        keys.push(Span::styled(
+            build,
+            Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
+        ));
+    }
+    let footer = Paragraph::new(Line::from(keys)).block(ui::widgets::themed_block(""));
     f.render_widget(footer, foot_area);
 
     // Full shortcut list overlay ('?') — a grouped two-column list: key on the
