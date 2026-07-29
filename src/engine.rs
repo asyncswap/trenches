@@ -201,10 +201,19 @@ pub struct Bot {
     // accounting
     pub baseline_eth: Option<f64>,       // ETH at session start (session PnL)
     pub daily_baseline: Option<f64>,     // ETH at start of the current day
+    /// Today's realised total, read from the fill ledger — the same figure the
+    /// calendar shows for today.
+    pub day_realized: f64,
     pub daily_day: u64,                  // day number (unix secs / 86400)
     pub bought_qty: f64,   // purchased token inventory (cost-basis tracking)
     pub bought_cost: f64,  // total ETH paid for that inventory
-    pub realized_pnl: f64, // cumulative realized profit from sells (ETH)
+    /// This session's realised profit — derived from the ledger, not counted
+    /// alongside it. Two tallies of the same thing drift; one of them then has
+    /// to be believed over the other, and nothing on screen says which.
+    pub realized_pnl: f64,
+    /// When this session began, so the ledger can be asked what it has made
+    /// since.
+    pub session_start: u64,
     pub last_fill_pnl: Option<f64>, // realized P&L of the most recent sell (per-trade return)
     pub entry_mc: f64,              // mkt cap (ETH) captured at the last buy — for the trade log
     pub entry_pooled_eth: f64,      // pooled ETH captured at the last buy
@@ -343,8 +352,27 @@ impl Bot {
 
     /// PnL since the start of the current calendar day (persisted across
     /// restarts via .bot/daily-<account>.json).
+    /// What today's trading made, from the fill ledger.
+    ///
+    /// This used to be the balance measured against a baseline taken at the
+    /// start of the day. That answers a different question: it counts gas, and
+    /// it counts a deposit as profit — so it disagreed with the PnL calendar,
+    /// which sums the fills. Two numbers labelled PnL that do not match is
+    /// worse than either of them being slightly wrong.
     pub fn daily_pnl(&self) -> f64 {
-        self.eth - self.daily_baseline.unwrap_or(self.eth)
+        self.day_realized
+    }
+
+    /// Recount from the ledger — today's total and this session's.
+    ///
+    /// One source of truth. The wallet panel, the session figure and the PnL
+    /// calendar all read the same fills off disk, so they cannot disagree; the
+    /// day figure used to be a balance difference, which counts gas and counts
+    /// a deposit as profit, and the session figure was a float added up in
+    /// parallel. Cheap, and only done when a fill lands or a session starts.
+    pub fn refresh_day_realized(&mut self) {
+        self.day_realized = crate::ledger::today_total(&self.account);
+        self.realized_pnl = crate::ledger::total_since(&self.account, self.session_start);
     }
 
     fn daily_path(&self) -> String {
@@ -521,7 +549,7 @@ impl Bot {
                 let from_basis = tok.min(self.bought_qty);
                 let cost = from_basis * self.avg_basis();
                 let realized = eth - cost; // free-bag portion has zero cost
-                self.realized_pnl += realized;
+
                 self.last_fill_pnl = Some(realized); // this sell's return, on its own
                 // Per-trade order record (greppable: "TRADE ") — a complete,
                 // cross-checkable row: entry (mc/pooled/buy-tx) + exit (mc/pooled/
@@ -554,6 +582,9 @@ impl Bot {
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
                     },
                 );
+                // The day figure comes from the ledger, so it is recounted
+                // once the fill is in it rather than being kept in step by hand.
+                self.refresh_day_realized();
                 self.bought_cost = (self.bought_cost - cost).max(0.0);
                 self.bought_qty = (self.bought_qty - from_basis).max(0.0);
                 // Position closed: the next buy opens a new one, and its hold

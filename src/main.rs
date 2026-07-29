@@ -1278,10 +1278,12 @@ async fn chain_session_on(
         ready: false,
         baseline_eth: None,
         daily_baseline: None,
+        day_realized: 0.0,
         daily_day: 0,
         bought_qty: 0.0,
         bought_cost: 0.0,
         realized_pnl: 0.0,
+        session_start: ledger::now(),
         last_fill_pnl: None,
         entry_mc: 0.0,
         entry_pooled_eth: 0.0,
@@ -1327,6 +1329,10 @@ async fn chain_session_on(
 
     let _ = log_path;
     bot.load_daily(); // restore today's PnL baseline across restarts
+    // Today's figure comes from the ledger, so it has to be read before the
+    // first render — otherwise the wallet shows zero for a day that already
+    // has trades in it, and disagrees with the calendar until you make another.
+    bot.refresh_day_realized();
     bot.meta = engine::fetch_token_meta(&provider, bot.pool.token).await; // socials for the start pool
     bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await; // pool age
 
@@ -2403,17 +2409,23 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     let (logo_box, indent_cols) = ui::image::header_box(ui::widgets::themed_block("").inner(c[0]));
     let venue = header_venue(bot);
     let avail = c[0].width.saturating_sub(indent_cols + 32);
+    // Trading says TRENCHES.SH; an empty screen says the chain.
+    //
+    // The venue's mark stays beside it — the logo is how you tell a Pons launch
+    // from a Uniswap pool at a glance, and that is worth keeping. Its name in
+    // large type is not: this is our screen, it ends up in screenshots, and
+    // setting someone else's brand across it in the biggest type on the page
+    // advertises them rather than us.
+    //
+    // The exception is the empty state, which names the chain. There is no
+    // trade to label there, and the chain is the one thing still true.
     let name = match venue {
-        ui::image::Venue::Uniswap => format!("UNISWAP {}", bot.pool.kind.proto().to_uppercase()),
-        // The launchpad is called pons.family, and on a wide terminal there is
-        // room to say so. On a narrow one the full name would drop out of large
-        // type altogether and render as small text, which is a worse trade than
-        // the short form set properly — so the fuller name is used only when it
-        // actually fits.
-        ui::image::Venue::Pons if ui::bigtext::width("PONS.FAMILY") <= avail => {
-            "PONS.FAMILY".to_string()
-        }
-        v => v.display_name(&bot.net),
+        ui::image::Venue::Chain => venue.display_name(&bot.net),
+        // Only when it fits: on a narrow terminal the full name drops out of
+        // large type and renders as small text, which is a worse trade than a
+        // short form set properly.
+        _ if ui::bigtext::width("TRENCHES.SH") <= avail => "TRENCHES.SH".to_string(),
+        _ => "TRENCHES".to_string(),
     };
 
     // Large type only if it fits; on a narrow terminal the plain name is
