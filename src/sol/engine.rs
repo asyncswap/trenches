@@ -68,6 +68,11 @@ pub enum Venue {
         /// True when SOL occupies the pool's base slot. Flips which instruction
         /// means "buy": on such a pool, paying SOL is a `sell` (base in).
         sol_is_base: bool,
+        /// BOOST: the pool's virtual quote reserves, raw quote base units.
+        /// Zero on a plain pool. Pricing uses effective = real + virtual; a
+        /// sell's PAYOUT stays capped at the real vault (the program refuses
+        /// past it with 6063), so quotes cap there too.
+        virtual_quote_raw: i128,
     },
 }
 
@@ -137,8 +142,11 @@ impl Coin {
     pub fn price_sol(&self) -> f64 {
         match &self.venue {
             Venue::Curve { curve, .. } => curve.price_sol(),
-            Venue::Amm { sol_res, token_res, .. } => {
-                if *token_res > 0.0 { sol_res / token_res } else { 0.0 }
+            Venue::Amm { .. } => {
+                // Effective reserves: a BOOST pool's price includes the
+                // virtual quote, exactly as the program computes it.
+                let (es, et) = self.amm_effective().unwrap_or_default();
+                if et > 0.0 { es / et } else { 0.0 }
             }
         }
     }
@@ -190,14 +198,35 @@ impl Coin {
         }
     }
 
+    /// The AMM's reserves as PRICING sees them: real vaults plus BOOST's
+    /// virtual quote, mapped onto the (SOL, coin) meaning by orientation.
+    /// Zero virtual — every plain pool — returns the vaults untouched.
+    fn amm_effective(&self) -> Option<(f64, f64)> {
+        let Venue::Amm { sol_res, token_res, sol_is_base, virtual_quote_raw, token_decimals, .. } =
+            &self.venue
+        else {
+            return None;
+        };
+        let vq = *virtual_quote_raw as f64;
+        // The virtual sits in the pool's QUOTE slot; which side of the
+        // (SOL, coin) pair that is depends on the orientation.
+        if *sol_is_base {
+            Some((*sol_res, token_res + vq / 10f64.powi(*token_decimals as i32)))
+        } else {
+            Some((sol_res + vq / 1e9, *token_res))
+        }
+    }
+
     /// Tokens received for `sol_in`, on whichever venue applies.
     pub fn tokens_out(&self, sol_in: f64) -> f64 {
         match &self.venue {
             // The fee comes off the SOL going in, so the curve only ever sees
             // what is left after it.
             Venue::Curve { curve, fee_frac, .. } => curve.tokens_out(sol_in * (1.0 - fee_frac)),
-            Venue::Amm { sol_res, token_res, fee_frac, .. } => {
-                pumpswap::tokens_out(*token_res, *sol_res, sol_in, *fee_frac)
+            Venue::Amm { token_res, fee_frac, .. } => {
+                let (es, et) = self.amm_effective().unwrap_or_default();
+                // The pool can only pay out tokens its vault actually holds.
+                pumpswap::tokens_out(et, es, sol_in, *fee_frac).min(token_res * 0.9995)
             }
         }
     }
@@ -208,8 +237,12 @@ impl Coin {
             // On the way out the swap happens first and the fee is taken from
             // the proceeds.
             Venue::Curve { curve, fee_frac, .. } => curve.sol_out(tokens) * (1.0 - fee_frac),
-            Venue::Amm { sol_res, token_res, fee_frac, .. } => {
-                pumpswap::sol_out(*token_res, *sol_res, tokens, *fee_frac)
+            Venue::Amm { sol_res, fee_frac, .. } => {
+                let (es, et) = self.amm_effective().unwrap_or_default();
+                // BOOST prices on effective but PAYS from the real vault —
+                // the program refuses past it (6063), so the quote stops there
+                // too rather than promising SOL the pool does not hold.
+                pumpswap::sol_out(et, es, tokens, *fee_frac).min(sol_res * 0.9995)
             }
         }
     }
@@ -239,7 +272,7 @@ pub async fn refresh_venue(rpc: &Rpc, coin: &mut Coin) -> eyre::Result<()> {
                 .ok_or_else(|| eyre::eyre!("bonding curve vanished"))?;
             *curve = BondingCurve::decode(&data)?;
         }
-        Venue::Amm { keys, sol_res, token_res, token_decimals, sol_is_base, .. } => {
+        Venue::Amm { keys, sol_res, token_res, token_decimals, sol_is_base, virtual_quote_raw, .. } => {
             let (b, q) = tokio::join!(
                 rpc.token_balance(&keys.pool_base_ta),
                 rpc.token_balance(&keys.pool_quote_ta),
@@ -251,6 +284,14 @@ pub async fn refresh_venue(rpc: &Rpc, coin: &mut Coin) -> eyre::Result<()> {
             };
             *sol_res = super::lamports_to_sol(sol_raw);
             *token_res = tok_raw as f64 / 10f64.powi(*token_decimals as i32);
+            // BOOST drains as it burns: re-read the pool account so the
+            // virtual side of the price tracks. Plain pools (zero) skip the
+            // extra read forever.
+            if *virtual_quote_raw != 0 {
+                if let Ok(Some((data, _))) = rpc.account(&keys.pool).await {
+                    *virtual_quote_raw = pumpswap::Pool::virtual_quote_reserves(&data);
+                }
+            }
         }
     }
     Ok(())
@@ -295,7 +336,7 @@ pub async fn load_coin(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<Coin> {
     }
 
     // Graduated (or never on a curve) -> PumpSwap AMM.
-    let (pool_key, pool) = pumpswap::find_pool(rpc, mint).await?;
+    let (pool_key, pool, virtual_quote_raw) = pumpswap::find_pool(rpc, mint).await?;
     let cfg_pda = pumpswap::global_config_pda();
     let (base_prog, quote_prog, cfg) = tokio::join!(
         rpc.mint_owner(&pool.base_mint),
@@ -333,6 +374,7 @@ pub async fn load_coin(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<Coin> {
             token_decimals,
             total_supply,
             sol_is_base,
+            virtual_quote_raw,
         },
     })
 }
@@ -587,7 +629,30 @@ mod tests {
                 token_decimals: 6,
                 total_supply: 1_000_000_000.0,
                 sol_is_base,
+                virtual_quote_raw: 0,
             },
+        }
+    }
+
+    /// BOOST pools price on real + virtual, but pay out of the real vault.
+    #[test]
+    fn boost_prices_on_effective_but_pays_from_the_real_vault() {
+        let mut plain = amm_coin_oriented(1_000_000.0, 50.0, false);
+        let mut boosted = amm_coin_oriented(1_000_000.0, 50.0, false);
+        if let Venue::Amm { virtual_quote_raw, .. } = &mut boosted.venue {
+            *virtual_quote_raw = 50_000_000_000; // +50 SOL virtual, quote slot
+        }
+        // Effective 100 SOL against the same tokens: exactly double the price.
+        assert!((boosted.price_sol() - 2.0 * plain.price_sol()).abs() < 1e-12);
+        // Pooled (exit liquidity) stays REAL.
+        assert_eq!(boosted.pooled_sol(), plain.pooled_sol());
+        // A sell big enough to want more than the vault holds is capped at
+        // (just under) the real 50 SOL, never the effective 100.
+        let out = boosted.sol_out(900_000.0);
+        assert!(out <= 50.0 * 0.9995 + 1e-9, "payout must cap at the real vault, got {out}");
+        // And the plain pool is untouched by the field existing at all.
+        if let Venue::Amm { virtual_quote_raw, .. } = &mut plain.venue {
+            assert_eq!(*virtual_quote_raw, 0);
         }
     }
 

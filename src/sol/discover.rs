@@ -2015,7 +2015,7 @@ mod live_amm_tape_tests {
             .parse()
             .expect("valid mint");
 
-        let (pool_key, _pool) = super::super::pumpswap::find_pool(&rpc, &mint)
+        let (pool_key, _pool, _virtual) = super::super::pumpswap::find_pool(&rpc, &mint)
             .await
             .expect("graduated coin should have a pool");
         println!("pool {pool_key}");
@@ -2066,7 +2066,7 @@ mod live_coverage_tests {
             .parse()
             .expect("valid mint");
 
-        let (pool, _) = super::super::pumpswap::find_pool(&rpc, &mint).await.expect("pool");
+        let (pool, _, _) = super::super::pumpswap::find_pool(&rpc, &mint).await.expect("pool");
         let newest = |v: &Vec<String>| v.first().cloned();
 
         // Mark the start of the observation window.
@@ -2124,7 +2124,7 @@ mod live_event_census {
             .unwrap_or_else(|_| "DtSA9ReBXyvJqtoJNKNnLToUGgjxjnypwY1o5y7aBX8o".into())
             .parse()
             .expect("valid mint");
-        let (pool, p) = super::super::pumpswap::find_pool(&rpc, &mint).await.expect("pool");
+        let (pool, p, _) = super::super::pumpswap::find_pool(&rpc, &mint).await.expect("pool");
         println!("pool {pool}  sol_is_base={}", p.is_sol_based());
 
         let sigs = rpc.signatures_for(&pool, 12).await.unwrap_or_default();
@@ -2174,7 +2174,7 @@ mod live_direction_truth {
             .unwrap_or_else(|_| "DtSA9ReBXyvJqtoJNKNnLToUGgjxjnypwY1o5y7aBX8o".into())
             .parse()
             .expect("valid mint");
-        let (pool, p) = super::super::pumpswap::find_pool(&rpc, &mint).await.expect("pool");
+        let (pool, p, _) = super::super::pumpswap::find_pool(&rpc, &mint).await.expect("pool");
         let sol_is_base = p.is_sol_based();
         println!("pool {pool}  sol_is_base={sol_is_base}\n");
 

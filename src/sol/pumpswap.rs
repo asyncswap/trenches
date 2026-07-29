@@ -88,6 +88,26 @@ impl Pool {
         self.is_sol_quoted() != self.is_sol_based()
     }
 
+    /// BOOST: the pool's virtual quote reserves, raw base units of the quote
+    /// mint. Read by OFFSET, not by widening the borsh struct: pools created
+    /// before the boost upgrade are shorter, and a strict decode would refuse
+    /// to load every one of them. Zero when absent — which is also the value
+    /// that makes all the boost math collapse back to the plain formulas.
+    ///
+    /// Pricing on a boost pool uses effective = real + virtual, but a sell's
+    /// PAYOUT is capped at the real vault (the program refuses past it, 6063).
+    pub fn virtual_quote_reserves(data: &[u8]) -> i128 {
+        const OFF: usize = 8      // discriminator
+            + 1 + 2               // pool_bump, index
+            + 32 * 6              // creator, base/quote/lp mints, both vault ATAs
+            + 8                   // lp_supply
+            + 32 + 1 + 1; // coin_creator, is_mayhem_mode, is_cashback_coin
+        data.get(OFF..OFF + 16)
+            .and_then(|b| b.try_into().ok())
+            .map(i128::from_le_bytes)
+            .unwrap_or(0)
+    }
+
     /// The non-SOL side — the coin this pool actually trades.
     pub fn coin_mint(&self) -> Option<Pubkey> {
         match (self.is_sol_based(), self.is_sol_quoted()) {
@@ -191,7 +211,7 @@ pub fn fee_config_pda() -> Pubkey {
 /// The pool PDA is seeded with `(index, creator, base_mint, quote_mint)` and we
 /// know only the mint, so this filters `getProgramAccounts` by account size plus
 /// a memcmp on `base_mint`. Picks the deepest pool when a coin has several.
-pub async fn find_pool(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<(Pubkey, Pool)> {
+pub async fn find_pool(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<(Pubkey, Pool, i128)> {
     // Look for the coin on BOTH sides. A PumpSwap pool may be created either way
     // round, and searching only the base slot hid ~78% of SOL pools on mainnet —
     // every one of them reported as "not a pump.fun coin".
@@ -202,14 +222,15 @@ pub async fn find_pool(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<(Pubkey, Pool)>
     let mut accounts = as_base?;
     accounts.extend(as_quote?);
     let total = accounts.len();
-    let mut candidates: Vec<(Pubkey, Pool)> = Vec::new();
+    let mut candidates: Vec<(Pubkey, Pool, i128)> = Vec::new();
     for (key, data) in accounts {
         let Ok(pool) = Pool::decode(&data) else { continue };
+        let virtual_quote = Pool::virtual_quote_reserves(&data);
         // Exactly one side must be SOL, and the other must be this coin.
         if !pool.sol_paired() || pool.coin_mint() != Some(*mint) {
             continue;
         }
-        candidates.push((key, pool));
+        candidates.push((key, pool, virtual_quote));
     }
 
     // Rank by the SOL actually in the pool, not by `lp_supply`.
@@ -223,7 +244,7 @@ pub async fn find_pool(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<(Pubkey, Pool)>
     // Popular coins have >100 pools, so balances are read in ONE batch.
     let vaults: Vec<Pubkey> = candidates
         .iter()
-        .map(|(_, p)| if p.is_sol_based() { p.pool_base_token_account } else { p.pool_quote_token_account })
+        .map(|(_, p, _)| if p.is_sol_based() { p.pool_base_token_account } else { p.pool_quote_token_account })
         .collect();
     let mut sol: Vec<u64> = Vec::with_capacity(vaults.len());
     for chunk in vaults.chunks(100) {
@@ -235,18 +256,18 @@ pub async fn find_pool(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<(Pubkey, Pool)>
     }
     sol.resize(candidates.len(), 0);
 
-    let mut best: Option<(Pubkey, Pool, u64)> = None;
-    for ((key, pool), lamports) in candidates.into_iter().zip(sol) {
+    let mut best: Option<(Pubkey, Pool, i128, u64)> = None;
+    for ((key, pool, vq), lamports) in candidates.into_iter().zip(sol) {
         let depth = if lamports > 0 { lamports } else { pool.lp_supply.min(1) };
-        if best.as_ref().is_none_or(|(_, _, d)| depth > *d) {
-            best = Some((key, pool, depth));
+        if best.as_ref().is_none_or(|(_, _, _, d)| depth > *d) {
+            best = Some((key, pool, vq, depth));
         }
     }
     // Say which of the two failures it is. "no SOL-quoted pool" reads as a
     // transient lookup problem when usually the coin simply isn't a pump coin
     // and trades on a DEX this bot doesn't speak.
-    if let Some((k, p, _)) = best {
-        return Ok((k, p));
+    if let Some((k, p, vq, _)) = best {
+        return Ok((k, p, vq));
     }
     if total == 0 {
         eyre::bail!("not a pump.fun coin — no PumpSwap pool exists for this mint");
