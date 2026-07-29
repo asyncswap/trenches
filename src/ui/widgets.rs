@@ -516,12 +516,32 @@ fn span_of(c: &VCell) -> Span<'static> {
     Span::styled(c.text.clone(), style_of(c))
 }
 
-fn constraints_of(t: &TableView) -> Vec<Constraint> {
+/// Column widths for `avail` columns of space. Fixed columns are SOLID: when
+/// everything does not fit, the take-the-rest (`Min`) column yields and gets
+/// only what remains, truncating off the right edge. Mapping `Min` straight to
+/// `Constraint::Min` did the opposite — ratatui's solver honoured the Min and
+/// crushed every fixed column to two characters, so a long signature squashed
+/// age, amount and price into unreadability while ITSELF staying whole.
+fn constraints_of(t: &TableView, avail: u16) -> Vec<Constraint> {
+    let spacing = t.cols.len().saturating_sub(1) as u16; // column_spacing(1)
+    let fixed: u16 = t
+        .cols
+        .iter()
+        .map(|c| match c.width {
+            Width::Fixed(w) => w,
+            Width::Min(_) => 0,
+        })
+        .sum();
+    let n_min = t.cols.iter().filter(|c| matches!(c.width, Width::Min(_))).count() as u16;
+    let rest = avail.saturating_sub(fixed + spacing);
+    // Never vanish entirely: a sliver of the overflow column still identifies
+    // the value it starts with.
+    let share = if n_min == 0 { 0 } else { (rest / n_min).max(4) };
     t.cols
         .iter()
         .map(|c| match c.width {
             Width::Fixed(w) => Constraint::Length(w),
-            Width::Min(w) => Constraint::Min(w),
+            Width::Min(_) => Constraint::Length(share),
         })
         .collect()
 }
@@ -593,7 +613,9 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
             .collect()
     };
     let block = themed_block_line(table_title(t));
-    let widths = constraints_of(t);
+    // Space inside the borders, minus the cursor symbol when one is drawn.
+    let avail = area.width.saturating_sub(2 + if state.is_some() { 2 } else { 0 });
+    let widths = constraints_of(t, avail);
     match state {
         Some(st) => {
             let w = Table::new(rows, widths)

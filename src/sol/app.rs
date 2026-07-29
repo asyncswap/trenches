@@ -374,7 +374,9 @@ pub struct SolBot {
     pub slot: u64,
     /// Round-trip time of the last refresh — the latency figure the EVM header shows.
     pub round_ms: f64,
-    pub buy_sol: f64,
+    /// Buy size as a FRACTION of the SOL balance, like the EVM side's
+    /// buy_frac — an absolute SOL amount was meaningless across wallet sizes.
+    pub buy_frac: f64,
     pub slippage_pct: f64,
     /// Fraction of the token balance `s` sells. `x` always sells everything.
     /// Mirrors the EVM side's `sell_frac`, adjusted with `<` / `>`.
@@ -418,7 +420,35 @@ pub struct SolBot {
     pub status: String,
 }
 
+/// The buy-size ladder, as fractions of the SOL balance. Multiplicative
+/// steps so a large wallet can go FINE — 0.1% is the finest precision — while
+/// the top still reaches all-in.
+const BUY_STEPS: [f64; 10] =
+    [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.10, 0.25, 0.50, 1.0];
+
+/// The next ladder rung from `cur`, up or down, clamped at the ends.
+fn buy_step(cur: f64, up: bool) -> f64 {
+    let i = BUY_STEPS
+        .iter()
+        .position(|s| (s - cur).abs() < 1e-9)
+        .unwrap_or_else(|| BUY_STEPS.iter().position(|s| *s > cur).unwrap_or(BUY_STEPS.len() - 1));
+    let j = if up { (i + 1).min(BUY_STEPS.len() - 1) } else { i.saturating_sub(1) };
+    BUY_STEPS[j]
+}
+
+/// A percentage label without noise: "0.1", "2.5", "5", "100".
+fn pct(frac: f64) -> String {
+    let p = frac * 100.0;
+    if (p - p.round()).abs() < 1e-9 { format!("{}", p.round()) } else { format!("{p:.2}").trim_end_matches('0').trim_end_matches('.').to_string() }
+}
+
 impl SolBot {
+    /// What a buy would spend right now: the fraction of the live balance,
+    /// less a little headroom so fees never turn 100% into "not enough SOL".
+    fn buy_size_sol(&self) -> f64 {
+        (self.sol * self.buy_frac).min((self.sol - 0.01).max(0.0))
+    }
+
     pub fn new(rpc: Rpc, signer: Keypair, rc: &crate::config::RugCheck, net: &str) -> SolBot {
         SolBot {
             net: net.to_string(),
@@ -431,7 +461,7 @@ impl SolBot {
             token_bal: 0.0,
             slot: 0,
             round_ms: 0.0,
-            buy_sol: 0.01,
+            buy_frac: 0.05, // 5% of balance; [ ] walk the ladder below
             slippage_pct: 5.0,
             sell_frac: 1.00,
             cu_price_micro: 10_000,
@@ -855,7 +885,10 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
             bot.orders.iter().filter(|o| o.state == OrderState::Pending).count()
         )),
     ]);
-    p.spans(vec![lbl("Buy Size"), Cell::toned(format!("{:.4} SOL", bot.buy_sol), Tone::Accent)]);
+    p.spans(vec![
+        lbl("Buy Size"),
+        Cell::toned(format!("{}% ≈{:.4} SOL", pct(bot.buy_frac), bot.buy_size_sol()), Tone::Accent),
+    ]);
     p.spans(vec![lbl("Slippage"), Cell::new(format!("{:.1}%", bot.slippage_pct))]);
     p.spans(vec![
         lbl("Priority"),
@@ -1184,7 +1217,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
             Line::from(vec![
                 hint("[ ] "),
                 slbl_pad("buy"),
-                val(format!("{:<14}", format!("{:.4} SOL", bot.buy_sol))),
+                val(format!("{:<14}", format!("{}% of SOL", pct(bot.buy_frac)))),
                 hint("[M] "),
                 slbl_pad("mode"),
                 val("manual".into()),
@@ -1655,8 +1688,8 @@ pub async fn run(
                         scroll = (scroll + 1).min(n.saturating_sub(1));
                     }
                     KeyCode::Down => scroll = scroll.saturating_sub(1),
-                    KeyCode::Char(']') => bot.buy_sol = (bot.buy_sol * 1.5).min(100.0),
-                    KeyCode::Char('[') => bot.buy_sol = (bot.buy_sol / 1.5).max(0.0001),
+                    KeyCode::Char(']') => bot.buy_frac = buy_step(bot.buy_frac, true),
+                    KeyCode::Char('[') => bot.buy_frac = buy_step(bot.buy_frac, false),
                     // [] buy · () sell · {} slippage · <> priority, matching
                     // the header labels and the EVM dashboard.
                     KeyCode::Char(')') => {
@@ -1800,7 +1833,7 @@ pub async fn run(
                         }
                     }
                     KeyCode::Char('b') => {
-                        let (sol, slip, cu) = (bot.buy_sol, bot.slippage_pct, bot.cu_price_micro);
+                        let (sol, slip, cu) = (bot.buy_size_sol(), bot.slippage_pct, bot.cu_price_micro);
                         if bot.coin.is_none() {
                             bot.note("No coin is selected");
                         } else if sol > bot.sol {

@@ -334,8 +334,20 @@ pub fn buy_ix(
     accounts.push(AccountMeta::new_readonly(global_volume_accumulator_pda(), false)); // 20
     accounts.push(AccountMeta::new(user_volume_accumulator_pda(user), false));        // 21
     accounts.extend(tail);                                                            // 22, 23
+    // Cashback (Feb 2026): a cashback coin's buy REVERTS with
+    // MissingCashbackAccounts (6059) unless the WSOL ATA of the user's volume
+    // accumulator rides as the 0th remaining account. The program creates the
+    // ATA if missing (rent paid by the user) and pays the would-be creator
+    // fee into it; on a non-cashback coin the extra account is ignored.
+    accounts.push(AccountMeta::new(uva_quote_ata(k, user), false));
 
     Instruction { program_id: PUMP_AMM_PROGRAM, accounts, data }
+}
+
+/// The quote-mint (WSOL) associated token account of the user's volume
+/// accumulator for the Pump AMM program — where AMM cashback accrues.
+fn uva_quote_ata(k: &SwapKeys, user: &Pubkey) -> Pubkey {
+    ata(&user_volume_accumulator_pda(user), &k.quote_mint, &k.quote_token_program)
 }
 
 /// `sell`: sell `base_amount_in` token base units for at least
@@ -345,7 +357,13 @@ pub fn sell_ix(k: &SwapKeys, user: &Pubkey, base_amount_in: u64, min_quote_amoun
     data.extend_from_slice(&DISC_SELL);
     data.extend_from_slice(&base_amount_in.to_le_bytes());
     data.extend_from_slice(&min_quote_amount_out.to_le_bytes());
-    Instruction { program_id: PUMP_AMM_PROGRAM, accounts: base_accounts(k, user), data }
+    let mut accounts = base_accounts(k, user);
+    // Cashback remaining accounts, same rule as the buy — sell wants the
+    // accumulator itself as well (index 1), per pump-public-docs
+    // PUMP_CASHBACK_README.
+    accounts.push(AccountMeta::new(uva_quote_ata(k, user), false));
+    accounts.push(AccountMeta::new(user_volume_accumulator_pda(user), false));
+    Instruction { program_id: PUMP_AMM_PROGRAM, accounts, data }
 }
 
 #[cfg(test)]
@@ -388,8 +406,16 @@ mod tests {
     #[test]
     fn account_counts_match_the_idl() {
         let user = Pubkey::new_from_array([9u8; 32]);
-        assert_eq!(buy_ix(&keys(), &user, 1, 1).accounts.len(), 23, "AMM buy takes 23");
-        assert_eq!(sell_ix(&keys(), &user, 1, 1).accounts.len(), 21, "AMM sell takes 21");
+        // 23 named + the cashback remaining account (the accumulator's WSOL
+        // ATA); sell carries two — the ATA and the accumulator itself.
+        let buy = buy_ix(&keys(), &user, 1, 1);
+        assert_eq!(buy.accounts.len(), 24, "AMM buy takes 23 named + 1 cashback");
+        assert_eq!(buy.accounts[23].pubkey, uva_quote_ata(&keys(), &user));
+        assert!(buy.accounts[23].is_writable, "cashback accrues INTO the ATA");
+        let sell = sell_ix(&keys(), &user, 1, 1);
+        assert_eq!(sell.accounts.len(), 23, "AMM sell takes 21 named + 2 cashback");
+        assert_eq!(sell.accounts[21].pubkey, uva_quote_ata(&keys(), &user));
+        assert_eq!(sell.accounts[22].pubkey, user_volume_accumulator_pda(&user));
     }
 
     #[test]
