@@ -1724,7 +1724,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // `q` is one keystroke away from every other action, so
                         // it asks first. `Q` is the deliberate escape hatch.
                         KeyCode::Char('q') => {
-                            if ui::confirm(terminal, "Quit the Trenches?")? {
+                            if ui::confirm(terminal, "Quit?")? {
                                 return Ok(Exit::Quit);
                             }
                         }

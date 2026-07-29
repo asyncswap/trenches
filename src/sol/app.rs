@@ -1466,7 +1466,7 @@ pub async fn run(
                 match k.code {
                     // `q`/esc ask first; `Q` quits outright.
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        if ui::confirm(term, "Quit the Trenches?")? {
+                        if ui::confirm(term, "Quit?")? {
                             break;
                         }
                     }
