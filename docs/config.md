@@ -34,6 +34,15 @@ It never overwrites a config that already exists. The installer runs it for you.
 from, that file wins** and the one under `~/.config` is never created. Handy for
 a checkout with its own settings; confusing if you did not mean to.
 
+State always lives in `~/.trenches`, wherever you run the binary from. Set
+`$TRENCHES_STATE` to put it somewhere else — useful for a second profile, and
+the only way to get a per-directory one.
+
+Earlier builds preferred a `.trenches` in the working directory when one
+existed, so history depended on where you launched from. If your PnL looks
+empty after updating, it is in that folder — copy `fills-*.jsonl` into
+`~/.trenches` and it comes back.
+
 **Other locations, in the order they are checked:**
 
 1. `$TRENCHES_CONFIG` — a full path, for running more than one profile

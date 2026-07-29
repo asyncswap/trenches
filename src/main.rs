@@ -266,15 +266,51 @@ pub fn trace_pool(where_: &str, p: &engine::PoolCfg) {
 pub fn state_dir() -> &'static str {
     static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let local = std::path::Path::new(".trenches");
-        if local.is_dir() {
-            return ".trenches".to_string();
-        }
-        match config::home_dir() {
-            Some(h) => h.join(".trenches").to_string_lossy().into_owned(),
-            None => ".trenches".to_string(),
-        }
+        let env = std::env::var("TRENCHES_STATE").ok().filter(|v| !v.is_empty());
+        let home = config::home_dir().map(|h| h.join(".trenches").to_string_lossy().into_owned());
+        resolve_state_dir(env, home)
     })
+}
+
+/// Where history lives: `$TRENCHES_STATE`, else `~/.trenches`.
+///
+/// It used to prefer a `.trenches` in the working directory, which meant your
+/// PnL depended on where you happened to launch from — two shells, two
+/// different calendars, and nothing on screen saying which one you were looking
+/// at. Fine while the only user ran it from a checkout; a trap for anyone
+/// running a release from a project folder that happens to contain one.
+///
+/// The local directory is still available, but you have to ask for it by name.
+fn resolve_state_dir(env: Option<String>, home: Option<String>) -> String {
+    // Last resort only: with no home directory there is nowhere better, and
+    // losing the history outright is worse than putting it underfoot.
+    env.or(home).unwrap_or_else(|| ".trenches".to_string())
+}
+
+#[cfg(test)]
+mod state_dir_tests {
+    use super::resolve_state_dir;
+
+    #[test]
+    fn history_does_not_depend_on_where_you_launched_from() {
+        let home = Some("/home/me/.trenches".to_string());
+        // The same answer whatever the working directory holds — that is the
+        // whole point of the change.
+        assert_eq!(resolve_state_dir(None, home.clone()), "/home/me/.trenches");
+        // Asked for explicitly, it is honoured.
+        assert_eq!(
+            resolve_state_dir(Some("/tmp/scratch".into()), home.clone()),
+            "/tmp/scratch"
+        );
+        // An empty variable is not an answer; it is a variable someone forgot
+        // to set, and it must not send the history to "".
+        assert_eq!(resolve_state_dir(None, home), "/home/me/.trenches");
+    }
+
+    #[test]
+    fn with_no_home_it_falls_back_rather_than_losing_the_history() {
+        assert_eq!(resolve_state_dir(None, None), ".trenches");
+    }
 }
 
 /// Read an ERC-20 symbol on-chain (fallback "TOK").
