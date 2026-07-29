@@ -66,6 +66,13 @@ pub struct Order {
 pub enum PoolKind {
     V4 { pool_id: B256, tick_spacing: i32 },     // native ETH, PoolManager/UniversalRouter
     V3 { pool_addr: Address, weth_is_token0: bool }, // WETH, SwapRouter02
+    // A Flaunch launch: the same PoolManager, but paired against flETH with the
+    // Flaunch hook attached, so swaps route ETH<->flETH<->coin through the
+    // UniversalRouter. Not a widened V4: that variant bakes in currency0 =
+    // native ETH and hooks = 0. coin_is_0 records _currencyFlipped from the
+    // launch (flETH's low address makes it currency0 in practice, but the
+    // protocol allows either order).
+    FlaunchV4 { pool_id: B256, coin_is_0: bool },
 }
 
 impl PoolKind {
@@ -73,6 +80,7 @@ impl PoolKind {
         match self {
             PoolKind::V4 { .. } => "v4",
             PoolKind::V3 { .. } => "v3",
+            PoolKind::FlaunchV4 { .. } => "flaunch",
         }
     }
 
@@ -83,6 +91,7 @@ impl PoolKind {
         match self {
             PoolKind::V4 { .. } => "Uniswap V4",
             PoolKind::V3 { .. } => "Uniswap V3",
+            PoolKind::FlaunchV4 { .. } => "Flaunch",
         }
     }
     pub fn is_v3(&self) -> bool {
@@ -91,7 +100,9 @@ impl PoolKind {
     /// True when no real pool is selected (placeholder / empty network).
     pub fn is_empty(&self) -> bool {
         match self {
-            PoolKind::V4 { pool_id, .. } => *pool_id == B256::ZERO,
+            PoolKind::V4 { pool_id, .. } | PoolKind::FlaunchV4 { pool_id, .. } => {
+                *pool_id == B256::ZERO
+            }
             PoolKind::V3 { pool_addr, .. } => *pool_addr == Address::ZERO,
         }
     }
@@ -265,6 +276,9 @@ pub struct Bot {
     pub last_read_ms: f64,
     pub lp_permit2_done: bool,
     pub v3_covered: bool, // SwapRouter02 allowance covers the full position (exact-amount, v3 sells)
+    // Permit2 + UniversalRouter allowances cover the full position (Flaunch
+    // sells settle the coin through Permit2, which needs both grants).
+    pub ur_permit2_done: bool,
     pub routes: Vec<Route>, // candidate ETH-quoted venues for best-execution routing
     pub meta: Meta,     // current token's on-chain socials/metadata (for the market view)
     /// Pons graduation block, for the pool-age display and the venue logo.
@@ -314,6 +328,57 @@ pub async fn fetch_token_meta<P: Provider>(provider: &P, token: Address) -> Meta
         .map(|s| (s.twitter, s.telegram, s.discord, s.website, s.farcaster))
         .unwrap_or_default();
     Meta { logo, description, twitter, telegram, website, discord, farcaster }
+}
+
+/// Rewrite an ipfs:// URI to a public-gateway URL; anything else passes through.
+fn ipfs_to_http(uri: &str) -> String {
+    match uri.strip_prefix("ipfs://") {
+        Some(cid) => format!("https://ipfs.io/ipfs/{cid}"),
+        None => uri.to_string(),
+    }
+}
+
+/// Fetch a Flaunch coin's metadata JSON from its launch tokenUri (ipfs://…).
+/// Unlike Pons, the socials live off-chain: the JSON carries image, description
+/// and the social URLs. Any failure (gateway down, bad JSON) returns an empty
+/// Meta — metadata is never worth stalling the app for. `farcaster` stays
+/// empty: Flaunch metadata has no such field.
+pub async fn fetch_flaunch_meta(token_uri: &str) -> Meta {
+    if token_uri.trim().is_empty() {
+        return Meta::default();
+    }
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build() {
+        Ok(c) => c,
+        Err(_) => return Meta::default(),
+    };
+    let json: serde_json::Value = match client.get(ipfs_to_http(token_uri)).send().await {
+        Ok(r) => match r.json().await {
+            Ok(j) => j,
+            Err(_) => return Meta::default(),
+        },
+        Err(_) => return Meta::default(),
+    };
+    let s = |keys: &[&str]| -> String {
+        keys.iter()
+            .filter_map(|k| json.get(*k).and_then(|v| v.as_str()))
+            .find(|v| !v.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Meta {
+        // The image is itself usually ipfs:// — store the gateway form so the
+        // detail panes hold a URL a person can actually open.
+        logo: {
+            let img = s(&["image", "imageIpfs"]);
+            if img.is_empty() { img } else { ipfs_to_http(&img) }
+        },
+        description: s(&["description"]),
+        twitter: s(&["twitterUrl", "twitter"]),
+        telegram: s(&["telegramUrl", "telegram"]),
+        website: s(&["websiteUrl", "website"]),
+        discord: s(&["discordUrl", "discord"]),
+        farcaster: String::new(),
+    }
 }
 
 impl Bot {
@@ -667,12 +732,75 @@ impl Bot {
         Ok(false)
     }
 
+    /// Ensure the token can be pulled by the UniversalRouter via Permit2 for at
+    /// least `need` wei — the settle path of a Flaunch sell. Two grants: the
+    /// ERC-20's allowance to Permit2 (MAX, matching the LP flow — Permit2's own
+    /// allowance is the bounded one), and Permit2's exact-amount allowance to
+    /// the router. Returns Ok(true) when both cover `need`, Ok(false) when an
+    /// approval was sent but has not mined yet (retry the sell shortly).
+    async fn ensure_ur_allowance<P: Provider>(&mut self, provider: &P, need: U256) -> eyre::Result<bool> {
+        use alloy::primitives::aliases::{U160, U48};
+        let erc = IERC20::new(self.pool.token, provider);
+        let p2 = IPermit2::new(PERMIT2, provider);
+        let erc_ok = erc
+            .allowance(self.trader, PERMIT2)
+            .call()
+            .await
+            .map(|a| a._0 >= need)
+            .unwrap_or(false);
+        // Permit2 allowances persist on-chain and expire — check before sending.
+        let now48 = U48::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        let need160: U160 = need.min(U256::from(U160::MAX)).to();
+        let p2_ok = p2
+            .allowance(self.trader, self.pool.token, UNIVERSAL_ROUTER)
+            .call()
+            .await
+            .map(|a| a.amount >= need160 && a.expiration > now48)
+            .unwrap_or(false);
+        if erc_ok && p2_ok {
+            return Ok(true);
+        }
+        self.note(format!("Approving {} for the Universal Router", self.pool.sym));
+        let mut last = None;
+        if !erc_ok {
+            let nonce = self.take_nonce(provider).await?;
+            last = Some(*erc.approve(PERMIT2, U256::MAX).gas(120_000).nonce(nonce).send().await?.tx_hash());
+        }
+        if !p2_ok {
+            let expiration48 = U48::from(v4::FAR_DEADLINE);
+            let nonce = self.take_nonce(provider).await?;
+            last = Some(
+                *p2.approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
+                    .gas(120_000)
+                    .nonce(nonce)
+                    .send()
+                    .await?
+                    .tx_hash(),
+            );
+        }
+        if let Some(hash) = last {
+            for _ in 0..6u32 {
+                if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
+                    return Ok(true);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        Ok(false)
+    }
+
     /// After a buy confirms, top the SwapRouter02 allowance up to the full token
     /// balance (exact amount, incremented per buy) so the eventual v3 sell needs
     /// no approval and fires instantly. No-op for tokens without a v3 route. Sets
     /// `v3_covered` so the hot sell path can skip the allowance check entirely.
+    /// Flaunch routes get the same treatment through Permit2 + the router.
     async fn pre_approve_exit<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
-        if !self.has_v3_route() {
+        if !self.has_v3_route() && !self.has_flaunch_route() {
             return Ok(());
         }
         let bal = IERC20::new(self.pool.token, provider)
@@ -683,10 +811,19 @@ impl Bot {
         if bal.is_zero() {
             return Ok(());
         }
-        let covered = self.ensure_v3_allowance(provider, bal).await?;
-        self.v3_covered = covered;
-        if covered {
-            self.note(format!("Pre approved {} so an exit can go out immediately", self.pool.sym));
+        if self.has_v3_route() {
+            let covered = self.ensure_v3_allowance(provider, bal).await?;
+            self.v3_covered = covered;
+            if covered {
+                self.note(format!("Pre approved {} so an exit can go out immediately", self.pool.sym));
+            }
+        }
+        if self.has_flaunch_route() {
+            let covered = self.ensure_ur_allowance(provider, bal).await?;
+            self.ur_permit2_done = covered;
+            if covered {
+                self.note(format!("Pre approved {} so an exit can go out immediately", self.pool.sym));
+            }
         }
         Ok(())
     }
@@ -700,7 +837,7 @@ impl Bot {
         // / price, since price is tokens-per-ETH).
         let eth = eth_of_label(&label)
             .unwrap_or_else(|| if price > 0.0 { self.token_bal / price } else { 0.0 });
-        let is_v4 = matches!(self.pool.kind, PoolKind::V4 { .. });
+        let is_v4 = matches!(self.pool.kind, PoolKind::V4 { .. } | PoolKind::FlaunchV4 { .. });
         self.orders.push_back(Order { label, status, hash, mc, pooled: self.r0, eth, is_v4 });
         while self.orders.len() > 200 {
             self.orders.pop_front();
@@ -800,6 +937,13 @@ impl Bot {
     /// sell). Used to grant the approval before simulating sells across venues.
     fn has_v3_route(&self) -> bool {
         self.routes.iter().any(|r| r.kind.is_v3())
+    }
+
+    /// True if any candidate route (or the active pool) is a Flaunch pool,
+    /// whose sells settle the coin through Permit2 and need `ensure_ur_allowance`.
+    fn has_flaunch_route(&self) -> bool {
+        matches!(self.pool.kind, PoolKind::FlaunchV4 { .. })
+            || self.routes.iter().any(|r| matches!(r.kind, PoolKind::FlaunchV4 { .. }))
     }
 
     /// Best-execution router: simulate `amount` (ETH for a buy, tokens for a
@@ -985,6 +1129,19 @@ impl Bot {
                 }
             }
         }
+        // Flaunch sells settle the coin through Permit2 — grant it before the
+        // routing pre-flight, or every simulated sell reverts.
+        if !buying && self.has_flaunch_route() && !self.ur_permit2_done {
+            let need = IERC20::new(self.pool.token, provider)
+                .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
+            if !need.is_zero() {
+                match self.ensure_ur_allowance(provider, need).await {
+                    Ok(true) => self.ur_permit2_done = true,
+                    Ok(false) => { self.note("Approval is still confirming. Try the sell again shortly".into()); return Ok(()); }
+                    Err(e) => { self.note(format!("Approval failed. {}", short_err(&e.to_string()))); return Ok(()); }
+                }
+            }
+        }
 
         // Best-execution routing: simulate this trade on every candidate venue
         // and take the one that nets the most (fee tiers + depth + hook take).
@@ -1058,11 +1215,17 @@ impl Bot {
         // WETH unwrapWETH9 step (this is what reverts sells, NOT slippage). You pay
         // for gas USED, so the headroom is free; sells carry the unwrap → larger cap.
         // Also skips a per-tx estimate round-trip, so sends are a touch faster.
+        // Flaunch swaps traverse TWO hooked pools (flETH + the Flaunch hook's
+        // fee machinery), so they get more headroom in both directions.
+        let gas_limit = match route.kind {
+            PoolKind::FlaunchV4 { .. } => if buying { 500_000 } else { 650_000 },
+            _ => if buying { 300_000 } else { 450_000 },
+        };
         let tx = TransactionRequest::default()
             .with_to(to)
             .with_input(data)
             .with_value(value)
-            .with_gas_limit(if buying { 300_000 } else { 450_000 })
+            .with_gas_limit(gas_limit)
             .with_from(self.trader);
 
         // Pre-flight: if it would revert, skip — do NOT spend gas. Surface the
@@ -1275,13 +1438,25 @@ impl Bot {
             self.note("The arb sell leg quoted nothing, so the tokens are being held".into());
             return Ok(());
         }
-        // v3 sells need the token approved to SwapRouter02 first (same token).
+        // v3 sells need the token approved to SwapRouter02 first (same token);
+        // Flaunch sells need the Permit2 + router grants.
         if sk.is_v3() && !self.v3_covered {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
                 match self.ensure_v3_allowance(provider, need).await {
                     Ok(true) => self.v3_covered = true,
+                    Ok(false) => { self.note("Arb approval is still confirming. Try again shortly".into()); return Ok(()); }
+                    Err(e) => { self.note(format!("Arb approval failed. {}", short_err(&e.to_string()))); return Ok(()); }
+                }
+            }
+        }
+        if matches!(sk, PoolKind::FlaunchV4 { .. }) && !self.ur_permit2_done {
+            let need = IERC20::new(self.pool.token, provider)
+                .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
+            if !need.is_zero() {
+                match self.ensure_ur_allowance(provider, need).await {
+                    Ok(true) => self.ur_permit2_done = true,
                     Ok(false) => { self.note("Arb approval is still confirming. Try again shortly".into()); return Ok(()); }
                     Err(e) => { self.note(format!("Arb approval failed. {}", short_err(&e.to_string()))); return Ok(()); }
                 }
@@ -1428,6 +1603,14 @@ impl Bot {
                 self.skips += 1;
                 self.push_order("ADD LP".into(), OrderStatus::Skipped, None);
                 self.note("Adding liquidity needs a Uniswap V4 pool. This one is trade only".into());
+                return Ok(());
+            }
+            // The MINT calldata builds hooks: 0, which on a Flaunch coin would
+            // target a pool that does not exist — refuse rather than revert.
+            PoolKind::FlaunchV4 { .. } => {
+                self.skips += 1;
+                self.push_order("ADD LP".into(), OrderStatus::Skipped, None);
+                self.note("Liquidity on Flaunch pools is managed by the Flaunch hook. Trade only".into());
                 return Ok(());
             }
         };
@@ -1737,6 +1920,13 @@ impl Bot {
                 }
             }
         }
+        if self.has_flaunch_route() && !self.ur_permit2_done {
+            match self.ensure_ur_allowance(provider, bal_u256).await {
+                Ok(true) => self.ur_permit2_done = true,
+                Ok(false) => { self.note("Approval is still confirming. Try selling everything again shortly".into()); return Ok(()); }
+                Err(e) => { self.note(format!("Approval for selling everything failed. {}", short_err(&e.to_string()))); return Ok(()); }
+            }
+        }
         let (route, expected) = match self.best_venue(provider, amount_in, false).await {
             Some(x) => x,
             None => {
@@ -1754,7 +1944,12 @@ impl Bot {
         let wei_min = Wei::rounded(min_out);
         let (to, data, _value) = build_swap(route.kind, route.token, route.fee, false, wei_in, wei_min, self.trader);
         // Sell + unwrapWETH9 → generous gas cap so the WETH withdraw never OOGs.
-        let tx = TransactionRequest::default().with_to(to).with_input(data).with_gas_limit(450_000).with_from(self.trader);
+        // A Flaunch dump crosses two hooked pools, so it gets more headroom.
+        let dump_gas = match route.kind {
+            PoolKind::FlaunchV4 { .. } => 650_000,
+            _ => 450_000,
+        };
+        let tx = TransactionRequest::default().with_to(to).with_input(data).with_gas_limit(dump_gas).with_from(self.trader);
         // Report the sell in ETH numeraire (expected proceeds), not token units.
         let label = format!("SELL ALL for {:.6} ETH @ {:.6} [{} {}] liq_eth={:.6}", expected, self.price(), route.kind.proto(), route.label, self.r0);
         if let Err(e) = provider.call(&tx).await {
@@ -1943,7 +2138,7 @@ async fn read_market_inner<P: Provider>(
 
     // sqrtPrice + raw liquidity L, from the protocol's state source.
     let (sqrt_p, tick, l) = match pref.kind {
-        PoolKind::V4 { pool_id, .. } => {
+        PoolKind::V4 { pool_id, .. } | PoolKind::FlaunchV4 { pool_id, .. } => {
             let sv = IStateView::new(STATE_VIEW, provider);
             let cb0 = sv.getSlot0(pool_id);
             let cbl = sv.getLiquidity(pool_id);
@@ -2019,6 +2214,16 @@ async fn read_market_inner<P: Provider>(
                 (a_raw / 1e18, b_raw / 10f64.powi(tdi))
             } else {
                 (b_raw / 1e18, a_raw / 10f64.powi(tdi))
+            }
+        }
+        // Flaunch: the quote side is flETH (18-dec, 1:1 with ETH), so the
+        // flETH reserve is r0 in ETH terms. The launch's _currencyFlipped bool
+        // decides the orientation, not the ETH-vs-token address ordering.
+        PoolKind::FlaunchV4 { coin_is_0, .. } => {
+            if coin_is_0 {
+                (b_raw / 1e18, a_raw / 10f64.powi(tdi))
+            } else {
+                (a_raw / 1e18, b_raw / 10f64.powi(tdi))
             }
         }
     };
@@ -2172,6 +2377,12 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             true, true,
             Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
         ),
+        // Same PoolManager events as V4, but the quote side is flETH, whose
+        // position follows the launch's _currencyFlipped rather than always 0.
+        PoolKind::FlaunchV4 { pool_id, coin_is_0 } => (
+            !coin_is_0, true,
+            Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
+        ),
         PoolKind::V3 { pool_addr, weth_is_token0 } => (
             weth_is_token0, false,
             Filter::new().address(pool_addr).from_block(from_block).to_block(to_block),
@@ -2228,8 +2439,10 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             } else {
                 0.0
             };
-            let eth_side = if v4 { a0 } else if weth0 { a0 } else { a1 };
-            let eth_wei = iabs_wei(b, if v4 { 0 } else if weth0 { 0 } else { 1 });
+            // The quote side follows weth0 on every protocol. (Plain-v4 pools
+            // always pass weth0 = true, so for them this is still word 0.)
+            let eth_side = if weth0 { a0 } else { a1 };
+            let eth_wei = iabs_wei(b, if weth0 { 0 } else { 1 });
             // v3 topic[2] is the recipient; v4 topic[2] is the sender.
             let trader = topics.get(2).map(|w| Address::from_word(*w)).unwrap_or_default();
             let (action, eth) = if v4 {
@@ -2390,6 +2603,13 @@ fn build_swap(
         PoolKind::V4 { tick_spacing, .. } => (
             UNIVERSAL_ROUTER,
             v4::swap_calldata(token, fee, tick_spacing, buying, wi, wm),
+            value,
+        ),
+        // `fee` is deliberately unused: the Flaunch pool key's fee is 0 (the
+        // hook charges its cut), and the builder hardcodes the key layout.
+        PoolKind::FlaunchV4 { .. } => (
+            UNIVERSAL_ROUTER,
+            v4::flaunch_swap_calldata(token, buying, wi, wm),
             value,
         ),
         PoolKind::V3 { .. } => {

@@ -328,7 +328,9 @@ fn routes_for(pools: &[SelPool], token: alloy::primitives::Address) -> Vec<engin
 /// anything else is a stablecoin quote (priced live, never assumed $1).
 fn quote_from(currency0: &str) -> (engine::Quote, String) {
     let addr = currency0.parse::<alloy::primitives::Address>().unwrap_or(alloy::primitives::Address::ZERO);
-    if addr == alloy::primitives::Address::ZERO || addr == contracts::WETH {
+    // flETH counts as ETH: it is redeemable 1:1, so a Flaunch pool is
+    // ETH-quoted even though its currency0 is the wrapper.
+    if addr == alloy::primitives::Address::ZERO || addr == contracts::WETH || addr == contracts::FLETH {
         (engine::Quote::Eth, "ETH".to_string())
     } else {
         (engine::Quote::Stable { token: addr, decimals: stable_decimals(addr) }, stable_symbol(addr))
@@ -340,9 +342,35 @@ fn quote_from(currency0: &str) -> (engine::Quote, String) {
 /// Most specific first — a launchpad beats the AMM it graduates into, which
 /// beats the chain underneath. With no pool selected there is no venue at all,
 /// so it falls all the way back to the chain.
+/// Fill the venue signals for the selected pool — Pons socials + graduation
+/// block, or the Flaunch metadata + launch block when the pool is a Flaunch
+/// one. Kind-gated so a Flaunch launch block can never make a plain Uniswap
+/// pool wear the Pons mark (the Pons signal is `pool_launch_block` alone).
+async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
+    if matches!(bot.pool.kind, engine::PoolKind::FlaunchV4 { .. }) {
+        match discover::fetch_flaunch_pool(provider, bot.pool.token).await {
+            Some(fl) => {
+                bot.pool_launch_block = Some(fl.launch_block);
+                bot.meta = engine::fetch_flaunch_meta(&fl.token_uri).await;
+            }
+            None => {
+                bot.pool_launch_block = None;
+                bot.meta = Default::default();
+            }
+        }
+    } else {
+        bot.meta = engine::fetch_token_meta(provider, bot.pool.token).await;
+        bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await;
+    }
+}
+
 fn header_venue(bot: &Bot) -> ui::image::Venue {
     if bot.pool.token.is_zero() {
         ui::image::Venue::Chain
+    } else if matches!(bot.pool.kind, engine::PoolKind::FlaunchV4 { .. }) {
+        // The kind IS the signal — checked before pons_launch so a launch
+        // block set for the Age row can never relabel a Flaunch coin.
+        ui::image::Venue::Flaunch
     } else if bot.pons_launch().is_some() {
         ui::image::Venue::Pons
     } else {
@@ -444,6 +472,7 @@ fn pool_sentence(label: &str) -> String {
         ("[public]", "public"),
         ("[v3]", "Uniswap V3"),
         ("[v4]", "Uniswap V4"),
+        ("[flaunch]", "Flaunch"),
     ] {
         out = out.replace(tag, word);
     }
@@ -507,7 +536,8 @@ const HEALTHY: &str = "Healthy — pool is live.";
 fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
     let (key, val) = match p.kind {
         engine::PoolKind::V3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
-        engine::PoolKind::V4 { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
+        engine::PoolKind::V4 { pool_id, .. }
+        | engine::PoolKind::FlaunchV4 { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
     };
     vec![
         ("sym", p.sym.clone()),
@@ -570,10 +600,22 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                 Err(_) => continue,
             };
             // Build the type-safe kind: v3 needs a pool address, v4 a pool id.
+            // "flaunch" must be matched before the v4 fallback, or a cached
+            // Flaunch pool would reload as plain V4 and get the wrong swap
+            // builder on restart.
             let kind = if p.kind.eq_ignore_ascii_case("v3") {
                 match p.address.parse::<alloy::primitives::Address>() {
                     Ok(a) if a != alloy::primitives::Address::ZERO => {
                         engine::PoolKind::V3 { pool_addr: a, weth_is_token0: weth_is_token0(tok) }
+                    }
+                    _ => continue,
+                }
+            } else if p.kind.eq_ignore_ascii_case("flaunch") {
+                match p.pool_id.parse::<B256>() {
+                    // Currency ordering is address ordering, so the coin's side
+                    // re-derives from the token itself — no extra cached field.
+                    Ok(id) if id != B256::ZERO => {
+                        engine::PoolKind::FlaunchV4 { pool_id: id, coin_is_0: tok < contracts::FLETH }
                     }
                     _ => continue,
                 }
@@ -1416,6 +1458,7 @@ async fn chain_session_on(
         last_read_ms: 0.0,
         lp_permit2_done: false,
         v3_covered: false,
+        ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
         meta: engine::Meta::default(),
         pool_launch_block: None,
@@ -1428,8 +1471,7 @@ async fn chain_session_on(
     // first render — otherwise the wallet shows zero for a day that already
     // has trades in it, and disagrees with the calendar until you make another.
     bot.refresh_day_realized();
-    bot.meta = engine::fetch_token_meta(&provider, bot.pool.token).await; // socials for the start pool
-    bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await; // pool age
+    refresh_venue_meta(&provider, &mut bot).await; // socials + pool age for the start pool
 
     // --- trading dashboard (same terminal), with live option switching ---
     let verified = build_verified(net);
@@ -1467,6 +1509,12 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
         engine::PoolKind::V4 { pool_id, tick_spacing } => (
             "v4", pool_id.to_string(), String::new(), tick_spacing,
             alloy::primitives::Address::ZERO.to_string(), contracts::STATE_VIEW.to_string(),
+        ),
+        // currency0 records flETH so collect_pools can re-derive the coin's
+        // side on reload (coin_is_0 = token < flETH).
+        engine::PoolKind::FlaunchV4 { pool_id, .. } => (
+            "flaunch", pool_id.to_string(), String::new(), contracts::FLAUNCH_TICK_SPACING,
+            contracts::FLETH.to_string(), contracts::STATE_VIEW.to_string(),
         ),
         engine::PoolKind::V3 { pool_addr, .. } => (
             "v3", String::new(), pool_addr.to_string(), 0,
@@ -2053,6 +2101,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             bot.bought_cost = 0.0;
                             bot.lp_permit2_done = false;
                             bot.v3_covered = false;
+                            bot.ur_permit2_done = false;
                             bot.meta = Default::default();
                             bot.pool_launch_block = None;
                             bot.arb_mode = false;
@@ -2081,6 +2130,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let saved = bot.pool.clone();
                             let saved_routes = std::mem::take(&mut bot.routes);
                             let saved_covered = bot.v3_covered;
+                            let saved_ur = bot.ur_permit2_done;
                             let mut swept = 0u32;
                             let mut seen: std::collections::HashSet<alloy::primitives::Address> = std::collections::HashSet::new();
                             for p in pools.clone() {
@@ -2092,12 +2142,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 trace_pool("switch", &bot.pool);
                                 bot.routes = routes_for(&pools, p.token);
                                 bot.v3_covered = false;
+                                bot.ur_permit2_done = false;
                                 let _ = tokio::time::timeout(Duration::from_secs(10), bot.sell_all(provider)).await;
                                 swept += 1;
                             }
                             bot.pool = saved;
                             bot.routes = saved_routes;
                             bot.v3_covered = saved_covered;
+                            bot.ur_permit2_done = saved_ur;
                             // Read the token real decimals BEFORE publishing to the market
                             // reader, so its first read is scaled correctly.
                             refresh_token_decimals(provider, bot).await;
@@ -2184,6 +2236,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     bot.bought_cost = 0.0;
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
+                                    bot.ur_permit2_done = false;
                                     apply_prices(bot, &feed);
                                     // Read the token's real decimals BEFORE publishing to the
                                     // market reader, so its first read is correctly scaled.
@@ -2192,8 +2245,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     refresh_token_decimals(provider, bot).await;
                                     *pool_cell.lock().unwrap() = bot.pool.as_ref();
                                     prices.clear();
-                                    bot.meta = engine::fetch_token_meta(provider, bot.pool.token).await;
-                                    bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await;
+                                    refresh_venue_meta(provider, bot).await;
                                     bot.status = format!("Now trading {}", pool_sentence(&p.label));
                                     bot.routes = routes_for(&pools, bot.pool.token);
                                 }
@@ -2263,7 +2315,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.status = "loading top tokens…".into();
                                 discover::screen_top_tokens(terminal, provider, discovery_rpc.clone()).await?
                             } else {
-                                bot.status = "scanning Pons graduations…".into();
+                                bot.status = "scanning Pons + Flaunch launches…".into();
                                 discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?
                             };
                             match grad {
@@ -2286,6 +2338,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     bot.bought_cost = 0.0;
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
+                                    bot.ur_permit2_done = false;
                                     apply_prices(bot, &feed);
                                     // Read the token's real decimals BEFORE publishing to the
                                     // market reader, so its first read is correctly scaled.
@@ -2371,6 +2424,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             token, sym, fee, owned: false,
                                                             quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                         })
+                                                    } else if let Some(fl) = discover::fetch_flaunch_pool(provider, token).await {
+                                                        // No v3 pool, but Flaunch launched it — trade the
+                                                        // flETH-paired hook pool instead.
+                                                        bot.status = format!("found Flaunch pool for {sym}");
+                                                        Some(SelPool {
+                                                            label: pool_label(false, "flaunch", "ETH", &sym, contracts::FLAUNCH_FEE_EST, ""),
+                                                            kind: engine::PoolKind::FlaunchV4 { pool_id: fl.pool_id, coin_is_0: fl.coin_is_0 },
+                                                            token, sym, fee: contracts::FLAUNCH_FEE_EST, owned: false,
+                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                        })
                                                     } else {
                                                         bot.status = format!("No liquid Uniswap V3 pool for {sym}. Try selecting assets to use V4");
                                                         None
@@ -2429,6 +2492,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     bot.bought_cost = 0.0;
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
+                                    bot.ur_permit2_done = false;
                                     apply_prices(bot, &feed); // value the new pool's quote
                                     // Read the token's real decimals BEFORE publishing to the
                                     // market reader, so its first read is correctly scaled.
@@ -2456,8 +2520,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     // Refresh venues AFTER the new pool is in `pools`, so a
                                     // freshly-added pool is itself a routing candidate.
                                     bot.routes = routes_for(&pools, bot.pool.token);
-                                    bot.meta = engine::fetch_token_meta(provider, bot.pool.token).await;
-                                    bot.pool_launch_block = discover::fetch_launch_block(bot.pool.token).await;
+                                    refresh_venue_meta(provider, bot).await;
                                 }
                             }
                         }
@@ -2716,7 +2779,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     match bot.pool.kind {
         engine::PoolKind::V3 { pool_addr, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
-        engine::PoolKind::V4 { pool_id, .. } =>
+        engine::PoolKind::V4 { pool_id, .. } | engine::PoolKind::FlaunchV4 { pool_id, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
     }
     // Which venue and pair, first — it moved off the header to make room for
@@ -2738,7 +2801,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     if let Some(lb) = bot.pons_launch() {
         let s = block.saturating_sub(lb) / 10; // ~10 blocks/sec since graduation
         let a = if s < 60 { format!("{s}s") } else if s < 3600 { format!("{}m", s / 60) } else { format!("{}h", s / 3600) };
-        mkt.push(Line::from(vec![mlbl("Age"), Span::raw(format!("{a} (since graduation)"))]));
+        let since = if matches!(bot.pool.kind, engine::PoolKind::FlaunchV4 { .. }) {
+            "since flaunch"
+        } else {
+            "since graduation"
+        };
+        mkt.push(Line::from(vec![mlbl("Age"), Span::raw(format!("{a} ({since})"))]));
     }
     // Pooled reserves (like dexscreener/gmgn) — each side its own row.
     // These come from L and the current price (`L/√P`, `L·√P`), which is what
@@ -2816,7 +2884,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             match pb.kind {
                 engine::PoolKind::V3 { pool_addr, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
-                engine::PoolKind::V4 { pool_id, .. } =>
+                engine::PoolKind::V4 { pool_id, .. } | engine::PoolKind::FlaunchV4 { pool_id, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
             }
             let pbp = bot.price_b();

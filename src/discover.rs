@@ -24,7 +24,10 @@ use crossterm::event::{self, Event, KeyCode};
 use futures::stream::StreamExt;
 use ratatui::{prelude::*, widgets::*};
 
-use crate::contracts::{IERC20, IPonsFactory, IV3Factory, IV3Pool, PONS_FACTORY, POOL_MANAGER, STATE_VIEW, V3_FACTORY, WETH};
+use crate::contracts::{
+    IERC20, IFlaunchPositionManager, IPonsFactory, IStateView, IV3Factory, IV3Pool,
+    FLAUNCH_FEE_EST, FLAUNCH_PM, PONS_FACTORY, POOL_MANAGER, STATE_VIEW, V3_FACTORY, WETH,
+};
 use crate::engine;
 use crate::ui;
 use crate::view;
@@ -76,7 +79,8 @@ impl Grad {
     pub fn pool_key(&self) -> B256 {
         match self.kind {
             engine::PoolKind::V3 { pool_addr, .. } => pool_addr.into_word(),
-            engine::PoolKind::V4 { pool_id, .. } => pool_id,
+            engine::PoolKind::V4 { pool_id, .. }
+            | engine::PoolKind::FlaunchV4 { pool_id, .. } => pool_id,
         }
     }
     /// Human display of the venue id — the 20-byte pool ADDRESS for v3, the
@@ -84,7 +88,8 @@ impl Grad {
     pub fn pool_display(&self) -> String {
         match self.kind {
             engine::PoolKind::V3 { pool_addr, .. } => format!("{pool_addr:#x}"),
-            engine::PoolKind::V4 { pool_id, .. } => format!("{pool_id:#x}"),
+            engine::PoolKind::V4 { pool_id, .. }
+            | engine::PoolKind::FlaunchV4 { pool_id, .. } => format!("{pool_id:#x}"),
         }
     }
     /// True when WETH/quote is token0 (only meaningful for ETH-quoted v3 pools).
@@ -298,6 +303,245 @@ async fn full_row<P: Provider, L: Provider>(
 /// Seconds since a row's pool graduated (from the block delta at measure time).
 fn age_secs(r: &Row) -> f64 {
     r.head_block.saturating_sub(r.grad.launch_block) as f64 * SECS_PER_BLOCK
+}
+
+// ---- Flaunch launch discovery ----
+// Flaunch coins launch straight into a v4 pool (flETH-paired, Flaunch hook) on
+// the same PoolManager the app already trades, announced by the Flaunch
+// PositionManager's PoolCreated event. Unlike Pons there is no bonding phase to
+// graduate from: the event IS the launch, and it carries the symbol, name and
+// metadata URI inline — so a scan needs no per-token reads at all.
+
+/// v4 PoolManager `Swap` topic0 — for the tx/sec sample of a Flaunch pool.
+const SWAP_V4: B256 =
+    alloy::primitives::b256!("40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
+
+/// One Flaunch launch, as decoded from PoolCreated (plus what recents cached).
+#[derive(Clone)]
+pub struct FlCand {
+    pub token: Address,
+    pub pool_id: B256,
+    pub coin_is_0: bool, // _currencyFlipped: the coin is currency0, flETH currency1
+    pub block: u64,
+    pub sym: String,
+    pub token_uri: String,
+    pub flaunch_at: u64, // scheduled go-live (unix secs); 0 = live at creation
+}
+
+/// Chunked PoolCreated scan over the Flaunch PositionManager — the same shape
+/// (and the same failure reporting) as the Pons `scan_candidates`.
+async fn scan_flaunch<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<FlCand> {
+    let mut raw = Vec::new();
+    let mut start = from;
+    let (mut ok, mut failed) = (0u32, 0u32);
+    while start <= to {
+        let end = (start + LOG_CHUNK - 1).min(to);
+        let filter = Filter::new()
+            .address(FLAUNCH_PM)
+            .event_signature(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH)
+            .from_block(start)
+            .to_block(end);
+        match tokio::time::timeout(RPC_TIMEOUT, logs.get_logs(&filter)).await {
+            Ok(Ok(l)) => {
+                ok += 1;
+                raw.extend(l);
+            }
+            Ok(Err(e)) => {
+                failed += 1;
+                crate::trace(&format!("flaunch scan {start}..{end} failed: {e}"));
+                let msg = e.to_string();
+                let rate_limited = msg.contains("429") || msg.to_lowercase().contains("rate limit");
+                crate::events::log(
+                    if rate_limited { crate::events::Level::Warn } else { crate::events::Level::Error },
+                    if rate_limited { "Discovery rate limited by the RPC" } else { "Discovery scan failed" },
+                    &[("blocks", format!("{start}..{end}")), ("reason", msg.chars().take(120).collect())],
+                );
+            }
+            Err(_) => {
+                failed += 1;
+                crate::trace(&format!("flaunch scan {start}..{end} timed out"));
+            }
+        }
+        start = end + 1;
+    }
+    crate::trace(&format!(
+        "flaunch scan {from}..{to}: {ok} chunks ok, {failed} failed, {} logs",
+        raw.len()
+    ));
+    let mut seen = std::collections::HashSet::new();
+    let mut cands = Vec::new();
+    for lg in raw {
+        // alloy decodes topics AND the dynamic FlaunchParams tuple — never
+        // hand-offset a log with dynamic fields.
+        let Ok(ev) = IFlaunchPositionManager::PoolCreated::decode_log(&lg.inner, true) else {
+            continue;
+        };
+        if !seen.insert(ev.data._poolId) {
+            continue;
+        }
+        cands.push(FlCand {
+            token: ev.data._memecoin,
+            pool_id: ev.data._poolId,
+            coin_is_0: ev.data._currencyFlipped,
+            block: lg.block_number.unwrap_or(0),
+            // On-chain names are attacker-controlled text — same trim the rest
+            // of the table gets from view rendering; length-cap here.
+            sym: ev.data._params.symbol.chars().take(12).collect(),
+            token_uri: ev.data._params.tokenUri.clone(),
+            flaunch_at: u64::try_from(ev.data._params.flaunchAt).unwrap_or(u64::MAX),
+        });
+    }
+    cands.sort_by(|a, b| b.block.cmp(&a.block)); // newest first
+    cands.truncate(MAX_SCAN);
+    cands
+}
+
+/// Off-chain metadata cache for Flaunch coins, keyed by token. Filled by a
+/// spawned task per coin, so a slow IPFS gateway only delays the socials
+/// column — the scan loop never waits on it. An entry (even an empty one)
+/// means "fetched or fetching": failures are not retried.
+fn fl_meta_cache() -> &'static Mutex<std::collections::HashMap<Address, engine::Meta>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<Address, engine::Meta>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fl_meta(token: Address, token_uri: &str) -> engine::Meta {
+    if let Ok(cache) = fl_meta_cache().lock() {
+        if let Some(m) = cache.get(&token) {
+            return m.clone();
+        }
+    }
+    if !token_uri.trim().is_empty() {
+        // Mark as in-flight BEFORE spawning, so the next 1.2s round doesn't
+        // spawn a duplicate fetch while this one is still resolving.
+        if let Ok(mut cache) = fl_meta_cache().lock() {
+            cache.insert(token, engine::Meta::default());
+        }
+        let uri = token_uri.to_string();
+        tokio::spawn(async move {
+            let meta = engine::fetch_flaunch_meta(&uri).await;
+            if let Ok(mut cache) = fl_meta_cache().lock() {
+                cache.insert(token, meta);
+            }
+        });
+    }
+    engine::Meta::default()
+}
+
+/// Everything for one Flaunch pool: live v4 metrics via StateView plus the
+/// symbol/meta the launch event already provided. Mirrors `full_row`.
+async fn flaunch_full_row<P: Provider, L: Provider>(
+    provider: &P,
+    logs: &L,
+    cand: FlCand,
+    trader: Address,
+    head: u64,
+) -> Row {
+    let meta = fl_meta(cand.token, &cand.token_uri);
+    let grad = Grad {
+        token: cand.token,
+        kind: engine::PoolKind::FlaunchV4 { pool_id: cand.pool_id, coin_is_0: cand.coin_is_0 },
+        quote: engine::Quote::Eth,
+        sym: cand.sym.clone(),
+        // The hook's ~1% cut, for quote estimates — the pool's own lpFee is 0.
+        fee: FLAUNCH_FEE_EST,
+        launch_block: cand.block,
+        meta,
+    };
+
+    // A scheduled launch that has not gone live yet would show a price but
+    // refuse every swap. Zero metrics keep it under the market-cap floor until
+    // its time arrives (rows are rebuilt every round, so it appears then).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if cand.flaunch_at > now {
+        return Row { grad, pooled_eth: 0.0, mkt_cap_eth: 0.0, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: false };
+    }
+
+    let sv = IStateView::new(STATE_VIEW, provider);
+    let tok = IERC20::new(cand.token, provider);
+    let sqrt = sv
+        .getSlot0(cand.pool_id)
+        .call()
+        .await
+        .map(|s| uf(s.sqrtPriceX96) / 2f64.powi(96))
+        .unwrap_or(0.0);
+    let liq = sv.getLiquidity(cand.pool_id).call().await.map(|l| uf(l.liquidity)).unwrap_or(0.0);
+    let supply_f = tok.totalSupply().call().await.map(|s| uf(s._0) / 1e18).unwrap_or(0.0);
+    let my_bal = tok.balanceOf(trader).call().await.map(|b| uf(b._0) / 1e18).unwrap_or(0.0);
+    let from = head.saturating_sub(ACTIVITY_WINDOW);
+    let swaps_filter = Filter::new()
+        .address(POOL_MANAGER)
+        .event_signature(SWAP_V4)
+        .topic1(cand.pool_id)
+        .from_block(from)
+        .to_block(head);
+    let n = match tokio::time::timeout(RPC_TIMEOUT, logs.get_logs(&swaps_filter)).await {
+        Ok(Ok(l)) => l.len(),
+        _ => 0,
+    };
+    // flETH ≈ ETH 1:1, so the flETH-side virtual reserve IS pooled ETH. flETH
+    // is token0 unless the launch flipped the pair (`coin_is_0`).
+    let fleth0 = !cand.coin_is_0;
+    let pooled_eth = if sqrt > 0.0 {
+        (if fleth0 { liq / sqrt } else { liq * sqrt }) / 1e18
+    } else {
+        0.0
+    };
+    let p_raw = sqrt * sqrt;
+    let tokens_per_eth = if fleth0 { p_raw } else if p_raw > 0.0 { 1.0 / p_raw } else { 0.0 };
+    let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
+    let mkt_cap_eth = supply_f * eth_per_token;
+    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let tx_per_sec = if secs > 0.0 { n as f64 / secs } else { 0.0 };
+
+    Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, head_block: head, verified: false }
+}
+
+/// A token's Flaunch pool, if the token was launched there — the Flaunch
+/// equivalent of `fetch_launch_block`, for coins that arrive by CA, holdings or
+/// the pool menu rather than through discovery.
+pub struct FlaunchPool {
+    pub pool_id: B256,
+    pub coin_is_0: bool,
+    pub launch_block: u64,
+    pub token_uri: String,
+}
+
+pub async fn fetch_flaunch_pool<P: Provider>(provider: &P, token: Address) -> Option<FlaunchPool> {
+    use alloy::sol_types::SolValue;
+    let pm = IFlaunchPositionManager::new(FLAUNCH_PM, provider);
+    let key = tokio::time::timeout(RPC_TIMEOUT, pm.poolKey(token).call())
+        .await
+        .ok()?
+        .ok()?
+        .key;
+    // The documented empty-answer marker for a token Flaunch never launched.
+    if key.tickSpacing.as_i32() == 0 {
+        return None;
+    }
+    let coin_is_0 = key.currency0 == token;
+    let pool_id: B256 = alloy::primitives::keccak256(key.abi_encode());
+    // Launch block + metadata URI from the PoolCreated log (topic1 = pool id,
+    // so the result set is one log). Wide-range getLogs go to the public RPC.
+    let lp = logs_provider().await?;
+    let filter = Filter::new()
+        .address(FLAUNCH_PM)
+        .event_signature(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH)
+        .topic1(pool_id)
+        .from_block(0);
+    let logs = tokio::time::timeout(RPC_TIMEOUT, lp.get_logs(&filter)).await.ok()?.ok()?;
+    let lg = logs.first()?;
+    let ev = IFlaunchPositionManager::PoolCreated::decode_log(&lg.inner, true).ok()?;
+    Some(FlaunchPool {
+        pool_id,
+        coin_is_0,
+        launch_block: lg.block_number.unwrap_or(0),
+        token_uri: ev.data._params.tokenUri.clone(),
+    })
 }
 
 // ---- Big-fish sweep: find larger-cap graduations at ANY age ----
@@ -745,6 +989,63 @@ pub fn remember(token: Address, pool: Address, block: u64) {
     save_recents(&rows);
 }
 
+/// Flaunch keeps its own recents file — the Pons cache and format are left
+/// exactly as they were.
+fn flaunch_recents_path() -> String {
+    format!("{}/discovered-flaunch.json", crate::state_dir())
+}
+
+fn load_flaunch_recents() -> Vec<FlCand> {
+    let Ok(text) = std::fs::read_to_string(flaunch_recents_path()) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        crate::trace("flaunch recents: cache is not readable JSON, starting empty");
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for it in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let s = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let (Ok(token), Ok(pool_id)) = (s("token").parse::<Address>(), s("pool_id").parse::<B256>()) else {
+            continue;
+        };
+        out.push(FlCand {
+            token,
+            pool_id,
+            coin_is_0: it.get("coin_is_0").and_then(|x| x.as_bool()).unwrap_or(false),
+            block: it.get("block").and_then(|b| b.as_u64()).unwrap_or(0),
+            sym: s("sym"),
+            token_uri: s("token_uri"),
+            flaunch_at: it.get("flaunch_at").and_then(|b| b.as_u64()).unwrap_or(0),
+        });
+    }
+    crate::trace(&format!("flaunch recents: loaded {} remembered tokens", out.len()));
+    out
+}
+
+fn save_flaunch_recents(rows: &[FlCand]) {
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "token": format!("{:#x}", c.token),
+                "pool_id": format!("{:#x}", c.pool_id),
+                "coin_is_0": c.coin_is_0,
+                "block": c.block,
+                "sym": c.sym,
+                "token_uri": c.token_uri,
+                "flaunch_at": c.flaunch_at,
+            })
+        })
+        .collect();
+    let Ok(text) = serde_json::to_string_pretty(&arr) else { return };
+    let path = flaunch_recents_path();
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 /// Background loop: rescan launches, fetch each pool concurrently, and publish
 /// rows into `shared` AS EACH RESOLVES so the UI fills in live. Ends when `stop`.
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
@@ -768,6 +1069,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // Seeded from disk, so the screen has something to show the instant it
     // opens rather than an empty table waiting on a scan.
     let mut known: Vec<(Address, Address, u64)> = load_recents();
+    // Flaunch launches ride the same incremental window, in their own list.
+    let mut known_fl: Vec<FlCand> = load_flaunch_recents();
 
     while !stop.load(Ordering::Relaxed) {
         // A head read that did not answer is not block zero. It used to fall
@@ -807,6 +1110,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                     known.push(c);
                 }
             }
+            for c in scan_flaunch(&logs, from, head).await {
+                if !known_fl.iter().any(|k| k.token == c.token) {
+                    known_fl.push(c);
+                }
+            }
         }
         scanned_to = Some(head);
         // Newest first, and bounded — but NOT aged out by the launch window.
@@ -817,6 +1125,10 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known.truncate(RECENTS_MAX);
         save_recents(&known);
         let cands = known.clone();
+        known_fl.sort_by(|a, b| b.block.cmp(&a.block));
+        known_fl.truncate(RECENTS_MAX);
+        save_flaunch_recents(&known_fl);
+        let cands_fl = known_fl.clone();
 
         // Rows survive between rounds, keyed by token, and keep their place.
         //
@@ -829,9 +1141,19 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // Now a resolved row replaces its previous self in place, and the
         // ranking is applied once the round is done rather than on every
         // arrival.
-        let mut stream = futures::stream::iter(cands)
-            .map(|(t, p, b)| full_row(&provider, &logs, t, p, b, trader, head))
-            .buffer_unordered(CONCURRENCY);
+        // Pons and Flaunch rows resolve through one merged stream (Either keeps
+        // the two future types in a single buffer_unordered), so both feeds
+        // fill in together under the same concurrency cap. The futures are
+        // built up front (they are inert until polled) — mapping lazily trips
+        // the borrow checker inside tokio::spawn.
+        let mut futs = Vec::new();
+        for (t, p, b) in cands {
+            futs.push(futures::future::Either::Left(full_row(&provider, &logs, t, p, b, trader, head)));
+        }
+        for c in cands_fl {
+            futs.push(futures::future::Either::Right(flaunch_full_row(&provider, &logs, c, trader, head)));
+        }
+        let mut stream = futures::stream::iter(futs).buffer_unordered(CONCURRENCY);
         while let Some(row) = stream.next().await {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -893,7 +1215,7 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
             r
         };
         if rows.is_empty() {
-            draw_scan_status(term, "Scanning Pons graduations…", "Esc to go back", spinner)?;
+            draw_scan_status(term, "Scanning Pons + Flaunch launches…", "Esc to go back", spinner)?;
             spinner = spinner.wrapping_add(1);
         } else {
             sel = sel.min(rows.len() - 1);
@@ -938,7 +1260,7 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // from one still running — and the keys it advertises do nothing until
     // there is a row to press them on.
     let text = if rows == 0 {
-        " Scanning Pons graduations… · Esc back ".to_string()
+        " Scanning Pons + Flaunch launches… · Esc back ".to_string()
     } else {
         format!(" Trenches live ({rows}) ↑↓/jk select · Enter trade · Esc back ")
     };
@@ -1574,11 +1896,21 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
     }
 }
 
+/// Which launchpad a discovery row came from, for the `src` column. Every V3
+/// grad in this feed is a Pons graduation; FlaunchV4 is Flaunch by identity.
+fn venue_tag(g: &Grad) -> &'static str {
+    match g.kind {
+        engine::PoolKind::V3 { .. } => "pons",
+        engine::PoolKind::FlaunchV4 { .. } => "flnch",
+        engine::PoolKind::V4 { .. } => "v4",
+    }
+}
+
 fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState) {
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "sym", "pooled ETH", "mkt cap", "meta", "tx/sec", "age", "mine", "pool",
+        "", "sym", "src", "pooled ETH", "mkt cap", "meta", "tx/sec", "age", "mine", "pool",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -1598,6 +1930,8 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
             ratatui::widgets::Row::new(vec![
                 Cell::from(if fire { "🔥" } else { "" }),
                 Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+                Cell::from(venue_tag(&r.grad))
+                    .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Dim))),
                 Cell::from(format!("{:.4}", r.pooled_eth)),
                 Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
                 Cell::from(format!("{}/{}", r.grad.meta.score(), META_FIELDS))
@@ -1614,6 +1948,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     let widths = [
         Constraint::Length(2),
         Constraint::Length(12),
+        Constraint::Length(5),
         Constraint::Length(11),
         Constraint::Length(11),
         Constraint::Length(5),
@@ -1665,4 +2000,105 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     };
     let p = Paragraph::new(detail).block(crate::ui::widgets::themed_block(""));
     f.render_widget(p, chunks[1]);
+}
+
+#[cfg(test)]
+mod flaunch_discovery_tests {
+    use super::*;
+    use alloy::primitives::{address, b256, keccak256, Bytes};
+    use alloy::sol_types::SolValue;
+
+    // A real PoolCreated log captured from Robinhood Chain block 22316018
+    // (the FREE launch) via eth_getLogs on the Flaunch PositionManager.
+    const TOPIC0: B256 = b256!("88f75d7341103964abd68b657439ace486e110bfda589da9374fe9d69213c7c8");
+    const POOL_ID: B256 = b256!("d38591585417dbf8a98e03a7db6f96df59b336914c623abfdd7790613c87afc0");
+    const DATA: &str = "000000000000000000000000450e67ad2abf5e47eb41f68e414f62ae7a29f7d1000000000000000000000000507e64349fe74b744a9e26634ae9f3466ff629b900000000000000000000000000000000000000000000000000000000000002d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000001a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000065d673f25b5878df2a2e8a5203fe2b2846c5cbba00000000000000000000000000000000000000000000000000000000000025e400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000024000000000000000000000000000000000000000000000000000000000000000044672656500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000446524545000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000035697066733a2f2f516d6358654c3867583279554739717069356e565469694373795456744c716b725369666f4156476d45724546310000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000002540be4000000000000000000000000000000000000000000000000000000000000000000";
+
+    fn fixture_log() -> alloy::primitives::Log {
+        alloy::primitives::Log::new_unchecked(
+            FLAUNCH_PM,
+            vec![TOPIC0, POOL_ID],
+            Bytes::from(alloy::hex::decode(DATA).unwrap()),
+        )
+    }
+
+    #[test]
+    fn pool_created_decodes_from_a_real_log() {
+        // The declared event signature must match the deployed contract's —
+        // a drifted sol! declaration fails here, not silently on-chain.
+        assert_eq!(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH, TOPIC0);
+        let ev = IFlaunchPositionManager::PoolCreated::decode_log(&fixture_log(), true).unwrap();
+        assert_eq!(ev.data._poolId, POOL_ID);
+        assert_eq!(ev.data._memecoin, address!("450e67ad2abf5e47eb41f68e414f62ae7a29f7d1"));
+        assert!(!ev.data._currencyFlipped);
+        assert_eq!(ev.data._params.symbol, "FREE");
+        assert!(ev.data._params.tokenUri.starts_with("ipfs://"));
+        assert_eq!(u64::try_from(ev.data._params.flaunchAt).unwrap(), 0);
+    }
+
+    #[test]
+    fn pool_id_recomputes_from_the_pool_key() {
+        // fetch_flaunch_pool derives the pool id from poolKey(token) — the
+        // derivation must land on the id the launch event indexed.
+        let ev = IFlaunchPositionManager::PoolCreated::decode_log(&fixture_log(), true).unwrap();
+        let key = crate::contracts::PoolKey {
+            currency0: crate::contracts::FLETH,
+            currency1: ev.data._memecoin,
+            fee: alloy::primitives::aliases::U24::ZERO,
+            tickSpacing: crate::contracts::FLAUNCH_TICK_SPACING.try_into().unwrap(),
+            hooks: FLAUNCH_PM,
+        };
+        assert_eq!(keccak256(key.abi_encode()), POOL_ID);
+    }
+
+    /// Live: scan a recent window on the public RPC, decode at least one
+    /// launch, and round-trip its pool through StateView + poolKey().
+    /// Run: cargo test flaunch_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn flaunch_live_scan_finds_pools() {
+        let lp = logs_provider().await.expect("public RPC reachable");
+        let head = lp.get_block_number().await.expect("head block");
+        // ~28 hours of blocks: launches are steady but not minutely.
+        let cands = scan_flaunch(&lp, head.saturating_sub(1_000_000), head).await;
+        println!("found {} launches in the window", cands.len());
+        assert!(!cands.is_empty(), "no PoolCreated logs in a 1M-block window");
+        let c = &cands[0];
+        println!("newest: {} {} pool {:#x}", c.sym, c.token, c.pool_id);
+        let sv = IStateView::new(STATE_VIEW, &lp);
+        let slot0 = sv.getSlot0(c.pool_id).call().await.expect("StateView answers");
+        assert!(uf(slot0.sqrtPriceX96) > 0.0, "pool has a price");
+        let fl = fetch_flaunch_pool(&lp, c.token).await.expect("poolKey() round-trips");
+        assert_eq!(fl.pool_id, c.pool_id, "poolKey-derived id equals the event's");
+        assert_eq!(fl.launch_block, c.block);
+    }
+
+    /// Live: a 0.001-ETH buy of the newest launch must pass eth_call from a
+    /// funded account (the coin's own treasury holds ETH-free tokens, so use a
+    /// known-funded EOA: the FlaunchZap deployer would do; any address with
+    /// ETH works since eth_call checks balance for value-bearing calls).
+    /// Run: cargo test flaunch_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn flaunch_live_buy_preflights() {
+        let lp = logs_provider().await.expect("public RPC reachable");
+        let head = lp.get_block_number().await.expect("head block");
+        let cands = scan_flaunch(&lp, head.saturating_sub(1_000_000), head).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let c = cands.iter().find(|c| c.flaunch_at <= now).expect("a live launch");
+        let data = crate::v4::flaunch_swap_calldata(c.token, true, 1_000_000_000_000_000, 0);
+        // A funded holder: the flETH contract itself always carries ETH.
+        let from = crate::contracts::FLETH;
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(crate::contracts::UNIVERSAL_ROUTER)
+            .input(data.into())
+            .value(U256::from(1_000_000_000_000_000u64))
+            .from(from);
+        let out = lp.call(&tx).await;
+        println!("preflight {} -> {:?}", c.sym, out.as_ref().map(|b| b.len()));
+        assert!(out.is_ok(), "buy preflight reverted: {:?}", out.err());
+    }
 }

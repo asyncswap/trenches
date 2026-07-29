@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn width_matches_what_a_header_can_fit() {
-        for name in ["UNISWAP V3", "UNISWAP V4", "PONS", "ROBINHOOD", "SOLANA", "PUMP.FUN"] {
+        for name in ["UNISWAP V3", "UNISWAP V4", "PONS", "FLAUNCH", "ROBINHOOD", "SOLANA", "PUMP.FUN"] {
             assert!(width(name) > 0);
             assert!(width(name) < 70, "{name} is too wide: {}", width(name));
         }

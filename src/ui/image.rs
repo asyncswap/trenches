@@ -170,6 +170,7 @@ pub const SOLANA_PNG: &[u8] = include_bytes!("../../assets/solana.png");
 pub const PUMP_PNG: &[u8] = include_bytes!("../../assets/pump.png");
 pub const PONS_PNG: &[u8] = include_bytes!("../../assets/pons.png");
 pub const UNISWAP_PNG: &[u8] = include_bytes!("../../assets/uniswap.png");
+pub const FLAUNCH_PNG: &[u8] = include_bytes!("../../assets/flaunch.png");
 
 impl Venue {
     /// The venue spelled out for large type in the header.
@@ -177,6 +178,7 @@ impl Venue {
         match self {
             Venue::PumpFun => "PUMP.FUN".to_string(),
             Venue::Pons => "PONS".to_string(),
+            Venue::Flaunch => "FLAUNCH".to_string(),
             Venue::Uniswap => "UNISWAP".to_string(),
             Venue::Chain => {
                 let n = network.to_lowercase();
@@ -197,6 +199,7 @@ pub fn for_venue(venue: Venue, network: &str) -> Option<&'static [u8]> {
     match venue {
         Venue::PumpFun => Some(PUMP_PNG),
         Venue::Pons => Some(PONS_PNG),
+        Venue::Flaunch => Some(FLAUNCH_PNG),
         Venue::Uniswap => Some(UNISWAP_PNG),
         Venue::Chain => for_network(network),
     }
@@ -220,6 +223,9 @@ pub enum Venue {
     /// graduation discovery sets one, so its presence IS the signal that this
     /// token came off Pons rather than being a plain Uniswap pair.
     Pons,
+    /// Flaunch. Detected from the pool kind itself (`PoolKind::FlaunchV4`) —
+    /// a Flaunch coin never stops being one, so no side-channel is needed.
+    Flaunch,
     /// A plain AMM trade.
     Uniswap,
     /// Nothing more specific known — fall back to the chain's own mark.
@@ -261,7 +267,7 @@ mod tests {
 
     #[test]
     fn embedded_assets_are_real_pngs() {
-        for png in [ROBINHOOD_PNG, SOLANA_PNG, PUMP_PNG, PONS_PNG, UNISWAP_PNG] {
+        for png in [ROBINHOOD_PNG, SOLANA_PNG, PUMP_PNG, PONS_PNG, UNISWAP_PNG, FLAUNCH_PNG] {
             assert!(png.len() > 1000, "asset looks truncated");
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
         }

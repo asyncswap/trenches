@@ -36,7 +36,7 @@ uncapped — full-size swaps.
 ## Finding something to trade
 
 ```
-f        live trenches — launches as they happen
+f        live trenches — Pons + Flaunch launches as they happen
 F        verified pools — the static, curated list          (EVM)
 t        top tokens — leaderboard and big-fish scan         (EVM)
 p        pools — switch pool, add by address, create new    (EVM)
