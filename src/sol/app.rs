@@ -1547,7 +1547,7 @@ pub async fn run(
                             if ui::confirm(term, &format!("Update to {v}?"))? {
                                 crate::events::action("Updating", &[("to", v.clone())]);
                                 bot.note(format!("Installing {v}…"));
-                                match crate::update::install_latest() {
+                                match crate::update::install_latest().await {
                                     Ok(msg) => {
                                         crate::events::action("Update installed", &[("version", v)]);
                                         bot.note(msg);

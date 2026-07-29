@@ -519,6 +519,24 @@ fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Colour codes for the plain-text output before the TUI starts, or empty
+/// strings where they would only be noise.
+///
+/// `--init` and `--version` get piped into logs and CI output as often as they
+/// are read by a person. The same rule the installer follows: a terminal that
+/// is not a TTY, or a NO_COLOR in the environment, means plain text.
+fn ansi() -> (&'static str, &'static str, &'static str) {
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let allowed = tty
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(false);
+    if allowed {
+        ("\u{1b}[38;5;215m", "\u{1b}[38;5;244m", "\u{1b}[0m")
+    } else {
+        ("", "", "")
+    }
+}
+
 fn token_cache_path(network: &str) -> String {
     // Filesystem-safe: a network name comes from config and can hold anything.
     let safe: String = network
@@ -633,17 +651,82 @@ async fn main() -> eyre::Result<()> {
                     std::fs::write(&path, config::starter_json())?;
                 }
                 std::fs::create_dir_all(state_dir())?;
+                // Boxed, and coloured where colour will land.
+                //
+                // These two paths are the whole answer to "where did it put my
+                // things", and they were four lines of prose among eight more.
+                // A frame makes them the thing on the screen; `--init` is
+                // usually read once, in a hurry, right after an install.
+                let (amber, dim, off) = ansi();
+                let head = if created { "Wrote a starter config" } else { "Config already present" };
+                let cfg = path.display().to_string();
+                const NOTE: &str = "   logs, cache, PnL history";
+                let st = format!("{}{NOTE}", state_dir());
+
+                // Each row's visible text, then one padding rule for all of
+                // them. Measuring the pieces separately is how the box came out
+                // a column short on the row with a suffix on it.
+                let body = [head.to_string(), String::new(), cfg, st];
+                let w = body.iter().map(|l| l.chars().count()).max().unwrap_or(0) + 4;
+                let rule = "─".repeat(w);
+
                 println!();
-                if created {
-                    println!("  Wrote a starter config:");
-                } else {
-                    println!("  Config already present:");
+                println!("  {dim}┌{rule}┐{off}");
+                for (i, line) in body.iter().enumerate() {
+                    let pad = w - line.chars().count() - 2;
+                    // The heading in accent, the trailing note dimmed; the paths
+                    // themselves plain, because they are the thing being read.
+                    let text = if i == 0 {
+                        format!("{amber}{line}{off}")
+                    } else if let Some(base) = line.strip_suffix(NOTE) {
+                        format!("{base}{dim}{NOTE}{off}")
+                    } else {
+                        line.clone()
+                    };
+                    println!("  {dim}│{off}  {text}{:pad$}{dim}│{off}", "");
                 }
-                println!("    {}", path.display());
-                println!("    {}   logs, cache, PnL history", state_dir());
+                println!("  {dim}└{rule}┘{off}");
                 println!();
                 println!("  It works as-is on public endpoints. Open the app and press `e`,");
                 println!("  or edit the file — your editor will complete it from the schema.");
+                println!();
+                return Ok(());
+            }
+            // Update from the shell, for when the app is not open — a
+            // long-running session, a headless box, or simply the habit of
+            // updating things from a prompt.
+            //
+            // Synchronous and blocking, unlike the launch check: someone who
+            // typed this is waiting for an answer, so it asks and reports here
+            // rather than spawning a task nobody will see.
+            "--update" => {
+                let (amber, dim, off) = ansi();
+                println!();
+                println!("  {dim}Current{off}  {}", update::full());
+                match update::check_now().await {
+                    update::Status::Update(v) => {
+                        println!("  {dim}Latest{off}   {amber}{v}{off}");
+                        println!();
+                        match update::install_latest().await {
+                            Ok(msg) => println!("  {msg}"),
+                            Err(why) => {
+                                println!("  {why}");
+                                println!();
+                                return Ok(());
+                            }
+                        }
+                    }
+                    update::Status::Latest => {
+                        println!();
+                        println!("  Already on the latest release.");
+                    }
+                    // Not "you are up to date": we do not know that.
+                    update::Status::Unknown | update::Status::Checking => {
+                        println!();
+                        println!("  Could not reach GitHub to check for updates.");
+                        println!("  Nothing was changed.");
+                    }
+                }
                 println!();
                 return Ok(());
             }
@@ -655,6 +738,7 @@ async fn main() -> eyre::Result<()> {
                 println!("USAGE:");
                 println!("    trenches            start the app");
                 println!("    trenches --init     write the config and state dirs, then exit");
+                println!("    trenches --update   install a newer release, if there is one");
                 println!("    trenches --version  print the version");
                 println!();
                 println!("There are no other flags — everything is a keypress once you are in.");
@@ -1807,7 +1891,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 if ui::confirm(terminal, &format!("Update to {v}?"))? {
                                     events::action("Updating", &[("to", v.clone())]);
                                     bot.note(format!("Installing {v}…"));
-                                    match update::install_latest() {
+                                    match update::install_latest().await {
                                         Ok(msg) => {
                                             events::action("Update installed", &[("version", v)]);
                                             bot.note(msg);

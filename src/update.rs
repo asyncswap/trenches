@@ -16,6 +16,9 @@
 
 use std::sync::RwLock;
 
+/// The one repository this trusts for releases.
+const REPO: &str = "asyncswap/trenches";
+
 /// What the check knows so far.
 ///
 /// Three states, not two. "No newer version" and "never got an answer" are
@@ -161,6 +164,23 @@ fn is_newer(candidate: &str, running: &str) -> bool {
     false
 }
 
+/// Check now, and wait for the answer.
+///
+/// The launch check is detached because nothing is waiting on it. This one is
+/// for `--update`, where someone typed a command and is watching the cursor —
+/// so it blocks, and the result lands in the same state the rest of the app
+/// reads.
+pub async fn check_now() -> Status {
+    let result = match fetch_latest_tag().await {
+        Some(tag) => Check::Known(tag),
+        None => Check::Failed,
+    };
+    if let Ok(mut w) = LATEST.write() {
+        *w = result;
+    }
+    status()
+}
+
 /// What the footer says about this build.
 ///
 /// Either "there is a newer one, press U" or "you are on the latest". Saying
@@ -175,32 +195,124 @@ pub fn footer_label() -> String {
     }
 }
 
-/// Run the published installer. Returns what to tell the user.
+/// The release asset for the machine this is running on.
 ///
-/// This shells out to the same one-liner the docs give you rather than
-/// downloading and swapping the binary itself, and that is the point: the
-/// installer verifies the release's SHA256SUMS before it writes anything. A
-/// bespoke update path inside a program that holds keys would be a second,
-/// less-examined way to put a new binary on the machine.
+/// Rust target triples, because that is what the release workflow names its
+/// assets after.
+fn asset_name() -> Option<&'static str> {
+    Some(match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("aarch64", "macos") => "trenches-aarch64-apple-darwin.tar.gz",
+        ("x86_64", "macos") => "trenches-x86_64-apple-darwin.tar.gz",
+        ("x86_64", "linux") => "trenches-x86_64-unknown-linux-gnu.tar.gz",
+        // Windows ships a .zip and has no tar guarantee; that one stays manual.
+        _ => return None,
+    })
+}
+
+/// Download the newest release and put it where this binary is running from.
 ///
-/// It replaces the file on disk. The running process keeps its own inode on
-/// Unix, so nothing changes underneath you — which is why this reports that a
-/// restart is needed rather than pretending to have done it.
-pub fn install_latest() -> Result<String, String> {
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("curl -fsSL https://trenches.sh/install | sh")
-        .output()
-        .map_err(|e| format!("Could not run the installer: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let why = err.trim().lines().last().unwrap_or("no reason given").to_string();
-        return Err(format!("The installer failed. {why}"));
+/// Deliberately does NOT pipe a script from our website into a shell, which is
+/// what this used to do. That made trenches.sh the trust anchor for a program
+/// holding trading keys: anyone who could change what that URL serves could run
+/// code on every machine that pressed `U`, and the installer's own checksum
+/// step would not have helped — a substituted script simply omits it.
+///
+/// Now the bytes come from the GitHub release, the SHA256SUMS come from the
+/// same release, and this verifies the hash itself before anything is written.
+/// Nothing downloaded is ever executed: the only program run is the system's
+/// own `tar`. The remaining trust is GitHub and the release workflow, which is
+/// the same trust already placed in the source.
+pub async fn install_latest() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let asset = asset_name().ok_or_else(|| {
+        "No automatic update for this platform — download it from the releases page.".to_string()
+    })?;
+    let dest = std::env::current_exe().map_err(|e| format!("Cannot find my own path: {e}"))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent(format!("trenches/{}", full()))
+        .build()
+        .map_err(|e| format!("Could not start the download: {e}"))?;
+
+    let get = |url: String| {
+        let client = client.clone();
+        async move {
+            let r = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("{url}: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("{url}: {e}"))?;
+            Ok::<Vec<u8>, String>(r.bytes().await.map_err(|e| format!("{url}: {e}"))?.to_vec())
+        }
+    };
+
+    let tag = match status() {
+        Status::Update(v) => v,
+        _ => return Err("No newer release to install.".to_string()),
+    };
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+
+    // The checksums first: without them the download is unverifiable, and an
+    // unverifiable binary is not one to write over the running one.
+    let sums = String::from_utf8(get(format!("{base}/SHA256SUMS")).await?)
+        .map_err(|_| "SHA256SUMS was not text.".to_string())?;
+    let want = sums
+        .lines()
+        .find_map(|l| {
+            let (h, f) = l.split_once(char::is_whitespace)?;
+            (f.trim() == asset).then(|| h.trim().to_lowercase())
+        })
+        .ok_or_else(|| format!("{asset} is not listed in SHA256SUMS."))?;
+
+    let bytes = get(format!("{base}/{asset}")).await?;
+    let got = format!("{:x}", Sha256::digest(&bytes));
+    if got != want {
+        return Err(format!(
+            "Checksum mismatch for {asset}. Nothing was written. Please report this."
+        ));
     }
-    // The installer prints where it put things; the last line is the useful one.
-    let tail = stdout.trim().lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-    Ok(format!("Updated. Restart Trenches to run it. {}", tail.trim()))
+
+    // Unpacked beside the binary it will replace, so the rename is on one
+    // filesystem and therefore atomic.
+    let dir = dest.parent().ok_or("Install path has no directory.")?;
+    let staging = dir.join(".trenches-update");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("Cannot write beside the binary: {e}"))?;
+    let tgz = staging.join(asset);
+    std::fs::write(&tgz, &bytes).map_err(|e| format!("Cannot write the download: {e}"))?;
+
+    let out = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&staging)
+        .output()
+        .map_err(|e| format!("Could not run tar: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!(
+            "Could not unpack {asset}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let fresh = staging.join("trenches");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755));
+    }
+    // Rename over the running binary. On Unix the running process keeps its own
+    // inode, so nothing changes underneath it — which is why this reports that
+    // a restart is needed rather than pretending to have done it.
+    std::fs::rename(&fresh, &dest).map_err(|e| format!("Could not replace the binary: {e}"))?;
+    let _ = std::fs::remove_dir_all(&staging);
+
+    Ok(format!("Updated to {tag}. Restart Trenches to run it."))
 }
 
 #[cfg(test)]
@@ -231,6 +343,32 @@ mod tests {
     }
 
     /// The endpoint has to be the one that includes pre-releases.
+    /// The update path must never execute something it downloaded.
+    ///
+    /// It used to pipe our own install script into a shell, which made
+    /// trenches.sh the trust anchor for a program that holds trading keys: a
+    /// compromised site meant code execution everywhere `U` was pressed, and
+    /// the script's own checksum step would not have helped, because a
+    /// substituted script just leaves it out.
+    #[test]
+    fn nothing_downloaded_is_ever_executed() {
+        // The code, not this module — a test that scans itself matches its own
+        // assertion strings and fails for saying what it forbids.
+        let whole = include_str!("update.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+        assert!(!src.contains("| sh"), "a downloaded script is being piped to a shell");
+        assert!(
+            !src.contains("trenches.sh/install"),
+            "the update path must not depend on the website"
+        );
+        // The bytes and their checksums both come from the release itself.
+        assert!(src.contains("SHA256SUMS"), "the download is not verified");
+        assert!(
+            src.contains("Sha256::digest"),
+            "the checksum must be computed here, not by something we fetched"
+        );
+    }
+
     #[test]
     fn the_check_reads_the_release_list_not_releases_latest() {
         let src = include_str!("update.rs");
