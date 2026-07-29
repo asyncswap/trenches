@@ -518,17 +518,15 @@ pub fn merge_tape(tape: &mut Vec<SolSwap>, fresh: Vec<SolSwap>) -> Vec<SolSwap> 
     // Oldest first: the log reads chronologically, the table newest-first.
     let mut added = add.clone();
     added.sort_by(|a, b| {
-        a.block_time
-            .unwrap_or(i64::MIN)
-            .cmp(&b.block_time.unwrap_or(i64::MIN))
-            .then_with(|| a.signature.cmp(&b.signature))
+        (a.slot, a.block_time.unwrap_or(i64::MIN), &a.signature, a.event_idx)
+            .cmp(&(b.slot, b.block_time.unwrap_or(i64::MIN), &b.signature, b.event_idx))
     });
     tape.extend(add);
+    // Slot first — the chain's own order. Time only covers a missing slot,
+    // and the signature only keeps the sort stable within one slot.
     tape.sort_by(|a, b| {
-        // Unknown block times sort last rather than jumping to the top.
-        b.block_time
-            .unwrap_or(i64::MIN)
-            .cmp(&a.block_time.unwrap_or(i64::MIN))
+        (b.slot, b.block_time.unwrap_or(i64::MIN))
+            .cmp(&(a.slot, a.block_time.unwrap_or(i64::MIN)))
             .then_with(|| a.signature.cmp(&b.signature))
             .then_with(|| a.event_idx.cmp(&b.event_idx))
     });
@@ -860,6 +858,12 @@ pub struct SolSwap {
     /// leg, so the tape showed a wall of buys while explorers showed the pairs.
     pub event_idx: usize,
     pub block_time: Option<i64>,
+    /// The slot the transaction landed in — the chain's own total order.
+    /// `block_time` has one-second resolution and a busy coin trades dozens
+    /// of times a second, so sorting by time alone shuffled same-second rows
+    /// (ties broke by SIGNATURE — alphabetical, i.e. random): the pooled
+    /// column jumped around while gmgn, sorting by slot, read smoothly.
+    pub slot: u64,
     /// True when the trader is us.
     pub mine: bool,
 }
@@ -1017,6 +1021,7 @@ pub async fn pool_tape(
     let mut out = Vec::new();
     for (sig, tx) in fetched {
         let block_time = tx.get("blockTime").and_then(|b| b.as_i64());
+        let slot = tx.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
         let keys = all_account_keys(&tx);
         let mut event_idx = 0usize;
 
@@ -1053,6 +1058,7 @@ pub async fn pool_tape(
                     signature: sig.clone(),
                     event_idx,
                     block_time,
+                    slot,
                 });
                 event_idx += 1;
             }
@@ -1241,6 +1247,7 @@ pub async fn amm_tape(
     let mut out = Vec::new();
     for (sig, tx) in fetched {
         let block_time = tx.get("blockTime").and_then(|b| b.as_i64());
+        let slot = tx.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
         let keys = all_account_keys(&tx);
         let mut event_idx = 0usize;
         let inners = tx
@@ -1327,6 +1334,7 @@ pub async fn amm_tape(
                     signature: sig.clone(),
                     event_idx,
                     block_time: block_time.or(Some(ts)),
+                    slot,
                 });
                 event_idx += 1;
             }
@@ -1478,6 +1486,7 @@ mod shape_tests {
             signature: "abcdefghijklmno".into(),
             event_idx: 0,
             block_time: Some(0),
+            slot: 1,
             mine: true,
         }];
         assert!(tape_view(&swaps, 0, 20, 150.0).is_well_formed());
@@ -1730,6 +1739,7 @@ mod tape_view_tests {
                 signature: format!("s{i}"),
                 event_idx: 0,
                 block_time: Some(i as i64),
+                slot: i as u64,
                 mine: false,
             })
             .collect()
@@ -1776,6 +1786,7 @@ mod tape_merge_tests {
             signature: sig.to_string(),
             event_idx: 0,
             block_time: Some(t),
+            slot: t.max(0) as u64,
             mine: false,
         }
     }
