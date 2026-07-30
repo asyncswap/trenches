@@ -2408,6 +2408,65 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             events::action("Opened docs", &[]);
                             ui::docs(terminal)?
                         }
+                        // Ask the copilot about the room — same v1 as the
+                        // Solana side: the user's own claude binary, fed the
+                        // live state. Reads everything, trades nothing.
+                        KeyCode::Char('A') => {
+                            if let Some(q) =
+                                ui::input(terminal, "Ask the copilot", "e.g. what does this tape say?")?
+                            {
+                                if !q.trim().is_empty() {
+                                    let mut ctx = String::new();
+                                    ctx.push_str(&format!(
+                                        "Network: {} (EVM)\nPool: {} / {} \n",
+                                        bot.net, bot.pool.sym, bot.pool.quote_sym
+                                    ));
+                                    if bot.eth_usd > 0.0 {
+                                        ctx.push_str(&format!("ETH/USD: {:.2}\n", bot.eth_usd));
+                                    }
+                                    ctx.push_str(&format!(
+                                        "My ETH: {:.6}. My {}: {:.4}. Basis {:.6} {}/{}.\n",
+                                        bot.eth,
+                                        bot.pool.sym,
+                                        bot.token_bal,
+                                        bot.avg_basis(),
+                                        bot.pool.quote_sym,
+                                        bot.pool.sym
+                                    ));
+                                    ctx.push_str(&format!(
+                                        "Realized PnL: {:+.6} {}. Open liquidity {:.4} ETH across {} positions.\n",
+                                        bot.realized_pnl,
+                                        bot.pool.quote_sym,
+                                        bot.our_liq_eth(),
+                                        bot.positions.len()
+                                    ));
+                                    {
+                                        let t = tape.lock().unwrap();
+                                        ctx.push_str("Recent tape, newest first (ETH amounts; MINE marks my fills):\n");
+                                        for s in t.iter().rev().take(40) {
+                                            let kind = match s.action {
+                                                engine::TapeAction::Buy => "BUY",
+                                                engine::TapeAction::Sell => "SELL",
+                                                engine::TapeAction::Add => "ADD-LP",
+                                                engine::TapeAction::Remove => "REMOVE-LP",
+                                            };
+                                            let mine = bot.own_txs.contains(&s.tx);
+                                            ctx.push_str(&format!(
+                                                "  {kind} {:.4} ETH pooled {:.2} ETH{}\n",
+                                                s.eth,
+                                                s.liq_eth,
+                                                if mine { "  MINE" } else { "" }
+                                            ));
+                                        }
+                                    }
+                                    ctx.push_str(&format!("Status line: {}\n", bot.status));
+                                    let rx = agent::spawn_ask(ctx, q.clone());
+                                    if let Some(ans) = ui::wait_for_answer(terminal, &q, &rx)? {
+                                        ui::text_view(terminal, " Copilot ", &ans)?;
+                                    }
+                                }
+                            }
+                        }
                         // Back to the account list on this same chain.
                         KeyCode::Char('W') => {
                             // Hand the current pool back so the rebuilt session
