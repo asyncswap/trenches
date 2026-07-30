@@ -259,7 +259,8 @@ pub fn extend_flat_to_now(out: &mut Vec<Candle>, iv_secs: u64, now: i64, max: us
     let iv = iv_secs.max(1) as i64;
     let Some(last) = out.last().copied() else { return };
     let nb = now - now.rem_euclid(iv);
-    let gaps = ((nb - last.t) / iv).clamp(0, (max / 2) as i64);
+    let cap = i64::try_from(max / 2).unwrap_or(i64::MAX);
+    let gaps = ((nb - last.t) / iv).clamp(0, cap);
     for k in 1..=gaps {
         out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t: last.t + k * iv });
     }
@@ -305,7 +306,10 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize, no
             // `gaps` buckets before this one — same flat line on screen, and
             // every candle still carries its true time.
             if let Some(last) = out.last().copied() {
-                let gaps = ((b - bucket) / iv - 1).clamp(0, max as i64);
+                // Saturating: `usize::MAX as i64` is -1, and clamp(0, -1)
+                // panics — a cap has to stay a cap however large it is asked.
+                let cap = i64::try_from(max).unwrap_or(i64::MAX);
+                let gaps = ((b - bucket) / iv - 1).clamp(0, cap);
                 for k in (1..=gaps).rev() {
                     let t = b - k * iv;
                     out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t });
@@ -368,6 +372,15 @@ mod candle_tests {
         assert_eq!(c.last().unwrap().t, 150);
         // And without a clock, nothing is invented.
         assert_eq!(candles_of(&pts, 10, 100, None).len(), 1);
+    }
+
+    #[test]
+    fn a_huge_cap_is_a_cap_not_a_panic() {
+        // usize::MAX as i64 is -1; clamp(0, -1) asserts. Any tape spanning
+        // two buckets crashed the whole app when a caller passed MAX.
+        let pts = [(100, 3.0, 1.0), (500, 4.0, 1.0)];
+        let c = candles_of(&pts, 60, usize::MAX, Some(700));
+        assert!(c.len() >= 2);
     }
 
     #[test]

@@ -943,7 +943,7 @@ impl SolBot {
             .filter(|s| !s.kind.is_lp() && s.tokens > 0.0)
             .filter_map(|s| s.block_time.map(|t| (t, s.sol / s.tokens, s.sol)))
             .collect();
-        let fresh = crate::view::candles_of(&points, 60, usize::MAX, None);
+        let fresh = crate::view::candles_of(&points, 60, HIST_MAX, None);
         let Some(first) = fresh.first() else { return };
         self.hist.retain(|c| c.t < first.t);
         // Stitch the seam: the fold had no context before the ring, so its
