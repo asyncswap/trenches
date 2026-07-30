@@ -4,6 +4,7 @@
 //! built speed-first: concurrent reads, pre-flight gas protection, and ready
 //! for a local Nitro node over ws:// or IPC (remote ~380ms -> local ~1ms).
 
+mod agent;
 mod config;
 mod contracts;
 mod discover;

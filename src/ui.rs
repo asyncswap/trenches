@@ -715,3 +715,81 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         height: h,
     }
 }
+
+
+/// A modal wait on the copilot: spinner, the question, Esc to cancel. The
+/// render loop is never blocked by a language model — this loop polls the
+/// answer channel and the keyboard at 50ms.
+pub fn wait_for_answer(
+    term: &mut Term,
+    question: &str,
+    rx: &std::sync::mpsc::Receiver<String>,
+) -> eyre::Result<Option<String>> {
+    use crossterm::event::{self, Event, KeyCode};
+    let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut i = 0usize;
+    loop {
+        if let Ok(ans) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            return Ok(Some(ans));
+        }
+        i = (i + 1) % spin.len();
+        let q = question.to_string();
+        term.draw(|f| {
+            let area = f.area();
+            let block = widgets::themed_block(" Copilot ");
+            let inner = ratatui::layout::Rect {
+                x: area.width / 8,
+                y: area.height / 3,
+                width: area.width * 3 / 4,
+                height: 5,
+            };
+            let text = ratatui::widgets::Paragraph::new(vec![
+                ratatui::text::Line::from(format!("{} thinking about: {q}", spin[i])),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from("esc cancels — the market keeps running behind this"),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(block);
+            f.render_widget(ratatui::widgets::Clear, inner);
+            f.render_widget(text, inner);
+        })?;
+        if event::poll(std::time::Duration::from_millis(30))? {
+            if let Event::Key(k) = event::read()? {
+                if k.code == KeyCode::Esc {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// A full-screen scrollable text view — the copilot's answer, readable at
+/// length. ↑/↓ and PgUp/PgDn scroll, anything else closes.
+pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
+    use crossterm::event::{self, Event, KeyCode};
+    let mut scroll: u16 = 0;
+    loop {
+        term.draw(|f| {
+            let area = f.area();
+            let para = ratatui::widgets::Paragraph::new(text.to_string())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((scroll, 0))
+                .block(widgets::themed_block(title));
+            f.render_widget(ratatui::widgets::Clear, area);
+            f.render_widget(para, area);
+        })?;
+        if event::poll(std::time::Duration::from_millis(120))? {
+            if let Event::Key(k) = event::read()? {
+                match k.code {
+                    KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                    KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    _ => return Ok(()),
+                }
+            }
+        }
+    }
+}
