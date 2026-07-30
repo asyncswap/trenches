@@ -1929,8 +1929,24 @@ pub async fn run(
         if event::poll(Duration::from_millis(100))? {
             let evt = event::read()?;
             if let Event::Mouse(m) = evt {
-                if msel.on_mouse(m) {
-                    copy_armed = true; // extracted on the next frame
+                use crossterm::event::MouseEventKind as MK;
+                match m.kind {
+                    // Wheel scrolls the active panel, three rows per notch.
+                    MK::ScrollUp => {
+                        let n = match view {
+                            Panel::Logs => bot.logs.len(),
+                            Panel::Tape => bot.tape.len(),
+                            Panel::Orders => bot.orders.len(),
+                            Panel::Chart => 0,
+                        };
+                        scroll = (scroll + 3).min(n.saturating_sub(1));
+                    }
+                    MK::ScrollDown => scroll = scroll.saturating_sub(3),
+                    _ => {
+                        if msel.on_mouse(m) {
+                            copy_armed = true; // extracted on the next frame
+                        }
+                    }
                 }
             }
             if let Event::Key(k) = evt {

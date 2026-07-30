@@ -2219,8 +2219,21 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             // key input — handled the instant it arrives
             ev = reader.next() => {
                 if let Some(Ok(Event::Mouse(m))) = ev {
-                    if msel.on_mouse(m) {
-                        copy_armed = true; // extracted on the next frame
+                    use crossterm::event::MouseEventKind as MK;
+                    match m.kind {
+                        // The wheel scrolls whatever panel is showing, three
+                        // rows per notch — the arrows' one-at-a-time is for
+                        // precision, not for covering a 143-row tape.
+                        MK::ScrollUp => {
+                            let n = match view { Panel::Tape => tape.lock().unwrap().len(), Panel::Logs => bot.logs.len(), _ => bot.orders.len() };
+                            orders_scroll = (orders_scroll + 3).min(n.saturating_sub(1));
+                        }
+                        MK::ScrollDown => orders_scroll = orders_scroll.saturating_sub(3),
+                        _ => {
+                            if msel.on_mouse(m) {
+                                copy_armed = true; // extracted on the next frame
+                            }
+                        }
                     }
                 }
                 if let Some(Ok(Event::Key(k))) = ev {
