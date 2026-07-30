@@ -33,7 +33,7 @@ pub struct Pending {
     pub position_id: Option<U256>, // v4 position tokenId for mint/burn txs
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum OrderStatus {
     Pending,
     Confirmed,
@@ -43,6 +43,7 @@ pub enum OrderStatus {
 }
 
 /// One user action in the orders queue — transitions pending -> confirmed/etc.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     pub label: String,
     pub status: OrderStatus,
@@ -863,6 +864,58 @@ impl Bot {
         while self.orders.len() > 200 {
             self.orders.pop_front();
         }
+        self.save_orders();
+    }
+
+    /// Where the orders queue sleeps between sessions — per trader, so two
+    /// wallets on one machine never read each other's history.
+    fn orders_path(trader: Address) -> String {
+        format!("{}/orders-evm-{trader}.jsonl", crate::state_dir())
+    }
+
+    /// Persist the queue, capped alongside the in-memory ring. A restart
+    /// should reopen onto your own history, not an empty ledger.
+    pub fn save_orders(&self) {
+        if self.trader.is_zero() {
+            return;
+        }
+        let _ = std::fs::create_dir_all(crate::state_dir());
+        let mut out = String::new();
+        for o in self.orders.iter() {
+            if let Ok(j) = serde_json::to_string(o) {
+                out.push_str(&j);
+                out.push('\n');
+            }
+        }
+        let path = Self::orders_path(self.trader);
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// The saved queue, for a session opening on this trader. A Pending order
+    /// from a dead session can never confirm — it loads as Failed, which is
+    /// what it is.
+    pub fn load_orders(trader: Address) -> VecDeque<Order> {
+        let mut out = VecDeque::new();
+        if trader.is_zero() {
+            return out;
+        }
+        if let Ok(s) = std::fs::read_to_string(Self::orders_path(trader)) {
+            for line in s.lines() {
+                if let Ok(mut o) = serde_json::from_str::<Order>(line) {
+                    if o.status == OrderStatus::Pending {
+                        o.status = OrderStatus::Failed;
+                    }
+                    out.push_back(o);
+                }
+            }
+        }
+        while out.len() > 200 {
+            out.pop_front();
+        }
+        out
     }
 
     /// Record a transaction as OURS, in memory and on disk. The tape's "your

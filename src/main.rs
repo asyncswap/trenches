@@ -1631,7 +1631,7 @@ async fn chain_session_on(
         positions: Vec::new(),
         pos_liq: std::collections::HashMap::new(),
         mint_liq: std::collections::HashMap::new(),
-        orders: VecDeque::new(),
+        orders: engine::Bot::load_orders(trader),
         log,
         logs: VecDeque::new(),
         buy_frac: 0.05,       // buy 5% of ETH balance (fine steps)
