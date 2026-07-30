@@ -719,9 +719,17 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
     }
 
     // Price axis on the right: 12 columns of labels, chart takes the rest.
-    const AXIS_W: u16 = 12;
+    const AXIS_W: u16 = 13;
+    // FIXED candle anatomy, at every interval and width: a three-column
+    // body, a single-column wick dead centre, one column of air. The box
+    // never changes shape — switching 5s to 1m changes what fills it, not
+    // its geometry — and the high-low line is always exactly one line.
+    const PITCH: usize = 4;
+    const BODY_W: usize = 3;
+    const WICK_COL: usize = 1;
     let chart_w = inner.width.saturating_sub(AXIS_W) as usize;
-    let shown = &cv.candles[cv.candles.len().saturating_sub(chart_w)..];
+    let n_fit = (chart_w / PITCH).max(1);
+    let shown = &cv.candles[cv.candles.len().saturating_sub(n_fit)..];
 
     let (mut lo, mut hi) = (f64::MAX, f64::MIN);
     for c in shown {
@@ -735,60 +743,80 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
     // not divide by zero into a full-height candle.
     let pad = ((hi - lo) * 0.05).max(hi.abs() * 1e-9).max(f64::MIN_POSITIVE);
     let (lo, hi) = (lo - pad, hi + pad);
+    let range = hi - lo;
 
     let rows = inner.height;
     let pixels = rows as i32 * 2;
     let py = |p: f64| -> i32 {
         // Pixel 0 is the TOP; higher price = smaller pixel index.
-        (((hi - p) / (hi - lo)) * (pixels - 1) as f64).round() as i32
+        (((hi - p) / range) * (pixels - 1) as f64).round() as i32
     };
 
     let buf = f.buffer_mut();
     for (i, c) in shown.iter().enumerate() {
-        let x = inner.x + i as u16;
+        let x0 = inner.x + (i * PITCH) as u16;
         let tone = if c.up() { Tone::Good } else { Tone::Bad };
         let color = tone_color(tone);
-        let (b_top, b_bot) = (py(c.o.max(c.c)), py(c.o.min(c.c)));
-        let (w_top, w_bot) = (py(c.h), py(c.l));
-        for row in 0..rows {
-            let (up_px, lo_px) = (row as i32 * 2, row as i32 * 2 + 1);
-            let in_body = |px: i32| px >= b_top && px <= b_bot;
-            let in_wick = |px: i32| px >= w_top && px <= w_bot;
-            let sym = match (in_body(up_px), in_body(lo_px)) {
-                (true, true) => "█",
-                (true, false) => "▀",
-                (false, true) => "▄",
-                (false, false) => {
-                    if in_wick(up_px) || in_wick(lo_px) {
-                        "│"
-                    } else {
-                        continue;
+        let (mut b_top, mut b_bot) = (py(c.o.max(c.c)), py(c.o.min(c.c)));
+        // A body is never thinner than one full CELL. Sub-pixel bodies drew
+        // as detached one-pixel dashes — "floating blobs", not candles.
+        if b_bot - b_top < 1 {
+            let cell = (b_top / 2) * 2;
+            b_top = cell;
+            b_bot = cell + 1;
+        }
+        let (w_top, w_bot) = (py(c.h).min(b_top), py(c.l).max(b_bot));
+        for col in 0..BODY_W {
+            let x = x0 + col as u16;
+            if x >= inner.x + chart_w as u16 {
+                break;
+            }
+            for row in 0..rows {
+                let (up_px, lo_px) = (row as i32 * 2, row as i32 * 2 + 1);
+                let in_body = |px: i32| px >= b_top && px <= b_bot;
+                // The wick runs the WHOLE high-low range — but ONLY in the
+                // centre column, so it is always exactly one line wide.
+                let in_wick = |px: i32| col == WICK_COL && px >= w_top && px <= w_bot;
+                let sym = match (in_body(up_px), in_body(lo_px)) {
+                    (true, true) => "█",
+                    // The wick leaving a half-height body edge gets the exact
+                    // transition glyph — thick where the body is, THIN where
+                    // the wick is — instead of promoting the whole cell to a
+                    // block, which read as a doubled line at the extremes.
+                    (true, false) => {
+                        if in_wick(lo_px) { "╿" } else { "▀" }
                     }
-                }
-            };
-            let cell = &mut buf[ratatui::layout::Position { x, y: inner.y + row }];
-            cell.set_symbol(sym);
-            cell.set_fg(color);
+                    (false, true) => {
+                        if in_wick(up_px) { "╽" } else { "▄" }
+                    }
+                    (false, false) => {
+                        if in_wick(up_px) || in_wick(lo_px) {
+                            "│"
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                let cell = &mut buf[Position { x, y: inner.y + row }];
+                cell.set_symbol(sym);
+                cell.set_fg(color);
+            }
         }
     }
 
-    // The axis: last close first (the number being watched), then the range.
-    let labels = 4u16.min(rows);
-    for k in 0..labels {
-        let y = inner.y + k * (rows - 1) / labels.max(1).min(rows);
-        let price = hi - (hi - lo) * (k as f64 * (rows as f64 - 1.0) / labels as f64) / (rows as f64 - 1.0).max(1.0);
-        let txt = format!("{} {}", crate::view::sol_compact(price), cv.unit);
-        buf.set_string(
-            inner.x + inner.width - AXIS_W + 1,
-            y,
-            txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
-            Style::default().fg(tone_color(Tone::Dim)),
-        );
-    }
+    // Last close, ruled across the chart the way TradingView does — the one
+    // line the eye keeps returning to. Only over empty cells, so candles win.
     if let Some(last) = shown.last() {
-        let y = (inner.y as i32 + py(last.c) / 2).clamp(inner.y as i32, (inner.y + rows - 1) as i32) as u16;
-        let txt = format!("▸{} {}", crate::view::sol_compact(last.c), cv.unit);
+        let y = ((py(last.c) / 2).clamp(0, rows as i32 - 1)) as u16 + inner.y;
         let tone = if last.up() { Tone::Good } else { Tone::Bad };
+        for x in inner.x..inner.x + chart_w as u16 {
+            let cell = &mut buf[Position { x, y }];
+            if cell.symbol() == " " {
+                cell.set_symbol("┄");
+                cell.set_fg(tone_color(Tone::Dim));
+            }
+        }
+        let txt = format!("▸{} {}", price_label(last.c, range), cv.unit);
         buf.set_string(
             inner.x + inner.width - AXIS_W + 1,
             y,
@@ -796,6 +824,36 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
             Style::default().fg(tone_color(tone)).add_modifier(Modifier::BOLD),
         );
     }
+
+    // Axis labels with enough decimals to DIFFER — a 0.00023-SOL range wants
+    // more precision than "0.0023" repeated four times down the edge.
+    let last_y = shown.last().map(|l| ((py(l.c) / 2).clamp(0, rows as i32 - 1)) as u16 + inner.y);
+    let labels = 4u16.min(rows);
+    for k in 0..=labels {
+        let y = inner.y + (k * rows.saturating_sub(1)) / labels.max(1);
+        if Some(y) == last_y {
+            continue; // the close marker owns that row
+        }
+        let frac = (y - inner.y) as f64 / (rows.saturating_sub(1)).max(1) as f64;
+        let price = hi - range * frac;
+        let txt = format!("{} {}", price_label(price, range), cv.unit);
+        buf.set_string(
+            inner.x + inner.width - AXIS_W + 1,
+            y,
+            txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
+            Style::default().fg(tone_color(Tone::Dim)),
+        );
+    }
+}
+
+/// A price with exactly enough decimals for labels `range` apart to differ.
+fn price_label(p: f64, range: f64) -> String {
+    let dec = if range > 0.0 && range.is_finite() {
+        ((-(range / 4.0).log10()).ceil() as i64 + 1).clamp(0, 10) as usize
+    } else {
+        4
+    };
+    format!("{p:.dec$}")
 }
 
 pub fn scatter(f: &mut Frame, area: Rect, s: &ScatterView) {
@@ -1488,5 +1546,49 @@ mod candle_render_tests {
             }
         }
         assert!(painted_rows.len() <= 2, "a flat price should be a thin line, got rows {painted_rows:?}");
+    }
+}
+
+/// A design harness, not an assertion: renders a plausible memecoin walk
+/// through the REAL widget and prints it, so the chart's look can be judged
+/// by eye without waiting for a live coin.
+///   cargo test candle_gallery -- --ignored --nocapture
+#[cfg(test)]
+mod candle_gallery {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn dump(buf: &ratatui::buffer::Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    #[ignore]
+    fn gallery() {
+        // A plausible memecoin walk: mostly small moves, occasional spikes.
+        let mut price = 0.00230_f64;
+        let mut pts: Vec<(i64, f64, f64)> = Vec::new();
+        let mut seed = 42u64;
+        let mut rnd = move || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as f64 / (1u64 << 31) as f64 };
+        for t in 0..240 {
+            let n = 1 + (rnd() * 4.0) as usize;
+            for k in 0..n {
+                let drift = (rnd() - 0.5) * 0.00002 + if t % 60 == 30 { 0.00008 } else { 0.0 };
+                price = (price + drift).max(0.0001);
+                pts.push((1000 + t * 5 + k as i64, price, 0.1 + rnd()));
+            }
+        }
+        let ck = crate::view::candles_of(&pts, 15, 240);
+        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL" };
+        let mut term = Terminal::new(TestBackend::new(140, 34)).unwrap();
+        term.draw(|f| candles(f, f.area(), &cv)).unwrap();
+        println!("{}", dump(term.backend().buffer()));
     }
 }

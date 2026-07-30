@@ -798,6 +798,7 @@ const DISC_TRADE_EVENT: [u8; 8] = [189, 219, 127, 211, 78, 230, 97, 238];
 /// the single biggest signal about a new coin, and it moves the reserves every
 /// other row is priced against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum SwapKind {
     Buy,
     Sell,
@@ -855,7 +856,9 @@ impl SwapKind {
 }
 
 /// One row on the tape: a swap or a liquidity event on this coin's pool.
-#[derive(Debug, Clone)]
+/// Serde because the tape is persisted per coin (tape-<mint>.json), so the
+/// trades you watched — and made — are still there after a restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SolSwap {
     pub kind: SwapKind,
     /// SOL that actually moved.

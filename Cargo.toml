@@ -70,7 +70,9 @@ opaline = { version = "0.4.1", default-features = false, features = ["builtin-th
 # Targeted crates rather than the `solana-sdk` umbrella: we only need keys,
 # PDAs, instruction/message/transaction building. RPC goes over the `reqwest`
 # JSON-RPC client we already use for EVM batch calls.
-solana-pubkey = { version = "3", features = ["borsh", "curve25519"], optional = true }
+# `serde` so seen coins and per-coin tape history survive a restart — a
+# pasted mint and its trades used to die with the process.
+solana-pubkey = { version = "3", features = ["borsh", "curve25519", "serde"], optional = true }
 solana-keypair = { version = "3", optional = true }
 solana-signer = { version = "3", optional = true }
 solana-instruction = { version = "3", optional = true }

@@ -44,11 +44,72 @@ const TAPE_DEPTH_MAX: u32 = 250;
 /// Mirrors the EVM side's pool list: the point is to get back to something you
 /// were already watching without re-pasting its mint.
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SeenCoin {
     pub mint: Pubkey,
     /// "SYMBOL · bonding curve" — the venue is part of the identity, since the
     /// same coin reads completely differently once it graduates.
     pub label: String,
+}
+
+/// Where the seen-coins list lives. Pasting a mint used to be a per-session
+/// fact: close the app and the coin's name, and the address you hunted down,
+/// were gone — repasted from scratch every time.
+fn coins_path() -> String {
+    format!("{}/coins-solana.json", crate::state_dir())
+}
+
+fn load_coins() -> Vec<SeenCoin> {
+    std::fs::read_to_string(coins_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_coins(coins: &[SeenCoin]) {
+    if let Ok(text) = serde_json::to_string_pretty(coins) {
+        let path = coins_path();
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Where one coin's tape history lives. The trades you watched — and MADE —
+/// reload into the Trades view the moment the coin is selected again; the
+/// live feed then merges on top (the (signature, event) dedup absorbs the
+/// overlap), so history and now are one list.
+fn tape_path(mint: &Pubkey) -> String {
+    format!("{}/tape-{mint}.json", crate::state_dir())
+}
+
+fn load_tape_history(mint: &Pubkey) -> Vec<discover::SolSwap> {
+    std::fs::read_to_string(tape_path(mint))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Debounced full rewrite — the ring is bounded at TAPE_RING rows, so the
+/// file is small and a rewrite beats bookkeeping appends.
+fn save_tape_history(mint: &Pubkey, rows: &[discover::SolSwap]) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed().as_secs() < 3) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    if let Ok(text) = serde_json::to_string(rows) {
+        let path = tape_path(mint);
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 /// Rungs of the network's priority-fee estimate.
@@ -502,10 +563,13 @@ impl SolBot {
             round_ms: 0.0,
             buy_frac: 0.05, // 5% of balance; [ ] walk the ladder below
             slippage_pct: 5.0,
-            chart_iv: 5,
+            // The ONE canonical candle to perfect first: the minute. Other
+            // intervals share every line of this code path, but the minute is
+            // the reference the chart is judged against.
+            chart_iv: 60,
             sell_frac: 1.00,
             cu_price_micro: 10_000,
-            coins: Vec::new(),
+            coins: load_coins(),
             // ON by default: a launch-sniping buy without a priority fee lands
             // slots late, and by then the price has left the slippage floor
             // behind. [P] still toggles it off for quiet markets.
@@ -600,6 +664,7 @@ impl SolBot {
         self.coins.retain(|c| c.mint != coin.mint);
         self.coins.insert(0, SeenCoin { mint: coin.mint, label });
         self.coins.truncate(30);
+        save_coins(&self.coins);
     }
 
     /// Hard ceiling on a single trade's priority fee, in SOL.
@@ -700,6 +765,13 @@ impl SolBot {
         // real events under a dozen lines the moment a coin is selected.
         let first_fill = self.tape.is_empty();
         let added = discover::merge_tape(&mut self.tape, snap.tape.clone());
+        // New rows -> the coin's history file (debounced). This is what makes
+        // a restart pick the story back up instead of starting it over.
+        if !added.is_empty() {
+            if let Some(m) = snap.mint {
+                save_tape_history(&m, &self.tape);
+            }
+        }
         if !first_fill {
             for t in added {
                 let who = if t.mine { "  ⭐ you" } else { "" };
@@ -2045,6 +2117,9 @@ pub async fn run(
                     bot.bought_qty = 0.0;
                     bot.bought_cost = 0.0;
                     bot.tape.clear();
+                    // History first: the trades you watched — and made — last
+                    // session are on disk, and the live feed dedups on top.
+                    discover::merge_tape(&mut bot.tape, load_tape_history(&p.mint));
                     discover::merge_tape(&mut bot.tape, p.seed);
                     *target.lock().unwrap() = Some(tgt);
                     view = Panel::Tape;

@@ -1533,7 +1533,7 @@ async fn chain_session_on(
         pool: to_poolcfg(&pool),
         strategy,
         last_market_trace: None,
-        chart_iv: 5,
+        chart_iv: 60, // the canonical minute candle — see the sol side's note
         arb_mode: false,
         pool_b: None,
         mkt_b: engine::Market::default(),
