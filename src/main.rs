@@ -141,6 +141,70 @@ fn load_last_wallet() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The buy-size status, quoting the stake in the units that matter: the
+/// percent you set, the ETH it works out to, and the dollars that is.
+fn buy_size_status(bot: &engine::Bot) -> String {
+    let stake = bot.eth * bot.buy_frac;
+    let usd = stake * bot.eth_usd;
+    if bot.eth > 0.0 && bot.eth_usd > 0.0 {
+        format!(
+            "Buy size {:.1}% \u{2248} {} ETH (~{})",
+            bot.buy_frac * 100.0,
+            view::eth(stake),
+            view::usd_compact(usd)
+        )
+    } else if bot.eth > 0.0 {
+        format!("Buy size {:.1}% \u{2248} {} ETH", bot.buy_frac * 100.0, view::eth(stake))
+    } else {
+        format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0)
+    }
+}
+
+/// Where a token's tape history sleeps between sessions. Keyed by TOKEN, so
+/// the history follows the coin across venue upgrades and pool migrations.
+fn evm_tape_path(token: &alloy::primitives::Address) -> String {
+    format!("{}/tape-evm-{token}.jsonl", state_dir())
+}
+
+/// Persist the tape, newest last, capped — a restart should reopen a coin
+/// onto the same tape it left, not an empty room waiting for strangers.
+fn save_evm_tape(token: &alloy::primitives::Address, rows: &std::collections::VecDeque<engine::Swap>) {
+    if token.is_zero() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(state_dir());
+    let mut out = String::new();
+    for s in rows.iter() {
+        if let Ok(j) = serde_json::to_string(s) {
+            out.push_str(&j);
+            out.push('\n');
+        }
+    }
+    let path = evm_tape_path(token);
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn load_evm_tape(token: &alloy::primitives::Address) -> std::collections::VecDeque<engine::Swap> {
+    let mut out = std::collections::VecDeque::new();
+    if token.is_zero() {
+        return out;
+    }
+    if let Ok(s) = std::fs::read_to_string(evm_tape_path(token)) {
+        for line in s.lines() {
+            if let Ok(sw) = serde_json::from_str::<engine::Swap>(line) {
+                out.push_back(sw);
+            }
+        }
+    }
+    while out.len() > 400 {
+        out.pop_front();
+    }
+    out
+}
+
 fn save_last_wallet(name: &str) {
     let _ = std::fs::create_dir_all(state_dir());
     let _ = std::fs::write(last_wallet_path(), name);
@@ -1803,6 +1867,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
             let mut last_swap_block = 0u64; // last block scanned for the tape (pool A)
             let mut last_swap_block_b = 0u64; // pool B (arb mode) tape cursor
             let mut tape_pref = *pool_cell.lock().unwrap();
+            // Reopening a coin starts from its saved tape, not an empty room.
+            *tape.lock().unwrap() = load_evm_tape(&tape_pref.token);
             let mut tape_b_key = alloy::primitives::Address::ZERO;
             // Balances, gas price and total supply are read once a second; the
             // price is read every poll. Reading all four every time was ~30
@@ -1868,7 +1934,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 {
                     block.store(b, Ordering::Relaxed);
                     // Pool switched? reset the tape scan window.
-                    if pref.token != tape_pref.token { tape.lock().unwrap().clear(); last_swap_block = 0; tape_pref = pref; }
+                    if pref.token != tape_pref.token {
+                        // Bank the coin we are leaving, seed the one we enter.
+                        save_evm_tape(&tape_pref.token, &tape.lock().unwrap());
+                        *tape.lock().unwrap() = load_evm_tape(&pref.token);
+                        last_swap_block = 0;
+                        tape_pref = pref;
+                    }
                     // R pressed? re-anchor both tape cursors — the rows stay,
                     // the next read starts from a window that can succeed.
                     if tape_relive.swap(false, Ordering::Relaxed) { last_swap_block = 0; last_swap_block_b = 0; }
@@ -1890,12 +1962,17 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let mut t = tape.lock().unwrap();
                             let have: std::collections::HashSet<_> =
                                 t.iter().map(|s| (s.tx, s.block, s.eth_wei)).collect();
+                            let mut added = false;
                             for s in sw {
                                 if !have.contains(&(s.tx, s.block, s.eth_wei)) {
                                     t.push_back(s);
+                                    added = true;
                                 }
                             }
                             while t.len() > 400 { t.pop_front(); }
+                            if added {
+                                save_evm_tape(&tape_pref.token, &t);
+                            }
                             drop(t);
                             last_swap_block = observed.max(b.saturating_sub(5)).max(last_swap_block);
                         } else if last_swap_block == 0 || b.saturating_sub(from) > 40 {
@@ -2410,10 +2487,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         //   ( )  SELL size (% of token balance) — 10% steps
                         //   { }  impact cap (% price move);  0 = off
                         KeyCode::Char(']') => {
-                            bot.buy_frac = (bot.buy_frac + 0.005).min(1.0); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
+                            bot.buy_frac = (bot.buy_frac + 0.005).min(1.0);
+                            let msg = buy_size_status(bot);
+                            setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), msg);
                         }
                         KeyCode::Char('[') => {
-                            bot.buy_frac = (bot.buy_frac - 0.005).max(0.005); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
+                            bot.buy_frac = (bot.buy_frac - 0.005).max(0.005);
+                            let msg = buy_size_status(bot);
+                            setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), msg);
                         }
                         // Bracket family, paired with the header labels:
                         // [] buy · () sell · {} slippage · <> impact cap.

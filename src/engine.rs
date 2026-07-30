@@ -2271,7 +2271,7 @@ async fn read_market_inner<P: Provider>(
     })
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TapeAction {
     Buy,
     Sell,
@@ -2280,7 +2280,7 @@ pub enum TapeAction {
 }
 
 /// A decoded pool event by ANY trader — the live tape (buys, sells, LP add/remove).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Swap {
     pub action: TapeAction,
     pub eth: f64,       // ETH/WETH size of the event
