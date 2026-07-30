@@ -64,14 +64,10 @@ Q     quit immediately
 
 ## Two numbers worth understanding
 
-**Pooled** is derived from the pool's liquidity and current price, not read as a
-balance. On a full-range position the two match. On a **concentrated** position
-it is the amount that would be there if liquidity spanned the whole curve, so it
-overstates real depth — sometimes past the token's entire supply, which is when
-the bot marks it `estimate, above supply` in amber.
-
-Treat an unmarked figure as a good estimate of what you can get out, and a
-marked one as an upper bound, not a promise.
+**Pooled** is the exit liquidity — a good estimate of what you can get out.
+On concentrated positions it can overstate real depth; when it does, the bot
+marks it `estimate, above supply` in amber. Treat a marked figure as an upper
+bound, not a promise.
 
 **Price impact cap** shrinks a swap so a single trade cannot move the pool price
 more than the set percentage. `off` means uncapped: swaps go out at full size.

@@ -20,10 +20,6 @@ keystore in `~/.foundry/keystores`:
 ＋ Import a seed phrase       derives the key at an index you choose
 ```
 
-The bot writes those files itself rather than shelling out to another tool: no
-CLI to install, no output to parse, and no password sitting in your shell
-history.
-
 **Importing a phrase does not store it.** The key is derived, encrypted and
 written; the phrase is not saved. If you want a second account from the same
 phrase, import it again at a different index.
@@ -33,69 +29,21 @@ the one you used last sits at the top.
 
 ## Or use Foundry
 
-The keystore directory is shared with Foundry deliberately, so anything `cast`
-makes shows up in the bot and the other way round. Use it if you already have it
-— it is not required.
+The keystore directory is shared with Foundry, so anything `cast` makes shows
+up in the bot and the other way round — `cast wallet list` shows the same
+names. Not required, just compatible.
 
-```
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
-```
-
-**A new key:**
-
-```
-cast wallet new ~/.foundry/keystores --account robin
-```
-
-**A key you already have:**
-
-```
-cast wallet import robin --interactive
-```
-
-`--interactive` prompts for the key so it never lands in your history.
-
-**Check what is there:**
-
-```
-cast wallet list
-```
-
-Those names are the names the bot shows.
-
-## Nothing to configure
-
-There is no step where you write the account into a file. The bot lists the
-keystores it finds on disk — make one and it is in the list on the next run.
-
-`config.json` has an `accounts` block, but the app fills it in. It is a record of
-what you have, not something to author. See **Config**.
+There is nothing to configure afterwards: the bot lists the keystores it finds
+on disk. Make one and it is in the list on the next run.
 
 ## Solana
 
 Same flow, same directory, same **W** key.
 
-Solana keystores deliberately use the Ethereum keystore format. Solana's own CLI
-writes keys as plaintext JSON arrays, and an encrypted file at rest is worth more
-than matching their convention.
-
-Solana accounts derive on the Phantom-compatible path `m/44'/501'/n'/0'`, so an
-address the bot derives from a phrase matches what Phantom shows for the same
-phrase and index. The two chains derive **differently** from one phrase —
-Ethereum uses `m/44'/60'/0'/0/n` — so the same seed gives different addresses on
-each side. Expected, not a bug.
-
-## Afterwards
-
-```
-cast wallet address --account robin     # show the address
-cast wallet change-password robin       # rotate the password
-cast wallet remove robin                # delete the keystore
-```
-
-Deleting a keystore removes the account from the list. It does not touch anything
-on chain.
+Phrases derive on the Phantom-compatible path, so an address derived here
+matches what Phantom shows for the same phrase and index. The two chains
+derive **differently** from one phrase, so the same seed gives different
+addresses on each side. Expected, not a bug.
 
 ## Losing the password
 

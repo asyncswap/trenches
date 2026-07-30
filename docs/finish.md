@@ -8,8 +8,8 @@ That is the tour. Press **enter** to pick a chain and start trading.
 encrypted keystore and asks for a password — nothing leaves your machine.
 
 **An endpoint.** Press `e` to paste your RPC URL. The defaults are public and
-rate limited; they work, they are just slow when it matters. Discovery — new
-pools, buyer charts — stays quiet until you set `discovery_rpc`.
+rate limited — fine for looking around, slow when it matters. A
+[Trenches RPC](https://rpc.trenches.sh) key or your own provider fixes that.
 
 **A size you would shrug at.** This is beta software signing real transactions
 against real chains. Start small enough that a bug is an annoyance rather than a

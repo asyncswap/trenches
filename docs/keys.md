@@ -48,11 +48,8 @@ Del      deselect the current pool — back to the empty state  (EVM)
 `f` is the live feed: coins appearing right now. `F` is the hand-curated list
 that does not change. `k` is for established tokens, not fresh launches.
 
-`Del` deselects whatever pool you are on and puts the screen back to empty: no
-pool, no tape, no position readout, and the order keys do nothing until you
-pick something. Sessions RESTORE where you left off — the last pool (EVM) or
-coin (Solana) reloads on start, tape history included — so `Del` is also how
-you tell the next session to start empty.
+Sessions restore where you left off — the last pool or coin reloads on start.
+`Del` deselects, and tells the next session to start empty.
 
 ## Liquidity
 
@@ -97,15 +94,9 @@ e        set RPC and API keys   (while the docs are open)
 ?        shortcuts overlay
 ```
 
-`L` opens the calendar: one cell per day, what it made in dollars, and the
-trades behind it. `h j k l` move a day (`j`/`k` a whole week, since that is what
-the grid's rows are), the arrows change month, `1` `2` `3` switch the summary
-between the last 1, 7 and 30 days, `t` jumps back to today and backspace returns
-to the whole month.
-
-A day with no trades shows `·`, not `$0` — a flat day and a day you sat out are
-different facts. History starts from the first sell after this feature landed:
-profit was never written down before that, so it cannot be recovered.
+`L` opens the calendar: one cell per day, what it made, and the trades behind
+it. `h j k l` move a day, arrows change month, `1` `2` `3` switch the 1/7/30-day
+summary, `t` jumps to today.
 
 ## Mouse
 
