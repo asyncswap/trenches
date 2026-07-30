@@ -1258,7 +1258,7 @@ const HELP: [(&str, &str); 23] = [
     ("", "p|add token by contract address"),
     ("VIEW", ""),
     ("", "t  o  l  v|trades · orders · logs · chart"),
-    ("", "→ ←|cycle panels"),
+    ("", "O  → ←|cycle panels"),
     ("", "↑ ↓|scroll"),
     ("SIZE", ""),
     ("", "[  ]|buy size −/+"),
@@ -1937,7 +1937,8 @@ pub async fn run(
                         view = Panel::Logs;
                         scroll = 0;
                     }
-                    KeyCode::Right => {
+                    // Capital O spins the carousel; lowercase keys jump direct.
+                    KeyCode::Char('O') | KeyCode::Right => {
                         view = match view {
                             Panel::Orders => Panel::Tape,
                             Panel::Tape => Panel::Chart,

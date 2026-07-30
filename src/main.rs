@@ -2389,7 +2389,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('t') => { view = Panel::Tape; orders_scroll = 0; }
                         KeyCode::Char('o') => { view = Panel::Orders; orders_scroll = 0; }
                         KeyCode::Char('l') => { view = Panel::Logs; orders_scroll = 0; }
-                        KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
+                        // Capital O spins the carousel for one-handed browsing;
+                        // the lowercase keys stay the fast direct jumps.
+                        KeyCode::Char('O') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
                         KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
                         // Straight to the chart; , . walk the candle interval.
                         KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
@@ -3829,7 +3831,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "e|auto arbitrage"),
             ("VIEW", ""),
             ("", "t  o  l  v|trades · orders · logs · chart"),
-            ("", "→ ←|cycle panels"),
+            ("", "O  → ←|cycle panels"),
             ("", "↑ ↓|scroll"),
             ("", "v|candlestick chart"),
             ("", ",  .|candle interval −/+"),
