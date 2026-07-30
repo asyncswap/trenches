@@ -3509,6 +3509,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 .map(|s| ((s.block / 10) as i64, 1.0 / s.price, s.eth))
                 .collect();
             let candles = view::candles_of(&points, bot.chart_iv, 240);
+            // Our own fills: any tape row whose tx is in the persisted
+            // own-transaction set, on the same block/10 clock as the points.
+            let trades: Vec<(i64, bool)> = tape
+                .iter()
+                .filter(|s| bot.own_txs.contains(&s.tx))
+                .filter(|s| matches!(s.action, engine::TapeAction::Buy | engine::TapeAction::Sell))
+                .map(|s| ((s.block / 10) as i64, matches!(s.action, engine::TapeAction::Buy)))
+                .collect();
             let cv = view::CandleView {
                 title: format!(
                     " {}/ETH {} candle [,] [.] ",
@@ -3519,6 +3527,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 interval_secs: bot.chart_iv,
                 unit: "ETH",
                 active_key: Some('v'),
+                trades,
             };
             ui::widgets::candles(f, mid_area, &cv);
         }

@@ -193,6 +193,9 @@ pub struct Candle {
     pub c: f64,
     /// Quote-side volume traded inside this candle.
     pub v: f64,
+    /// Unix second this candle's bucket starts at — what lets a trade
+    /// timestamp find its column again (entry/exit markers).
+    pub t: i64,
 }
 
 impl Candle {
@@ -212,6 +215,10 @@ pub struct CandleView {
     /// When set, the panel menu ([t] Trades · [v] Candles · …) rides the top
     /// border with this key highlighted — every view names its siblings.
     pub active_key: Option<char>,
+    /// OUR trades — (unix seconds, is_buy) — drawn as vertical marker lines
+    /// through the candle they landed in, so entries and exits sit on the
+    /// chart the way they sit in memory.
+    pub trades: Vec<(i64, bool)>,
 }
 
 /// Aggregate raw trades into time-bucketed candles, oldest-first.
@@ -244,10 +251,15 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) ->
                 out.push(k);
             }
             // …and flat-fill the silent buckets between it and this one.
+            // When a gap is wider than `max` the fill is clamped to the LAST
+            // `gaps` buckets before this one — same flat line on screen, and
+            // every candle still carries its true time.
             if let Some(last) = out.last().copied() {
-                let gaps = ((b - bucket) / iv - 1).clamp(0, max as i64) as usize;
-                let flat = Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0 };
-                out.extend(std::iter::repeat_n(flat, gaps));
+                let gaps = ((b - bucket) / iv - 1).clamp(0, max as i64);
+                for k in (1..=gaps).rev() {
+                    let t = b - k * iv;
+                    out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t });
+                }
             }
             bucket = b;
         }
@@ -259,9 +271,9 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) ->
             // the body/wick covers the ground from prev-close to first trade.
             None => {
                 let o = out.last().map_or(p, |k| k.c);
-                Candle { o, h: o.max(p), l: o.min(p), c: p, v }
+                Candle { o, h: o.max(p), l: o.min(p), c: p, v, t: b }
             }
-            Some(k) => Candle { o: k.o, h: k.h.max(p), l: k.l.min(p), c: p, v: k.v + v },
+            Some(k) => Candle { o: k.o, h: k.h.max(p), l: k.l.min(p), c: p, v: k.v + v, ..k },
         });
     }
     if let Some(k) = cur {
@@ -333,7 +345,7 @@ mod candle_tests {
 /// The candle-interval ladder, seconds. Bounded by what the live tape can
 /// hold — longer candles (4h, 1d) want persisted trade history, which is the
 /// next step, not this one.
-pub const IV_STEPS: [u64; 7] = [1, 5, 15, 60, 300, 900, 3600];
+pub const IV_STEPS: [u64; 9] = [1, 5, 15, 60, 300, 900, 3600, 14400, 86400];
 
 pub fn iv_step(cur: u64, up: bool) -> u64 {
     let i = IV_STEPS.iter().position(|s| *s == cur).unwrap_or(3);
@@ -345,8 +357,10 @@ pub fn iv_label(iv: u64) -> String {
         format!("{iv}s")
     } else if iv < 3600 {
         format!("{}m", iv / 60)
-    } else {
+    } else if iv < 86_400 {
         format!("{}h", iv / 3600)
+    } else {
+        format!("{}d", iv / 86_400)
     }
 }
 

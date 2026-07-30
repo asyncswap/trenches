@@ -811,6 +811,26 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
     };
 
     let buf = f.buffer_mut();
+
+    // Our entries and exits, as vertical lines through the candle each trade
+    // landed in — drawn FIRST so the candles themselves stay on top and the
+    // line reads as behind the tape, the way TradingView draws positions.
+    let iv = cv.interval_secs.max(1) as i64;
+    for &(ts, _buy) in &cv.trades {
+        let bucket = ts - ts.rem_euclid(iv);
+        let Some(i) = shown.iter().position(|c| c.t == bucket) else { continue };
+        // Centre column of the candle's box.
+        let x = inner.x + (i * PITCH) as u16 + (BODY_W / 2) as u16;
+        if x >= inner.x + chart_w as u16 {
+            continue;
+        }
+        for row in 0..rows {
+            let cell = &mut buf[Position { x, y: inner.y + row }];
+            cell.set_symbol("┊");
+            cell.set_fg(tone_color(Tone::Info));
+        }
+    }
+
     for (i, c) in shown.iter().enumerate() {
         let x0 = inner.x + (i * PITCH) as u16;
         let tone = if c.up() { Tone::Good } else { Tone::Bad };
@@ -885,14 +905,13 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
                 cell.set_fg(tone_color(Tone::Dim));
             }
         }
-        // The ▸ starts one cell EARLY, hanging into the chart gutter over the
-        // rule it points along — otherwise it spends one of the axis's own
-        // columns and the unit truncates to "SO".
-        let txt = format!("▸{} {}", price_label(last.c, range), cv.unit);
+        // No arrow: the dashed rule and the coloured, bold label already say
+        // "this is the live price" — the ▸ only cost label room.
+        let txt = format!("{} {}", price_label(last.c, range), cv.unit);
         buf.set_string(
-            inner.x + inner.width - AXIS_W,
+            inner.x + inner.width - AXIS_W + 1,
             y,
-            txt.chars().take(AXIS_W as usize).collect::<String>(),
+            txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
             Style::default().fg(tone_color(tone)).add_modifier(Modifier::BOLD),
         );
     }
@@ -1560,13 +1579,13 @@ mod candle_render_tests {
     use ratatui::backend::TestBackend;
 
     fn cv(candles: Vec<crate::view::Candle>) -> crate::view::CandleView {
-        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL", active_key: None }
+        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL", active_key: None, trades: Vec::new() }
     }
 
     #[test]
     fn candles_paint_bodies_wicks_and_two_colours() {
-        let up = crate::view::Candle { o: 1.0, h: 4.0, l: 0.5, c: 3.0, v: 1.0 };
-        let dn = crate::view::Candle { o: 3.0, h: 3.5, l: 0.8, c: 1.2, v: 1.0 };
+        let up = crate::view::Candle { o: 1.0, h: 4.0, l: 0.5, c: 3.0, v: 1.0, t: 0 };
+        let dn = crate::view::Candle { o: 3.0, h: 3.5, l: 0.8, c: 1.2, v: 1.0, t: 0 };
         let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv(vec![up, dn, up, dn]))).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1605,7 +1624,7 @@ mod candle_render_tests {
 
     #[test]
     fn a_dead_flat_market_does_not_divide_into_a_wall() {
-        let flat = crate::view::Candle { o: 2.0, h: 2.0, l: 2.0, c: 2.0, v: 0.0 };
+        let flat = crate::view::Candle { o: 2.0, h: 2.0, l: 2.0, c: 2.0, v: 0.0, t: 0 };
         let mut term = Terminal::new(TestBackend::new(50, 12)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv(vec![flat; 20]))).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1658,7 +1677,7 @@ mod candle_gallery {
             }
         }
         let ck = crate::view::candles_of(&pts, 15, 240);
-        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL", active_key: None };
+        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL", active_key: None, trades: Vec::new() };
         let mut term = Terminal::new(TestBackend::new(140, 34)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv)).unwrap();
         println!("{}", dump(term.backend().buffer()));
@@ -1690,3 +1709,4 @@ mod panel_menu_shape {
         }
     }
 }
+
