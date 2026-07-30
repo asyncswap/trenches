@@ -81,7 +81,10 @@ struct Endpoint {
     /// Host only — never the full URL, which usually carries an API key.
     host: String,
     /// Can this endpoint answer a multi-thousand-block `eth_getLogs`?
-    wide_logs: bool,
+    /// Starts from a hostname guess and is DEMOTED the first time the
+    /// endpoint refuses a range — a proxy in front of a capped provider
+    /// looks wide until it answers.
+    wide_logs: std::sync::atomic::AtomicBool,
     /// Unix millis until which this endpoint is benched. 0 = available.
     cooldown_until: AtomicU64,
     /// Unix millis before which a BENCHED endpoint may not even be probed.
@@ -133,6 +136,12 @@ pub fn set_shared(b: &Balanced) {
     *SHARED.lock().unwrap() = Some(b.clone());
 }
 
+/// The shared pool's chunk choice, for scanners that run before or without
+/// a pool: the caller's default until every endpoint refuses wide ranges.
+pub fn shared_log_chunk(default: u64) -> u64 {
+    shared().map(|b| b.log_chunk(default)).unwrap_or(default)
+}
+
 pub fn shared() -> Option<Balanced> {
     SHARED.lock().unwrap().clone()
 }
@@ -156,7 +165,7 @@ impl Balanced {
             endpoints.push(Endpoint {
                 // Alchemy free tier refuses wide getLogs ranges; everything
                 // else is assumed able until it proves otherwise.
-                wide_logs: !host.contains("alchemy"),
+                wide_logs: std::sync::atomic::AtomicBool::new(!host.contains("alchemy")),
                 host,
                 url,
                 cooldown_until: AtomicU64::new(0),
@@ -204,7 +213,25 @@ impl Balanced {
     /// but a loop that retries every second turns that mercy into a hammer,
     /// guaranteeing the endpoint never gets to finish resting.
     pub fn wide_ready(&self) -> bool {
-        self.0.endpoints.iter().any(|e| e.wide_logs && !e.cooling())
+        let wide = |e: &Endpoint| e.wide_logs.load(Ordering::Relaxed);
+        if self.0.endpoints.iter().any(&wide) {
+            self.0.endpoints.iter().any(|e| wide(e) && !e.cooling())
+        } else {
+            // Every endpoint has refused a wide range: scans run narrow now,
+            // so any rested endpoint is enough to hold a round.
+            self.0.endpoints.iter().any(|e| !e.cooling())
+        }
+    }
+
+    /// The widest `eth_getLogs` span worth asking this pool for: the caller's
+    /// own default while anyone still takes wide scans, the narrow cap once
+    /// every endpoint has refused one.
+    pub fn log_chunk(&self, default: u64) -> u64 {
+        if self.0.endpoints.iter().any(|e| e.wide_logs.load(Ordering::Relaxed)) {
+            default
+        } else {
+            NARROW_LOG_SPAN
+        }
     }
 
     /// Report the outcome of a raw call made against `pick_url`, so cooldowns
@@ -230,7 +257,7 @@ impl Inner {
         let mut avail: Vec<usize> = Vec::new();
         let mut benched: Vec<usize> = Vec::new();
         for (i, ep) in self.endpoints.iter().enumerate() {
-            if wide_logs && !ep.wide_logs {
+            if wide_logs && !ep.wide_logs.load(Ordering::Relaxed) {
                 continue;
             }
             if ep.cooling() {
@@ -353,12 +380,29 @@ impl Inner {
                 continue;
             }
             if !status.is_success() {
-                // A 4xx other than 429 is OUR mistake — every endpoint will
-                // refuse it the same way, so asking the next one just spends
-                // quota restating the problem.
+                let text = String::from_utf8_lossy(&bytes);
+                // One 4xx is NOT our mistake: a range-capped provider (or a
+                // proxy in front of one) refusing a wide getLogs. That is a
+                // fact about the endpoint's plan, not the call — learn it,
+                // route around it, and let scanners clamp when nobody wide
+                // is left.
+                if wide && range_capped(&text) {
+                    if ep.wide_logs.swap(false, Ordering::Relaxed) {
+                        crate::trace(&format!(
+                            "rpc: {} caps getLogs ranges — wide scans go elsewhere",
+                            ep.host
+                        ));
+                    }
+                    last_err =
+                        Some(TransportErrorKind::http_error(status.as_u16(), text.into_owned()));
+                    continue;
+                }
+                // Any other 4xx is ours — every endpoint will refuse it the
+                // same way, so asking the next one just spends quota
+                // restating the problem.
                 return Err(TransportErrorKind::http_error(
                     status.as_u16(),
-                    String::from_utf8_lossy(&bytes).into_owned(),
+                    text.into_owned(),
                 ));
             }
 
@@ -381,6 +425,22 @@ impl Inner {
                 continue;
             }
 
+            // The same refusal can arrive as HTTP 200 with a JSON-RPC error.
+            if wide {
+                if let Some(msg) = packet.as_error().map(|e| e.message.to_string()) {
+                    if range_capped(&msg) {
+                        if ep.wide_logs.swap(false, Ordering::Relaxed) {
+                            crate::trace(&format!(
+                                "rpc: {} caps getLogs ranges — wide scans go elsewhere",
+                                ep.host
+                            ));
+                        }
+                        last_err = Some(TransportErrorKind::http_error(400, msg));
+                        continue;
+                    }
+                }
+            }
+
             ep.observe(t0.elapsed());
             if attempt > 0 {
                 crate::trace(&format!("rpc: {} answered {method} after failover", ep.host));
@@ -396,6 +456,14 @@ impl Inner {
             TransportErrorKind::custom_str("no RPC endpoint could be tried")
         }))
     }
+}
+
+/// True when this error text is a provider refusing a getLogs RANGE — the
+/// call is fine; the endpoint's plan is small. Alchemy free says "up to a 10
+/// block range"; other providers phrase it as the range being too large.
+fn range_capped(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("block range") || m.contains("range too large") || m.contains("range is too")
 }
 
 /// True when a parsed response is a provider refusing for rate, on any

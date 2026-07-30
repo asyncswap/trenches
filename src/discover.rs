@@ -148,6 +148,29 @@ const PUBLIC_RPC: &str = "https://rpc.mainnet.chain.robinhood.com/rpc";
 /// inside what the node will answer.
 const LOG_CHUNK: u64 = 2_000;
 
+/// How many chunks a NARROW scan may spend. When every endpoint caps
+/// `eth_getLogs` at ten blocks, a multi-thousand-block backfill would take
+/// hundreds of calls a round — degraded mode instead follows the freshest
+/// few chunks and says so, which keeps live discovery alive on a capped pool.
+const NARROW_SCAN_CHUNKS: u64 = 8;
+
+/// The span the pool can actually serve, and a floor for `from` once the
+/// pool is narrow. Returns (from, chunk).
+fn clamp_scan(what: &str, from: u64, to: u64, default_chunk: u64) -> (u64, u64) {
+    let chunk = crate::rpc::shared_log_chunk(default_chunk);
+    if chunk >= default_chunk {
+        return (from, chunk);
+    }
+    let max_blocks = chunk.saturating_mul(NARROW_SCAN_CHUNKS);
+    let lo = from.max(to.saturating_sub(max_blocks.saturating_sub(1)));
+    if lo > from {
+        crate::trace(&format!(
+            "{what} clamped {from}..{to} -> {lo}..{to}: every endpoint caps getLogs at {chunk} blocks"
+        ));
+    }
+    (lo, chunk)
+}
+
 fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64)> {
     let topics = lg.topics();
     if topics.len() < 4 {
@@ -173,10 +196,11 @@ async fn scan_launchpads<P: Provider>(
     to: u64,
 ) -> (Vec<(Address, Address, u64)>, Vec<FlCand>) {
     let mut logs = Vec::new();
+    let (from, chunk) = clamp_scan("launch scan", from, to, LOG_CHUNK);
     let mut start = from;
     let (mut ok, mut failed) = (0u32, 0u32);
     while start <= to {
-        let end = (start + LOG_CHUNK - 1).min(to);
+        let end = (start + chunk - 1).min(to);
         let filter = Filter::new()
             .address(vec![PONS_FACTORY, FLAUNCH_PM])
             .event_signature(vec![
@@ -313,10 +337,11 @@ pub struct FlCand {
 /// (and the same failure reporting) as the Pons `scan_candidates`.
 async fn scan_flaunch<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<FlCand> {
     let mut raw = Vec::new();
+    let (from, chunk) = clamp_scan("flaunch scan", from, to, LOG_CHUNK);
     let mut start = from;
     let (mut ok, mut failed) = (0u32, 0u32);
     while start <= to {
-        let end = (start + LOG_CHUNK - 1).min(to);
+        let end = (start + chunk - 1).min(to);
         let filter = Filter::new()
             .address(FLAUNCH_PM)
             .event_signature(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH)
@@ -605,9 +630,10 @@ async fn batch_call(client: &reqwest::Client, url: &str, calls: &[(Address, Vec<
 async fn scan_all<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<(Address, Address, u64)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
+    let (from, chunk) = clamp_scan("big-fish scan", from, to, 6_000);
     let mut lo = from;
     while lo <= to {
-        let hi = (lo + 6_000).min(to);
+        let hi = (lo + chunk).min(to);
         let filter = Filter::new()
             .address(PONS_FACTORY)
             .event_signature(IPonsFactory::TokenLaunched::SIGNATURE_HASH)
@@ -720,9 +746,10 @@ async fn scan_v4_inits<L: Provider>(
 ) -> Vec<(B256, Address, engine::Quote, i32, u32, u64)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
+    let (from, chunk) = clamp_scan("v4-init scan", from, to, 6_000);
     let mut lo = from;
     while lo <= to {
-        let hi = (lo + 6_000).min(to);
+        let hi = (lo + chunk).min(to);
         let filter = Filter::new()
             .address(POOL_MANAGER)
             .event_signature(INIT_TOPIC)
