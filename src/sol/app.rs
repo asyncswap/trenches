@@ -427,9 +427,13 @@ async fn poller(
 /// The chart, straight off the tape: every swap IS a price at a time, so the
 /// candles are a pure re-reading of data the dashboard already holds.
 fn chart_view(bot: &SolBot) -> crate::view::CandleView {
+    // OLDEST first: the tape displays newest-first, and block_time only has
+    // second resolution — feeding the sorter newest-first flipped open and
+    // close inside every same-second bucket, which painted the wrong colour.
     let points: Vec<(i64, f64, f64)> = bot
         .tape
         .iter()
+        .rev()
         .filter(|s| !s.kind.is_lp() && s.tokens > 0.0)
         .filter_map(|s| s.block_time.map(|t| (t, s.sol / s.tokens, s.sol)))
         .collect();

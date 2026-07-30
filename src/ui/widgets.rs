@@ -765,7 +765,18 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
             b_top = cell;
             b_bot = cell + 1;
         }
-        let (w_top, w_bot) = (py(c.h).min(b_top), py(c.l).max(b_bot));
+        // A wick that EXISTS gets at least one pixel, even when it rounds
+        // into the body: a high is a fact, and "missing low/high" on candles
+        // that had them read as a bug (it was). Sub-pixel truth becomes a
+        // one-pixel nub instead of nothing — the same call TradingView makes.
+        let mut w_top = py(c.h).min(b_top);
+        let mut w_bot = py(c.l).max(b_bot);
+        if c.h > c.o.max(c.c) && w_top >= b_top {
+            w_top = b_top - 1;
+        }
+        if c.l < c.o.min(c.c) && w_bot <= b_bot {
+            w_bot = b_bot + 1;
+        }
         for col in 0..BODY_W {
             let x = x0 + col as u16;
             if x >= inner.x + chart_w as u16 {
