@@ -963,6 +963,55 @@ impl SolBot {
         }
     }
 
+    /// Fill the Orders panel from the coin's saved history. The tape already
+    /// remembers OUR fills (`mine`, the ⭐ rows) — the same record the chart's
+    /// buy/sell lines and the PnL story draw from — so a coin traded last
+    /// week arrives with its orders on the page, not an empty queue
+    /// pretending nothing ever happened. Confirmed on arrival: `reap` only
+    /// touches Pending orders, so nothing double-books.
+    fn backfill_orders(&mut self) {
+        let known: std::collections::HashSet<String> =
+            self.orders.iter().filter_map(|o| o.sig.clone()).collect();
+        // Oldest first, so the newest fill sits where the panel reads first.
+        let fills: Vec<&SolSwap> = self
+            .tape
+            .iter()
+            .rev()
+            .filter(|s| s.mine && !s.kind.is_lp())
+            .filter(|s| !known.contains(&s.signature))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for s in fills {
+            // One order per transaction — a sandwich of events is one press.
+            if !seen.insert(s.signature.clone()) {
+                continue;
+            }
+            // `Instant` cannot name a moment before the process started;
+            // checked_sub keeps a fill from last week from panicking the age
+            // column and falls back to "old" at the horizon.
+            let at = s
+                .block_time
+                .and_then(|bt| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs() as i64;
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs((now - bt).max(0) as u64))
+                })
+                .unwrap_or_else(std::time::Instant::now);
+            self.orders.push_back(SolOrder {
+                at,
+                action: if matches!(s.kind, discover::SwapKind::Buy) { "BUY" } else { "SELL" },
+                sol: s.sol,
+                state: OrderState::Confirmed,
+                sig: Some(s.signature.clone()),
+                mc: s.mkt_cap_sol,
+                pooled: s.pooled_sol,
+            });
+        }
+    }
+
     fn absorb(&mut self, snap: &Snapshot) {
         self.sol = snap.sol;
         self.slot = snap.slot;
@@ -2421,6 +2470,7 @@ pub async fn run(
                     // current with whatever the tape already holds.
                     bot.hist = load_candles(&p.mint);
                     bot.reseal_candles();
+                    bot.backfill_orders();
                     *target.lock().unwrap() = Some(tgt);
                     view = Panel::Tape;
                     scroll = 0;
