@@ -72,6 +72,23 @@ mod seen_coin_shape {
     }
 }
 
+/// The last coin the user was trading. A wallet switch rebuilds the whole
+/// session, and an app restart obviously does — both used to come back with
+/// no coin selected, the pool panel empty, and the user re-pasting what the
+/// app knew perfectly well five seconds earlier. The EVM side has restored
+/// its last pool since day one; this is the same courtesy.
+fn last_coin_path() -> String {
+    format!("{}/last-coin-solana.txt", crate::state_dir())
+}
+
+fn save_last_coin(mint: &Pubkey) {
+    let _ = std::fs::write(last_coin_path(), mint.to_string());
+}
+
+fn load_last_coin() -> Option<Pubkey> {
+    std::fs::read_to_string(last_coin_path()).ok()?.trim().parse().ok()
+}
+
 fn coins_path() -> String {
     format!("{}/coins-solana.json", crate::state_dir())
 }
@@ -1769,6 +1786,14 @@ pub async fn run(
             });
         }
     };
+
+    // Pick up where the last session (or the pre-wallet-switch session)
+    // left off: the last coin resolves in the background, its saved tape
+    // loads with it, and the dashboard is exactly as it was left.
+    if let Some(mint) = load_last_coin() {
+        bot.note(format!("restoring {mint}…"));
+        spawn_resolve(mint, None, None);
+    }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let poll_handle = tokio::spawn(poller(
         bot.rpc.clone(),
@@ -2128,6 +2153,7 @@ pub async fn run(
                     let graduated = c.graduated();
                     bot.meta = p.meta;
                     bot.remember_coin(&c);
+                    save_last_coin(&p.mint);
                     bot.coin = Some(c);
                     bot.launched_at = p.launched;
                     bot.token_bal = 0.0;
