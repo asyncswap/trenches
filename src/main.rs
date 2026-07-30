@@ -843,6 +843,9 @@ async fn main() -> eyre::Result<()> {
                 println!("  It works as-is on public endpoints. Open the app and press `e`,");
                 println!("  or edit the file — your editor will complete it from the schema.");
                 println!();
+                println!("  Want one key that covers every chain, websockets included?");
+                println!("  Free and Pro plans: https://rpc.trenches.sh");
+                println!();
                 return Ok(());
             }
             // Update from the shell, for when the app is not open — a
@@ -955,8 +958,9 @@ async fn main() -> eyre::Result<()> {
         println!("    {}", cfg_path.display());
         println!();
         println!("  It works as-is on public endpoints, which are rate limited. For live");
-        println!("  trading put your own RPC URL in it — the file explains which fields and");
-        println!("  why. Never put a seed phrase in it; accounts are keystores, added with W.");
+        println!("  trading grab a key at https://rpc.trenches.sh — free at 10 req/s, Pro");
+        println!("  for uncapped — or put your own provider's RPC URL in the file.");
+        println!("  Never put a seed phrase in it; accounts are keystores, added with W.");
         println!();
         println!("  Starting…");
         println!();
