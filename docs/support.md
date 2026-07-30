@@ -26,4 +26,4 @@ pooled providers with failover. Sign in at
 [rpc.trenches.sh](https://rpc.trenches.sh).
 
 - **Free**: 10 requests/second — enough to run the terminal.
-- **Pro**: $119/month, 10M requests included, then $5 per million. Uncapped.
+- **Pro**: $119/month, 10M requests included. Uncapped.
