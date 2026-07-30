@@ -840,9 +840,6 @@ async fn main() -> eyre::Result<()> {
                 }
                 println!("  {dim}└{rule}┘{off}");
                 println!();
-                println!("  It works as-is on public endpoints. Open the app and press `e`,");
-                println!("  or edit the file — your editor will complete it from the schema.");
-                println!();
                 println!("  Want one key that covers every chain, websockets included?");
                 println!("  Free and Pro plans: https://rpc.trenches.sh");
                 println!();
