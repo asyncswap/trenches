@@ -28,8 +28,6 @@ use crate::contracts::{
     FLAUNCH_FEE_EST, FLAUNCH_PM, PONS_FACTORY, POOL_MANAGER, STATE_VIEW, V3_FACTORY, WETH,
 };
 use crate::engine;
-use crate::ui;
-use crate::view;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -1605,15 +1603,6 @@ fn draw_status(term: &mut Term, msg: &str) -> eyre::Result<()> {
 }
 
 /// Decode a 32-byte two's-complement int256 to f64.
-// Axis tick: compact seconds/minutes label for the cluster ruler.
-fn fmt_secs(s: f64) -> String {
-    if s < 60.0 {
-        format!("{s:.0}s")
-    } else {
-        format!("{:.1}m", s / 60.0)
-    }
-}
-
 fn i256_to_f64(d: &[u8]) -> f64 {
     if d.len() < 32 {
         return 0.0;
@@ -1657,165 +1646,6 @@ async fn pool_swaps<L: Provider>(logs: &L, pool: Address, weth0: bool, from: u64
     out
 }
 
-/// Expand one swap into a filled disc of scatter points whose radius scales with
-/// the trade's ETH size — bigger amount → bigger circle. `cx`/`cy` are the data
-/// units per terminal cell (so the disc looks round, not stretched by the axes).
-fn disc(x: f64, y: f64, size_frac: f64, cx: f64, cy: f64, out: &mut Vec<(f64, f64)>) {
-    // 0..=3 cell radius across the size range (sqrt so small trades still differ).
-    let r = (size_frac.max(0.0).sqrt() * 3.0).round() as i32;
-    if r <= 0 {
-        out.push((x, y));
-        return;
-    }
-    for i in -r..=r {
-        for j in -r..=r {
-            if i * i + j * j <= r * r {
-                out.push((x + i as f64 * cx, y + j as f64 * cy));
-            }
-        }
-    }
-}
-
-/// A hollow SQUARE outline (box border) used to pin our own trades so they stand
-/// out over the filled market dots. Only perimeter cells — clearly empty center.
-/// Minimum radius 2 (a 5×5 box with a 3×3 hole) so even a tiny trade reads hollow.
-fn ring(x: f64, y: f64, size_frac: f64, cx: f64, cy: f64, out: &mut Vec<(f64, f64)>) {
-    let r = ((size_frac.max(0.0).sqrt() * 3.0).round() as i32).max(2);
-    for i in -r..=r {
-        for j in -r..=r {
-            if i.abs() == r || j.abs() == r {
-                out.push((x + i as f64 * cx, y + j as f64 * cy));
-            }
-        }
-    }
-}
-
-/// Live buyer scatter for the current v3 pool ('c'): each swap is a dot over
-/// (seconds-since-launch × ETH size). Green = buys, red = sells. A tight early
-/// clump of same-size green dots = a coordinated swarm; a spread = organic.
-/// Refreshes ~every 0.6s. Esc to exit. Self-contained — never touches the loop.
-pub async fn screen_clusters<P: Provider>(term: &mut Term, provider: &P, pool: Address, weth0: bool, launch_block: Option<u64>, ours: std::collections::HashSet<B256>) -> eyre::Result<()> {
-    // This screen owns the terminal now: take down any image the last one left.
-    // Clearing also marks every placement stale, so the dashboard redraws its
-    // logo when we return — no screen has to know about any other.
-    crate::ui::image::clear();
-    // Incremental: the full history is fetched ONCE, then each refresh asks
-    // only for the blocks mined since. This used to re-read everything from
-    // the launch block every 0.6s — on an hour-old pool, a growing full-history
-    // getLogs per frame, forever.
-    let mut acc: Vec<(f64, f64, Address, bool, B256)> = Vec::new();
-    let mut base: Option<u64> = None;
-    let mut scanned: Option<u64> = None;
-    loop {
-        // Same here: without a head there is no window to ask about, and
-        // asking anyway costs a request that buys nothing.
-        let head = match tokio::time::timeout(RPC_TIMEOUT, provider.get_block_number()).await {
-            Ok(Ok(h)) if h > 0 => h,
-            _ => {
-                crate::trace("chart: no head block, skipping this round");
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                continue;
-            }
-        };
-        let anchor = *base.get_or_insert_with(|| launch_block.unwrap_or_else(|| head.saturating_sub(3_000)));
-        let from = scanned.map(|t| t + 1).unwrap_or(anchor);
-        if from <= head {
-            acc.extend(pool_swaps(provider, pool, weth0, from, head, anchor).await);
-            scanned = Some(head);
-        }
-        let swaps = &acc;
-        // Split into market vs OURS (tx hash matches an order) × buy vs sell.
-        // Log y: sizes run from a ten-thousandth of an ETH to several ETH, so a
-        // linear axis puts almost every trade on the bottom row.
-        // Fixed floor for the same reason: a floor derived from the smallest
-        // trade seen would shift the whole axis the moment a smaller one lands.
-        let y_floor = 1e-4;
-        let (mut mbuy, mut msell, mut obuy, mut osell) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for s in swaps.iter() {
-            let pt = (s.0, view::log_scale(s.1, y_floor));
-            match (ours.contains(&s.4), s.3) {
-                (false, true) => mbuy.push(pt),
-                (false, false) => msell.push(pt),
-                (true, true) => obuy.push(pt),
-                (true, false) => osell.push(pt),
-            }
-        }
-        let n_buys = swaps.iter().filter(|s| s.3).count();
-        let n_sells = swaps.len() - n_buys;
-        let _n_ours = obuy.len() + osell.len();
-        let distinct: std::collections::HashSet<Address> = swaps.iter().filter(|s| s.3).map(|s| s.2).collect();
-        // Quantise the time axis. It grows a little every refresh, and any
-        // change to the bound moves EVERY point — which repaints the whole plot
-        // and reads as a blink. Stepping it keeps points still until the bound
-        // genuinely needs to grow.
-        let raw_t = swaps.iter().map(|s| s.0).fold(1.0f64, f64::max);
-        let step = if raw_t <= 120.0 {
-            30.0
-        } else if raw_t <= 1800.0 {
-            300.0
-        } else {
-            1800.0
-        };
-        let max_t = (raw_t / step).ceil() * step;
-        let max_sz = swaps.iter().map(|s| s.1).fold(0.0001f64, f64::max);
-        // Market trades = filled discs; OURS = hollow squares (the pinned border).
-        let sv = view::ScatterView {
-            title: format!(
-                " Buys ({}) Sells ({}) Users ({}) esc back ",
-                n_buys, n_sells, distinct.len()
-            ),
-            series: vec![
-                // One dot per trade — size is the y axis, so a blob only blurs
-                // neighbouring trades together.
-                view::Series { name: "buys".into(), tone: view::Tone::Good, shape: view::Shape::Dot, points: mbuy },
-                view::Series { name: "sells".into(), tone: view::Tone::Bad, shape: view::Shape::Dot, points: msell },
-                view::Series { name: "you buy".into(), tone: view::Tone::Mine, shape: view::Shape::Ring, points: obuy },
-                view::Series { name: "you sell".into(), tone: view::Tone::Warn, shape: view::Shape::Ring, points: osell },
-            ],
-            x: view::AxisView {
-                title: "s since launch".into(),
-                max: max_t,
-                labels: vec![
-                    "0".into(),
-                    fmt_secs(max_t * 0.25),
-                    fmt_secs(max_t * 0.5),
-                    fmt_secs(max_t * 0.75),
-                    fmt_secs(max_t),
-                ],
-            },
-            y: {
-                let top = view::log_scale(max_sz, y_floor).max(1.0);
-                // Label each decade, so the axis reads 0.0001 / 0.001 / 0.01 …
-                let labels = (0..=top.ceil() as i32)
-                    .map(|d| {
-                        let v = y_floor * 10f64.powi(d);
-                        if v >= 1.0 { format!("{v:.2}") } else { format!("{v:.4}") }
-                    })
-                    .collect();
-                view::AxisView { title: "ETH (log)".into(), max: top, labels }
-            },
-            // The key strip names the four series; the axis titles already say
-            // what the axes are. Anything more is a caption nobody reads twice.
-            key_note: String::new(),
-        };
-        term.draw(|f| {
-            // Paint the theme background across the WHOLE frame first. The plot
-            // is height-capped, so without this everything below it keeps the
-            // terminal's own background — and whatever the previous screen left
-            // there shows through.
-            ui::widgets::paint_bg(f);
-            ui::widgets::scatter(f, f.area(), &sv);
-        })?;
-        crate::ui_alive();
-        if event::poll(Duration::from_millis(600))? {
-            if let Event::Key(k) = event::read()? {
-                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c')) {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
 
 /// Static Verified-pools browser (Shift-F): the hand-curated pools from config
 /// (stock tokens etc.), shown INSTANTLY — no pricing, no mining. Select one to

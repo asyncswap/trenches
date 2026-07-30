@@ -39,7 +39,7 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use config::Registry;
-use engine::{Bot, Side, Strategy};
+use engine::{Bot, Side};
 
 /// Where the config was read from, for anything that needs to name it.
 ///
@@ -1459,7 +1459,6 @@ async fn chain_session_on(
     let pool = resume_pool
         .clone()
         .unwrap_or_else(|| blank_pool(&view::pretty_network(&net.name)));
-    let strategy = Strategy::Manual; // default: manual — nothing preset, nothing automatic
 
     // Wallet-selectable assets: ETH (currency0) + every known token on this
     // network. Used by the pair picker so the user selects assets, not addresses.
@@ -1531,7 +1530,6 @@ async fn chain_session_on(
         net: view::pretty_network(&net.name),
         account: account.clone(),
         pool: to_poolcfg(&pool),
-        strategy,
         last_market_trace: None,
         chart_iv: 60, // the canonical minute candle — see the sol side's note
         arb_mode: false,
@@ -1578,10 +1576,6 @@ async fn chain_session_on(
         eth_usd: 1871.0,    // ETH price estimate for USD market cap (adjust as needed)
         profit_guard: false, // OFF by default — don't gate on positive EV; toggle with 'g'
         guard_dup: true,     // ON by default — stop double buys; toggle with 'n'
-        copy_buy_eth: 0.0,
-        copy_tiers: Vec::new(),
-        copy_idx: 0,
-        copy_manual: false,
         min_edge_eth: 0.0,
         ref_price: 0.0,
         gas_price: 0.0,
@@ -1947,7 +1941,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     };
 
     let mut prices: VecDeque<f64> = VecDeque::new();
-    let mut sma = 0.0;
     let mut tele_ctr: u64 = 0;
     // For ageing the status line out; see the act tick.
     let mut last_status = String::new();
@@ -2072,38 +2065,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     bot.mkt_b.read_ms = mb.read_ms;
                 }
                 let blk = block.load(Ordering::Relaxed);
-                sma = if prices.is_empty() { bot.price() } else { prices.iter().sum::<f64>() / prices.len() as f64 };
-                bot.ref_price = sma; // reference for the profitability filter
+                // Reference for the profitability filter: a 60-sample SMA.
+                bot.ref_price = if prices.is_empty() { bot.price() } else { prices.iter().sum::<f64>() / prices.len() as f64 };
                 if !rpc_ok.load(Ordering::Relaxed) {
                     bot.status = "Cannot reach the RPC endpoint. Retrying now.".into();
                 }
                 let mut tape_snap: Vec<engine::Swap> = tape.lock().unwrap().iter().copied().collect();
                 tape_snap.sort_by_key(|s| s.block); // merged pools -> chronological
-                // Copy mode: build the deployer's buy ladder from the tape (recurring
-                // external buy sizes, excluding our own trades) and resolve the
-                // selected rung. Auto-snaps to the modal rung until the user steps
-                // it with [ ]; then holds the manual pick.
-                if bot.is_copy() {
-                    // Persisted set, not the session's order list — marks survive restarts.
-                    let ours = &bot.own_txs;
-                    let buys: Vec<u128> = tape_snap.iter()
-                        .filter(|s| matches!(s.action, engine::TapeAction::Buy) && s.eth_wei > 0 && !ours.contains(&s.tx))
-                        .map(|s| s.eth_wei)
-                        .collect();
-                    bot.copy_tiers = buy_tiers(&buys);
-                    if bot.copy_tiers.is_empty() {
-                        bot.copy_idx = 0;
-                        bot.copy_buy_eth = 0.0;
-                    } else {
-                        if !bot.copy_manual {
-                            // Snap to the modal rung (highest count) as the blend-in default.
-                            bot.copy_idx = bot.copy_tiers.iter().enumerate()
-                                .max_by_key(|(_, (_, c))| *c).map(|(i, _)| i).unwrap_or(0);
-                        }
-                        bot.copy_idx = bot.copy_idx.min(bot.copy_tiers.len() - 1);
-                        bot.copy_buy_eth = bot.copy_tiers[bot.copy_idx].0;
-                    }
-                }
                 let mut logo_box = None;
                 let mut grabbed: Option<String> = None;
                 // Named so a freeze here is attributable: a draw blocks when
@@ -2150,11 +2118,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     }
                     prices.push_back(bot.price());
                     if prices.len() > 60 { prices.pop_front(); }
-                    if bot.strategy != Strategy::Manual {
-                        if let Some(side) = bot.signal(sma, 0.003) {
-                            let _ = tokio::time::timeout(Duration::from_secs(3), bot.place(provider, side)).await;
-                        }
-                    }
                 } else if rpc_ok.load(Ordering::Relaxed) && !bot.pool.kind.is_empty() {
                     // Only when a pool is actually selected. `ready` is false
                     // both for a pool with no liquidity AND for no pool at all,
@@ -2394,7 +2357,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('O') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
                         KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
                         // Straight to the chart; , . walk the candle interval.
-                        KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
+                        KeyCode::Char('c') | KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
                         KeyCode::Char(',') => { bot.chart_iv = view::iv_step(bot.chart_iv, false); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
                         KeyCode::Char('.') => { bot.chart_iv = view::iv_step(bot.chart_iv, true); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
                         // Scroll the active panel (↑ older, ↓ newer) — orders or tape.
@@ -2429,25 +2392,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         //   [ ]  BUY size (% of ETH balance)    — 0.5% steps
                         //   ( )  SELL size (% of token balance) — 10% steps
                         //   { }  impact cap (% price move);  0 = off
-                        // In copy mode, [ ] walk the deployer's buy ladder (rungs);
-                        // otherwise they nudge buy_frac (% of wallet) as usual.
                         KeyCode::Char(']') => {
-                            if bot.is_copy() {
-                                bot.copy_manual = true;
-                                if !bot.copy_tiers.is_empty() { bot.copy_idx = (bot.copy_idx + 1).min(bot.copy_tiers.len() - 1); }
-                                bot.status = copy_status(bot);
-                            } else {
-                                bot.buy_frac = (bot.buy_frac + 0.005).min(1.0); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
-                            }
+                            bot.buy_frac = (bot.buy_frac + 0.005).min(1.0); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
                         }
                         KeyCode::Char('[') => {
-                            if bot.is_copy() {
-                                bot.copy_manual = true;
-                                bot.copy_idx = bot.copy_idx.saturating_sub(1);
-                                bot.status = copy_status(bot);
-                            } else {
-                                bot.buy_frac = (bot.buy_frac - 0.005).max(0.005); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
-                            }
+                            bot.buy_frac = (bot.buy_frac - 0.005).max(0.005); setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0));
                         }
                         // Bracket family, paired with the header labels:
                         // [] buy · () sell · {} slippage · <> impact cap.
@@ -2470,24 +2419,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             } else {
                                 "Duplicate guard is off, be careful, the same buy can repeat".to_string()
                             }; }
-                        // Quick mode toggle (Shift-M): flip mode 0 (manual) <-> mode 1.
-                        KeyCode::Char('M') => {
-                            bot.strategy = if bot.is_copy() { Strategy::Manual } else { Strategy::CopyBuyAmount };
-                            bot.copy_manual = false;
-                            bot.status = if bot.is_copy() { copy_status(bot) } else { "Switched to manual mode".into() };
-                        }
-                        // Mode picker (m): choose the trading mode from a menu.
-                        KeyCode::Char('m') => {
-                            let opts = vec![
-                                "mode 0 (manual)  — buys use buy_frac".to_string(),
-                                "mode 1           — [ ] steps the value".to_string(),
-                            ];
-                            if let Some(i) = ui::select(terminal, "Select mode", &opts)? {
-                                bot.strategy = if i == 1 { Strategy::CopyBuyAmount } else { Strategy::Manual };
-                                bot.copy_manual = false;
-                                bot.status = if bot.is_copy() { copy_status(bot) } else { "Switched to manual mode".into() };
-                            }
-                        }
                         // Clear the board. Everything on screen — pool, tape,
                         // position, routes, arb pair — belonged to a coin you are
                         // done with, and a half-cleared screen is worse than none:
@@ -2692,23 +2623,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('e') => {
                             bot.status = "arb: executing…".into();
                             let _ = tokio::time::timeout(Duration::from_secs(14), bot.arb(provider)).await;
-                        }
-                        KeyCode::Char('c') => {
-                            // Live buyer scatter for the current pool (dots, scope-tui style).
-                            let v3 = match &bot.pool.kind {
-                                engine::PoolKind::V3 { pool_addr, weth_is_token0 } => Some((*pool_addr, *weth_is_token0)),
-                                _ => None,
-                            };
-                            let lb = bot.pons_launch();
-                            let ours = bot.own_txs.clone();
-                            if let Some((pa, w0)) = v3 {
-                                poll_paused.store(true, Ordering::Relaxed);
-                                let r = discover::screen_clusters(terminal, provider, pa, w0, lb, ours).await;
-                                poll_paused.store(false, Ordering::Relaxed);
-                                r?;
-                            } else {
-                                bot.status = "The cluster view supports Uniswap V3 pools only for now".into();
-                            }
                         }
                         KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('k') => {
                             // 'f' = live Pons v3 trenches; Shift-'F' = static Verified pools;
@@ -3126,9 +3040,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 hint("[ ] "),
                 sbold(format!("{:<10}", "buy")),
                 val(format!("{:<10}", format!("{:.1}%", bot.buy_frac * 100.0))),
-                hint("[M] "),
+                hint("    "),
                 sbold(format!("{:<10}", "mode")),
-                val(strat_name(bot.strategy).to_string()),
+                val("manual".to_string()),
             ]),
             Line::from(vec![
                 hint("( ) "),
@@ -3182,8 +3096,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     "Status  ",
                     Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD),
                 ),
-                // Normal text: it is the message, not a control.
-                val(bot.status.clone()),
+                // The highlight blue: the status is the one sentence the
+                // dashboard is currently saying to you.
+                Span::styled(bot.status.clone(), Style::default().fg(ui::widgets::tone_color(view::Tone::Info))),
             ]),
         ])
         .block(ui::widgets::themed_block(" Settings ")),
@@ -3232,7 +3147,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             mlbl("Protocol"),
             Span::styled(
                 format!("{} ETH/{} {}", bot.pool.kind.venue_label(), bot.pool.sym, fee_label(bot.pool.fee)),
-                Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
     );
@@ -3299,7 +3214,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 Style::default().fg(ui::widgets::tone_color(view::Tone::Info)),
             )),
             Line::from(Span::styled(
-                "  [t] top tokens",
+                "  [k] top tokens",
                 Style::default().fg(ui::widgets::tone_color(view::Tone::Info)),
             )),
             Line::from(Span::styled(
@@ -3422,9 +3337,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             } else {
                 Span::styled(
                     format!("{}", bot.trader),
-                    Style::default()
-                        .fg(ui::widgets::tone_color(view::Tone::Info))
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(Modifier::BOLD),
                 )
             },
         ]),
@@ -3508,7 +3421,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 .filter(|s| (bot.arb_mode || s.is_v4 == pool_is_v4) && s.price > 0.0)
                 .map(|s| ((s.block / 10) as i64, 1.0 / s.price, s.eth))
                 .collect();
-            let candles = view::candles_of(&points, bot.chart_iv, 240);
+            // "Now" on the same block/10 clock as the points, so five quiet
+            // minutes read as a flat line up to the live head, not a freeze.
+            let candles = view::candles_of(&points, bot.chart_iv, 240, Some((block / 10) as i64));
             // Our own fills: any tape row whose tx is in the persisted
             // own-transaction set, on the same block/10 clock as the points.
             let trades: Vec<(i64, bool)> = tape
@@ -3526,7 +3441,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 candles,
                 interval_secs: bot.chart_iv,
                 unit: "ETH",
-                active_key: Some('v'),
+                active_key: Some('c'),
                 trades,
             };
             ui::widgets::candles(f, mid_area, &cv);
@@ -3624,7 +3539,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 if bot.trader.is_zero() {
                     "press [W] to unlock an account, then [f] or [t] to pick a token\nnothing trades until you do both".into()
                 } else {
-                    "press [f] or [t] to pick a token and start trading".into()
+                    "press [f] or [k] to pick a token and start trading".into()
                 }
             } else if bot.trader.is_zero() {
                 "press [W] to unlock an account before you can trade this pool".into()
@@ -3822,7 +3737,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 36] = [
+        let items: [(&str, &str); 33] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
@@ -3840,12 +3755,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "d|toggle multi-pool view"),
             ("", "e|auto arbitrage"),
             ("VIEW", ""),
-            ("", "t  o  l  v|trades · orders · logs · chart"),
+            ("", "t  o  l  c|trades · orders · logs · chart"),
             ("", "O  → ←|cycle panels"),
             ("", "↑ ↓|scroll"),
-            ("", "v|candlestick chart"),
+            ("", "c  v|candlestick chart"),
             ("", ",  .|candle interval −/+"),
-            ("", "c|cluster graph"),
             ("", "L|PnL calendar"),
             ("SIZE", ""),
             ("", "[  ]|buy size −/+"),
@@ -3853,8 +3767,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "{  }  0|slippage −/+"),
             ("MODE", ""),
             ("", "T|theme picker"),
-            ("", "m|mode"),
-            ("", "M|toggle mode"),
             ("", "g|toggle profit guard"),
             ("", "n|toggle buy dedup"),
             ("", "q|quit"),
@@ -3946,53 +3858,6 @@ async fn pick_pair<P: Provider>(
 /// Split an order label into (action, amount, price) columns for the table.
 /// Handles trades ("BUY ~0.00017 ETH @ 1.0"), skips ("BUY (no edge +0.0001)"),
 /// LP ops ("ADD LP ~0.001 ETH", "REMOVE LP #505"), and pool ops.
-/// The deployer's buy ladder: EXACT on-chain buy amounts (keyed by integer wei —
-/// no rounding), counted only on exact matches, kept where an amount repeats
-/// (count >= 2), sorted ascending so [ ] steps monotonically. Each step is a real
-/// wei amount someone bought N times. Falls back to the latest buy if none repeat.
-fn buy_tiers(buys_wei: &[u128]) -> Vec<(f64, usize)> {
-    if buys_wei.is_empty() {
-        return Vec::new();
-    }
-    let mut counts: std::collections::HashMap<u128, usize> = std::collections::HashMap::new();
-    for &w in buys_wei {
-        if w > 0 {
-            *counts.entry(w).or_insert(0) += 1;
-        }
-    }
-    let mut v: Vec<(f64, usize)> = counts
-        .into_iter()
-        .filter(|&(_, c)| c >= 2)
-        .map(|(w, c)| (w as f64 / 1e18, c))
-        .collect();
-    if v.is_empty() {
-        return vec![(*buys_wei.last().unwrap() as f64 / 1e18, 1)]; // nothing repeated — shadow latest
-    }
-    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    v
-}
-
-/// Status line for mode 1 (masked): selected step, how many steps, frequency.
-/// Plain-sentence description of the copy mode, for the status bar.
-///
-/// The header used to carry a cryptic "copy: waiting for buys" tag. Explaining
-/// a mode belongs in the status line, in words, not as a symbol in a row of
-/// numbers.
-fn copy_status(bot: &Bot) -> String {
-    if bot.copy_tiers.is_empty() {
-        return "Watching for a buy size that repeats. Until one appears, buys use your own buy size"
-            .into();
-    }
-    let (sz, c) = bot.copy_tiers[bot.copy_idx.min(bot.copy_tiers.len() - 1)];
-    format!(
-        "Copying buy step {} of {}, {:.9} ETH, seen {} times. Press the bracket keys to change it",
-        bot.copy_idx + 1,
-        bot.copy_tiers.len(),
-        sz,
-        c
-    )
-}
-
 fn parse_order(label: &str) -> (String, String, String) {
     // Trade with a price.
     if let Some((lhs, price)) = label.split_once(" @ ") {
@@ -4024,15 +3889,6 @@ fn fee_label(fee: u32) -> String {
     let s = format!("{pct:.4}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     format!("{s}%")
-}
-
-/// The mode name shown beside `[M]` in Settings. "manual" and "copy" are the
-/// words the app uses everywhere else for these two.
-fn strat_name(s: engine::Strategy) -> &'static str {
-    match s {
-        engine::Strategy::Manual => "manual",
-        engine::Strategy::CopyBuyAmount => "copy",
-    }
 }
 
 // ---------------- interactive selection (arrow-key menus via inquire) -------

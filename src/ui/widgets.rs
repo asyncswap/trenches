@@ -586,8 +586,10 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
         let note = if t.empty_note.is_empty() { "nothing yet" } else { &t.empty_note };
         let mut lines = vec![Line::from("")];
         for (i, l) in note.split('\n').enumerate() {
-            // First line carries the message; any others are a quieter hint.
-            let tone = if i == 0 { Tone::Normal } else { Tone::Dim };
+            // First line carries the message — in the highlight blue, since an
+            // empty panel's note IS its call to action; any others are a
+            // quieter hint.
+            let tone = if i == 0 { Tone::Info } else { Tone::Dim };
             lines.push(Line::from(Span::styled(
                 l.to_string(),
                 Style::default().fg(tone_color(tone)).add_modifier(Modifier::ITALIC),
@@ -708,11 +710,11 @@ fn axis(a: &AxisView) -> Axis<'static> {
 /// on top of the data. Disc/Ring series are size-scaled by their y magnitude.
 /// The stationary panel menu that rides every view container's top border:
 /// all four destinations, always visible, the active one lit. Bare keys, no
-/// words — `[t] [v] [o] [l]` — the same at every width, so the border never
+/// words — `[t] [c] [o] [l]` — the same at every width, so the border never
 /// crowds the title and the eye learns one fixed shape.
 fn panel_menu(active: char) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for key in ['t', 'v', 'o', 'l'] {
+    for key in ['t', 'c', 'o', 'l'] {
         // The one you are ON reads in the highlight blue; the rest wear the
         // border's own colour, so they sit in the frame as part of it and
         // only the current screen's key stands out.
@@ -1659,7 +1661,7 @@ mod candle_gallery {
                 pts.push((1000 + t * 5 + k as i64, price, 0.1 + rnd()));
             }
         }
-        let ck = crate::view::candles_of(&pts, 15, 240);
+        let ck = crate::view::candles_of(&pts, 15, 240, None);
         let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL", active_key: None, trades: Vec::new() };
         let mut term = Terminal::new(TestBackend::new(140, 34)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv)).unwrap();
@@ -1687,7 +1689,7 @@ mod panel_menu_shape {
     fn the_menu_is_bare_keys_at_every_width() {
         for w in [50u16, 100] {
             let border = top_border(w);
-            assert!(border.contains("[t] [v] [o] [l]"), "menu missing at width {w}: {border}");
+            assert!(border.contains("[t] [c] [o] [l]"), "menu missing at width {w}: {border}");
             assert!(border.contains(" Orders (0) "), "title missing at width {w}: {border}");
         }
     }

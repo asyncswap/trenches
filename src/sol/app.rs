@@ -490,7 +490,14 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
         .filter(|s| !s.kind.is_lp() && s.tokens > 0.0)
         .filter_map(|s| s.block_time.map(|t| (t, s.sol / s.tokens, s.sol)))
         .collect();
-    let candles = crate::view::candles_of(&points, bot.chart_iv, 240);
+    // The chain's clock, not the wall clock: block_time stamps the points, so
+    // the flat line extends on the same axis. Falls back to the wall clock
+    // only because the two agree within a second on Solana.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .ok();
+    let candles = crate::view::candles_of(&points, bot.chart_iv, 240, now);
     let sym = bot
         .meta
         .as_ref()
@@ -1062,7 +1069,7 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
     }
 
     // "Which account am I?" belongs with the balances, not in the header.
-    p.spans(vec![lbl("Account"), Cell::toned(bot.trader().to_string(), Tone::Info)]);
+    p.spans(vec![lbl("Account"), Cell::bold(bot.trader().to_string(), Tone::Normal)]);
     p.spans(vec![lbl("SOL"), Cell::new(format!("{:.6}", bot.sol))]);
     p.spans(vec![lbl("Token"), Cell::new(format!("{:.4}", bot.token_bal))]);
     // Name the unit: "SOL/tok" is ambiguous once several coins are in play.
@@ -1114,7 +1121,6 @@ fn market_panel(bot: &SolBot) -> PanelView {
             p.line_toned("  No coin selected", Tone::Normal);
             p.line("");
             p.line_toned("  [f] find coins in the trenches", Tone::Info);
-            p.line_toned("  [t] top coins", Tone::Info);
             p.line_toned("  [p] add a coin by mint address", Tone::Info);
         }
         Some(c) => {
@@ -1314,7 +1320,7 @@ const HELP: [(&str, &str); 23] = [
     ("", "f|find market (live launches)"),
     ("", "p|add token by contract address"),
     ("VIEW", ""),
-    ("", "t  o  l  v|trades · orders · logs · chart"),
+    ("", "t  o  l  c|trades · orders · logs · chart"),
     ("", "O  → ←|cycle panels"),
     ("", "↑ ↓|scroll"),
     ("SIZE", ""),
@@ -1475,7 +1481,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
                     Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD),
                 ),
                 // Normal text: it is the message, not a control.
-                val(bot.status.clone()),
+                Span::styled(bot.status.clone(), Style::default().fg(ui::widgets::tone_color(Tone::Info))),
             ]),
         ])
         .block(ui::widgets::themed_block(" Settings ")),
@@ -1501,7 +1507,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         }
         Panel::Chart => {
             let mut cv = chart_view(bot);
-            cv.active_key = Some('v');
+            cv.active_key = Some('c');
             ui::widgets::candles(f, c[3], &cv)
         }
     }
@@ -2043,7 +2049,7 @@ pub async fn run(
                         scroll = 0;
                     }
                     // Straight to the chart, and , . walk the candle interval.
-                    KeyCode::Char('v') => {
+                    KeyCode::Char('c') | KeyCode::Char('v') => {
                         view = Panel::Chart;
                         scroll = 0;
                     }

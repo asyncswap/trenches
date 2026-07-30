@@ -22,11 +22,6 @@ pub enum Side {
     Sell,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Strategy {
-    Manual,     // trade only on b/s keypress; buys sized by buy_frac
-    CopyBuyAmount, // preselects the buy AMOUNT from the deployer's buy steps ([ ] picks the step); manual timing
-}
 
 pub struct Pending {
     pub hash: TxHash,
@@ -196,7 +191,6 @@ pub struct Bot {
     pub net: String,
     pub account: String,
     pub pool: PoolCfg,
-    pub strategy: Strategy,
     /// When the market line last went to the trace, and at what tick — so the
     /// line is written on change, not ten times a second forever.
     pub last_market_trace: Option<(std::time::Instant, i32)>,
@@ -271,10 +265,6 @@ pub struct Bot {
     pub nonce: Option<u64>,   // locally-tracked nonce (fast, race-free sends)
     pub profit_guard: bool,   // gate trades on positive EV (toggle with 'g')
     pub guard_dup: bool,      // one trade in flight per token — no double buys (toggle 'n')
-    pub copy_buy_eth: f64,    // resolved target buy size (ETH) — the selected tier
-    pub copy_tiers: Vec<(f64, usize)>, // deployer buy ladder rungs (size, count), size-ascending
-    pub copy_idx: usize,      // which rung is selected ([ ] steps it)
-    pub copy_manual: bool,    // user has stepped the rung; stop auto-snapping to modal
     pub min_edge_eth: f64,    // required edge over gas (ETH)
     pub ref_price: f64,       // reference price (SMA) for the profit filter
     pub gas_price: f64,       // wei, from the market read
@@ -1131,15 +1121,6 @@ impl Bot {
         let available = (balance_in - reserved - gas_buffer).max(0.0);
         let frac = if buying { self.buy_frac } else { self.sell_frac };
         let mut amount_in = (balance_in * frac).min(available);
-
-        // Copy mode: on a BUY, size to the observed buyer step from the tape — but
-        // ONLY if we can actually afford it. If the step is bigger than our balance
-        // (e.g. their 0.06 ETH buy while we hold 0.002), copying would clamp to the
-        // whole wallet — a bad bet. In that case fall back to the manual buy_frac
-        // amount (the % you set). Also falls back when no step is known yet.
-        if buying && self.is_copy() && self.copy_buy_eth > 0.0 && self.copy_buy_eth <= available {
-            amount_in = self.copy_buy_eth;
-        }
 
         // For sells, clamp to the LIVE token balance — the cached snapshot can be
         // stale-high (a just-confirmed sell), and selling more than is held makes
@@ -2085,17 +2066,6 @@ impl Bot {
         Ok(())
     }
 
-    /// True when copy mode is active (buys shadow the deployer's ladder rung).
-    pub fn is_copy(&self) -> bool {
-        self.strategy == Strategy::CopyBuyAmount
-    }
-
-    /// Auto-strategy signal for this tick (None = hold). Both current modes are
-    /// MANUAL-timing — you press b/s. CopyBuyAmount only changes the buy SIZE (to the
-    /// copied ladder rung), it never fires trades on its own.
-    pub fn signal(&self, _sma: f64, _band: f64) -> Option<Side> {
-        None
-    }
 }
 
 /// Compress a multi-line RPC/revert error to a single readable line for the

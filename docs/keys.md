@@ -73,8 +73,6 @@ e        execute the arb                       (EVM)
 ## Modes and guards
 
 ```
-M        toggle mode — manual or copy
-m        pick a mode from a list               (EVM)
 g        profit filter on/off                  (EVM)
 n        duplicate-buy guard on/off            (EVM)
 ```
@@ -88,10 +86,9 @@ every trade runs, including losing ones.
 t        trades — the live tape
 o        orders — your own actions
 l        logs — the raw session log
-v        candlestick chart
+c or v        candlestick chart
 ,  .     candle interval  smaller / larger
 O  → ←   cycle through the panels
-c        buyer scatter for this pool           (EVM)
 L        PnL calendar — a month of trading at a time
 R        refresh everything — market, tape, prices, metadata  (EVM)
 T        theme picker

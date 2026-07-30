@@ -227,7 +227,13 @@ pub struct CandleView {
 /// time — and every candle OPENS at the previous candle's close, so the line
 /// of prices is continuous across the whole chart. At most `max` candles come
 /// back — the newest.
-pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) -> Vec<Candle> {
+///
+/// `now` (unix seconds, or the chain clock the points use) extends the flat
+/// line to the present: five silent minutes draw as five minutes of flat, not
+/// a chart frozen at the last trade. Safe even with late-arriving trades —
+/// candles rebuild from the raw tape every frame, so a bucket that showed
+/// flat becomes a real candle the moment its trade lands.
+pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize, now: Option<i64>) -> Vec<Candle> {
     let iv = interval_secs.max(1) as i64;
     let mut pts: Vec<(i64, f64, f64)> =
         points.iter().copied().filter(|(t, p, _)| *t > 0 && *p > 0.0).collect();
@@ -275,6 +281,13 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) ->
     if let Some(k) = cur {
         out.push(k);
     }
+    if let (Some(now), Some(last)) = (now, out.last().copied()) {
+        let nb = now - now.rem_euclid(iv);
+        let gaps = ((nb - last.t) / iv).clamp(0, max as i64);
+        for k in 1..=gaps {
+            out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t: last.t + k * iv });
+        }
+    }
     if out.len() > max {
         out.drain(..out.len() - max);
     }
@@ -289,10 +302,28 @@ mod candle_tests {
     fn trades_in_one_bucket_fold_into_one_honest_candle() {
         // Out of order on purpose: the tape merges fetches out of order too.
         let pts = [(103, 5.0, 1.0), (101, 2.0, 1.0), (100, 3.0, 1.0), (104, 4.0, 1.0)];
-        let c = candles_of(&pts, 10, 100);
+        let c = candles_of(&pts, 10, 100, None);
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].o, c[0].h, c[0].l, c[0].c, c[0].v), (3.0, 5.0, 2.0, 4.0, 4.0));
         assert!(c[0].up());
+    }
+
+    #[test]
+    fn silence_since_the_last_trade_draws_flat_to_now() {
+        // One trade at 100, and it is now 152: buckets 110..150 are silent.
+        // The chart must show five flat candles after the real one — a live
+        // flat line — instead of freezing at the last trade.
+        let pts = [(100, 3.0, 1.0)];
+        let c = candles_of(&pts, 10, 100, Some(152));
+        // Buckets 110..150 inclusive — the CURRENT, in-progress bucket draws
+        // too, so the flat line reaches the right edge of "now".
+        assert_eq!(c.len(), 6);
+        for flat in &c[1..] {
+            assert_eq!((flat.o, flat.c, flat.v), (3.0, 3.0, 0.0));
+        }
+        assert_eq!(c.last().unwrap().t, 150);
+        // And without a clock, nothing is invented.
+        assert_eq!(candles_of(&pts, 10, 100, None).len(), 1);
     }
 
     #[test]
@@ -301,7 +332,7 @@ mod candle_tests {
         // second candle must open at 5 (and its low reach down to it), not
         // open at 9 and float disconnected from the line of prices.
         let pts = [(100, 3.0, 1.0), (105, 5.0, 1.0), (112, 9.0, 1.0)];
-        let c = candles_of(&pts, 10, 100);
+        let c = candles_of(&pts, 10, 100, None);
         assert_eq!(c.len(), 2);
         assert_eq!(c[1].o, 5.0);
         assert_eq!(c[1].l, 5.0);
@@ -312,7 +343,7 @@ mod candle_tests {
     #[test]
     fn silence_reads_as_a_flat_line_not_skipped_time() {
         let pts = [(100, 3.0, 1.0), (145, 6.0, 1.0)];
-        let c = candles_of(&pts, 10, 100);
+        let c = candles_of(&pts, 10, 100, None);
         // 100s, three silent buckets (110/120/130), then 140s.
         assert_eq!(c.len(), 5);
         for flat in &c[1..4] {
@@ -324,7 +355,7 @@ mod candle_tests {
     #[test]
     fn only_the_newest_max_candles_survive() {
         let pts: Vec<(i64, f64, f64)> = (0..50).map(|i| (i * 10, i as f64 + 1.0, 1.0)).collect();
-        let c = candles_of(&pts, 10, 8);
+        let c = candles_of(&pts, 10, 8, None);
         assert_eq!(c.len(), 8);
         assert_eq!(c.last().unwrap().c, 50.0);
     }
@@ -332,7 +363,7 @@ mod candle_tests {
     #[test]
     fn zero_prices_and_times_are_junk_not_data() {
         let pts = [(0, 5.0, 1.0), (100, 0.0, 1.0), (100, 2.0, 1.0)];
-        let c = candles_of(&pts, 10, 10);
+        let c = candles_of(&pts, 10, 10, None);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].o, 2.0);
     }
