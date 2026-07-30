@@ -83,10 +83,6 @@ pub struct TableView {
     pub title: String,
     /// When set, the panel menu rides the top border, this key highlighted.
     pub active_key: Option<char>,
-    /// Draw the running version in the top-right corner — for full-screen
-    /// views (the finder) where the version should be visible without a
-    /// dashboard footer under it.
-    pub show_version: bool,
     pub cols: Vec<Col>,
     pub rows: Vec<Vec<Cell>>,
     /// Optional per-row background emphasis (index-aligned with `rows`).

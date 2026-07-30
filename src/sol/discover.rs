@@ -562,7 +562,7 @@ pub fn table_view(
     warn_score: u32,
 ) -> TableView {
     let mut t = TableView::new(
-        format!(" Trenches — {} live coins   j/k select · Enter trade · Esc back ", rows.len()),
+        format!(" Trenches Bot v{} — {} live coins   j/k select · Enter trade · Esc back ", env!("CARGO_PKG_VERSION"), rows.len()),
         vec![
             Col::fixed("sym", 12),
             Col::fixed("pooled SOL", 12),

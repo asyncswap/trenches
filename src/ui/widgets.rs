@@ -581,9 +581,6 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
         if let Some(k) = t.active_key {
             block = block.title_top(panel_menu(k).right_aligned());
         }
-        if t.show_version {
-            block = with_version(block);
-        }
         let inner = block.inner(area);
         f.render_widget(block, area);
         let note = if t.empty_note.is_empty() { "nothing yet" } else { &t.empty_note };
@@ -621,9 +618,6 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
     let mut block = themed_block_line(table_title(t));
     if let Some(k) = t.active_key {
         block = block.title_top(panel_menu(k).right_aligned());
-    }
-    if t.show_version {
-        block = with_version(block);
     }
     // Space inside the borders, minus the cursor symbol when one is drawn.
     let avail = area.width.saturating_sub(2 + if state.is_some() { 2 } else { 0 });
@@ -738,17 +732,6 @@ fn panel_menu(active: char) -> Line<'static> {
 /// paragraph) that build their block by hand rather than through a view type.
 pub fn with_panel_menu(block: Block<'static>) -> Block<'static> {
     block.title_top(panel_menu('l').right_aligned())
-}
-
-/// The running version, dim and against the right edge of a screen's top
-/// border — so every full-screen view names what is running without spending
-/// a whole line on it.
-pub fn with_version(block: Block<'static>) -> Block<'static> {
-    let v = Span::styled(
-        format!(" v{} ", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(tone_color(Tone::Dim)),
-    );
-    block.title_top(Line::from(v).right_aligned())
 }
 
 /// A candlestick chart, drawn at HALF-CELL vertical resolution.

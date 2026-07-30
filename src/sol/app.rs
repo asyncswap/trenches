@@ -1729,7 +1729,6 @@ async fn screen_trenches(
             });
         }
         let mut table = discover::table_view(&rows, sol_usd, Some(risk), warn_score);
-        table.show_version = true;
         // Replace the generic note with what the feed is actually doing.
         if rows.is_empty() {
             let status = feed.lock().map(|f| f.clone()).unwrap_or_default();
