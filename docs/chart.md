@@ -19,11 +19,11 @@ either chain.
 
 ## The grammar
 
-Every candle **opens where the previous one closed** — price is a continuous
-line, never a scatter of disconnected boxes. Minutes nobody traded draw as a
-**flat line at the last close**, extended live to *now*: five quiet minutes on
-a 1s chart read as five minutes of flat, not a frozen screen. A wick that
-exists always gets at least one pixel — a high is a fact.
+Every candle **opens where the previous one closed** — price draws as one
+continuous line. Minutes nobody traded draw as a **flat line at the last
+close**, extended live to *now*: five quiet minutes on a 1s chart read as five
+minutes of flat, not a frozen screen. A wick that exists always gets at least
+one pixel — a high is a fact.
 
 Candles render at half-cell resolution (two price pixels per terminal row),
 green up, red down, with a dotted rule across the chart at the live price.
