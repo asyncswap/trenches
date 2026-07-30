@@ -3537,7 +3537,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             // coming. Say what is actually missing, in the order it is needed.
             t.empty_note = if bot.pool.kind.is_empty() {
                 if bot.trader.is_zero() {
-                    "press [W] to unlock an account, then [f] or [t] to pick a token\nnothing trades until you do both".into()
+                    "press [W] to unlock an account, then [f] or [k] to pick a token\nnothing trades until you do both".into()
                 } else {
                     "press [f] or [k] to pick a token and start trading".into()
                 }
