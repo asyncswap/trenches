@@ -22,8 +22,10 @@ conversation beats a thousand-line surprise.
 
 ## Trenches Pro — the hosted endpoint
 
-The app is free and stays free. What costs real money to run is what's sold:
-**Trenches Pro**, one key that unlocks pooled RPC built for this terminal.
+For the trader who never wants to scramble around collecting API keys
+again: **one key covers everything the terminal will ever need** — every
+chain, every websocket, every provider, already pooled and tuned. The app is
+free and stays free; Pro is the key.
 
 - **Two providers at once.** Every request has Helius *and* Alchemy behind
   it, with fastest-first failover — one provider's bad hour is invisible,
@@ -32,7 +34,7 @@ The app is free and stays free. What costs real money to run is what's sold:
   subscription feed + Robinhood Chain, behind one URL you paste into `e`.
 - **Free tier**: 10 requests/second, self-served at
   [rpc.trenches.sh](https://rpc.trenches.sh) — enough to run the terminal.
-- **Pro**: $79/month, 10M requests included, then $5 per million. Uncapped
+- **Pro**: $119/month, 10M requests included, then $5 per million. Uncapped
   rate, and every subscription upgrades the pool for everyone on it.
 
 The terminal is the fastest UI in the trenches, and it rides free — Pro is
