@@ -12,6 +12,10 @@ authors = ["AsyncSwap Labs, Inc."]
 # Testnets and local nodes. Off in a release: without this they are not
 # compiled in at all, so a production binary cannot offer a chain nobody trades.
 testnet = []
+# The in-app copilot (A key): spawns the user's own `claude` CLI with live
+# market context. EXPERIMENTAL — off in default and release builds while it
+# bakes; build with `--features agent` to play.
+agent = []
 # Solana/pump.fun support is OFF by default: the solana crate tree is heavy and
 # would slow the EVM-only `cargo build --release` cycle. Build with
 # `cargo build --release --features solana` when working on that side.

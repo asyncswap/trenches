@@ -34,20 +34,12 @@ fn ask(context: &str, question: &str) -> String {
     use std::process::{Command, Stdio};
 
     if !available() {
-        return "The copilot needs Claude Code installed — it borrows the `claude` \
- binary on your PATH (your login, your models). Get it at \
-                https://claude.com/claude-code and press A again."
+        return "The copilot needs Claude Code installed — it borrows the `claude`  binary on your PATH (your login, your models). Get it at  https://claude.com/claude-code and press A again."
             .to_string();
     }
 
     let prompt = format!(
-        "You are the copilot inside Trenches, a terminal app for trading memecoins. \
-         The user is mid-session; answer like a sharp trading desk neighbor: terse, \
-         concrete, plain text (no markdown headings), a few short paragraphs at most. \
-         Numbers you cite must come from the context below. If the context can't \
-         answer, say so plainly. Never invent trades and never claim you executed \
-         anything — you cannot; only the user's keys trade.\n\n\
-         LIVE CONTEXT\n{context}\n\nQUESTION\n{question}\n"
+        "You are the copilot inside Trenches, a terminal app for trading memecoins.  The user is mid-session; answer like a sharp trading desk neighbor: terse,  concrete, plain text (no markdown headings), a few short paragraphs at most.  Numbers you cite must come from the context below. If the context can't  answer, say so plainly. Never invent trades and never claim you executed  anything — you cannot; only the user's keys trade.\n\n LIVE CONTEXT\n{context}\n\nQUESTION\n{question}\n"
     );
 
     let child = Command::new("claude")
@@ -91,82 +83,109 @@ pub struct Chat {
     pub transcript: Vec<(bool, String)>,
 }
 
-/// Ask within a conversation. Returns `(answer, session_id)` — the id from
-/// claude's JSON envelope, handed back on every turn so a crashed parse on
-/// one turn doesn't orphan the thread.
-pub fn spawn_chat_ask(
+/// One streamed reply: text as it is generated, then the receipt.
+pub enum StreamEvent {
+    Delta(String),
+    Done { session_id: Option<String> },
+    Fail(String),
+}
+
+/// Ask within a conversation, streaming. Deltas arrive as claude writes;
+/// `Done` carries the session id that lets the next question resume the
+/// thread. The child is spawned on a plain thread — the UI polls the
+/// channel between frames and never blocks on the model.
+pub fn spawn_stream(
     session: Option<String>,
     context: String,
     question: String,
-) -> std::sync::mpsc::Receiver<(String, Option<String>)> {
+) -> std::sync::mpsc::Receiver<StreamEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(ask_chat(session.as_deref(), &context, &question));
-    });
+    std::thread::spawn(move || stream(tx, session.as_deref(), &context, &question));
     rx
 }
 
-fn ask_chat(session: Option<&str>, context: &str, question: &str) -> (String, Option<String>) {
-    use std::io::Write;
+fn stream(
+    tx: std::sync::mpsc::Sender<StreamEvent>,
+    session: Option<&str>,
+    context: &str,
+    question: &str,
+) {
+    use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
 
     if !available() {
-        return (
-            "The copilot needs Claude Code installed — it borrows the `claude` binary on your PATH. Get it at https://claude.com/claude-code and press A again."
-                .to_string(),
-            None,
-        );
+        let _ = tx.send(StreamEvent::Fail(
+            "the copilot needs Claude Code installed — https://claude.com/claude-code".into(),
+        ));
+        return;
     }
-
-    // The first turn carries the manners and the room; follow-ups carry a
-    // fresh look at the room — the market moved while you were typing.
     let prompt = match session {
         None => format!(
-            "You are the copilot inside Trenches, a terminal app for trading memecoins. The user is mid-session; answer like a sharp trading desk neighbor: terse, concrete, plain text (no markdown headings). Numbers you cite must come from the context. If the context can't answer, say so plainly. Never claim you executed anything — you cannot; only the user's keys trade.\n\nLIVE CONTEXT\n{context}\n\nQUESTION\n{question}\n"
+            "You are the copilot inside Trenches, a terminal app for trading memecoins.  The user is mid-session; answer like a sharp trading desk neighbor: terse,  concrete, plain text (no markdown headings). Numbers you cite must come  from the context. If the context can't answer, say so plainly. Never claim  you executed anything — you cannot; only the user's keys trade.\n\n LIVE CONTEXT\n{context}\n\nQUESTION\n{question}\n"
         ),
         Some(_) => format!(
-            "CONTEXT UPDATE — the live market state as of this question (the tape may have moved since your last look):\n{context}\n\nQUESTION\n{question}\n"
+            "CONTEXT UPDATE — the live market as of this question:\n{context}\n\nQUESTION\n{question}\n"
         ),
     };
-
     let mut cmd = Command::new("claude");
-    cmd.args(["-p", "--output-format", "json"]);
+    cmd.args([
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+    ]);
     if let Some(id) = session {
         cmd.args(["--resume", id]);
     }
     let child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return (format!("could not start claude: {e}"), None),
+        Err(e) => {
+            let _ = tx.send(StreamEvent::Fail(format!("could not start claude: {e}")));
+            return;
+        }
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
     }
-    match child.wait_with_output() {
-        Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout);
-            match serde_json::from_str::<serde_json::Value>(raw.trim()) {
-                Ok(v) => {
-                    let ans = v
-                        .get("result")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("claude answered nothing — try again.")
-                        .trim()
-                        .to_string();
-                    let sid = v.get("session_id").and_then(|s| s.as_str()).map(String::from);
-                    (ans, sid)
+    let Some(stdout) = child.stdout.take() else {
+        let _ = tx.send(StreamEvent::Fail("no stdout from claude".into()));
+        return;
+    };
+    let mut got_delta = false;
+    let mut session_id: Option<String> = None;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("stream_event") => {
+                if let Some(d) = v
+                    .get("event")
+                    .and_then(|e| e.get("delta"))
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    got_delta = true;
+                    if tx.send(StreamEvent::Delta(d.to_string())).is_err() {
+                        let _ = child.kill();
+                        return;
+                    }
                 }
-                Err(_) => (raw.trim().to_string(), None),
             }
+            Some("result") => {
+                session_id = v.get("session_id").and_then(|s| s.as_str()).map(String::from);
+                // An older CLI without partial messages still answers — the
+                // whole reply arrives here as one late delta.
+                if !got_delta {
+                    if let Some(r) = v.get("result").and_then(|r| r.as_str()) {
+                        let _ = tx.send(StreamEvent::Delta(r.to_string()));
+                    }
+                }
+            }
+            _ => {}
         }
-        Ok(out) => (
-            format!(
-                "claude exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stdout).chars().take(300).collect::<String>()
-            ),
-            None,
-        ),
-        Err(e) => (format!("claude failed: {e}"), None),
     }
+    let _ = child.wait();
+    let _ = tx.send(StreamEvent::Done { session_id });
 }

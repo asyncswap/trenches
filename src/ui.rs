@@ -717,6 +717,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 
+#[cfg(feature = "agent")]
 /// A modal wait on the copilot: spinner, the question, Esc to cancel. The
 /// render loop is never blocked by a language model — this loop polls the
 /// answer channel and the keyboard at 50ms.
@@ -763,6 +764,7 @@ pub fn wait_for_answer<T: Send + 'static>(
     }
 }
 
+#[cfg(feature = "agent")]
 /// A full-screen scrollable text view — the copilot's answer, readable at
 /// length. ↑/↓ and PgUp/PgDn scroll, anything else closes.
 pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
@@ -795,77 +797,182 @@ pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
 }
 
 
-/// The copilot conversation, at reading length: you ▸ and claude ▸ turns,
-/// scrollable, with `i` (or `a`) asking the next question — nvim manners.
-/// Returns true when the caller should open the input for a follow-up.
-pub fn chat_view(term: &mut Term, transcript: &[(bool, String)]) -> eyre::Result<bool> {
+#[cfg(feature = "agent")]
+/// The copilot, full screen: the conversation above, a live input below with
+/// a blinking cursor, answers streaming in as claude writes them. Enter asks;
+/// Esc cancels a stream in flight, and closes the screen when idle. The
+/// market keeps trading behind this — the poller never stops.
+pub fn chat_screen(
+    term: &mut Term,
+    chat: &mut crate::agent::Chat,
+    context: &dyn Fn() -> String,
+) -> eyre::Result<()> {
+    use crate::agent::StreamEvent;
     use crossterm::event::{self, Event, KeyCode};
-    let mut scroll: Option<u16> = None; // None = pin to the bottom on first draw
-    loop {
-        let mut total: u16 = 0;
-        let mut cur = scroll;
-        term.draw(|f| {
-            let area = f.area();
-            let width = area.width.saturating_sub(2).max(10) as usize;
-            let mut lines: Vec<ratatui::text::Line> = Vec::new();
-            for (who, text) in transcript {
-                let head = if *who { "you ▸ " } else { "claude ▸ " };
-                let style = if *who {
-                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD)
-                } else {
-                    ratatui::style::Style::default()
-                };
-                let mut first = true;
-                for para in text.split('\n') {
-                    let mut line = String::new();
-                    for word in para.split_whitespace() {
-                        let lead = if first && line.is_empty() { head.len() } else { 2 };
-                        if !line.is_empty() && lead + line.len() + 1 + word.len() > width {
-                            let prefix = if first { head.to_string() } else { "  ".to_string() };
-                            lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
-                            first = false;
-                            line.clear();
-                        }
-                        if !line.is_empty() {
-                            line.push(' ');
-                        }
-                        line.push_str(word);
-                    }
+
+    fn wrap_into<'a>(
+        lines: &mut Vec<ratatui::text::Line<'a>>,
+        head: &str,
+        text: &str,
+        width: usize,
+        style: ratatui::style::Style,
+    ) {
+        let mut first = true;
+        for para in text.split('\n') {
+            let mut line = String::new();
+            for word in para.split_whitespace() {
+                let lead = if first { head.len() } else { 2 };
+                if !line.is_empty() && lead + line.len() + 1 + word.len() > width {
                     let prefix = if first { head.to_string() } else { "  ".to_string() };
                     lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
                     first = false;
+                    line.clear();
                 }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            let prefix = if first { head.to_string() } else { "  ".to_string() };
+            lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
+            first = false;
+        }
+    }
+
+    let mut input = String::new();
+    let mut streaming: Option<std::sync::mpsc::Receiver<StreamEvent>> = None;
+    let mut partial = String::new();
+    let mut from_bottom: u16 = 0; // 0 = pinned to the newest line
+    let t0 = std::time::Instant::now();
+
+    loop {
+        // Drain whatever claude has written since the last frame.
+        let mut finished = false;
+        if let Some(rx) = &streaming {
+            loop {
+                match rx.try_recv() {
+                    Ok(StreamEvent::Delta(d)) => {
+                        partial.push_str(&d);
+                        from_bottom = 0;
+                    }
+                    Ok(StreamEvent::Done { session_id }) => {
+                        if session_id.is_some() {
+                            chat.session_id = session_id;
+                        }
+                        if !partial.is_empty() {
+                            chat.transcript.push((false, std::mem::take(&mut partial)));
+                        }
+                        finished = true;
+                        break;
+                    }
+                    Ok(StreamEvent::Fail(e)) => {
+                        chat.transcript.push((false, format!("({e})")));
+                        partial.clear();
+                        finished = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if !partial.is_empty() {
+                            chat.transcript.push((false, std::mem::take(&mut partial)));
+                        }
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if finished {
+            streaming = None;
+        }
+
+        let busy = streaming.is_some();
+        let blink = (t0.elapsed().as_millis() / 500) % 2 == 0;
+        term.draw(|f| {
+            let area = f.area();
+            let chunks = ratatui::layout::Layout::default()
+                .direction(ratatui::layout::Direction::Vertical)
+                .constraints([
+                    ratatui::layout::Constraint::Min(3),
+                    ratatui::layout::Constraint::Length(3),
+                ])
+                .split(area);
+
+            let width = chunks[0].width.saturating_sub(2).max(10) as usize;
+            let bold = ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD);
+            let plain = ratatui::style::Style::default();
+            let mut lines: Vec<ratatui::text::Line> = Vec::new();
+            for (who, text) in chat.transcript.iter() {
+                wrap_into(&mut lines, if *who { "you ▸ " } else { "claude ▸ " }, text, width, if *who { bold } else { plain });
                 lines.push(ratatui::text::Line::from(""));
             }
-            lines.push(ratatui::text::Line::styled(
-                "i ask a follow-up · j/k scroll · esc back to trading",
-                ratatui::style::Style::default().fg(widgets::tone_color(crate::view::Tone::Dim)),
-            ));
-            total = lines.len() as u16;
-            let view_h = area.height.saturating_sub(2);
+            if busy {
+                let live = format!("{partial}{}", if blink { "▌" } else { " " });
+                wrap_into(&mut lines, "claude ▸ ", &live, width, plain);
+            }
+            let total = lines.len() as u16;
+            let view_h = chunks[0].height.saturating_sub(2);
             let max_scroll = total.saturating_sub(view_h);
-            let s = cur.unwrap_or(max_scroll).min(max_scroll);
-            cur = Some(s);
+            let s = max_scroll.saturating_sub(from_bottom.min(max_scroll));
             let para = ratatui::widgets::Paragraph::new(lines)
                 .scroll((s, 0))
-                .block(widgets::themed_block(" Copilot "));
+                .block(widgets::themed_block(" Copilot — the market keeps running behind this "));
             f.render_widget(ratatui::widgets::Clear, area);
-            f.render_widget(para, area);
+            f.render_widget(para, chunks[0]);
+
+            let cursor = if busy { "" } else if blink { "▌" } else { " " };
+            let hint = if busy { "esc stops the answer" } else { "enter asks · esc closes · ↑/↓ scroll" };
+            let input_line = ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled("❯ ", bold),
+                ratatui::text::Span::raw(format!("{input}{cursor}")),
+                ratatui::text::Span::styled(
+                    format!("   {hint}"),
+                    ratatui::style::Style::default().fg(widgets::tone_color(crate::view::Tone::Dim)),
+                ),
+            ]);
+            let inp = ratatui::widgets::Paragraph::new(input_line).block(widgets::themed_block(" Ask "));
+            f.render_widget(inp, chunks[1]);
         })?;
-        scroll = cur;
-        if event::poll(std::time::Duration::from_millis(120))? {
+
+        if event::poll(std::time::Duration::from_millis(33))? {
             if let Event::Key(k) = event::read()? {
+                if k.kind == crossterm::event::KeyEventKind::Release {
+                    continue;
+                }
                 match k.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        scroll = Some(scroll.unwrap_or(0).saturating_sub(1))
+                    KeyCode::Esc => {
+                        if busy {
+                            streaming = None;
+                            if !partial.is_empty() {
+                                let cut = format!("{} (stopped)", std::mem::take(&mut partial));
+                                chat.transcript.push((false, cut));
+                            }
+                        } else {
+                            return Ok(());
+                        }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        scroll = Some(scroll.unwrap_or(0).saturating_add(1))
+                    KeyCode::Enter => {
+                        if !busy && !input.trim().is_empty() {
+                            let q = std::mem::take(&mut input);
+                            chat.transcript.push((true, q.clone()));
+                            partial.clear();
+                            from_bottom = 0;
+                            streaming = Some(crate::agent::spawn_stream(
+                                chat.session_id.clone(),
+                                context(),
+                                q,
+                            ));
+                        }
                     }
-                    KeyCode::PageUp => scroll = Some(scroll.unwrap_or(0).saturating_sub(10)),
-                    KeyCode::PageDown => scroll = Some(scroll.unwrap_or(0).saturating_add(10)),
-                    KeyCode::Char('i') | KeyCode::Char('a') => return Ok(true),
-                    _ => return Ok(false),
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Up => from_bottom = from_bottom.saturating_add(1),
+                    KeyCode::Down => from_bottom = from_bottom.saturating_sub(1),
+                    KeyCode::PageUp => from_bottom = from_bottom.saturating_add(10),
+                    KeyCode::PageDown => from_bottom = from_bottom.saturating_sub(10),
+                    KeyCode::Char(c) => input.push(c),
+                    _ => {}
                 }
             }
         }

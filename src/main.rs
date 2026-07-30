@@ -4,6 +4,7 @@
 //! built speed-first: concurrent reads, pre-flight gas protection, and ready
 //! for a local Nitro node over ws:// or IPC (remote ~380ms -> local ~1ms).
 
+#[cfg(feature = "agent")]
 mod agent;
 mod config;
 mod contracts;
@@ -2411,6 +2412,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // Ask the copilot about the room — same v1 as the
                         // Solana side: the user's own claude binary, fed the
                         // live state. Reads everything, trades nothing.
+                        #[cfg(feature = "agent")]
                         KeyCode::Char('A') => {
                             if let Some(q) =
                                 ui::input(terminal, "Ask the copilot", "e.g. what does this tape say?")?

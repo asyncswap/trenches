@@ -789,8 +789,29 @@ pub struct SolBot {
 }
 
 impl SolBot {
+    /// What my own fills on THIS coin's tape say I hold: buys minus sells,
+    /// newest evidence first. The tape hears a confirmed fill a second after
+    /// it lands — long before the next balance poll — so this is the number
+    /// that unblocks a fast exit. Never used to oversell: engine::sell clamps
+    /// to the wallet's actual units at send time.
+    pub fn tape_net_tokens(&self) -> f64 {
+        let mut net = 0.0f64;
+        for r in &self.tape {
+            if !r.mine {
+                continue;
+            }
+            match r.kind {
+                super::discover::SwapKind::Buy => net += r.tokens,
+                super::discover::SwapKind::Sell => net -= r.tokens,
+                _ => {}
+            }
+        }
+        net.max(0.0)
+    }
+
     /// The room, written down for the copilot: what coin, what price, what
     /// we hold, and the recent tape. Plain text — a prompt, not an API.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
     pub fn agent_context(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("Network: {}\n", self.net));
@@ -2211,6 +2232,7 @@ pub async fn run(
     let mut copy_armed = false;
     // The copilot's thread: survives panel flips and coin changes, dies with
     // the dashboard — a conversation about this sitting, not a diary.
+    #[cfg(feature = "agent")]
     let mut chat = crate::agent::Chat::default();
     loop {
         let mut logo_box = None;
@@ -2327,39 +2349,11 @@ pub async fn run(
                     // Ask the copilot about the room. v1: the user's own
                     // `claude` binary, fed the live state as context. It can
                     // read everything and trade nothing.
+                    #[cfg(feature = "agent")]
                     KeyCode::Char('A') => {
-                        // The conversation persists for the whole dashboard
-                        // session: every question resumes the same claude
-                        // thread, and every turn carries a fresh look at the
-                        // market. i inside the view asks the next one.
-                        loop {
-                            let next = if chat.transcript.is_empty() {
-                                ui::input(term, "Ask the copilot", "e.g. what does this tape say?")?
-                            } else if ui::chat_view(term, &chat.transcript)? {
-                                ui::input(term, "Ask the copilot", "follow-up — esc closes")?
-                            } else {
-                                None
-                            };
-                            let Some(q) = next.filter(|q| !q.trim().is_empty()) else { break };
-                            chat.transcript.push((true, q.clone()));
-                            let rx = crate::agent::spawn_chat_ask(
-                                chat.session_id.clone(),
-                                bot.agent_context(),
-                                q,
-                            );
-                            match ui::wait_for_answer(term, "the copilot is reading the room", &rx)? {
-                                Some((ans, sid)) => {
-                                    if sid.is_some() {
-                                        chat.session_id = sid;
-                                    }
-                                    chat.transcript.push((false, ans));
-                                }
-                                None => {
-                                    chat.transcript.pop();
-                                    break;
-                                }
-                            }
-                        }
+                        // Full-screen copilot: streaming answers, one thread
+                        // for the whole sitting, the market running behind it.
+                        ui::chat_screen(term, &mut chat, &|| bot.agent_context())?;
                     }
                     // Back to the wallet list on this same chain, as on EVM.
                     KeyCode::Char('W') => {
@@ -2583,10 +2577,27 @@ pub async fn run(
                         // `x` always liquidates; `s` sells the configured slice.
                         let all = matches!(k.code, KeyCode::Char('x'));
                         let frac = if all { 1.0 } else { bot.sell_frac };
+                        // The balance the POLL knows is a read old — but our own
+                        // fills are on the tape within a second of confirming.
+                        // A buy you just made IS something to sell: size from
+                        // the larger of the two and let engine::sell clamp to
+                        // the wallet's actual units at send time. This is the
+                        // race that kept "There is nothing to sell" on screen
+                        // for ten seconds after a confirmed entry.
+                        let held = bot.token_bal.max(bot.tape_net_tokens());
                         let (tokens, slip, cu) =
-                            (bot.token_bal * frac, bot.slippage_pct, bot.cu_price_micro);
+                            (held * frac, bot.slippage_pct, bot.cu_price_micro);
+                        // One liquidation in flight at a time: a second x while
+                        // the first is pending burned a fee on a guaranteed
+                        // revert — the wallet it would read is already empty.
+                        let sell_pending = bot
+                            .orders
+                            .iter()
+                            .any(|o| o.action == "SELL" && o.state == OrderState::Pending);
                         if bot.coin.is_none() {
                             bot.note("No coin is selected");
+                        } else if sell_pending {
+                            bot.note("A sell is already in flight — waiting for it to land");
                         } else if tokens <= 0.0 {
                             bot.note("There is nothing to sell");
                         } else {
