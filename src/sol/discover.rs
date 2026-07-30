@@ -1031,14 +1031,21 @@ pub async fn pool_tape(
     // Newest first from the RPC, so truncating keeps the most recent trades and
     // defers the older backlog to later rounds.
     sigs.truncate(MAX_TX_PER_READ);
-    let scanned = sigs.clone();
-    let fetched: Vec<(String, serde_json::Value)> = rpc
-        .transactions(&sigs)
-        .await
-        .into_iter()
-        .zip(sigs)
-        .filter_map(|(tx, sig)| tx.map(|t| (sig, t)))
-        .collect();
+    // A signature only counts as SEEN once its transaction actually came
+    // back. `getTransaction` answers null for a tx not yet queryable at this
+    // commitment — and for a whole rate-limited batch. Marking those seen
+    // anyway (the old `scanned = sigs` before the fetch) buried their trades
+    // forever: a few throttled rounds in a row and the tape sat frozen while
+    // the market moved. Unanswered signatures now stay fresh and are asked
+    // for again next round.
+    let mut scanned = Vec::new();
+    let mut fetched: Vec<(String, serde_json::Value)> = Vec::new();
+    for (tx, sig) in rpc.transactions(&sigs).await.into_iter().zip(sigs) {
+        if let Some(t) = tx {
+            scanned.push(sig.clone());
+            fetched.push((sig, t));
+        }
+    }
 
     let mut out = Vec::new();
     for (sig, tx) in fetched {
@@ -1280,15 +1287,18 @@ pub async fn amm_tape(
     // Newest first from the RPC, so truncating keeps the most recent trades and
     // defers the older backlog to later rounds.
     sigs.truncate(MAX_TX_PER_READ);
-    let scanned = sigs.clone();
     let amm_str = super::PUMP_AMM_PROGRAM.to_string();
-    let fetched: Vec<(String, serde_json::Value)> = rpc
-        .transactions(&sigs)
-        .await
-        .into_iter()
-        .zip(sigs)
-        .filter_map(|(tx, sig)| tx.map(|t| (sig, t)))
-        .collect();
+    // Same rule as the curve tape: only an ANSWERED signature is seen. A null
+    // (not yet queryable, or a throttled batch) stays fresh for next round —
+    // marking it seen threw its trade away forever.
+    let mut scanned = Vec::new();
+    let mut fetched: Vec<(String, serde_json::Value)> = Vec::new();
+    for (tx, sig) in rpc.transactions(&sigs).await.into_iter().zip(sigs) {
+        if let Some(t) = tx {
+            scanned.push(sig.clone());
+            fetched.push((sig, t));
+        }
+    }
 
     let scale = 10f64.powi(token_decimals as i32);
     let mut out = Vec::new();

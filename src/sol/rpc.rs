@@ -86,6 +86,19 @@ impl Rpc {
     /// Returns the `result` value, or an error carrying the node's message —
     /// RPC errors arrive in-band with HTTP 200, not as a status code.
     async fn call(&self, method: &str, params: Value) -> eyre::Result<Value> {
+        self.call_on(method, params, |_| true).await
+    }
+
+    /// `call`, restricted to endpoints `allow` accepts — for provider-specific
+    /// methods. Asking everyone meant every rotation hop before the right
+    /// provider answered "Method not found" into the log and a phantom
+    /// failure into the health stats, every poll, forever.
+    async fn call_on(
+        &self,
+        method: &str,
+        params: Value,
+        allow: impl Fn(&str) -> bool,
+    ) -> eyre::Result<Value> {
         /// Host only — an API key must never reach a log line.
         fn safe_host(url: &str) -> &str {
             url.split('?').next().unwrap_or(url)
@@ -110,6 +123,9 @@ impl Rpc {
             for hop in 0..order.len() {
                 let i = order[hop];
                 let url = &self.urls[i];
+                if !allow(url) {
+                    continue;
+                }
                 // Skip an endpoint that recently answered 429 — asking again
                 // inside its window converts one refusal into a stream of
                 // them. Unless it is the last hope this pass, in which case
@@ -367,7 +383,9 @@ impl Rpc {
         // 250ms between-pass sleep — before falling back. Four doomed requests
         // per poll, forever, out of the same budget the tape needs.
         if self.has_helius() {
-            if let Ok(v) = self.call("getPriorityFeeEstimate", params).await {
+            if let Ok(v) =
+                self.call_on("getPriorityFeeEstimate", params, |u| u.contains("helius")).await
+            {
                 if let Some(f) = v
                     .get("priorityFeeLevels")
                     .and_then(|l| l.get(level))
