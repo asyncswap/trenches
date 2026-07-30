@@ -3358,7 +3358,18 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 )
             },
         ]),
-        Line::from(vec![lbl("ETH"), Span::raw(view::eth(bot.eth))]),
+        Line::from({
+            // The balance in the unit you spend, and beside it the unit you
+            // think in — dimmed, approximate, absent when the price is.
+            let mut spans = vec![lbl("ETH"), Span::raw(view::eth(bot.eth))];
+            if bot.eth_usd > 0.0 && bot.eth > 0.0 {
+                spans.push(Span::styled(
+                    format!("  (~{})", view::usd_compact(bot.eth * bot.eth_usd)),
+                    Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
+                ));
+            }
+            spans
+        }),
         Line::from(vec![lbl(&bot.pool.sym), Span::raw(format!("{:.4}", bot.token_bal))]),
         Line::from(vec![
             lbl("Our Liq"),
