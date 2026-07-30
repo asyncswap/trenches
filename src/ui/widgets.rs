@@ -719,10 +719,13 @@ fn axis(a: &AxisView) -> Axis<'static> {
 fn panel_menu(active: char) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for key in ['t', 'v', 'o', 'l'] {
+        // The one you are ON reads in the highlight blue; the rest wear the
+        // border's own colour, so they sit in the frame as part of it and
+        // only the current screen's key stands out.
         let style = if key == active {
-            Style::default().fg(tone_color(Tone::Accent)).add_modifier(Modifier::BOLD)
+            Style::default().fg(tone_color(Tone::Info)).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(tone_color(Tone::Info))
+            Style::default().fg(border_color())
         };
         spans.push(Span::styled(format!("[{key}]"), style));
         spans.push(Span::raw(" "));
