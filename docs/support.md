@@ -20,7 +20,7 @@ The source is AGPL-3.0 and public. Pull requests are welcome. Unsure whether
 something is worth building? Open an issue and ask first — a ten-minute
 conversation beats a thousand-line surprise.
 
-## Trenches Pro — the hosted endpoint
+## Trenches RPC — the hosted endpoint
 
 For the trader who never wants to scramble around collecting API keys
 again: **one key covers everything the terminal will ever need** — every
