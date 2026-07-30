@@ -1451,8 +1451,11 @@ pub fn tape_view(swaps: &[SolSwap], scroll: usize, h: usize, sol_usd: f64) -> Ta
                 Cell::new(age),
                 Cell::bold(s.kind.label(), s.kind.tone()),
                 Cell::new(format!("{:.6}", s.sol)),
-                Cell::new(format!("{:.0}", s.tokens)),
-                Cell::toned(view::sol_compact(s.pooled_sol), s.kind.tone()),
+                // Two decimals: "0 tokens" for a 0.42-token buy read as a
+                // decode bug, and a pooled figure without cents drifts in
+                // and out of agreement with the panel above it.
+                Cell::new(format!("{:.2}", s.tokens)),
+                Cell::toned(format!("{:.2}", s.pooled_sol), s.kind.tone()),
                 // Market cap in dollars: SOL is the right unit for pooled
                 // liquidity (that IS the exit), but a cap denominated in SOL
                 // means nothing at a glance.
