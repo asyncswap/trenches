@@ -888,11 +888,14 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
                 cell.set_fg(tone_color(Tone::Dim));
             }
         }
+        // The ▸ starts one cell EARLY, hanging into the chart gutter over the
+        // rule it points along — otherwise it spends one of the axis's own
+        // columns and the unit truncates to "SO".
         let txt = format!("▸{} {}", price_label(last.c, range), cv.unit);
         buf.set_string(
-            inner.x + inner.width - AXIS_W + 1,
+            inner.x + inner.width - AXIS_W,
             y,
-            txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
+            txt.chars().take(AXIS_W as usize).collect::<String>(),
             Style::default().fg(tone_color(tone)).add_modifier(Modifier::BOLD),
         );
     }
