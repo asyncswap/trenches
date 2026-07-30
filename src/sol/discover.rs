@@ -870,6 +870,7 @@ pub struct SolSwap {
     /// Market cap (SOL) right after this trade.
     pub mkt_cap_sol: f64,
     /// The trader.
+    #[serde(with = "super::pubkey_b58")]
     pub user: Pubkey,
     pub signature: String,
     /// Which event this was WITHIN its transaction.

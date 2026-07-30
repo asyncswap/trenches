@@ -46,6 +46,7 @@ const TAPE_DEPTH_MAX: u32 = 250;
 #[derive(Debug, Clone)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SeenCoin {
+    #[serde(with = "super::pubkey_b58")]
     pub mint: Pubkey,
     /// "SYMBOL · bonding curve" — the venue is part of the identity, since the
     /// same coin reads completely differently once it graduates.
@@ -55,6 +56,22 @@ pub struct SeenCoin {
 /// Where the seen-coins list lives. Pasting a mint used to be a per-session
 /// fact: close the app and the coin's name, and the address you hunted down,
 /// were gone — repasted from scratch every time.
+#[cfg(test)]
+mod seen_coin_shape {
+    use super::*;
+
+    /// Round-trip + shape print, so a hand-written backfill file cannot
+    /// silently fail load_coins' forgiving parse.
+    #[test]
+    fn seen_coins_round_trip() {
+        let coins = vec![SeenCoin { mint: Pubkey::new_from_array([7u8; 32]), label: "X · curve".into() }];
+        let text = serde_json::to_string(&coins).unwrap();
+        println!("SHAPE: {text}");
+        let back: Vec<SeenCoin> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back[0].mint, coins[0].mint);
+    }
+}
+
 fn coins_path() -> String {
     format!("{}/coins-solana.json", crate::state_dir())
 }

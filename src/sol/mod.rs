@@ -223,3 +223,19 @@ mod pda_tests {
         println!("fee_config                 = {}", fee_config_pda());
     }
 }
+
+/// Serde as BASE58 — the form every explorer and human speaks — instead of
+/// the raw 32-byte array the derive emits. These files live in the state dir
+/// where their owner will read and occasionally hand-edit them.
+pub mod pubkey_b58 {
+    use solana_pubkey::Pubkey;
+
+    pub fn serialize<S: serde::Serializer>(p: &Pubkey, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&p.to_string())
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Pubkey, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
