@@ -1361,7 +1361,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         // The chain leads: it anchors the column while the two below it change.
         Line::from(vec![Span::styled(
             format!("{} ", bot.net),
-            Style::default().fg(ui::widgets::tone_color(Tone::Info)).add_modifier(Modifier::BOLD),
+            Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD),
         )]),
         // Value first, label last: right-aligned, the labels line up flush
         // against the edge with the numbers beside them.
@@ -1500,6 +1500,11 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
     let key = |k: &'static str, t: Tone| {
         Span::styled(k, Style::default().fg(ui::widgets::tone_color(t)).add_modifier(Modifier::BOLD))
     };
+    // System keys wear the frame's own colour, like the panel menu's inactive
+    // keys — only the trade keys carry tones, so colour means action.
+    let sys = |k: &'static str| {
+        Span::styled(k, Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD))
+    };
     let mut keys: Vec<Span> = vec![
         key("[b]", Tone::Good),
         Span::raw(" buy  "),
@@ -1510,17 +1515,17 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         key("[f]", Tone::Accent),
         Span::raw(" find  "),
 
-        key("[T]", Tone::Info),
+        sys("[T]"),
         Span::raw(" theme  "),
-        key("[?]", Tone::Info),
+        sys("[?]"),
         Span::raw(" help  "),
-        key("[C]", Tone::Info),
+        sys("[C]"),
         Span::raw(" chain  "),
-        key("[W]", Tone::Info),
+        sys("[W]"),
         Span::raw(" wallet  "),
-        key("[D]", Tone::Info),
+        sys("[D]"),
         Span::raw(" docs  "),
-        key("[q]", Tone::Info),
+        sys("[q]"),
         Span::raw(" quit"),
     ];
 

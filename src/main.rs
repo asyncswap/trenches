@@ -3766,14 +3766,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Span::raw(" sell-all/close  "),
         Span::styled("[f]", Style::default().fg(ui::widgets::tone_color(view::Tone::Accent)).add_modifier(Modifier::BOLD)),
         Span::raw(" find  "),
-        Span::styled("[?]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
+        Span::styled("[?]", Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD)),
         Span::raw(" help  "),
 
-        Span::styled("[W]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
+        Span::styled("[W]", Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD)),
         Span::raw(" wallet  "),
-        Span::styled("[D]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
+        Span::styled("[D]", Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD)),
         Span::raw(" docs  "),
-        Span::styled("[q]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
+        Span::styled("[q]", Style::default().fg(ui::widgets::border_color()).add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
     ];
 
