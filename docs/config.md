@@ -26,8 +26,10 @@ and every request goes to whichever endpoint answers fastest.
 **`rpc`** — where requests go. **`ws`** — websockets, Solana only, for the
 live launch feed.
 
-The simple version is one [Trenches RPC](https://rpc.trenches.sh) key, which
-covers every chain and the websocket in one URL:
+The app is free, and the endpoints are your choice. Bring your own RPC from
+any provider, or use a [Trenches RPC](https://rpc.trenches.sh) key — free at
+10 requests a second, or the paid plan for uncapped rates. One key covers
+every chain and the websocket in one URL:
 
 ```json
 {
