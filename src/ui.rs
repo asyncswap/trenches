@@ -225,6 +225,7 @@ pub const DOCS: &[(&str, &str)] = &[
     ("Terms", include_str!("../docs/terms.md")),
     ("Privacy", include_str!("../docs/privacy.md")),
     ("License", include_str!("../docs/license.md")),
+    ("Support", include_str!("../docs/support.md")),
     // Last, and the reason the reader is a sequence rather than a menu: someone
     // who scrolls to the end should find a door, not run out of pages.
     ("Finish", include_str!("../docs/finish.md")),
