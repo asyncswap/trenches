@@ -26,8 +26,8 @@ x     sell the lot        (Solana)  ·  close all LP positions  (EVM)
 Everything else moves you around. Those three spend money.
 
 Nothing else does. No timer, no strategy, no background loop opens a position
-while you are away from the keyboard — the copy modes only pre-fill a size, and
-you still press the key.
+while you are away from the keyboard. The bot is in manual mode — the only
+mode there is.
 
 ## When something goes wrong
 

@@ -1539,10 +1539,13 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // from one still running — and the keys it advertises do nothing until
     // there is a row to press them on.
     let v = env!("CARGO_PKG_VERSION");
+    // No live count in the title: the list IS the count, and a number that
+    // ticks up makes the whole header jitter. Keys wear their brackets, same
+    // as everywhere else in the app.
     let text = if rows == 0 {
-        format!(" Trenches Bot v{v} — discovering token launches… · Esc back ")
+        format!(" Trenches Bot v{v} — discovering token launches…  [Esc] back ")
     } else {
-        format!(" Trenches Bot v{v} — {rows} live  ↑↓/jk select · Enter trade · Esc back ")
+        format!(" Trenches Bot v{v}  [j/k] select  [Enter] trade  [Esc] back ")
     };
     Line::from(vec![Span::raw(" "), health_dot(), Span::raw(text)])
 }

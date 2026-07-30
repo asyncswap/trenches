@@ -107,6 +107,16 @@ A day with no trades shows `·`, not `$0` — a flat day and a day you sat out a
 different facts. History starts from the first sell after this feature landed:
 profit was never written down before that, so it cannot be recovered.
 
+## Mouse
+
+```
+wheel        scroll the active panel, or the docs
+click+drag   select text; release copies it to the clipboard
+```
+
+Selection works everywhere — dashboards, the finder, these docs. It reads
+straight off the screen, so what you copy is exactly what you see.
+
 ## Leaving
 
 ```

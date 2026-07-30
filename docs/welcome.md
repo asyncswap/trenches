@@ -16,8 +16,8 @@ A terminal trading bot.
 - pump.fun
 - PumpSwap AMM
 
-**Nothing here trades by itself.** Every order is a key you pressed. Copy modes
-only ever pre-fill a size — they never submit.
+**Nothing here trades by itself.** Every order is a key you pressed. The bot
+is in manual mode — the only mode there is.
 
 Use `tab` to move between these documents, `↑` `↓` to scroll, `esc` to go back.
 

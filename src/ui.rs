@@ -221,6 +221,7 @@ pub const DOCS: &[(&str, &str)] = &[
     ("Accounts", include_str!("../docs/wallets.md")),
     ("Config", include_str!("../docs/config.md")),
     ("Shortcuts", include_str!("../docs/keys.md")),
+    ("Chart", include_str!("../docs/chart.md")),
     ("Terms", include_str!("../docs/terms.md")),
     ("Privacy", include_str!("../docs/privacy.md")),
     ("License", include_str!("../docs/license.md")),
