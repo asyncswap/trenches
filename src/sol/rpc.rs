@@ -623,6 +623,41 @@ impl Rpc {
     /// Submit a signed transaction. `wire` is the serialized transaction; it is
     /// sent base64 and the encoding is stated explicitly — pump's docs call out
     /// that relying on the RPC's default encoding causes silent failures.
+    /// Simulate a signed transaction and return the POST-state token amount
+    /// (base units) of `ata`. This is the chain quoting its own swap: fee
+    /// tiers, boost reserves, whatever pump invents next — the simulation
+    /// already priced it. `None` on any failure; callers fall back to math.
+    pub async fn simulate_post_token(
+        &self,
+        wire: &[u8],
+        ata: &Pubkey,
+    ) -> Option<u64> {
+        let res = self
+            .call(
+                "simulateTransaction",
+                json!([
+                    b64_encode(wire),
+                    {
+                        "encoding": "base64",
+                        "sigVerify": false,
+                        "replaceRecentBlockhash": true,
+                        "commitment": "processed",
+                        "accounts": {"encoding": "base64", "addresses": [ata.to_string()]}
+                    }
+                ]),
+            )
+            .await
+            .ok()?;
+        let val = res.get("value")?;
+        if !val.get("err").map(|e| e.is_null()).unwrap_or(false) {
+            return None;
+        }
+        let acc = val.get("accounts")?.get(0)?;
+        let data = b64_decode(acc.get("data")?.get(0)?.as_str()?).ok()?;
+        // SPL token account layout: mint(32) owner(32) amount(u64 LE).
+        data.get(64..72).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes)
+    }
+
     pub async fn send_transaction(&self, wire: &[u8]) -> eyre::Result<String> {
         let res = self
             .call(

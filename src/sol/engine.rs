@@ -428,7 +428,43 @@ pub async fn buy(
             ),
         ],
         Venue::Amm { keys, sol_is_base, .. } => {
-            amm_buy_ixs(keys, &user, sol_to_lamports(sol_in), min_tokens_out, *sol_is_base)
+            // The AMM's real price is whatever pump's CURRENT rules say —
+            // boost reserves, dynamic fee tiers by market cap, fields newer
+            // than this binary. Instead of modeling that treadmill, ask the
+            // chain: simulate the exact swap with a floor of 1, read the
+            // token delta the program itself would pay, and set the real
+            // floor from THAT. One extra RPC per buy; correct under any fee
+            // regime. The formula floor stays as the ceiling — a simulation
+            // cannot talk the floor UP past the honest quote — and as the
+            // fallback when simulation is unavailable.
+            let probe = amm_buy_ixs(keys, &user, sol_to_lamports(sol_in), 1, *sol_is_base);
+            // The COIN side's ATA — which slot that is depends on orientation.
+            let (coin_mint, coin_prog) = if *sol_is_base {
+                (&keys.quote_mint, &keys.quote_token_program)
+            } else {
+                (&keys.base_mint, &keys.base_token_program)
+            };
+            let ata = super::ata(&user, coin_mint, coin_prog);
+            let pre = rpc
+                .token_balances(&[ata])
+                .await
+                .ok()
+                .and_then(|b| b.first().copied().flatten())
+                .unwrap_or(0);
+            let mut floor = min_tokens_out;
+            if let Ok((tx0, _)) = tx::build_signed(rpc, signer, probe, tx::CU_LIMIT_AMM, cu_price_micro).await {
+                if let Ok(w) = tx::wire(&tx0) {
+                    if let Some(post) = rpc.simulate_post_token(&w, &ata).await {
+                        let sim_out = post.saturating_sub(pre);
+                        if sim_out > 0 {
+                            let sim_floor =
+                                trade::with_slippage(sim_out, slippage_pct.max(1.0), false);
+                            floor = sim_floor.min(min_tokens_out);
+                        }
+                    }
+                }
+            }
+            amm_buy_ixs(keys, &user, sol_to_lamports(sol_in), floor, *sol_is_base)
         }
     };
     tx::send(rpc, signer, ixs, tx::CU_LIMIT_AMM, cu_price_micro).await
