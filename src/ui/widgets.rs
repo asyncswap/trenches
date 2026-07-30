@@ -920,6 +920,27 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
             Style::default().fg(tone_color(Tone::Dim)),
         );
     }
+
+    // Name each trade line at its right end — "buy" green, "sell" red — so
+    // two blue lines never leave you guessing which was the entry and which
+    // the exit. Drawn LAST so the tag wins its row; the live-price row keeps
+    // its label, which matters more.
+    for &(_, price, buy) in &cv.trades {
+        if !(price > lo && price < hi) {
+            continue;
+        }
+        let y = ((py(price) / 2).clamp(0, rows as i32 - 1)) as u16 + inner.y;
+        if Some(y) == last_y {
+            continue;
+        }
+        let (tag, tone) = if buy { ("buy ", Tone::Good) } else { ("sell", Tone::Bad) };
+        buf.set_string(
+            inner.x + inner.width - AXIS_W + 1,
+            y,
+            tag,
+            Style::default().fg(tone_color(tone)).add_modifier(Modifier::BOLD),
+        );
+    }
 }
 
 /// A price with exactly enough decimals for labels `range` apart to differ.
@@ -1694,4 +1715,5 @@ mod panel_menu_shape {
         }
     }
 }
+
 
