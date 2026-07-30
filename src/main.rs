@@ -3568,7 +3568,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             lines.push(Line::from("  (no log lines yet)"));
         }
         let logs = Paragraph::new(lines)
-            .block(ui::widgets::with_panel_menu(ui::widgets::themed_block(" Logs "), 'l'));
+            .block(ui::widgets::with_panel_menu(ui::widgets::themed_block(" Logs ")));
         f.render_widget(logs, mid_area);
         }
         Panel::Tape => {

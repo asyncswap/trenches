@@ -713,25 +713,19 @@ fn axis(a: &AxisView) -> Axis<'static> {
 /// Draw a scatter plot with a one-line key strip above it, so labels never sit
 /// on top of the data. Disc/Ring series are size-scaled by their y magnitude.
 /// The stationary panel menu that rides every view container's top border:
-/// all four destinations, always visible, the active one lit. Once every
-/// panel names its siblings, the footer no longer has to.
+/// all four destinations, always visible, the active one lit. Bare keys, no
+/// words — `[t] [v] [o] [l]` — the same at every width, so the border never
+/// crowds the title and the eye learns one fixed shape.
 fn panel_menu(active: char) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (key, label) in [('t', "Trades"), ('v', "Candles"), ('o', "Orders"), ('l', "Logs")] {
-        let (key_tone, label_tone, bold) = if key == active {
-            (Tone::Accent, Tone::Normal, true)
+    for key in ['t', 'v', 'o', 'l'] {
+        let style = if key == active {
+            Style::default().fg(tone_color(Tone::Accent)).add_modifier(Modifier::BOLD)
         } else {
-            (Tone::Info, Tone::Dim, false)
+            Style::default().fg(tone_color(Tone::Info))
         };
-        let mut ks = Style::default().fg(tone_color(key_tone));
-        let mut ls = Style::default().fg(tone_color(label_tone));
-        if bold {
-            ks = ks.add_modifier(Modifier::BOLD);
-            ls = ls.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(format!("[{key}] "), ks));
-        spans.push(Span::styled(label.to_string(), ls));
-        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("[{key}]"), style));
+        spans.push(Span::raw(" "));
     }
     spans.pop();
     Line::from(spans)
@@ -739,8 +733,8 @@ fn panel_menu(active: char) -> Line<'static> {
 
 /// Attach the panel menu to an arbitrary block — for screens (the EVM Logs
 /// paragraph) that build their block by hand rather than through a view type.
-pub fn with_panel_menu(block: Block<'static>, active: char) -> Block<'static> {
-    block.title_top(panel_menu(active).right_aligned())
+pub fn with_panel_menu(block: Block<'static>) -> Block<'static> {
+    block.title_top(panel_menu('l').right_aligned())
 }
 
 /// The running version, dim and against the right edge of a screen's top
@@ -1665,5 +1659,31 @@ mod candle_gallery {
         let mut term = Terminal::new(TestBackend::new(140, 34)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv)).unwrap();
         println!("{}", dump(term.backend().buffer()));
+    }
+}
+
+#[cfg(test)]
+mod panel_menu_shape {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn top_border(width: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, 4)).unwrap();
+        let mut t = crate::view::TableView::new(
+            " Orders (0) ",
+            vec![crate::view::Col::fixed("status", 9), crate::view::Col::min("tx", 10)],
+        );
+        t.active_key = Some('o');
+        term.draw(|f| super::table(f, f.area(), &t, None)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..width).map(|x| buf[(x, 0)].symbol().to_string()).collect()
+    }
+
+    #[test]
+    fn the_menu_is_bare_keys_at_every_width() {
+        for w in [50u16, 100] {
+            let border = top_border(w);
+            assert!(border.contains("[t] [v] [o] [l]"), "menu missing at width {w}: {border}");
+            assert!(border.contains(" Orders (0) "), "title missing at width {w}: {border}");
+        }
     }
 }
