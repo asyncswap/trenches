@@ -27,9 +27,9 @@ and every request goes to whichever endpoint answers fastest.
 live launch feed.
 
 The app is free, and the endpoints are your choice. Bring your own RPC from
-any provider, or use a [Trenches RPC](https://rpc.trenches.sh) key — free at
-10 requests a second, or the paid plan for uncapped rates. One key covers
-every chain and the websocket in one URL:
+any provider, or use a [Trenches RPC](https://rpc.trenches.sh) key — which we
+highly recommend: free at 10 requests a second, or the paid plan for uncapped
+rates. One key covers every chain and the websocket in one URL:
 
 ```json
 {
