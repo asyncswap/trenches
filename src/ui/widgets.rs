@@ -577,7 +577,13 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
     // Empty state gets the WHOLE area, centred — putting it in the first cell
     // truncates it to that column's width ("scanning pum").
     if t.rows.is_empty() {
-        let block = themed_block_line(table_title(t));
+        let mut block = themed_block_line(table_title(t));
+        if let Some(k) = t.active_key {
+            block = block.title_top(panel_menu(k).right_aligned());
+        }
+        if t.show_version {
+            block = with_version(block);
+        }
         let inner = block.inner(area);
         f.render_widget(block, area);
         let note = if t.empty_note.is_empty() { "nothing yet" } else { &t.empty_note };
@@ -612,7 +618,13 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
             })
             .collect()
     };
-    let block = themed_block_line(table_title(t));
+    let mut block = themed_block_line(table_title(t));
+    if let Some(k) = t.active_key {
+        block = block.title_top(panel_menu(k).right_aligned());
+    }
+    if t.show_version {
+        block = with_version(block);
+    }
     // Space inside the borders, minus the cursor symbol when one is drawn.
     let avail = area.width.saturating_sub(2 + if state.is_some() { 2 } else { 0 });
     let widths = constraints_of(t, avail);
@@ -644,7 +656,11 @@ pub fn panel(f: &mut Frame, area: Rect, p: &PanelView) {
         .iter()
         .map(|cells| Line::from(cells.iter().map(span_of).collect::<Vec<_>>()))
         .collect();
-    let w = Paragraph::new(lines).block(themed_block(p.title.clone()));
+    let mut block = themed_block(p.title.clone());
+    if let Some(k) = p.active_key {
+        block = block.title_top(panel_menu(k).right_aligned());
+    }
+    let w = Paragraph::new(lines).block(block);
     f.render_widget(w, area);
 }
 
@@ -696,6 +712,48 @@ fn axis(a: &AxisView) -> Axis<'static> {
 
 /// Draw a scatter plot with a one-line key strip above it, so labels never sit
 /// on top of the data. Disc/Ring series are size-scaled by their y magnitude.
+/// The stationary panel menu that rides every view container's top border:
+/// all four destinations, always visible, the active one lit. Once every
+/// panel names its siblings, the footer no longer has to.
+fn panel_menu(active: char) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (key, label) in [('t', "Trades"), ('v', "Candles"), ('o', "Orders"), ('l', "Logs")] {
+        let (key_tone, label_tone, bold) = if key == active {
+            (Tone::Accent, Tone::Normal, true)
+        } else {
+            (Tone::Info, Tone::Dim, false)
+        };
+        let mut ks = Style::default().fg(tone_color(key_tone));
+        let mut ls = Style::default().fg(tone_color(label_tone));
+        if bold {
+            ks = ks.add_modifier(Modifier::BOLD);
+            ls = ls.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(format!("[{key}] "), ks));
+        spans.push(Span::styled(label.to_string(), ls));
+        spans.push(Span::raw("  "));
+    }
+    spans.pop();
+    Line::from(spans)
+}
+
+/// Attach the panel menu to an arbitrary block — for screens (the EVM Logs
+/// paragraph) that build their block by hand rather than through a view type.
+pub fn with_panel_menu(block: Block<'static>, active: char) -> Block<'static> {
+    block.title_top(panel_menu(active).right_aligned())
+}
+
+/// The running version, dim and against the right edge of a screen's top
+/// border — so every full-screen view names what is running without spending
+/// a whole line on it.
+pub fn with_version(block: Block<'static>) -> Block<'static> {
+    let v = Span::styled(
+        format!(" v{} ", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(tone_color(Tone::Dim)),
+    );
+    block.title_top(Line::from(v).right_aligned())
+}
+
 /// A candlestick chart, drawn at HALF-CELL vertical resolution.
 ///
 /// Each terminal cell is treated as two stacked pixels via the half-block
@@ -704,7 +762,10 @@ fn axis(a: &AxisView) -> Axis<'static> {
 /// per column: full cells for the body, a thin │ for the wick, green up and
 /// red down, exactly the grammar TradingView taught everyone.
 pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
-    let block = themed_block_line(Line::from(cv.title.clone()));
+    let mut block = themed_block_line(Line::from(cv.title.clone()));
+    if let Some(k) = cv.active_key {
+        block = block.title_top(panel_menu(k).right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 12 || inner.height < 4 || cv.candles.is_empty() {
@@ -1499,7 +1560,7 @@ mod candle_render_tests {
     use ratatui::backend::TestBackend;
 
     fn cv(candles: Vec<crate::view::Candle>) -> crate::view::CandleView {
-        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL" }
+        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL", active_key: None }
     }
 
     #[test]
@@ -1597,7 +1658,7 @@ mod candle_gallery {
             }
         }
         let ck = crate::view::candles_of(&pts, 15, 240);
-        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL" };
+        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL", active_key: None };
         let mut term = Terminal::new(TestBackend::new(140, 34)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv)).unwrap();
         println!("{}", dump(term.backend().buffer()));

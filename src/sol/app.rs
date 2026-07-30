@@ -70,6 +70,20 @@ mod seen_coin_shape {
         let back: Vec<SeenCoin> = serde_json::from_str(&text).unwrap();
         assert_eq!(back[0].mint, coins[0].mint);
     }
+
+    /// The legacy byte-array shape — what an older build wrote — must load
+    /// forever. This is the exact file that once came back empty and got
+    /// overwritten by the next save.
+    #[test]
+    fn legacy_byte_array_mints_still_load() {
+        let mint = Pubkey::new_from_array([9u8; 32]);
+        let legacy = serde_json::json!({ "mint": mint.to_bytes().to_vec(), "label": "OLD · curve" });
+        let coin = coin_of_value(legacy).expect("legacy entry must parse");
+        assert_eq!(coin.mint, mint);
+        assert_eq!(coin.label, "OLD · curve");
+        // And a rotten row costs itself, not its neighbours.
+        assert!(coin_of_value(serde_json::json!({ "mint": [1, 2, 3], "label": "?" })).is_none());
+    }
 }
 
 /// The last coin the user was trading. A wallet switch rebuilds the whole
@@ -94,10 +108,41 @@ fn coins_path() -> String {
 }
 
 fn load_coins() -> Vec<SeenCoin> {
-    std::fs::read_to_string(coins_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let path = coins_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        // Not even a JSON list. Whatever it is, the one thing that must not
+        // happen is the next save overwriting the only copy — that is exactly
+        // how a format change once erased 18 coins. Move it aside instead.
+        let _ = std::fs::rename(&path, format!("{path}.bad"));
+        super::trace("coins file unreadable; set aside as coins-solana.json.bad");
+        return Vec::new();
+    };
+    let total = vals.len();
+    let coins: Vec<SeenCoin> = vals.into_iter().filter_map(coin_of_value).collect();
+    if coins.len() < total {
+        super::trace(&format!("coins file: salvaged {} of {total} entries", coins.len()));
+    }
+    coins
+}
+
+/// One seen-coin entry, from EITHER shape this file has ever had: the mint as
+/// a base58 string (current) or as a 32-number byte array (what an older
+/// build wrote). The array shape is what wiped the list once — the stricter
+/// parser refused the whole file, load came back empty, and the next save
+/// overwrote everything. Old shapes stay loadable forever.
+fn coin_of_value(mut v: serde_json::Value) -> Option<SeenCoin> {
+    if let Some(bytes) = pubkey_bytes(v.get("mint")) {
+        v["mint"] = serde_json::Value::String(bs58::encode(&bytes).into_string());
+    }
+    serde_json::from_value(v).ok()
+}
+
+/// A JSON value that is a 32-entry byte array — the legacy pubkey encoding.
+fn pubkey_bytes(v: Option<&serde_json::Value>) -> Option<Vec<u8>> {
+    let arr = v?.as_array()?;
+    let bytes: Vec<u8> = arr.iter().filter_map(|n| n.as_u64().map(|b| b as u8)).collect();
+    (bytes.len() == 32).then_some(bytes)
 }
 
 fn save_coins(coins: &[SeenCoin]) {
@@ -119,10 +164,18 @@ fn tape_path(mint: &Pubkey) -> String {
 }
 
 fn load_tape_history(mint: &Pubkey) -> Vec<discover::SolSwap> {
-    std::fs::read_to_string(tape_path(mint))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(tape_path(mint)) else { return Vec::new() };
+    let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else { return Vec::new() };
+    // Per-entry, tolerant of the legacy byte-array pubkey shape, same story
+    // as load_coins: one unreadable row must not cost the rest of the tape.
+    vals.into_iter()
+        .filter_map(|mut v| {
+            if let Some(bytes) = pubkey_bytes(v.get("user")) {
+                v["user"] = serde_json::Value::String(bs58::encode(&bytes).into_string());
+            }
+            serde_json::from_value(v).ok()
+        })
+        .collect()
 }
 
 /// Debounced full rewrite — the ring is bounded at TAPE_RING rows, so the
@@ -444,21 +497,12 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
         .map(|m| m.symbol.clone())
         .or_else(|| bot.coin.as_ref().map(|c| short_mint(&c.mint)))
         .unwrap_or_default();
-    // How much history the tape actually holds, so the reader knows what the
-    // chart can and cannot show yet.
-    let span = bot
-        .tape
-        .iter()
-        .filter_map(|s| s.block_time)
-        .max()
-        .zip(bot.tape.iter().filter_map(|s| s.block_time).min())
-        .map(|(hi, lo)| crate::view::age_compact((hi - lo).max(0) as f64))
-        .unwrap_or_else(|| "0s".into());
     crate::view::CandleView {
-        title: format!(" {} · {} candles · {} of tape · , . interval  [v] ", sym, crate::view::iv_label(bot.chart_iv), span),
+        title: format!(" {}/SOL {} candle [,] [.] ", sym, crate::view::iv_label(bot.chart_iv)),
         candles,
         interval_secs: bot.chart_iv,
         unit: "SOL",
+        active_key: None,
     }
 }
 
@@ -1169,7 +1213,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     let total = bot.orders.len();
     let title = if total > h {
         format!(
-            " Orders {}–{} of {} ↑/↓ scroll  ·  {}  [o] ",
+            " Orders {}–{} of {} ↑/↓ scroll  ·  {} ",
             scroll + 1,
             (scroll + h).min(total),
             total,
@@ -1178,7 +1222,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     } else {
         // The trader is the same wallet on every row, so it belongs in the
         // title once rather than eating 44 columns per line.
-        format!(" Orders ({total})  [o] ")
+        format!(" Orders ({total}) ")
     };
     let mut t = TableView::new(
         title,
@@ -1220,7 +1264,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
 }
 
 fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
-    let mut p = PanelView::new(" Logs [l] ");
+    let mut p = PanelView::new(" Logs ");
 
     // Both streams, as on the EVM side: what the bot did, and what the
     // machinery reported. Both carry an [HH:MM:SS] stamp, so a stable sort on
@@ -1341,7 +1385,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
     ])
     .alignment(Alignment::Right);
 
-    let head_block = ui::widgets::themed_block(" Trenches Bot [C] ");
+    let head_block = ui::widgets::themed_block(format!(" Trenches Bot v{} ", crate::update::current()));
     let head_inner = head_block.inner(c[0]);
     f.render_widget(head_block, c[0]);
     let head_cols = Layout::horizontal([
@@ -1431,10 +1475,26 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
 
     let h = c[3].height.saturating_sub(3).max(1) as usize;
     match view {
-        Panel::Orders => ui::widgets::table(f, c[3], &orders_table(bot, scroll, h), None),
-        Panel::Tape => ui::widgets::table(f, c[3], &discover::tape_view(&bot.tape, scroll, h, bot.sol_usd), None),
-        Panel::Logs => ui::widgets::panel(f, c[3], &logs_panel(bot, scroll, h + 1)),
-        Panel::Chart => ui::widgets::candles(f, c[3], &chart_view(bot)),
+        Panel::Orders => {
+            let mut tv = orders_table(bot, scroll, h);
+            tv.active_key = Some('o');
+            ui::widgets::table(f, c[3], &tv, None)
+        }
+        Panel::Tape => {
+            let mut tv = discover::tape_view(&bot.tape, scroll, h, bot.sol_usd);
+            tv.active_key = Some('t');
+            ui::widgets::table(f, c[3], &tv, None)
+        }
+        Panel::Logs => {
+            let mut pv = logs_panel(bot, scroll, h + 1);
+            pv.active_key = Some('l');
+            ui::widgets::panel(f, c[3], &pv)
+        }
+        Panel::Chart => {
+            let mut cv = chart_view(bot);
+            cv.active_key = Some('v');
+            ui::widgets::candles(f, c[3], &cv)
+        }
     }
 
     let key = |k: &'static str, t: Tone| {
@@ -1449,10 +1509,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         Span::raw(" sell-all  "),
         key("[f]", Tone::Accent),
         Span::raw(" find  "),
-        key("[l]", Tone::Normal),
-        Span::raw(" logs  "),
-        key("[v]", Tone::Info),
-        Span::raw(" chart  "),
+
         key("[T]", Tone::Info),
         Span::raw(" theme  "),
         key("[?]", Tone::Info),
@@ -1658,6 +1715,7 @@ async fn screen_trenches(
             });
         }
         let mut table = discover::table_view(&rows, sol_usd, Some(risk), warn_score);
+        table.show_version = true;
         // Replace the generic note with what the feed is actually doing.
         if rows.is_empty() {
             let status = feed.lock().map(|f| f.clone()).unwrap_or_default();
@@ -1781,7 +1839,18 @@ pub async fn run(
         move |mint: Pubkey, launched: Option<i64>, launch_sig: Option<String>| {
             let (rpc, cell) = (rpc.clone(), cell.clone());
             tokio::spawn(async move {
-                let coin = engine::load_coin(&rpc, &mint).await;
+                // A couple of bounded retries: session start resolves the
+                // restored coin while every RPC is still cold, and one
+                // transient refusal used to cost the whole restore — the
+                // dashboard came up empty and the mint had to be re-pasted.
+                let mut coin = engine::load_coin(&rpc, &mint).await;
+                for wait_ms in [700u64, 1500] {
+                    if coin.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    coin = engine::load_coin(&rpc, &mint).await;
+                }
                 let meta = super::metadata::token_meta(&rpc, &mint).await;
                 let seed = match &launch_sig {
                     Some(sig) => discover::tape_seed(&rpc, sig, &mint, &trader).await,

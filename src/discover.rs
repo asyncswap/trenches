@@ -1571,7 +1571,7 @@ fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyr
     let spin = SPIN[frame % SPIN.len()];
     term.draw(|f| {
         crate::ui::image::clear();
-        let block = crate::ui::widgets::themed_block_line(trenches_title(0));
+        let block = crate::ui::widgets::with_version(crate::ui::widgets::themed_block_line(trenches_title(0)));
         let body = vec![
             Line::from(""),
             Line::from(vec![
@@ -1596,7 +1596,7 @@ fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyr
 fn draw_status(term: &mut Term, msg: &str) -> eyre::Result<()> {
     term.draw(|f| {
         crate::ui::image::clear();
-        let block = crate::ui::widgets::themed_block_line(trenches_title(0));
+        let block = crate::ui::widgets::with_version(crate::ui::widgets::themed_block_line(trenches_title(0)));
         let p = Paragraph::new(msg).block(block).alignment(Alignment::Center);
         f.render_widget(p, f.area());
     })?;
@@ -2267,7 +2267,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
         .column_spacing(1)
         // Fixed-width count: a title that grows from "(1)" to "(12)" shifts
         // every word after it, so the header appears to jitter as launches land.
-        .block(crate::ui::widgets::themed_block_line(trenches_title(rows.len())));
+        .block(crate::ui::widgets::with_version(crate::ui::widgets::themed_block_line(trenches_title(rows.len()))));
     f.render_stateful_widget(table, chunks[0], state);
 
     // Details box for the selected pool — the actual X / telegram / website.

@@ -3079,7 +3079,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     ])
     .alignment(Alignment::Right);
 
-    let head_block = ui::widgets::themed_block(" Trenches Bot [C] ");
+    let head_block = ui::widgets::themed_block(format!(" Trenches Bot v{} ", update::current()));
     let head_inner = head_block.inner(c[0]);
     f.render_widget(head_block, c[0]);
     let head_cols = Layout::horizontal([
@@ -3511,13 +3511,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let candles = view::candles_of(&points, bot.chart_iv, 240);
             let cv = view::CandleView {
                 title: format!(
-                    " {} · {} candles · , . interval  [v] ",
+                    " {}/ETH {} candle [,] [.] ",
                     bot.pool.sym,
                     view::iv_label(bot.chart_iv)
                 ),
                 candles,
                 interval_secs: bot.chart_iv,
                 unit: "ETH",
+                active_key: Some('v'),
             };
             ui::widgets::candles(f, mid_area, &cv);
         }
@@ -3567,7 +3568,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             lines.push(Line::from("  (no log lines yet)"));
         }
         let logs = Paragraph::new(lines)
-            .block(ui::widgets::themed_block(" Logs [l] "));
+            .block(ui::widgets::with_panel_menu(ui::widgets::themed_block(" Logs "), 'l'));
         f.render_widget(logs, mid_area);
         }
         Panel::Tape => {
@@ -3590,7 +3591,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 tape.iter().filter(|s| bot.arb_mode || s.is_v4 == pool_is_v4).collect();
             let scroll = orders_scroll.min(shown.len().saturating_sub(1));
             let mut t = view::TableView::new(
-                format!(" Trades ({}) ⭐ = you [t] ", shown.len()),
+                format!(" Trades ({}) ⭐ = you ", shown.len()),
                 vec![
                     view::Col::fixed("", 2),
                     // Age leads, as on the Solana tape: a tape is read
@@ -3606,6 +3607,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Col::min("tx", 12),
                 ],
             );
+            t.active_key = Some('t');
             // With no pool there is nothing to stream, so saying trades "stream
             // in as they happen" reads as waiting for something that is never
             // coming. Say what is actually missing, in the order it is needed.
@@ -3689,9 +3691,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // Built as a chain-agnostic TableView and drawn by the shared widget —
         // same code path as the Solana orders panel.
         let title = if total > h {
-            format!(" Orders {}–{} of {} ↑/↓ scroll [o] ", scroll + 1, (scroll + h).min(total), total)
+            format!(" Orders {}–{} of {} ↑/↓ scroll ", scroll + 1, (scroll + h).min(total), total)
         } else {
-            format!(" Orders ({total}) [o] ")
+            format!(" Orders ({total}) ")
         };
         let mut t = view::TableView::new(
             title,
@@ -3709,6 +3711,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ],
         );
         t.empty_note = "no orders yet\npress b to buy  ·  s to sell  ·  a add LP  ·  x sell all".into();
+        t.active_key = Some('o');
         for o in bot.orders.iter().rev().skip(scroll).take(h) {
             let (st, stone) = match o.status {
                 engine::OrderStatus::Confirmed => ("confirmed", view::Tone::Good),
@@ -3763,8 +3766,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Span::raw(" sell-all/close  "),
         Span::styled("[f]", Style::default().fg(ui::widgets::tone_color(view::Tone::Accent)).add_modifier(Modifier::BOLD)),
         Span::raw(" find  "),
-        Span::styled("[l]", Style::default().fg(ui::widgets::tone_color(view::Tone::Normal)).add_modifier(Modifier::BOLD)),
-        Span::raw(" logs  "),
         Span::styled("[?]", Style::default().fg(ui::widgets::tone_color(view::Tone::Info)).add_modifier(Modifier::BOLD)),
         Span::raw(" help  "),
 

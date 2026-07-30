@@ -81,6 +81,12 @@ impl Col {
 #[derive(Clone, Debug, Default)]
 pub struct TableView {
     pub title: String,
+    /// When set, the panel menu rides the top border, this key highlighted.
+    pub active_key: Option<char>,
+    /// Draw the running version in the top-right corner — for full-screen
+    /// views (the finder) where the version should be visible without a
+    /// dashboard footer under it.
+    pub show_version: bool,
     pub cols: Vec<Col>,
     pub rows: Vec<Vec<Cell>>,
     /// Optional per-row background emphasis (index-aligned with `rows`).
@@ -97,7 +103,8 @@ pub struct TableView {
 
 impl TableView {
     pub fn new(title: impl Into<String>, cols: Vec<Col>) -> TableView {
-        TableView { title: title.into(), cols, ..Default::default() }
+        TableView {
+            active_key: None, title: title.into(), cols, ..Default::default() }
     }
     pub fn push(&mut self, row: Vec<Cell>) {
         self.rows.push(row);
@@ -119,13 +126,16 @@ impl TableView {
 /// A bordered text panel (market / wallet): a title plus lines of styled spans.
 #[derive(Clone, Debug, Default)]
 pub struct PanelView {
+    /// When set, the panel menu rides the top border, this key highlighted.
+    pub active_key: Option<char>,
     pub title: String,
     pub lines: Vec<Vec<Cell>>,
 }
 
 impl PanelView {
     pub fn new(title: impl Into<String>) -> PanelView {
-        PanelView { title: title.into(), lines: Vec::new() }
+        PanelView {
+            active_key: None, title: title.into(), lines: Vec::new() }
     }
     /// One plain line of text.
     pub fn line(&mut self, text: impl Into<String>) {
@@ -199,6 +209,9 @@ pub struct CandleView {
     pub interval_secs: u64,
     /// Unit label for the y axis ("SOL" / "ETH").
     pub unit: &'static str,
+    /// When set, the panel menu ([t] Trades · [v] Candles · …) rides the top
+    /// border with this key highlighted — every view names its siblings.
+    pub active_key: Option<char>,
 }
 
 /// Aggregate raw trades into time-bucketed candles, oldest-first.
@@ -208,7 +221,9 @@ pub struct CandleView {
 /// rather than trusting the caller is what keeps a candle's open/close honest.
 /// Buckets nobody traded in carry the previous close as a flat candle, so
 /// quiet seconds read as a flat line instead of the chart silently skipping
-/// time. At most `max` candles come back — the newest.
+/// time — and every candle OPENS at the previous candle's close, so the line
+/// of prices is continuous across the whole chart. At most `max` candles come
+/// back — the newest.
 pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) -> Vec<Candle> {
     let iv = interval_secs.max(1) as i64;
     let mut pts: Vec<(i64, f64, f64)> =
@@ -237,7 +252,15 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) ->
             bucket = b;
         }
         cur = Some(match cur {
-            None => Candle { o: p, h: p, l: p, c: p, v },
+            // A new candle opens where the previous one CLOSED, not at its own
+            // first trade — that's the grammar every charting tool taught:
+            // price is continuous, so a gap between close and next-open reads
+            // as candles jumping around. The chained open joins the range, so
+            // the body/wick covers the ground from prev-close to first trade.
+            None => {
+                let o = out.last().map_or(p, |k| k.c);
+                Candle { o, h: o.max(p), l: o.min(p), c: p, v }
+            }
             Some(k) => Candle { o: k.o, h: k.h.max(p), l: k.l.min(p), c: p, v: k.v + v },
         });
     }
@@ -262,6 +285,20 @@ mod candle_tests {
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].o, c[0].h, c[0].l, c[0].c, c[0].v), (3.0, 5.0, 2.0, 4.0, 4.0));
         assert!(c[0].up());
+    }
+
+    #[test]
+    fn each_candle_opens_at_the_previous_close() {
+        // Bucket 1 closes at 5; bucket 2's first trade is way up at 9. The
+        // second candle must open at 5 (and its low reach down to it), not
+        // open at 9 and float disconnected from the line of prices.
+        let pts = [(100, 3.0, 1.0), (105, 5.0, 1.0), (112, 9.0, 1.0)];
+        let c = candles_of(&pts, 10, 100);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].o, 5.0);
+        assert_eq!(c[1].l, 5.0);
+        assert_eq!(c[1].c, 9.0);
+        assert!(c[1].up());
     }
 
     #[test]
@@ -299,7 +336,7 @@ mod candle_tests {
 pub const IV_STEPS: [u64; 7] = [1, 5, 15, 60, 300, 900, 3600];
 
 pub fn iv_step(cur: u64, up: bool) -> u64 {
-    let i = IV_STEPS.iter().position(|s| *s == cur).unwrap_or(1);
+    let i = IV_STEPS.iter().position(|s| *s == cur).unwrap_or(3);
     IV_STEPS[if up { (i + 1).min(IV_STEPS.len() - 1) } else { i.saturating_sub(1) }]
 }
 

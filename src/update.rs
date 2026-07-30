@@ -125,15 +125,21 @@ pub fn current() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// The version as anyone should quote it: `0.1.0-commit-1b2b33`.
+/// The commit this binary was built from — which *build*, not which release.
+pub fn commit() -> &'static str {
+    env!("TRENCHES_COMMIT")
+}
+
+/// The version as anyone should quote it: `0.1.0+1b2b33`.
 ///
 /// A tag says which release; the commit says which *build*, which is what
 /// matters when a release is rebuilt or when someone is running a binary handed
 /// to them. One string, so `--version`, the log header and the user agent
-/// cannot drift apart. The comparison in `is_newer` stops at the first `-`, so
-/// carrying the stamp here does not make every build look like an upgrade.
+/// cannot drift apart. The `+` is semver's build-metadata separator, and the
+/// comparison in `is_newer` stops there, so carrying the stamp does not make
+/// every build look like an upgrade.
 pub fn full() -> String {
-    format!("{}-commit-{}", current(), env!("TRENCHES_COMMIT"))
+    format!("{}+{}", current(), commit())
 }
 
 /// A newer version than this one, if the check found one. Cheap; safe to call
@@ -206,7 +212,7 @@ async fn fetch_latest_tag() -> Option<(String, u64)> {
 fn parts(v: &str) -> Vec<u64> {
     v.trim()
         .trim_start_matches(['v', 'V'])
-        .split('-')
+        .split(['-', '+'])
         .next()
         .unwrap_or("")
         .split('.')
@@ -259,12 +265,15 @@ pub fn footer_label() -> String {
         // already says there is one and what to press; repeating it as an arrow
         // on the right is the same news twice, and the corner's job is to answer
         // "what am I running" — which stays true either way.
-        Status::Update(_) | Status::Checking | Status::Unknown => full(),
-        Status::Latest => format!("{} (latest)", full()),
+        // Just the commit hash: the version now lives in the header where it
+        // reads as identity, and the corner keeps the one thing a bug report
+        // can't reconstruct — which build.
+        Status::Update(_) | Status::Checking | Status::Unknown => commit().to_string(),
+        Status::Latest => format!("{} (latest)", commit()),
         // Not something to act on, so it reads as current with a note rather
         // than as a call to do anything.
         Status::Soaking { tag, ready_in } => {
-            format!("{} (latest) · {tag} in {}", full(), short_hours(ready_in))
+            format!("{} (latest) · {tag} in {}", commit(), short_hours(ready_in))
         }
     }
 }
@@ -592,7 +601,7 @@ mod tests {
     fn the_build_stamp_rides_along_without_confusing_the_comparison() {
         let v = full();
         assert!(v.starts_with(current()), "{v} does not start with its version");
-        assert!(v.contains("-commit-"), "{v} carries no build stamp");
+        assert!(v.contains('+'), "{v} carries no build stamp");
         // And a build carrying a stamp is not newer than the same version.
         assert!(!is_newer(&v, current()));
         assert!(!is_newer(current(), &v));

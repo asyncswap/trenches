@@ -1411,9 +1411,9 @@ pub fn tape_view(swaps: &[SolSwap], scroll: usize, h: usize, sol_usd: f64) -> Ta
     let swaps = &swaps[start.min(total)..end];
     let mut t = TableView::new(
         if total > h {
-            format!(" Trades {}–{} of {} ↑/↓ scroll ⭐ = you [t] ", start + 1, end, total)
+            format!(" Trades {}–{} of {} ↑/↓ scroll ⭐ = you ", start + 1, end, total)
         } else {
-            format!(" Trades ({total}) ⭐ = you [t] ")
+            format!(" Trades ({total}) ⭐ = you ")
         },
         vec![
             Col::fixed("", 2),
