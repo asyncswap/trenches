@@ -821,13 +821,14 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
         let tone = if c.up() { Tone::Good } else { Tone::Bad };
         let color = tone_color(tone);
         let (mut b_top, mut b_bot) = (py(c.o.max(c.c)), py(c.o.min(c.c)));
-        // A body is never thinner than one full CELL. Sub-pixel bodies drew
-        // as detached one-pixel dashes — "floating blobs", not candles.
-        if b_bot - b_top < 1 {
-            let cell = (b_top / 2) * 2;
-            b_top = cell;
-            b_bot = cell + 1;
-        }
+        // Bodies snap OUTWARD to whole cells: a body edge landing mid-cell
+        // gave the side columns a half block while the wick interrupted the
+        // centre — which read as a notch bitten out of the candle. Solid,
+        // flat tops and bottoms always; the wick keeps half-cell precision.
+        // (This also guarantees the one-full-cell minimum that kept sub-pixel
+        // bodies from drawing as detached dashes.)
+        b_top = (b_top / 2) * 2;
+        b_bot = (b_bot / 2) * 2 + 1;
         // A wick that EXISTS gets at least one pixel, even when it rounds
         // into the body: a high is a fact, and "missing low/high" on candles
         // that had them read as a bug (it was). Sub-pixel truth becomes a
