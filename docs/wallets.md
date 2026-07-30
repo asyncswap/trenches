@@ -5,7 +5,7 @@ How to set up an account to trade from.
 An account here is an **encrypted keystore file** — your private key, encrypted
 with a password you type each time you unlock it. That is the only kind of
 account the bot has. There is no way to configure a plain private key or a seed
-phrase, and nothing written into a config file will be treated as one.
+phrase.
 
 ## Make one in the app
 
