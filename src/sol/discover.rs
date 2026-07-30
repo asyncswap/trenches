@@ -1590,7 +1590,11 @@ async fn watch_tape_once(
                     // Not queryable yet — usually a step behind `confirmed`.
                     let n = tries.entry(sig.clone()).or_insert(0);
                     *n += 1;
-                    if *n < 5 {
+                    // Flushes run every ~300ms; five tries gave a slow
+                    // confirmation barely a second and a half before the
+                    // fill was dropped on the floor. Twenty is ~six seconds
+                    // of patience, and the safety-net poll still backstops.
+                    if *n < 20 {
                         pending.push(sig);
                     }
                 }

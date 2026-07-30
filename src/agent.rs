@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Ask the machine about the market it is watching.
+#![cfg_attr(not(feature = "agent"), allow(dead_code))]
 //!
 //! v1 is deliberately thin: spawn the user's own `claude` CLI headless, with
 //! the app's live state written into the prompt. Their auth, their models,

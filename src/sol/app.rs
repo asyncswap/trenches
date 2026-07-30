@@ -438,16 +438,16 @@ async fn poller(
     target: Arc<Mutex<Option<PollTarget>>>,
     out: Arc<Mutex<Snapshot>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    rows_tx: tokio::sync::mpsc::UnboundedSender<(Pubkey, String, Vec<discover::SolSwap>)>,
+    mut rows_rx: tokio::sync::mpsc::UnboundedReceiver<(Pubkey, String, Vec<discover::SolSwap>)>,
 ) {
     let http = reqwest::Client::new();
     let mut sol_usd = 0.0f64;
     let mut tape_cache = TapeCache::default();
-    // The live tape: one subscription per selected coin, rows arriving over
-    // this channel the moment they land on chain. While the socket is alive,
-    // the polling read below drops to a slow safety net — the subscription
-    // is the tape, the poll just catches what a reconnect gap missed.
-    let (rows_tx, mut rows_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(Pubkey, String, Vec<discover::SolSwap>)>();
+    // The live tape rides the channel handed in by the session: the WS
+    // subscription writes to it, and so does the confirmation path — your
+    // own fill is injected the moment a trade confirms, from its own
+    // signature, whether or not the socket heard it.
     let ws_alive = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut ws_task: Option<(Pubkey, Arc<std::sync::atomic::AtomicBool>, tokio::task::JoinHandle<()>)> = None;
     let mut tick: u64 = 0;
@@ -786,6 +786,9 @@ pub struct SolBot {
     pub warn_score: u32,
     http: reqwest::Client,
     pub status: String,
+    /// Where confirmation-time fills are injected into the tape. Set once
+    /// the session's channel exists.
+    pub fills_tx: Option<tokio::sync::mpsc::UnboundedSender<(Pubkey, String, Vec<discover::SolSwap>)>>,
 }
 
 impl SolBot {
@@ -938,6 +941,7 @@ impl SolBot {
             warn_score: rc.warn_score,
             http: reqwest::Client::new(),
             status: "Press f to find a coin".into(),
+            fills_tx: None,
         }
     }
 
@@ -951,9 +955,33 @@ impl SolBot {
     }
 
     /// Slippage-aware value of selling everything now, minus what it cost.
+    /// The holdings number worth trusting RIGHT NOW. The poll is authoritative
+    /// at rest, but for ~a dozen seconds after one of our own fills it lags —
+    /// a fresh buy reads as zero, a fresh exit reads as still held. When the
+    /// tape heard one of our fills in the last 12s, the tape's net is the
+    /// fresher witness, in both directions.
+    pub fn effective_tokens(&self) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh_own_fill = self
+            .tape
+            .iter()
+            .filter(|r| r.mine)
+            .filter_map(|r| r.block_time)
+            .any(|bt| now - bt < 12);
+        if fresh_own_fill {
+            self.tape_net_tokens()
+        } else {
+            self.token_bal
+        }
+    }
+
     pub fn live_edge(&self) -> f64 {
+        let held = self.effective_tokens();
         match &self.coin {
-            Some(c) if self.token_bal > 0.0 => c.sol_out(self.token_bal) - self.bought_cost,
+            Some(c) if held > 0.0 => c.sol_out(held) - self.bought_cost,
             _ => 0.0,
         }
     }
@@ -1263,6 +1291,46 @@ impl SolBot {
             if let Some(o) = self.orders.get_mut(i) {
                 o.state = if ok { OrderState::Confirmed } else { OrderState::Failed };
             }
+            // Your own fill must never depend on the socket having heard it:
+            // the signature is RIGHT HERE. Fetch that one transaction and
+            // inject its rows into the tape — same decoders, same channel,
+            // deduped by the seen-set like everything else. This is what
+            // makes "buy, then sell immediately" reliable.
+            if ok {
+                if let (Some(coin), Some(fills)) = (&self.coin, &self.fills_tx) {
+                    let tgt = poll_target(coin, &self.signer.pubkey(), None);
+                    let rpc = self.rpc.clone();
+                    let fills = fills.clone();
+                    let sig2 = sig.clone();
+                    let trader = self.signer.pubkey();
+                    tokio::spawn(async move {
+                        for wait_ms in [0u64, 300, 600, 1000, 1600] {
+                            if wait_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                            }
+                            let Ok(tx) = rpc.transaction(&sig2).await else { continue };
+                            if tx.is_null() {
+                                continue;
+                            }
+                            let rows = if tgt.amm_vaults.is_some() {
+                                discover::amm_swaps_in_tx(
+                                    &tx,
+                                    &sig2,
+                                    &tgt.bonding_curve,
+                                    &trader,
+                                    tgt.token_decimals,
+                                    tgt.sol_is_base,
+                                    tgt.total_supply,
+                                )
+                            } else {
+                                discover::curve_swaps_in_tx(&tx, &sig2, &tgt.mint, &trader)
+                            };
+                            let _ = fills.send((tgt.mint, sig2, rows));
+                            return;
+                        }
+                    });
+                }
+            }
             // The WHOLE signature. A truncated one cannot be pasted into an
             // explorer, matched against a fill, or quoted in a bug report —
             // which is the entire reason it is written down.
@@ -1401,7 +1469,14 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
 
     // "Which account am I?" belongs with the balances, not in the header.
     p.spans(vec![lbl("Account"), Cell::bold(bot.trader().to_string(), Tone::Normal)]);
-    p.spans(vec![lbl("SOL"), Cell::new(format!("{:.6}", bot.sol))]);
+    p.spans(vec![
+        lbl("SOL"),
+        Cell::new(if bot.sol_usd > 0.0 && bot.sol > 0.0 {
+            format!("{:.6}  (~${:.2})", bot.sol, bot.sol * bot.sol_usd)
+        } else {
+            format!("{:.6}", bot.sol)
+        }),
+    ]);
     p.spans(vec![lbl("Token"), Cell::new(format!("{:.4}", bot.token_bal))]);
     // Name the unit: "SOL/tok" is ambiguous once several coins are in play.
     let unit = bot.meta.as_ref().map(|m| m.symbol.as_str()).unwrap_or("tok");
@@ -1463,10 +1538,7 @@ fn market_panel(bot: &SolBot) -> PanelView {
                 ),
             ]);
             if let Some(m) = &bot.meta {
-                p.spans(vec![
-                    lbl("Token"),
-                    Cell::bold(format!("{} ({})", m.name, m.symbol), Tone::Accent),
-                ]);
+                p.spans(vec![lbl("Token"), Cell::new(format!("{} ({})", m.name, m.symbol))]);
             }
             p.spans(vec![lbl("Mint"), Cell::new(c.mint.to_string())]);
             // The pool is what you actually trade against, and it's the address
@@ -1549,6 +1621,15 @@ fn market_panel(bot: &SolBot) -> PanelView {
             // in itself: the pool carries no creator-fee recipient, which is
             // how a third-party-created pool differs from a pump migration.
             p.spans(vec![lbl("Creator"), Cell::new(c.creator().to_string())]);
+            // Socials, from the launch metadata. An empty set is a signal in
+            // itself — a coin nobody bothered to give a twitter is telling
+            // you something at second 49.
+            if let Some(m) = &bot.meta {
+                p.spans(vec![lbl("Socials"), Cell::new(format!("{}/3 filled", m.socials.len()))]);
+                for (label, url) in m.socials.iter().take(3) {
+                    p.spans(vec![lbl(label), Cell::new(url.clone())]);
+                }
+            }
 
         }
     }
@@ -2219,6 +2300,9 @@ pub async fn run(
         spawn_resolve(mint, None, None);
     }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (rows_tx, rows_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Pubkey, String, Vec<discover::SolSwap>)>();
+    bot.fills_tx = Some(rows_tx.clone());
     let poll_handle = tokio::spawn(poller(
         bot.rpc.clone(),
         bot.trader(),
@@ -2226,6 +2310,8 @@ pub async fn run(
         target.clone(),
         snap.clone(),
         stop.clone(),
+        rows_tx,
+        rows_rx,
     ));
 
     let mut msel = ui::mouse::Selection::default();
@@ -2584,7 +2670,7 @@ pub async fn run(
                         // the wallet's actual units at send time. This is the
                         // race that kept "There is nothing to sell" on screen
                         // for ten seconds after a confirmed entry.
-                        let held = bot.token_bal.max(bot.tape_net_tokens());
+                        let held = bot.effective_tokens().max(bot.tape_net_tokens());
                         let (tokens, slip, cu) =
                             (held * frac, bot.slippage_pct, bot.cu_price_micro);
                         // One liquidation in flight at a time: a second x while
@@ -2601,6 +2687,20 @@ pub async fn run(
                         } else if tokens <= 0.0 {
                             bot.note("There is nothing to sell");
                         } else {
+                            // Quote the exit from reserves read NOW, not from
+                            // the last poll: on a dumping curve a stale quote
+                            // sets a slippage floor the pool can no longer
+                            // pay, and the simulation rejects every retry
+                            // with the same custom program error. The buy
+                            // path has refreshed before quoting for ages —
+                            // the sell deserved the same.
+                            if let Some(c) = bot.coin.as_mut() {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_millis(900),
+                                    engine::refresh_venue(&bot.rpc, c),
+                                )
+                                .await;
+                            }
                             let est = bot.coin.as_ref().map(|c| c.sol_out(tokens)).unwrap_or(0.0);
                             bot.note(if all {
                                 format!("sending SELL ALL (~{est:.6} SOL)…")

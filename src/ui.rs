@@ -636,33 +636,6 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
     }
 }
 
-/// Masked password entry. Returns the typed string, or None if cancelled.
-/// A password that wipes itself when it goes out of scope.
-///
-/// A `String` freed normally leaves its bytes in the heap until something else
-/// happens to reuse them — readable from a core dump, a swap file, or a
-/// debugger attached to the process. The window is small and the risk is not
-/// theoretical: this is the one secret the user types by hand, and the file it
-/// unlocks is designed to be safe to copy precisely BECAUSE the password is not
-/// stored anywhere. Leaving it in freed memory undoes that.
-///
-/// Deref means callers use it exactly like a `&str`.
-pub struct Secret(String);
-
-impl std::ops::Deref for Secret {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.0.zeroize();
-    }
-}
-
 pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
     // This screen owns the terminal now: take down any image the previous one
     // left, which also marks every placement stale so it redraws on return.
@@ -809,6 +782,12 @@ pub fn chat_screen(
 ) -> eyre::Result<()> {
     use crate::agent::StreamEvent;
     use crossterm::event::{self, Event, KeyCode};
+
+    // This screen owns the terminal now: take down any image the dashboard
+    // left (the coin logo is a graphics PLACEMENT, not cells — it floats over
+    // whatever is drawn under it until explicitly cleared). Clearing also
+    // marks placements stale, so the dashboard redraws its logo on return.
+    image::clear();
 
     fn wrap_into<'a>(
         lines: &mut Vec<ratatui::text::Line<'a>>,

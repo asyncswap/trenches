@@ -313,6 +313,7 @@ where
 
 /// Whether releases are signature-checked, for the places that tell someone
 /// what they are trusting.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn signing_status() -> &'static str {
     if MINISIGN_PUBKEY.is_empty() {
         "checksum only — releases are not signed yet"

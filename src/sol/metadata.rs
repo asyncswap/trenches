@@ -37,6 +37,11 @@ pub fn metadata_pda(mint: &Pubkey) -> Pubkey {
 pub struct TokenMeta {
     pub name: String,
     pub symbol: String,
+    /// The metadata URI from the on-chain account — where the off-chain JSON
+    /// (image, description, socials) lives. pump.fun writes it at launch.
+    pub uri: Option<String>,
+    /// `("X" | "TG" | "Web", url)` — read from the URI's JSON, best-effort.
+    pub socials: Vec<(&'static str, String)>,
 }
 
 /// Read a borsh string (u32 LE length + bytes) at `off`, returning it and the
@@ -67,10 +72,14 @@ pub fn decode(data: &[u8]) -> Option<TokenMeta> {
     }
     const DATA_START: usize = 1 + 32 + 32;
     let (name, off) = borsh_string(data, DATA_START)?;
-    let (symbol, _) = borsh_string(data, off)?;
+    let (symbol, off) = borsh_string(data, off)?;
+    // The uri is best-effort: a coin without one is still a coin.
+    let uri = borsh_string(data, off).map(|(u, _)| u.trim().to_string()).filter(|u| !u.is_empty());
     Some(TokenMeta {
         name: super::discover::clean_text(&name, 32),
         symbol: super::discover::clean_text(&symbol, 12),
+        uri,
+        socials: Vec::new(),
     })
 }
 
@@ -102,10 +111,14 @@ pub fn decode_token2022(data: &[u8]) -> Option<TokenMeta> {
             let val = &data[start..end];
             // Skip update_authority + mint.
             let (name, o) = borsh_string(val, 64)?;
-            let (symbol, _) = borsh_string(val, o)?;
+            let (symbol, o) = borsh_string(val, o)?;
+            let uri =
+                borsh_string(val, o).map(|(u, _)| u.trim().to_string()).filter(|u| !u.is_empty());
             return Some(TokenMeta {
                 name: super::discover::clean_text(&name, 32),
                 symbol: super::discover::clean_text(&symbol, 12),
+                uri,
+                socials: Vec::new(),
             });
         }
         off = end;
@@ -119,13 +132,58 @@ pub fn decode_token2022(data: &[u8]) -> Option<TokenMeta> {
 /// then the legacy Metaplex account. `None` when neither exists — never an
 /// error the caller has to handle, since a nameless coin is still tradeable.
 pub async fn token_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
+    let mut meta = None;
     if let Ok(Some((data, _))) = rpc.account(mint).await {
-        if let Some(m) = decode_token2022(&data) {
-            return Some(m);
-        }
+        meta = decode_token2022(&data);
     }
-    let (data, _owner) = rpc.account(&metadata_pda(mint)).await.ok()??;
-    decode(&data)
+    if meta.is_none() {
+        let (data, _owner) = rpc.account(&metadata_pda(mint)).await.ok()??;
+        meta = decode(&data);
+    }
+    let mut meta = meta?;
+    meta.socials = fetch_socials(meta.uri.as_deref()).await;
+    Some(meta)
+}
+
+/// The socials, from the URI's off-chain JSON. The POINTER is on chain; the
+/// contents are one HTTP fetch away — pump.fun writes twitter/telegram/website
+/// keys when the creator fills them in. Best-effort with a short timeout:
+/// a coin whose metadata host is down is still a coin.
+async fn fetch_socials(uri: Option<&str>) -> Vec<(&'static str, String)> {
+    let Some(uri) = uri else { return Vec::new() };
+    // ipfs:// travels over a public gateway; anything else must be http(s).
+    let url = if let Some(cid) = uri.strip_prefix("ipfs://") {
+        format!("https://ipfs.io/ipfs/{cid}")
+    } else if uri.starts_with("http://") || uri.starts_with("https://") {
+        uri.to_string()
+    } else {
+        return Vec::new();
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(3_000))
+        .build()
+    else {
+        return Vec::new();
+    };
+    let Ok(resp) = client.get(&url).send().await else { return Vec::new() };
+    let Ok(v) = resp.json::<serde_json::Value>().await else { return Vec::new() };
+    let mut out = Vec::new();
+    let grab = |v: &serde_json::Value, key: &str| -> Option<String> {
+        let s = v.get(key)?.as_str()?.trim();
+        (!s.is_empty()).then(|| super::discover::clean_text(s, 72))
+    };
+    // Top level first, then the Metaplex `extensions` nest some tools write.
+    let ext = v.get("extensions").cloned().unwrap_or(serde_json::Value::Null);
+    if let Some(x) = grab(&v, "twitter").or_else(|| grab(&ext, "twitter")) {
+        out.push(("X", x));
+    }
+    if let Some(t) = grab(&v, "telegram").or_else(|| grab(&ext, "telegram")) {
+        out.push(("TG", t));
+    }
+    if let Some(w) = grab(&v, "website").or_else(|| grab(&ext, "website")) {
+        out.push(("Web", w));
+    }
+    out
 }
 
 #[cfg(test)]
