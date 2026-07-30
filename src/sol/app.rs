@@ -1128,7 +1128,7 @@ fn market_panel(bot: &SolBot) -> PanelView {
                 lbl("Venue"),
                 Cell::bold(
                     if c.on_amm() { "PumpSwap AMM (graduated)" } else { "bonding curve" },
-                    if c.on_amm() { Tone::Info } else { Tone::Accent },
+                    Tone::Normal,
                 ),
             ]);
             if let Some(m) = &bot.meta {

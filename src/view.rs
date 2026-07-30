@@ -282,8 +282,12 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize, no
         out.push(k);
     }
     if let (Some(now), Some(last)) = (now, out.last().copied()) {
+        // At most HALF the window of live flat — enough that quiet reads as
+        // quiet, never so much that it drains the real candles out of the
+        // window. A coin reopened a day after its last trade used to show
+        // 240 flats and none of the saved history the tape had just loaded.
         let nb = now - now.rem_euclid(iv);
-        let gaps = ((nb - last.t) / iv).clamp(0, max as i64);
+        let gaps = ((nb - last.t) / iv).clamp(0, (max / 2) as i64);
         for k in 1..=gaps {
             out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t: last.t + k * iv });
         }
@@ -324,6 +328,16 @@ mod candle_tests {
         assert_eq!(c.last().unwrap().t, 150);
         // And without a clock, nothing is invented.
         assert_eq!(candles_of(&pts, 10, 100, None).len(), 1);
+    }
+
+    #[test]
+    fn old_history_survives_the_live_flat_extension() {
+        // Ten real 1s candles from yesterday, reopened hours later: the flat
+        // line to "now" must not flood the window and push them all out.
+        let pts: Vec<(i64, f64, f64)> = (0..10).map(|i| (1000 + i, 2.0, 1.0)).collect();
+        let c = candles_of(&pts, 1, 240, Some(90_000));
+        assert_eq!(c.iter().filter(|k| k.v > 0.0).count(), 10, "history drained");
+        assert!(c.len() <= 240);
     }
 
     #[test]
@@ -372,7 +386,7 @@ mod candle_tests {
 /// The candle-interval ladder, seconds. Bounded by what the live tape can
 /// hold — longer candles (4h, 1d) want persisted trade history, which is the
 /// next step, not this one.
-pub const IV_STEPS: [u64; 9] = [1, 5, 15, 60, 300, 900, 3600, 14400, 86400];
+pub const IV_STEPS: [u64; 10] = [1, 5, 15, 60, 300, 600, 900, 3600, 14400, 86400];
 
 pub fn iv_step(cur: u64, up: bool) -> u64 {
     let i = IV_STEPS.iter().position(|s| *s == cur).unwrap_or(3);
