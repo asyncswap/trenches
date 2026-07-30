@@ -20,11 +20,20 @@ The source is AGPL-3.0 and public. Pull requests are welcome. Unsure whether
 something is worth building? Open an issue and ask first — a ten-minute
 conversation beats a thousand-line surprise.
 
-## Trenches Pro — coming
+## Trenches Pro — the hosted endpoint
 
-The app is free and stays free. What costs real money to run — fast RPC
-endpoints, websockets that do not rate-limit you mid-launch, priority-fee
-estimates, deep candle history — is being built as a hosted service: one URL
-you paste into `e` (endpoints) and this terminal gets faster. If you would
-pay for that, say so on the issues page; the first people to ask will shape
-what it becomes.
+The app is free and stays free. What costs real money to run is what's sold:
+**Trenches Pro**, one key that unlocks pooled RPC built for this terminal.
+
+- **Two providers at once.** Every request has Helius *and* Alchemy behind
+  it, with fastest-first failover — one provider's bad hour is invisible,
+  and nobody rate-limits you mid-launch.
+- **Both chains, websockets included.** Solana RPC + the pump.fun
+  subscription feed + Robinhood Chain, behind one URL you paste into `e`.
+- **Free tier**: 10 requests/second, self-served at
+  [rpc.trenches.sh](https://rpc.trenches.sh) — enough to run the terminal.
+- **Pro**: $79/month, 10M requests included, then $5 per million. Uncapped
+  rate, and every subscription upgrades the pool for everyone on it.
+
+The terminal is the fastest UI in the trenches, and it rides free — Pro is
+how it stays that way. Sign in at [rpc.trenches.sh](https://rpc.trenches.sh).
