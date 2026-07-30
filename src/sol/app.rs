@@ -1661,7 +1661,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
             // "SELL ALL" is 8 characters; 7 truncated it to "SELL AL".
             Col::fixed("action", 9),
             Col::fixed("amount SOL", 13),
-            Col::fixed("entry mc", 11),
+            Col::fixed("entry mc $", 11),
             Col::fixed("pooled", 10),
             // Full signature, last so it takes every remaining column: a
             // truncated hash cannot be pasted into an explorer, which is the
@@ -1682,7 +1682,18 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
             Cell::bold(st, tone),
             Cell::bold(o.action, atone),
             Cell::new(format!("{:.6}", o.sol)),
-            Cell::new(if o.mc > 0.0 { format!("{:.2}", o.mc) } else { String::new() }),
+            // Dollars, matching the tape's mkt cap column — the same number
+            // in two currencies with no label read as a bug. SOL only when
+            // no rate is known, and say so with the unit.
+            Cell::new(if o.mc > 0.0 {
+                if bot.sol_usd > 0.0 {
+                    crate::view::usd_compact(o.mc * bot.sol_usd)
+                } else {
+                    format!("{:.2} SOL", o.mc)
+                }
+            } else {
+                String::new()
+            }),
             Cell::new(if o.pooled > 0.0 { format!("{:.3}", o.pooled) } else { String::new() }),
             Cell::toned(o.sig.clone().unwrap_or_default(), Tone::Normal),
         ]);
