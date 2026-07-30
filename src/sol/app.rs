@@ -2209,6 +2209,9 @@ pub async fn run(
 
     let mut msel = ui::mouse::Selection::default();
     let mut copy_armed = false;
+    // The copilot's thread: survives panel flips and coin changes, dies with
+    // the dashboard — a conversation about this sitting, not a diary.
+    let mut chat = crate::agent::Chat::default();
     loop {
         let mut logo_box = None;
         let mut grabbed: Option<String> = None;
@@ -2325,13 +2328,35 @@ pub async fn run(
                     // `claude` binary, fed the live state as context. It can
                     // read everything and trade nothing.
                     KeyCode::Char('A') => {
-                        if let Some(q) =
-                            ui::input(term, "Ask the copilot", "e.g. what does this tape say?")?
-                        {
-                            if !q.trim().is_empty() {
-                                let rx = crate::agent::spawn_ask(bot.agent_context(), q.clone());
-                                if let Some(ans) = ui::wait_for_answer(term, &q, &rx)? {
-                                    ui::text_view(term, " Copilot ", &ans)?;
+                        // The conversation persists for the whole dashboard
+                        // session: every question resumes the same claude
+                        // thread, and every turn carries a fresh look at the
+                        // market. i inside the view asks the next one.
+                        loop {
+                            let next = if chat.transcript.is_empty() {
+                                ui::input(term, "Ask the copilot", "e.g. what does this tape say?")?
+                            } else if ui::chat_view(term, &chat.transcript)? {
+                                ui::input(term, "Ask the copilot", "follow-up — esc closes")?
+                            } else {
+                                None
+                            };
+                            let Some(q) = next.filter(|q| !q.trim().is_empty()) else { break };
+                            chat.transcript.push((true, q.clone()));
+                            let rx = crate::agent::spawn_chat_ask(
+                                chat.session_id.clone(),
+                                bot.agent_context(),
+                                q,
+                            );
+                            match ui::wait_for_answer(term, "the copilot is reading the room", &rx)? {
+                                Some((ans, sid)) => {
+                                    if sid.is_some() {
+                                        chat.session_id = sid;
+                                    }
+                                    chat.transcript.push((false, ans));
+                                }
+                                None => {
+                                    chat.transcript.pop();
+                                    break;
                                 }
                             }
                         }

@@ -720,11 +720,11 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 /// A modal wait on the copilot: spinner, the question, Esc to cancel. The
 /// render loop is never blocked by a language model — this loop polls the
 /// answer channel and the keyboard at 50ms.
-pub fn wait_for_answer(
+pub fn wait_for_answer<T: Send + 'static>(
     term: &mut Term,
     question: &str,
-    rx: &std::sync::mpsc::Receiver<String>,
-) -> eyre::Result<Option<String>> {
+    rx: &std::sync::mpsc::Receiver<T>,
+) -> eyre::Result<Option<T>> {
     use crossterm::event::{self, Event, KeyCode};
     let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut i = 0usize;
@@ -788,6 +788,84 @@ pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
                     KeyCode::Char('j') => scroll = scroll.saturating_add(1),
                     KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
                     _ => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+
+/// The copilot conversation, at reading length: you ▸ and claude ▸ turns,
+/// scrollable, with `i` (or `a`) asking the next question — nvim manners.
+/// Returns true when the caller should open the input for a follow-up.
+pub fn chat_view(term: &mut Term, transcript: &[(bool, String)]) -> eyre::Result<bool> {
+    use crossterm::event::{self, Event, KeyCode};
+    let mut scroll: Option<u16> = None; // None = pin to the bottom on first draw
+    loop {
+        let mut total: u16 = 0;
+        let mut cur = scroll;
+        term.draw(|f| {
+            let area = f.area();
+            let width = area.width.saturating_sub(2).max(10) as usize;
+            let mut lines: Vec<ratatui::text::Line> = Vec::new();
+            for (who, text) in transcript {
+                let head = if *who { "you ▸ " } else { "claude ▸ " };
+                let style = if *who {
+                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD)
+                } else {
+                    ratatui::style::Style::default()
+                };
+                let mut first = true;
+                for para in text.split('\n') {
+                    let mut line = String::new();
+                    for word in para.split_whitespace() {
+                        let lead = if first && line.is_empty() { head.len() } else { 2 };
+                        if !line.is_empty() && lead + line.len() + 1 + word.len() > width {
+                            let prefix = if first { head.to_string() } else { "  ".to_string() };
+                            lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
+                            first = false;
+                            line.clear();
+                        }
+                        if !line.is_empty() {
+                            line.push(' ');
+                        }
+                        line.push_str(word);
+                    }
+                    let prefix = if first { head.to_string() } else { "  ".to_string() };
+                    lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
+                    first = false;
+                }
+                lines.push(ratatui::text::Line::from(""));
+            }
+            lines.push(ratatui::text::Line::styled(
+                "i ask a follow-up · j/k scroll · esc back to trading",
+                ratatui::style::Style::default().fg(widgets::tone_color(crate::view::Tone::Dim)),
+            ));
+            total = lines.len() as u16;
+            let view_h = area.height.saturating_sub(2);
+            let max_scroll = total.saturating_sub(view_h);
+            let s = cur.unwrap_or(max_scroll).min(max_scroll);
+            cur = Some(s);
+            let para = ratatui::widgets::Paragraph::new(lines)
+                .scroll((s, 0))
+                .block(widgets::themed_block(" Copilot "));
+            f.render_widget(ratatui::widgets::Clear, area);
+            f.render_widget(para, area);
+        })?;
+        scroll = cur;
+        if event::poll(std::time::Duration::from_millis(120))? {
+            if let Event::Key(k) = event::read()? {
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        scroll = Some(scroll.unwrap_or(0).saturating_sub(1))
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        scroll = Some(scroll.unwrap_or(0).saturating_add(1))
+                    }
+                    KeyCode::PageUp => scroll = Some(scroll.unwrap_or(0).saturating_sub(10)),
+                    KeyCode::PageDown => scroll = Some(scroll.unwrap_or(0).saturating_add(10)),
+                    KeyCode::Char('i') | KeyCode::Char('a') => return Ok(true),
+                    _ => return Ok(false),
                 }
             }
         }
