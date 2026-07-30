@@ -211,10 +211,10 @@ pub struct CandleView {
     /// When set, the panel menu ([t] Trades · [v] Candles · …) rides the top
     /// border with this key highlighted — every view names its siblings.
     pub active_key: Option<char>,
-    /// OUR trades — (unix seconds, is_buy) — drawn as vertical marker lines
-    /// through the candle they landed in, so entries and exits sit on the
-    /// chart the way they sit in memory.
-    pub trades: Vec<(i64, bool)>,
+    /// OUR trades — (unix seconds, price, is_buy) — drawn as horizontal
+    /// lines at each fill's PRICE, the way TradingView draws a position:
+    /// where you got in and out, readable against where price is now.
+    pub trades: Vec<(i64, f64, bool)>,
 }
 
 /// Aggregate raw trades into time-bucketed candles, oldest-first.

@@ -797,22 +797,22 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
 
     let buf = f.buffer_mut();
 
-    // Our entries and exits, as vertical lines through the candle each trade
-    // landed in — drawn FIRST so the candles themselves stay on top and the
-    // line reads as behind the tape, the way TradingView draws positions.
-    let iv = cv.interval_secs.max(1) as i64;
-    for &(ts, _buy) in &cv.trades {
-        let bucket = ts - ts.rem_euclid(iv);
-        let Some(i) = shown.iter().position(|c| c.t == bucket) else { continue };
-        // Centre column of the candle's box.
-        let x = inner.x + (i * PITCH) as u16 + (BODY_W / 2) as u16;
-        if x >= inner.x + chart_w as u16 {
+    // Our entries and exits, as horizontal lines at each fill's PRICE — the
+    // way TradingView draws a position. Drawn FIRST so candles and the
+    // last-close rule paint over them: the line reads as behind the tape.
+    // Only fills inside the visible price range draw; a line for a price
+    // the chart can't show would pin to the edge and lie.
+    for &(_, price, _) in &cv.trades {
+        if !(price > lo && price < hi) {
             continue;
         }
-        for row in 0..rows {
-            let cell = &mut buf[Position { x, y: inner.y + row }];
-            cell.set_symbol("┊");
-            cell.set_fg(tone_color(Tone::Info));
+        let y = ((py(price) / 2).clamp(0, rows as i32 - 1)) as u16 + inner.y;
+        for x in inner.x..inner.x + chart_w as u16 {
+            let cell = &mut buf[Position { x, y }];
+            if cell.symbol() == " " {
+                cell.set_symbol("┄");
+                cell.set_fg(tone_color(Tone::Info));
+            }
         }
     }
 

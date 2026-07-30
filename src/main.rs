@@ -3439,11 +3439,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let candles = view::candles_of(&points, bot.chart_iv, 240, Some((block / 10) as i64));
             // Our own fills: any tape row whose tx is in the persisted
             // own-transaction set, on the same block/10 clock as the points.
-            let trades: Vec<(i64, bool)> = tape
+            let trades: Vec<(i64, f64, bool)> = tape
                 .iter()
-                .filter(|s| bot.own_txs.contains(&s.tx))
+                .filter(|s| bot.own_txs.contains(&s.tx) && s.price > 0.0)
                 .filter(|s| matches!(s.action, engine::TapeAction::Buy | engine::TapeAction::Sell))
-                .map(|s| ((s.block / 10) as i64, matches!(s.action, engine::TapeAction::Buy)))
+                .map(|s| ((s.block / 10) as i64, 1.0 / s.price, matches!(s.action, engine::TapeAction::Buy)))
                 .collect();
             let cv = view::CandleView {
                 title: format!(

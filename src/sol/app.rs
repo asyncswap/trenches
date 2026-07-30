@@ -506,11 +506,13 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
         .unwrap_or_default();
     // Our own fills, straight off the tape's `mine` marks — the chart shows
     // where you got in and out, not just what the market did around you.
-    let trades: Vec<(i64, bool)> = bot
+    let trades: Vec<(i64, f64, bool)> = bot
         .tape
         .iter()
-        .filter(|s| s.mine && !s.kind.is_lp())
-        .filter_map(|s| s.block_time.map(|t| (t, matches!(s.kind, discover::SwapKind::Buy))))
+        .filter(|s| s.mine && !s.kind.is_lp() && s.tokens > 0.0)
+        .filter_map(|s| {
+            s.block_time.map(|t| (t, s.sol / s.tokens, matches!(s.kind, discover::SwapKind::Buy)))
+        })
         .collect();
     crate::view::CandleView {
         title: format!(" {}/SOL {} candle [,] [.] ", sym, crate::view::iv_label(bot.chart_iv)),
