@@ -2383,7 +2383,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             }
                         }
                         // View cycling: 'l' or → next, ← previous. Reset scroll.
-                        KeyCode::Char('l') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
+                        // Direct panel keys — a panel is a destination, not a
+                        // stop on a carousel: t trades, o orders, l logs,
+                        // v chart. The arrows still cycle for the habit.
+                        KeyCode::Char('t') => { view = Panel::Tape; orders_scroll = 0; }
+                        KeyCode::Char('o') => { view = Panel::Orders; orders_scroll = 0; }
+                        KeyCode::Char('l') => { view = Panel::Logs; orders_scroll = 0; }
+                        KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
                         KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
                         // Straight to the chart; , . walk the candle interval.
                         KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
@@ -2702,9 +2708,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.status = "The cluster view supports Uniswap V3 pools only for now".into();
                             }
                         }
-                        KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('t') => {
+                        KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('k') => {
                             // 'f' = live Pons v3 trenches; Shift-'F' = static Verified pools;
-                            // 't' = top tokens (leaderboard + big-fish, established tokens).
+                            // 'k' = top tokens (leaderboard + big-fish; parked here while
+                            // 't' belongs to the Trades panel — pending a rethink).
                             // Pause the dashboard poll while a modal owns the
                             // screen — its numbers are invisible, and discovery
                             // needs the requests more.
@@ -2712,7 +2719,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let grad = if k.code == KeyCode::Char('F') {
                                 bot.status = "Loading verified tokens".into();
                                 discover::screen_verified(terminal, verified.clone()).await?
-                            } else if k.code == KeyCode::Char('t') {
+                            } else if k.code == KeyCode::Char('k') {
                                 bot.status = "loading top tokens…".into();
                                 discover::screen_top_tokens(terminal, provider, discovery_rpc.clone()).await?
                             } else {
@@ -3581,7 +3588,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 tape.iter().filter(|s| bot.arb_mode || s.is_v4 == pool_is_v4).collect();
             let scroll = orders_scroll.min(shown.len().saturating_sub(1));
             let mut t = view::TableView::new(
-                format!(" Trades ({}) ⭐ = you [l] ", shown.len()),
+                format!(" Trades ({}) ⭐ = you [t] ", shown.len()),
                 vec![
                     view::Col::fixed("", 2),
                     // Age leads, as on the Solana tape: a tape is read
@@ -3680,9 +3687,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // Built as a chain-agnostic TableView and drawn by the shared widget —
         // same code path as the Solana orders panel.
         let title = if total > h {
-            format!(" Orders {}–{} of {} ↑/↓ scroll [l] ", scroll + 1, (scroll + h).min(total), total)
+            format!(" Orders {}–{} of {} ↑/↓ scroll [o] ", scroll + 1, (scroll + h).min(total), total)
         } else {
-            format!(" Orders ({total}) [l] ")
+            format!(" Orders ({total}) [o] ")
         };
         let mut t = view::TableView::new(
             title,
@@ -3803,7 +3810,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 35] = [
+        let items: [(&str, &str); 36] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
@@ -3814,14 +3821,15 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("DISCOVER", ""),
             ("", "f|find market"),
             ("", "F|verified tokens"),
-            ("", "t|leaderboard"),
+            ("", "k|leaderboard"),
             ("POOL / ARB", ""),
             ("", "p|select pool"),
             ("", "Del|deselect the pool"),
             ("", "d|toggle multi-pool view"),
             ("", "e|auto arbitrage"),
             ("VIEW", ""),
-            ("", "l  → ←|cycle orders · trades · chart · logs"),
+            ("", "t  o  l  v|trades · orders · logs · chart"),
+            ("", "→ ←|cycle panels"),
             ("", "↑ ↓|scroll"),
             ("", "v|candlestick chart"),
             ("", ",  .|candle interval −/+"),

@@ -4,7 +4,7 @@
 //!
 //! Deliberately mirrors the EVM layout field-for-field: same header (account /
 //! slot / round-trip latency / sizing knobs), same Wallet + Market columns, and
-//! the same Orders · Tape · Logs cycle on `l`. Renders entirely through the
+//! the same direct panel keys (t/o/l/v) and arrow cycle. Renders through the
 //! shared `view` models and `ui::widgets`, so both chains stay in step.
 //!
 //! Like the EVM side, **nothing auto-trades**: `b`/`s`/`x` are the only things
@@ -1165,7 +1165,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     let total = bot.orders.len();
     let title = if total > h {
         format!(
-            " Orders {}–{} of {} ↑/↓ scroll  ·  {}  [l] ",
+            " Orders {}–{} of {} ↑/↓ scroll  ·  {}  [o] ",
             scroll + 1,
             (scroll + h).min(total),
             total,
@@ -1174,7 +1174,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     } else {
         // The trader is the same wallet on every row, so it belongs in the
         // title once rather than eating 44 columns per line.
-        format!(" Orders ({total})  [l] ")
+        format!(" Orders ({total})  [o] ")
     };
     let mut t = TableView::new(
         title,
@@ -1248,7 +1248,7 @@ fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
     p
 }
 
-const HELP: [(&str, &str); 22] = [
+const HELP: [(&str, &str); 23] = [
     ("TRADE", ""),
     ("", "b|buy"),
     ("", "s|sell a slice of the balance"),
@@ -1257,7 +1257,8 @@ const HELP: [(&str, &str); 22] = [
     ("", "f|find market (live launches)"),
     ("", "p|add token by contract address"),
     ("VIEW", ""),
-    ("", "l  → ←|cycle orders · trades · logs"),
+    ("", "t  o  l  v|trades · orders · logs · chart"),
+    ("", "→ ←|cycle panels"),
     ("", "↑ ↓|scroll"),
     ("SIZE", ""),
     ("", "[  ]|buy size −/+"),
@@ -1922,7 +1923,21 @@ pub async fn run(
                     KeyCode::Char('L') => {
                         crate::pnl::screen(term)?;
                     }
-                    KeyCode::Char('l') | KeyCode::Right => {
+                    // Direct panel keys, matching the EVM dashboard: a panel
+                    // is a destination, not a stop on a carousel.
+                    KeyCode::Char('t') => {
+                        view = Panel::Tape;
+                        scroll = 0;
+                    }
+                    KeyCode::Char('o') => {
+                        view = Panel::Orders;
+                        scroll = 0;
+                    }
+                    KeyCode::Char('l') => {
+                        view = Panel::Logs;
+                        scroll = 0;
+                    }
+                    KeyCode::Right => {
                         view = match view {
                             Panel::Orders => Panel::Tape,
                             Panel::Tape => Panel::Chart,
