@@ -38,7 +38,7 @@ uncapped — full-size swaps.
 ```
 f        live trenches — Pons + Flaunch launches as they happen
 F        verified pools — the static, curated list          (EVM)
-t        top tokens — leaderboard and big-fish scan         (EVM)
+k        top tokens — leaderboard and big-fish scan         (EVM)
 p        pools — switch pool, add by address, create new    (EVM)
 p        add a token by contract address (CA)                (Solana)
 h        wallet holdings — leftover tokens you still hold   (EVM)
@@ -46,12 +46,13 @@ Del      deselect the current pool — back to the empty state  (EVM)
 ```
 
 `f` is the live feed: coins appearing right now. `F` is the hand-curated list
-that does not change. `t` is for established tokens, not fresh launches.
+that does not change. `k` is for established tokens, not fresh launches.
 
-`Del` deselects whatever pool you are on and puts the screen back to empty: no pool, no tape, no position readout, and
-the order keys do nothing until you pick something. Nothing carries over between
-sessions either — the app always starts empty, so `b` is never one keystroke
-from a coin you opened days ago.
+`Del` deselects whatever pool you are on and puts the screen back to empty: no
+pool, no tape, no position readout, and the order keys do nothing until you
+pick something. Sessions RESTORE where you left off — the last pool (EVM) or
+coin (Solana) reloads on start, tape history included — so `Del` is also how
+you tell the next session to start empty.
 
 ## Liquidity
 
@@ -84,10 +85,15 @@ every trade runs, including losing ones.
 ## View
 
 ```
-l        cycle Trades / Orders / Logs
+t        trades — the live tape
+o        orders — your own actions
+l        logs — the raw session log
+v        candlestick chart
+,  .     candle interval  smaller / larger
+O  → ←   cycle through the panels
 c        buyer scatter for this pool           (EVM)
 L        PnL calendar — a month of trading at a time
-R        force a price refresh                 (EVM)
+R        refresh everything — market, tape, prices, metadata  (EVM)
 T        theme picker
 D        these docs
 e        set RPC and API keys   (while the docs are open)
