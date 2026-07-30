@@ -1,0 +1,20 @@
+name: Feature request
+description: An idea worth building. A ten-minute conversation beats a thousand-line surprise.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the terminal makes hard or impossible?
+      placeholder: When I'm watching two pools at once, I have to…
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: How you imagine it working — keys, screens, behavior. Optional; the problem is the important part.
+    validations:
+      required: false

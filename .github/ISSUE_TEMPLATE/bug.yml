@@ -1,0 +1,79 @@
+name: Bug report
+description: Something broke in the terminal. Bugs are the point of a beta — thank you.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Build
+      description: Bottom-right corner of the dashboard, or `trenches --version`.
+      placeholder: v0.2.2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM)
+        - Windows
+    validations:
+      required: true
+
+  - type: dropdown
+    id: chain
+    attributes:
+      label: Chain
+      description: Where were you when it happened?
+      options:
+        - Solana mainnet
+        - Robinhood Chain
+        - Both / not chain-related
+    validations:
+      required: false
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What you expected, and what happened instead
+      description: The two sentences that matter most. Screenshots welcome — drag them in.
+      placeholder: |
+        Expected: pressing b on the pool screen opens the buy prompt.
+        Happened: the tape froze and the header clock stopped.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      description: Best effort — "it happens every time I…" is plenty. Skip if it was a one-off.
+      placeholder: |
+        1. Open a pump.fun pool with the tape running
+        2. Switch to the chart with c
+        3. Wait ~a minute
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Session log
+      description: >
+        `~/.trenches/` keeps one log per session — paste the tail of the relevant one
+        if it looks related. It renders as plain text here.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scrubbed
+    attributes:
+      label: Before posting
+      options:
+        - label: I checked the log and screenshots for API keys and wallet addresses I'd rather not publish.
+          required: true

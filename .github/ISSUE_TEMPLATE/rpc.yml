@@ -1,0 +1,54 @@
+name: Trenches RPC
+description: The hosted endpoint at rpc.trenches.sh — errors, rate limits, billing, refunds.
+labels: [rpc]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        **Never post your full API key.** The first eight characters
+        (`trk_xxxx`) are enough to find your account — the rest stays secret.
+
+  - type: input
+    id: key
+    attributes:
+      label: Key prefix
+      description: The first 8 characters of your key, from the API Keys table. Never the whole thing.
+      placeholder: trk_7wHn
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is this about?
+      options:
+        - Endpoint errors (HTTP)
+        - Websocket drops or silence
+        - Rate limiting
+        - Billing or subscription
+        - Refund request
+        - Something else
+    validations:
+      required: true
+
+  - type: dropdown
+    id: chain
+    attributes:
+      label: Endpoint
+      options:
+        - /solana
+        - /solana-ws
+        - /robinhood
+        - Not endpoint-specific
+    validations:
+      required: false
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >
+        What you saw, roughly when (UTC helps us line it up with our logs), and what
+        you expected. For refunds: a sentence on why is all we need — a human reads it.
+    validations:
+      required: true

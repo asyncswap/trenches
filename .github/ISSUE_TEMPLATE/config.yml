@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: "@msakiart on X"
+    url: https://x.com/msakiart
+    about: Quick questions, and anything that doesn't fit a form.
+  - name: Trenches RPC console
+    url: https://rpc.trenches.sh
+    about: Keys, usage, billing and subscription management — self-serve.
