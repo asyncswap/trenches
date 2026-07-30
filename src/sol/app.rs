@@ -434,6 +434,7 @@ impl TapeCache {
 async fn poller(
     rpc: Rpc,
     trader: Pubkey,
+    ws_urls: Vec<String>,
     target: Arc<Mutex<Option<PollTarget>>>,
     out: Arc<Mutex<Snapshot>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -441,10 +442,67 @@ async fn poller(
     let http = reqwest::Client::new();
     let mut sol_usd = 0.0f64;
     let mut tape_cache = TapeCache::default();
+    // The live tape: one subscription per selected coin, rows arriving over
+    // this channel the moment they land on chain. While the socket is alive,
+    // the polling read below drops to a slow safety net — the subscription
+    // is the tape, the poll just catches what a reconnect gap missed.
+    let (rows_tx, mut rows_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Pubkey, String, Vec<discover::SolSwap>)>();
+    let ws_alive = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut ws_task: Option<(Pubkey, Arc<std::sync::atomic::AtomicBool>, tokio::task::JoinHandle<()>)> = None;
+    let mut tick: u64 = 0;
+    let unix_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         let t0 = Instant::now();
         let tgt = *target.lock().unwrap();
         tape_cache.retarget(tgt.as_ref().map(|t| t.mint));
+
+        // Retargeting kills the old subscription and starts the new one.
+        let want = tgt.as_ref().map(|t| t.bonding_curve);
+        if ws_task.as_ref().map(|(a, _, _)| *a) != want {
+            if let Some((_, s, h)) = ws_task.take() {
+                s.store(true, std::sync::atomic::Ordering::Relaxed);
+                h.abort();
+            }
+            ws_alive.store(0, std::sync::atomic::Ordering::Relaxed);
+            if let (Some(t), false) = (tgt.as_ref(), ws_urls.is_empty()) {
+                let target = discover::TapeTarget {
+                    account: t.bonding_curve,
+                    mint: t.mint,
+                    amm: t.amm_vaults.map(|_| discover::AmmTapeParams {
+                        token_decimals: t.token_decimals,
+                        sol_is_base: t.sol_is_base,
+                        total_supply: t.total_supply,
+                    }),
+                };
+                let s = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let h = tokio::spawn(discover::watch_tape_ha(
+                    rpc.clone(),
+                    ws_urls.clone(),
+                    target,
+                    trader,
+                    rows_tx.clone(),
+                    ws_alive.clone(),
+                    s.clone(),
+                ));
+                ws_task = Some((t.bonding_curve, s, h));
+            }
+        }
+        // Drain pushed trades. Rows are tagged by mint, so anything from a
+        // coin we've already left is dropped instead of haunting the tape.
+        while let Ok((mint, sig, rows)) = rows_rx.try_recv() {
+            if tape_cache.mint == Some(mint) && tape_cache.seen.insert(sig) {
+                discover::merge_tape(&mut tape_cache.rows, rows);
+            }
+        }
+        tick += 1;
+        let ws_live = unix_ms().saturating_sub(ws_alive.load(std::sync::atomic::Ordering::Relaxed)) < 45_000;
+        let poll_tape = !ws_live || tick % 20 == 0;
 
         // Fire the independent reads together. The priority estimate rides
         // along in the same round so auto mode costs no extra latency, and is
@@ -467,20 +525,29 @@ async fn poller(
                 Some((base_ta, quote_ta)) => {
                     // Three balances in ONE request instead of three.
                     let want = [base_ta, quote_ta, t.ata];
-                    let (bals, batch) = tokio::join!(
-                        rpc.token_balances(&want),
-                        // Graduated: trades live on the pool, not the curve.
-                        discover::amm_tape(
-                            &rpc,
-                            &t.bonding_curve,
-                            tape_cache.depth(),
-                            &trader,
-                            t.token_decimals,
-                            t.sol_is_base,
-                            t.total_supply,
-                            &tape_cache.seen,
-                        ),
-                    );
+                    let (bals, batch) = tokio::join!(rpc.token_balances(&want), async {
+                        if poll_tape {
+                            // Graduated: trades live on the pool, not the curve.
+                            discover::amm_tape(
+                                &rpc,
+                                &t.bonding_curve,
+                                tape_cache.depth(),
+                                &trader,
+                                t.token_decimals,
+                                t.sol_is_base,
+                                t.total_supply,
+                                &tape_cache.seen,
+                            )
+                            .await
+                        } else {
+                            discover::TapeBatch {
+                                rows: Vec::new(),
+                                scanned: Vec::new(),
+                                unanswered: Vec::new(),
+                                fresh_total: 0,
+                            }
+                        }
+                    });
                     let bals = bals.unwrap_or_default();
                     let g = |i: usize| bals.get(i).copied().flatten().unwrap_or(0);
                     // Vault 0 is the pool's base slot, vault 1 its quote slot —
@@ -499,7 +566,19 @@ async fn poller(
                     let (curve_acc, tb, batch) = tokio::join!(
                         rpc.account(&t.bonding_curve),
                         rpc.token_balance(&t.ata),
-                        discover::pool_tape(&rpc, &t.mint, tape_cache.depth(), &trader, &tape_cache.seen),
+                        async {
+                            if poll_tape {
+                                discover::pool_tape(&rpc, &t.mint, tape_cache.depth(), &trader, &tape_cache.seen)
+                                    .await
+                            } else {
+                                discover::TapeBatch {
+                                    rows: Vec::new(),
+                                    scanned: Vec::new(),
+                                    unanswered: Vec::new(),
+                                    fresh_total: 0,
+                                }
+                            }
+                        },
                     );
                     let curve = curve_acc
                         .ok()
@@ -2066,6 +2145,7 @@ pub async fn run(
     let poll_handle = tokio::spawn(poller(
         bot.rpc.clone(),
         bot.trader(),
+        ws_urls.clone(),
         target.clone(),
         snap.clone(),
         stop.clone(),

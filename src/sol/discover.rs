@@ -1297,7 +1297,6 @@ pub async fn amm_tape(
     // Newest first from the RPC, so truncating keeps the most recent trades and
     // defers the older backlog to later rounds.
     sigs.truncate(MAX_TX_PER_READ);
-    let amm_str = super::PUMP_AMM_PROGRAM.to_string();
     // Same rule as the curve tape: only an ANSWERED signature is seen. A null
     // (not yet queryable, or a throttled batch) stays fresh for next round —
     // marking it seen threw its trade away forever.
@@ -1314,104 +1313,290 @@ pub async fn amm_tape(
         }
     }
 
-    let scale = 10f64.powi(token_decimals as i32);
     let mut out = Vec::new();
     for (sig, tx) in fetched {
-        let block_time = tx.get("blockTime").and_then(|b| b.as_i64());
-        let slot = tx.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
-        let keys = all_account_keys(&tx);
-        let mut event_idx = 0usize;
-        let inners = tx
-            .get("meta")
-            .and_then(|m| m.get("innerInstructions"))
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for group in inners {
-            for ix in group.get("instructions").and_then(|i| i.as_array()).into_iter().flatten() {
-                let pi = ix.get("programIdIndex").and_then(|p| p.as_u64()).unwrap_or(u64::MAX) as usize;
-                if keys.get(pi).map(String::as_str) != Some(amm_str.as_str()) {
-                    continue;
-                }
-                let Some(data) = ix.get("data").and_then(|d| d.as_str()).and_then(b58_decode) else { continue };
+        out.extend(amm_swaps_in_tx(&tx, &sig, pool, trader, token_decimals, sol_is_base, total_supply));
+    }
+    TapeBatch { rows: out, scanned, unanswered, fresh_total }
+}
 
-                // A swap, or a liquidity event — both matter on the tape.
-                let row = if let Some((is_buy, ev)) = decode_amm_trade_event(&data) {
-                    Some((
-                        if is_buy { SwapKind::Buy } else { SwapKind::Sell },
+/// Every AMM swap/LP event for `pool` inside ONE transaction. Split from the
+/// polling read so the live subscription decodes a pushed transaction with
+/// exactly the same rules.
+pub fn amm_swaps_in_tx(
+    tx: &serde_json::Value,
+    sig: &str,
+    pool: &Pubkey,
+    trader: &Pubkey,
+    token_decimals: u8,
+    sol_is_base: bool,
+    total_supply: f64,
+) -> Vec<SolSwap> {
+    let amm_str = super::PUMP_AMM_PROGRAM.to_string();
+    let scale = 10f64.powi(token_decimals as i32);
+    let mut out = Vec::new();
+    let block_time = tx.get("blockTime").and_then(|b| b.as_i64());
+    let slot = tx.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
+    let keys = all_account_keys(tx);
+    let mut event_idx = 0usize;
+    let inners = tx
+        .get("meta")
+        .and_then(|m| m.get("innerInstructions"))
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for group in inners {
+        for ix in group.get("instructions").and_then(|i| i.as_array()).into_iter().flatten() {
+            let pi = ix.get("programIdIndex").and_then(|p| p.as_u64()).unwrap_or(u64::MAX) as usize;
+            if keys.get(pi).map(String::as_str) != Some(amm_str.as_str()) {
+                continue;
+            }
+            let Some(data) = ix.get("data").and_then(|d| d.as_str()).and_then(b58_decode) else { continue };
+
+            // A swap, or a liquidity event — both matter on the tape.
+            let row = if let Some((is_buy, ev)) = decode_amm_trade_event(&data) {
+                Some((
+                    if is_buy { SwapKind::Buy } else { SwapKind::Sell },
+                    ev.pool,
+                    ev.user,
+                    ev.timestamp,
+                    ev.user_quote_amount,
+                    ev.base_amount,
+                    ev.pool_base_reserves,
+                    ev.pool_quote_reserves,
+                ))
+            } else if let Some((kind, ev)) = decode_amm_lp_event(&data) {
+                Some((
+                    kind,
+                    ev.pool,
+                    ev.user,
+                    ev.timestamp,
+                    ev.quote_amount,
+                    ev.base_amount,
+                    ev.pool_base_reserves,
+                    ev.pool_quote_reserves,
+                ))
+            } else {
+                // The launch's own liquidity seeding.
+                decode_amm_create_pool(&data).map(|ev| {
+                    (
+                        SwapKind::AddLp,
                         ev.pool,
-                        ev.user,
+                        ev.creator,
                         ev.timestamp,
-                        ev.user_quote_amount,
-                        ev.base_amount,
-                        ev.pool_base_reserves,
-                        ev.pool_quote_reserves,
-                    ))
-                } else if let Some((kind, ev)) = decode_amm_lp_event(&data) {
-                    Some((
-                        kind,
-                        ev.pool,
-                        ev.user,
-                        ev.timestamp,
-                        ev.quote_amount,
-                        ev.base_amount,
-                        ev.pool_base_reserves,
-                        ev.pool_quote_reserves,
-                    ))
-                } else {
-                    // The launch's own liquidity seeding.
-                    decode_amm_create_pool(&data).map(|ev| {
-                        (
-                            SwapKind::AddLp,
-                            ev.pool,
-                            ev.creator,
-                            ev.timestamp,
-                            ev.quote_amount_in,
-                            ev.base_amount_in,
-                            ev.pool_base_amount,
-                            ev.pool_quote_amount,
-                        )
-                    })
+                        ev.quote_amount_in,
+                        ev.base_amount_in,
+                        ev.pool_base_amount,
+                        ev.pool_quote_amount,
+                    )
+                })
+            };
+            let Some((kind, ev_pool, user, ts, quote_raw, base_raw, base_res, quote_res)) = row
+            else {
+                continue;
+            };
+            // A pool account can be referenced by unrelated routing hops.
+            if ev_pool != *pool {
+                continue;
+            }
+            // Events speak the pool's BASE/QUOTE slots. On an inverted pool
+            // SOL is the base, so every amount swaps sides — and the sense
+            // of the event flips too: paying quote (the coin) to receive
+            // base (SOL) is a SELL, even though it is a `BuyEvent`.
+            let (kind, sol_raw, tok_raw, sol_res, tok_res) = if sol_is_base {
+                (kind.mirrored(), base_raw, quote_raw, base_res, quote_res)
+            } else {
+                (kind, quote_raw, base_raw, quote_res, base_res)
+            };
+            let base = tok_res as f64 / scale;
+            let quote = super::lamports_to_sol(sol_res);
+            let price = if base > 0.0 { quote / base } else { 0.0 };
+            out.push(SolSwap {
+                kind,
+                sol: super::lamports_to_sol(sol_raw),
+                tokens: tok_raw as f64 / scale,
+                // On the AMM the pool's quote balance IS the exit liquidity.
+                pooled_sol: quote,
+                mkt_cap_sol: total_supply * price,
+                mine: user == *trader,
+                user,
+                signature: sig.to_string(),
+                event_idx,
+                block_time: block_time.or(Some(ts)),
+                slot,
+            });
+            event_idx += 1;
+        }
+    }
+    out
+}
+
+/// What the live tape watches, and how to decode what it hears.
+pub struct TapeTarget {
+    /// The account trades mention: the bonding curve PDA, or the AMM pool.
+    pub account: Pubkey,
+    pub mint: Pubkey,
+    /// `Some` on a graduated coin — the AMM decode needs the pool's shape.
+    pub amm: Option<AmmTapeParams>,
+}
+
+#[derive(Clone, Copy)]
+pub struct AmmTapeParams {
+    pub token_decimals: u8,
+    pub sol_is_base: bool,
+    pub total_supply: f64,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The live tape: `logsSubscribe` on the coin's account, so trades arrive
+/// when they land instead of at the next poll. A notification carries the
+/// signature; transactions are fetched in micro-batches (one RPC call per
+/// ~300ms burst, retried while the tx is still short of `confirmed`) and
+/// decoded with exactly the decoders the polling path uses. Every decoded
+/// signature — including ones that yield no rows — is reported, so the
+/// safety-net poll never re-fetches what the socket already saw.
+pub async fn watch_tape_ha(
+    rpc: Rpc,
+    ws_urls: Vec<String>,
+    target: TapeTarget,
+    trader: Pubkey,
+    rows: tokio::sync::mpsc::UnboundedSender<(Pubkey, String, Vec<SolSwap>)>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        for url in &ws_urls {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let r = watch_tape_once(&rpc, url, &target, &trader, &rows, &alive, &stop).await;
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            attempt += 1;
+            let backoff = std::time::Duration::from_secs((1u64 << (attempt.min(4))).min(15));
+            let safe = url.split('?').next().unwrap_or(url);
+            match r {
+                Ok(()) => crate::trace(&format!("tape ws: {safe} closed; retrying in {}s", backoff.as_secs())),
+                Err(e) => crate::trace(&format!("tape ws: {safe} failed ({e}); retrying in {}s", backoff.as_secs())),
+            }
+            tokio::time::sleep(backoff).await;
+        }
+        if ws_urls.is_empty() {
+            return;
+        }
+    }
+}
+
+async fn watch_tape_once(
+    rpc: &Rpc,
+    ws_url: &str,
+    t: &TapeTarget,
+    trader: &Pubkey,
+    rows: &tokio::sync::mpsc::UnboundedSender<(Pubkey, String, Vec<SolSwap>)>,
+    alive: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> eyre::Result<()> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let safe_url = ws_url.split('?').next().unwrap_or(ws_url).to_string();
+    let ws_url = &normalize_ws_url(ws_url);
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url.as_str())
+        .await
+        .map_err(|e| eyre::eyre!("websocket connect to {safe_url} failed: {e}"))?;
+    let sub = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+        // `confirmed`, not `processed`: the tape is a record, and a processed
+        // notification can still be dropped. getTransaction answers at
+        // confirmed, so the fetch below needs no long ladder.
+        "params": [{"mentions": [t.account.to_string()]}, {"commitment": "confirmed"}]
+    });
+    ws.send(Message::Text(sub.to_string())).await?;
+    crate::trace(&format!("tape ws: subscribed to {} via {safe_url}", t.account));
+    alive.store(unix_ms(), std::sync::atomic::Ordering::Relaxed);
+
+    // Signatures heard but not yet fetched, with attempts per signature.
+    let mut pending: Vec<String> = Vec::new();
+    let mut tries: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await;
+        match msg {
+            Err(_) => {} // quiet 300ms — fall through to the flush
+            Ok(None) => return Ok(()),
+            Ok(Some(Ok(Message::Text(text)))) => {
+                alive.store(unix_ms(), std::sync::atomic::Ordering::Relaxed);
+                let v: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
                 };
-                let Some((kind, ev_pool, user, ts, quote_raw, base_raw, base_res, quote_res)) = row
-                else {
-                    continue;
-                };
-                // A pool account can be referenced by unrelated routing hops.
-                if ev_pool != *pool {
+                if v.get("result").is_some() && v.get("params").is_none() {
+                    continue; // subscription ack
+                }
+                let val = v
+                    .get("params")
+                    .and_then(|p| p.get("result"))
+                    .and_then(|r| r.get("value"));
+                let Some(val) = val else { continue };
+                // Failed transactions are not trades.
+                if !val.get("err").map(|e| e.is_null()).unwrap_or(false) {
                     continue;
                 }
-                // Events speak the pool's BASE/QUOTE slots. On an inverted pool
-                // SOL is the base, so every amount swaps sides — and the sense
-                // of the event flips too: paying quote (the coin) to receive
-                // base (SOL) is a SELL, even though it is a `BuyEvent`.
-                let (kind, sol_raw, tok_raw, sol_res, tok_res) = if sol_is_base {
-                    (kind.mirrored(), base_raw, quote_raw, base_res, quote_res)
-                } else {
-                    (kind, quote_raw, base_raw, quote_res, base_res)
-                };
-                let base = tok_res as f64 / scale;
-                let quote = super::lamports_to_sol(sol_res);
-                let price = if base > 0.0 { quote / base } else { 0.0 };
-                out.push(SolSwap {
-                    kind,
-                    sol: super::lamports_to_sol(sol_raw),
-                    tokens: tok_raw as f64 / scale,
-                    // On the AMM the pool's quote balance IS the exit liquidity.
-                    pooled_sol: quote,
-                    mkt_cap_sol: total_supply * price,
-                    mine: user == *trader,
-                    user,
-                    signature: sig.clone(),
-                    event_idx,
-                    block_time: block_time.or(Some(ts)),
-                    slot,
-                });
-                event_idx += 1;
+                if let Some(sig) = val.get("signature").and_then(|s| s.as_str()) {
+                    if !pending.iter().any(|p| p == sig) {
+                        pending.push(sig.to_string());
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Ping(p)))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) => return Ok(()),
+            _ => {}
+        }
+
+        if pending.is_empty() {
+            continue;
+        }
+        // One micro-batch per burst: a hot second of trades is one RPC call,
+        // not one per trade.
+        let batch: Vec<String> = std::mem::take(&mut pending);
+        for (tx, sig) in rpc.transactions(&batch).await.into_iter().zip(batch) {
+            match tx {
+                Some(tx) => {
+                    tries.remove(&sig);
+                    let decoded = match t.amm {
+                        Some(p) => amm_swaps_in_tx(
+                            &tx, &sig, &t.account, trader, p.token_decimals, p.sol_is_base, p.total_supply,
+                        ),
+                        None => curve_swaps_in_tx(&tx, &sig, &t.mint, trader),
+                    };
+                    if rows.send((t.mint, sig, decoded)).is_err() {
+                        return Ok(()); // the poller is gone
+                    }
+                }
+                None => {
+                    // Not queryable yet — usually a step behind `confirmed`.
+                    let n = tries.entry(sig.clone()).or_insert(0);
+                    *n += 1;
+                    if *n < 5 {
+                        pending.push(sig);
+                    }
+                }
             }
         }
     }
-    TapeBatch { rows: out, scanned, unanswered, fresh_total }
 }
 
 /// First 6 and last 4 of a pubkey — enough to match against an explorer's
