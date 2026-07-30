@@ -174,6 +174,145 @@ pub struct AxisView {
     pub labels: Vec<String>,
 }
 
+/// One OHLC candle — the unit TradingView made everyone fluent in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candle {
+    pub o: f64,
+    pub h: f64,
+    pub l: f64,
+    pub c: f64,
+    /// Quote-side volume traded inside this candle.
+    pub v: f64,
+}
+
+impl Candle {
+    pub fn up(&self) -> bool {
+        self.c >= self.o
+    }
+}
+
+/// A candlestick chart: candles oldest-first, plus what to call the numbers.
+#[derive(Clone, Debug, Default)]
+pub struct CandleView {
+    pub title: String,
+    pub candles: Vec<Candle>,
+    pub interval_secs: u64,
+    /// Unit label for the y axis ("SOL" / "ETH").
+    pub unit: &'static str,
+}
+
+/// Aggregate raw trades into time-bucketed candles, oldest-first.
+///
+/// `points` is (unix seconds, price, quote volume) in ANY order — the tape
+/// accumulates newest-first and merges out-of-order fetches, so ordering here
+/// rather than trusting the caller is what keeps a candle's open/close honest.
+/// Buckets nobody traded in carry the previous close as a flat candle, so
+/// quiet seconds read as a flat line instead of the chart silently skipping
+/// time. At most `max` candles come back — the newest.
+pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize) -> Vec<Candle> {
+    let iv = interval_secs.max(1) as i64;
+    let mut pts: Vec<(i64, f64, f64)> =
+        points.iter().copied().filter(|(t, p, _)| *t > 0 && *p > 0.0).collect();
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    pts.sort_by_key(|(t, _, _)| *t);
+
+    let mut out: Vec<Candle> = Vec::new();
+    let mut bucket = pts[0].0 - pts[0].0.rem_euclid(iv);
+    let mut cur: Option<Candle> = None;
+    for (t, p, v) in pts {
+        let b = t - t.rem_euclid(iv);
+        if b != bucket {
+            // Close the bucket in hand…
+            if let Some(k) = cur.take() {
+                out.push(k);
+            }
+            // …and flat-fill the silent buckets between it and this one.
+            if let Some(last) = out.last().copied() {
+                let gaps = ((b - bucket) / iv - 1).clamp(0, max as i64) as usize;
+                let flat = Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0 };
+                out.extend(std::iter::repeat_n(flat, gaps));
+            }
+            bucket = b;
+        }
+        cur = Some(match cur {
+            None => Candle { o: p, h: p, l: p, c: p, v },
+            Some(k) => Candle { o: k.o, h: k.h.max(p), l: k.l.min(p), c: p, v: k.v + v },
+        });
+    }
+    if let Some(k) = cur {
+        out.push(k);
+    }
+    if out.len() > max {
+        out.drain(..out.len() - max);
+    }
+    out
+}
+
+#[cfg(test)]
+mod candle_tests {
+    use super::*;
+
+    #[test]
+    fn trades_in_one_bucket_fold_into_one_honest_candle() {
+        // Out of order on purpose: the tape merges fetches out of order too.
+        let pts = [(103, 5.0, 1.0), (101, 2.0, 1.0), (100, 3.0, 1.0), (104, 4.0, 1.0)];
+        let c = candles_of(&pts, 10, 100);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].o, c[0].h, c[0].l, c[0].c, c[0].v), (3.0, 5.0, 2.0, 4.0, 4.0));
+        assert!(c[0].up());
+    }
+
+    #[test]
+    fn silence_reads_as_a_flat_line_not_skipped_time() {
+        let pts = [(100, 3.0, 1.0), (145, 6.0, 1.0)];
+        let c = candles_of(&pts, 10, 100);
+        // 100s, three silent buckets (110/120/130), then 140s.
+        assert_eq!(c.len(), 5);
+        for flat in &c[1..4] {
+            assert_eq!((flat.o, flat.h, flat.l, flat.c, flat.v), (3.0, 3.0, 3.0, 3.0, 0.0));
+        }
+        assert_eq!(c[4].c, 6.0);
+    }
+
+    #[test]
+    fn only_the_newest_max_candles_survive() {
+        let pts: Vec<(i64, f64, f64)> = (0..50).map(|i| (i * 10, i as f64 + 1.0, 1.0)).collect();
+        let c = candles_of(&pts, 10, 8);
+        assert_eq!(c.len(), 8);
+        assert_eq!(c.last().unwrap().c, 50.0);
+    }
+
+    #[test]
+    fn zero_prices_and_times_are_junk_not_data() {
+        let pts = [(0, 5.0, 1.0), (100, 0.0, 1.0), (100, 2.0, 1.0)];
+        let c = candles_of(&pts, 10, 10);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].o, 2.0);
+    }
+}
+
+/// The candle-interval ladder, seconds. Bounded by what the live tape can
+/// hold — longer candles (4h, 1d) want persisted trade history, which is the
+/// next step, not this one.
+pub const IV_STEPS: [u64; 7] = [1, 5, 15, 60, 300, 900, 3600];
+
+pub fn iv_step(cur: u64, up: bool) -> u64 {
+    let i = IV_STEPS.iter().position(|s| *s == cur).unwrap_or(1);
+    IV_STEPS[if up { (i + 1).min(IV_STEPS.len() - 1) } else { i.saturating_sub(1) }]
+}
+
+pub fn iv_label(iv: u64) -> String {
+    if iv < 60 {
+        format!("{iv}s")
+    } else if iv < 3600 {
+        format!("{}m", iv / 60)
+    } else {
+        format!("{}h", iv / 3600)
+    }
+}
+
 /// A scatter plot with a horizontal key strip above it.
 #[derive(Clone, Debug, Default)]
 pub struct ScatterView {

@@ -329,12 +329,49 @@ async fn poller(
     }
 }
 
+/// The chart, straight off the tape: every swap IS a price at a time, so the
+/// candles are a pure re-reading of data the dashboard already holds.
+fn chart_view(bot: &SolBot) -> crate::view::CandleView {
+    let points: Vec<(i64, f64, f64)> = bot
+        .tape
+        .iter()
+        .filter(|s| !s.kind.is_lp() && s.tokens > 0.0)
+        .filter_map(|s| s.block_time.map(|t| (t, s.sol / s.tokens, s.sol)))
+        .collect();
+    let candles = crate::view::candles_of(&points, bot.chart_iv, 240);
+    let sym = bot
+        .meta
+        .as_ref()
+        .map(|m| m.symbol.clone())
+        .or_else(|| bot.coin.as_ref().map(|c| short_mint(&c.mint)))
+        .unwrap_or_default();
+    // How much history the tape actually holds, so the reader knows what the
+    // chart can and cannot show yet.
+    let span = bot
+        .tape
+        .iter()
+        .filter_map(|s| s.block_time)
+        .max()
+        .zip(bot.tape.iter().filter_map(|s| s.block_time).min())
+        .map(|(hi, lo)| crate::view::age_compact((hi - lo).max(0) as f64))
+        .unwrap_or_else(|| "0s".into());
+    crate::view::CandleView {
+        title: format!(" {} · {} candles · {} of tape · , . interval  [v] ", sym, crate::view::iv_label(bot.chart_iv), span),
+        candles,
+        interval_secs: bot.chart_iv,
+        unit: "SOL",
+    }
+}
+
 /// Which panel occupies the lower half — mirrors the EVM `Panel`.
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
     Orders,
     Tape,
     Logs,
+    /// The candlestick chart, built from the same tape the Trades panel
+    /// shows — no extra RPC, just a different way of reading it.
+    Chart,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -378,6 +415,8 @@ pub struct SolBot {
     /// buy_frac — an absolute SOL amount was meaningless across wallet sizes.
     pub buy_frac: f64,
     pub slippage_pct: f64,
+    /// Candle interval for the chart panel, seconds. , and . walk the ladder.
+    pub chart_iv: u64,
     /// Fraction of the token balance `s` sells. `x` always sells everything.
     /// Mirrors the EVM side's `sell_frac`, adjusted with `<` / `>`.
     pub sell_frac: f64,
@@ -463,6 +502,7 @@ impl SolBot {
             round_ms: 0.0,
             buy_frac: 0.05, // 5% of balance; [ ] walk the ladder below
             slippage_pct: 5.0,
+            chart_iv: 5,
             sell_frac: 1.00,
             cu_price_micro: 10_000,
             coins: Vec::new(),
@@ -1283,6 +1323,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         Panel::Orders => ui::widgets::table(f, c[3], &orders_table(bot, scroll, h), None),
         Panel::Tape => ui::widgets::table(f, c[3], &discover::tape_view(&bot.tape, scroll, h, bot.sol_usd), None),
         Panel::Logs => ui::widgets::panel(f, c[3], &logs_panel(bot, scroll, h + 1)),
+        Panel::Chart => ui::widgets::candles(f, c[3], &chart_view(bot)),
     }
 
     let key = |k: &'static str, t: Tone| {
@@ -1299,6 +1340,8 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
         Span::raw(" find  "),
         key("[l]", Tone::Normal),
         Span::raw(" logs  "),
+        key("[v]", Tone::Info),
+        Span::raw(" chart  "),
         key("[T]", Tone::Info),
         Span::raw(" theme  "),
         key("[?]", Tone::Info),
@@ -1768,7 +1811,8 @@ pub async fn run(
                     KeyCode::Char('l') | KeyCode::Right => {
                         view = match view {
                             Panel::Orders => Panel::Tape,
-                            Panel::Tape => Panel::Logs,
+                            Panel::Tape => Panel::Chart,
+                            Panel::Chart => Panel::Logs,
                             Panel::Logs => Panel::Orders,
                         };
                         scroll = 0;
@@ -1776,16 +1820,31 @@ pub async fn run(
                     KeyCode::Left => {
                         view = match view {
                             Panel::Orders => Panel::Logs,
-                            Panel::Logs => Panel::Tape,
+                            Panel::Logs => Panel::Chart,
+                            Panel::Chart => Panel::Tape,
                             Panel::Tape => Panel::Orders,
                         };
                         scroll = 0;
+                    }
+                    // Straight to the chart, and , . walk the candle interval.
+                    KeyCode::Char('v') => {
+                        view = Panel::Chart;
+                        scroll = 0;
+                    }
+                    KeyCode::Char(',') => {
+                        bot.chart_iv = crate::view::iv_step(bot.chart_iv, false);
+                        bot.note(format!("candles: {}", crate::view::iv_label(bot.chart_iv)));
+                    }
+                    KeyCode::Char('.') => {
+                        bot.chart_iv = crate::view::iv_step(bot.chart_iv, true);
+                        bot.note(format!("candles: {}", crate::view::iv_label(bot.chart_iv)));
                     }
                     KeyCode::Up => {
                         let n = match view {
                             Panel::Logs => bot.logs.len(),
                             Panel::Tape => bot.tape.len(),
                             Panel::Orders => bot.orders.len(),
+                            Panel::Chart => 0,
                         };
                         scroll = (scroll + 1).min(n.saturating_sub(1));
                     }

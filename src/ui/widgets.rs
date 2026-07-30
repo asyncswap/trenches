@@ -696,6 +696,108 @@ fn axis(a: &AxisView) -> Axis<'static> {
 
 /// Draw a scatter plot with a one-line key strip above it, so labels never sit
 /// on top of the data. Disc/Ring series are size-scaled by their y magnitude.
+/// A candlestick chart, drawn at HALF-CELL vertical resolution.
+///
+/// Each terminal cell is treated as two stacked pixels via the half-block
+/// glyphs (▀ ▄ █), which doubles the price resolution — the difference
+/// between "a chart" and "a bar of blobs" at dashboard heights. One candle
+/// per column: full cells for the body, a thin │ for the wick, green up and
+/// red down, exactly the grammar TradingView taught everyone.
+pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
+    let block = themed_block_line(Line::from(cv.title.clone()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 12 || inner.height < 4 || cv.candles.is_empty() {
+        let note = if cv.candles.is_empty() { "no trades yet — candles build from the tape" } else { "window too small" };
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(note)
+                .style(Style::default().fg(tone_color(Tone::Dim)).add_modifier(Modifier::ITALIC))
+                .alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    // Price axis on the right: 12 columns of labels, chart takes the rest.
+    const AXIS_W: u16 = 12;
+    let chart_w = inner.width.saturating_sub(AXIS_W) as usize;
+    let shown = &cv.candles[cv.candles.len().saturating_sub(chart_w)..];
+
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for c in shown {
+        lo = lo.min(c.l);
+        hi = hi.max(c.h);
+    }
+    if !(lo.is_finite() && hi.is_finite()) {
+        return;
+    }
+    // Breathing room, and a floor for the dead-flat case so one price does
+    // not divide by zero into a full-height candle.
+    let pad = ((hi - lo) * 0.05).max(hi.abs() * 1e-9).max(f64::MIN_POSITIVE);
+    let (lo, hi) = (lo - pad, hi + pad);
+
+    let rows = inner.height;
+    let pixels = rows as i32 * 2;
+    let py = |p: f64| -> i32 {
+        // Pixel 0 is the TOP; higher price = smaller pixel index.
+        (((hi - p) / (hi - lo)) * (pixels - 1) as f64).round() as i32
+    };
+
+    let buf = f.buffer_mut();
+    for (i, c) in shown.iter().enumerate() {
+        let x = inner.x + i as u16;
+        let tone = if c.up() { Tone::Good } else { Tone::Bad };
+        let color = tone_color(tone);
+        let (b_top, b_bot) = (py(c.o.max(c.c)), py(c.o.min(c.c)));
+        let (w_top, w_bot) = (py(c.h), py(c.l));
+        for row in 0..rows {
+            let (up_px, lo_px) = (row as i32 * 2, row as i32 * 2 + 1);
+            let in_body = |px: i32| px >= b_top && px <= b_bot;
+            let in_wick = |px: i32| px >= w_top && px <= w_bot;
+            let sym = match (in_body(up_px), in_body(lo_px)) {
+                (true, true) => "█",
+                (true, false) => "▀",
+                (false, true) => "▄",
+                (false, false) => {
+                    if in_wick(up_px) || in_wick(lo_px) {
+                        "│"
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let cell = &mut buf[ratatui::layout::Position { x, y: inner.y + row }];
+            cell.set_symbol(sym);
+            cell.set_fg(color);
+        }
+    }
+
+    // The axis: last close first (the number being watched), then the range.
+    let labels = 4u16.min(rows);
+    for k in 0..labels {
+        let y = inner.y + k * (rows - 1) / labels.max(1).min(rows);
+        let price = hi - (hi - lo) * (k as f64 * (rows as f64 - 1.0) / labels as f64) / (rows as f64 - 1.0).max(1.0);
+        let txt = format!("{} {}", crate::view::sol_compact(price), cv.unit);
+        buf.set_string(
+            inner.x + inner.width - AXIS_W + 1,
+            y,
+            txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
+            Style::default().fg(tone_color(Tone::Dim)),
+        );
+    }
+    if let Some(last) = shown.last() {
+        let y = (inner.y as i32 + py(last.c) / 2).clamp(inner.y as i32, (inner.y + rows - 1) as i32) as u16;
+        let txt = format!("▸{} {}", crate::view::sol_compact(last.c), cv.unit);
+        let tone = if last.up() { Tone::Good } else { Tone::Bad };
+        buf.set_string(
+            inner.x + inner.width - AXIS_W + 1,
+            y,
+            txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
+            Style::default().fg(tone_color(tone)).add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
 pub fn scatter(f: &mut Frame, area: Rect, s: &ScatterView) {
     // Cap the plot height. Full-screen, a scatter is mostly empty space: the
     // data is a horizontal band and the extra rows add nothing but distance
@@ -1319,5 +1421,72 @@ mod table_padding_tests {
         // 2 for the double-width star, plus ratatui's single column gap. The
         // star cannot be narrower, so this is the floor for a leading marker.
         assert_eq!(left_gap(&t), 3, "left edge should be the marker column plus one gap");
+    }
+}
+
+#[cfg(test)]
+mod candle_render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn cv(candles: Vec<crate::view::Candle>) -> crate::view::CandleView {
+        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL" }
+    }
+
+    #[test]
+    fn candles_paint_bodies_wicks_and_two_colours() {
+        let up = crate::view::Candle { o: 1.0, h: 4.0, l: 0.5, c: 3.0, v: 1.0 };
+        let dn = crate::view::Candle { o: 3.0, h: 3.5, l: 0.8, c: 1.2, v: 1.0 };
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| candles(f, f.area(), &cv(vec![up, dn, up, dn]))).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut bodies = 0;
+        let mut wicks = 0;
+        let mut colours: std::collections::HashSet<String> = Default::default();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                match cell.symbol() {
+                    "█" | "▀" | "▄" => {
+                        bodies += 1;
+                        colours.insert(format!("{:?}", cell.style().fg));
+                    }
+                    "│" => wicks += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(bodies > 0, "no candle bodies painted");
+        assert!(wicks > 0, "no wicks painted");
+        assert_eq!(colours.len(), 2, "up and down candles must differ in colour: {colours:?}");
+    }
+
+    #[test]
+    fn an_empty_chart_says_so_instead_of_panicking() {
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| candles(f, f.area(), &cv(Vec::new()))).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("no trades yet"), "empty state should explain itself");
+    }
+
+    #[test]
+    fn a_dead_flat_market_does_not_divide_into_a_wall() {
+        let flat = crate::view::Candle { o: 2.0, h: 2.0, l: 2.0, c: 2.0, v: 0.0 };
+        let mut term = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        term.draw(|f| candles(f, f.area(), &cv(vec![flat; 20]))).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut painted_rows: std::collections::HashSet<u16> = Default::default();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if matches!(buf[(x, y)].symbol(), "█" | "▀" | "▄") {
+                    painted_rows.insert(y);
+                }
+            }
+        }
+        assert!(painted_rows.len() <= 2, "a flat price should be a thin line, got rows {painted_rows:?}");
     }
 }

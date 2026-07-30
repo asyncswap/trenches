@@ -1533,6 +1533,7 @@ async fn chain_session_on(
         pool: to_poolcfg(&pool),
         strategy,
         last_market_trace: None,
+        chart_iv: 5,
         arb_mode: false,
         pool_b: None,
         mkt_b: engine::Market::default(),
@@ -2382,8 +2383,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             }
                         }
                         // View cycling: 'l' or → next, ← previous. Reset scroll.
-                        KeyCode::Char('l') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
-                        KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
+                        KeyCode::Char('l') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
+                        KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
+                        // Straight to the chart; , . walk the candle interval.
+                        KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
+                        KeyCode::Char(',') => { bot.chart_iv = view::iv_step(bot.chart_iv, false); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
+                        KeyCode::Char('.') => { bot.chart_iv = view::iv_step(bot.chart_iv, true); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
                         // Scroll the active panel (↑ older, ↓ newer) — orders or tape.
                         KeyCode::Up => {
                             let n = match view { Panel::Tape => tape.lock().unwrap().len(), Panel::Logs => bot.logs.len(), _ => bot.orders.len() };
@@ -2965,6 +2970,7 @@ enum Panel {
     Orders, // our own actions
     Tape,   // all traders' swaps on the pool
     Logs,   // raw session log
+    Chart,  // the tape re-read as candles — same data, TradingView grammar
 }
 
 
@@ -3481,6 +3487,31 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     }
 
     match view {
+        Panel::Chart => {
+            // The tape re-read as candles. EVM swaps carry a BLOCK, not a
+            // wall-clock stamp — at ~10 blocks/sec, block/10 is a perfectly
+            // good second for bucketing (only relative spacing matters).
+            // Price per token in ETH is the INVERSE of the tape's
+            // tokens-per-ETH, so up on the chart means up in price.
+            let pool_is_v4 = matches!(bot.pool.kind, engine::PoolKind::V4 { .. } | engine::PoolKind::FlaunchV4 { .. });
+            let points: Vec<(i64, f64, f64)> = tape
+                .iter()
+                .filter(|s| (bot.arb_mode || s.is_v4 == pool_is_v4) && s.price > 0.0)
+                .map(|s| ((s.block / 10) as i64, 1.0 / s.price, s.eth))
+                .collect();
+            let candles = view::candles_of(&points, bot.chart_iv, 240);
+            let cv = view::CandleView {
+                title: format!(
+                    " {} · {} candles · , . interval  [v] ",
+                    bot.pool.sym,
+                    view::iv_label(bot.chart_iv)
+                ),
+                candles,
+                interval_secs: bot.chart_iv,
+                unit: "ETH",
+            };
+            ui::widgets::candles(f, mid_area, &cv);
+        }
         Panel::Logs => {
         // Logs view: last N lines (fit to panel), errors/skips highlighted.
         let h = mid_area.height.saturating_sub(2) as usize;
@@ -3772,7 +3803,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 33] = [
+        let items: [(&str, &str); 35] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
@@ -3790,8 +3821,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "d|toggle multi-pool view"),
             ("", "e|auto arbitrage"),
             ("VIEW", ""),
-            ("", "l  → ←|cycle orders · trades · logs"),
+            ("", "l  → ←|cycle orders · trades · chart · logs"),
             ("", "↑ ↓|scroll"),
+            ("", "v|candlestick chart"),
+            ("", ",  .|candle interval −/+"),
             ("", "c|cluster graph"),
             ("", "L|PnL calendar"),
             ("SIZE", ""),
