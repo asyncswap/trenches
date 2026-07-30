@@ -1,157 +1,65 @@
 # CONFIG
 
-Where the bot's settings and state live, and how to set an API key.
-
-## Two places
+One file, one directory:
 
 ```
 ~/.config/trenches/config.json    config — networks, RPC URLs, API keys
-~/.trenches/                      cache and state — logs, theme, tokens, PnL
+~/.trenches/                      state — logs, theme, token history, PnL
 ```
 
-The split matters. Config is what you decide and would carry to another machine.
-Cache is what the bot worked out and can work out again — delete `~/.trenches`
-and you lose history, nothing else.
+Config is what you decide. State is what the app works out and can work out
+again — delete `~/.trenches` and you lose history, nothing else.
 
-The bot never writes to your config. Coins you add by contract address go to
-`~/.trenches/tokens-<chain_id>.json`, not into the file you edit, so an RPC URL
-you set by hand does not end up buried under three hundred tokens you never
-typed.
+The installer writes a starter config that works as-is on public endpoints.
+`trenches --init` writes one too, prints both paths, and never overwrites an
+existing file.
 
-On first run the bot writes a starter `config.json` and tells you where. It works
-as-is on public endpoints.
+Two environment variables move things, if you want them moved:
+`$TRENCHES_CONFIG` points at a different config file, `$TRENCHES_STATE` at a
+different state directory — useful for a second profile.
 
-To write it yourself, or to check where it went:
+## RPC endpoints
 
-```
-trenches --init
-```
+Two fields per network. Each takes one URL or a list — a list forms a pool,
+and every request goes to whichever endpoint answers fastest.
 
-That creates the config and the state directory, prints both paths, and exits.
-It never overwrites a config that already exists. The installer runs it for you.
+**`rpc`** — where requests go. **`ws`** — websockets, Solana only, for the
+live launch feed.
 
-**If you keep a `config.json` or `deployments.json` in the directory you run
-from, that file wins** and the one under `~/.config` is never created. Handy for
-a checkout with its own settings; confusing if you did not mean to.
-
-State always lives in `~/.trenches`, wherever you run the binary from. Set
-`$TRENCHES_STATE` to put it somewhere else — useful for a second profile, and
-the only way to get a per-directory one.
-
-Earlier builds preferred a `.trenches` in the working directory when one
-existed, so history depended on where you launched from. If your PnL looks
-empty after updating, it is in that folder — copy `fills-*.jsonl` into
-`~/.trenches` and it comes back.
-
-**Other locations, in the order they are checked:**
-
-1. `$TRENCHES_CONFIG` — a full path, for running more than one profile
-2. `./config.json` or `./deployments.json` in the current directory, if present
-3. `~/.config/trenches/config.json`
-
-`deployments.json` is the old name and is still read. It described a list of
-contracts we had deployed; the file holds endpoints and keys now, so the name
-went.
-
-## Setting an API key
-
-Open `~/.config/trenches/config.json` in any editor. Two fields matter.
-
-**`rpc`** — where every request goes. One URL as a string, or several as a
-list; either shape parses. All of them form one pool: requests go to whichever
-answers fastest, a rate-limited endpoint is rested for exactly as long as its
-reply says the window needs to reset, and wide log scans are steered to
-endpoints that allow them (Alchemy's free tier caps `eth_getLogs` at 10
-blocks, so those scans go elsewhere automatically).
+The simple version is one [Trenches RPC](https://rpc.trenches.sh) key, which
+covers every chain and the websocket in one URL:
 
 ```json
 {
-  "name": "robinhood-mainnet",
-  "chain_id": 4663,
-  "rpc": [
-    "https://rpc.mainnet.chain.robinhood.com/rpc",
-    "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  "networks": [
+    {
+      "name": "solana-mainnet",
+      "kind": "solana",
+      "rpc": "https://rpc.trenches.sh/YOUR_KEY/solana",
+      "ws": "wss://rpc.trenches.sh/YOUR_KEY/solana-ws"
+    },
+    {
+      "name": "robinhood-mainnet",
+      "chain_id": 4663,
+      "rpc": "https://rpc.trenches.sh/YOUR_KEY/robinhood"
+    }
   ]
 }
 ```
 
-Alchemy, Helius, QuickNode and Ankr all work. One paid endpoint in the list is
-the single biggest speed upgrade: the public default's per-minute quota is the
-thing that makes discovery stall.
+Provider URLs from Alchemy, Helius, QuickNode or Ankr work the same way, alone
+or mixed into the list. Restart the app after editing.
 
-**`ws`** — websocket, Solana only, for the live launch feed. Also a string or
-a list; the feed rotates to the next on a drop. Providers often serve WS on a
-different host than HTTP, which is why it is its own field.
+Or skip the editor: press **D** for docs, then **e** — the app asks for each
+endpoint in turn and writes the config itself.
 
-Older configs with `rpcs` and `discovery_rpc` still work — those fields are
-read and merged into the same pool, so there is nothing to migrate by hand.
-
-**`rugcheck.api_key`** — optional. Token risk scoring works without one; the key
-only raises the rate limit.
-
-Restart the bot after editing. Nothing here is sent anywhere except to the
-endpoints you name.
-
-### Without leaving the app
-
-Press **D** for these docs, then **e**. It asks for each endpoint in turn — one
-chain at a time — and writes them to the config. Esc stops the walk without
-saving the rest, and an empty answer clears a field rather than blanking it to
-an endpoint that resolves to nothing.
-
-The file is written to a temporary name and renamed into place, so an
-interrupted write cannot leave you with a truncated config.
-
-### Editor help
-
-Every config carries a `$schema` line pointing at
-`https://trenches.sh/config.schema.json`. Any editor that understands JSON Schema
-will validate the file, complete field names as you type, and tell you what each
-one is for.
-
-## Opening on the docs
-
-The app shows these pages on the way in until you have been through them, then
-goes straight to the chain picker — and once more after an update, since a
-release can move a key or add a chain and the docs you read three versions ago
-were a different set. `D` opens them from anywhere regardless.
-
-To decide it outright:
-
-```json
-"start_on_docs": true
-```
-
-`true` keeps them on every start, `false` never shows them. Leave it out for the
-default. The marker is `~/.trenches/onboarded` and holds the version whose docs
-were read — delete it
-to get them back on start.
-
-## Where it opens
-
-After the first run the bot goes straight to the chain you used last and asks
-for that account's password. `C` changes chain, `W` changes account, and `esc`
-from the account list steps back to the chain picker.
-
-The chain is remembered in `~/.trenches/last-chain.txt`, by name — an index
-would point at a different chain the moment you reordered the file.
-
-## No seed phrases
-
-There is no field for one. Accounts are password-encrypted keystores, shared with
-Foundry at `~/.foundry/keystores` — make or import them in the app with **W**.
-
-Deliberate, not an oversight. A config file gets backed up, synced between
-machines, and pasted into a bug report by someone trying to be helpful. None of
-that should be able to cost you your funds. A phrase written into this file is
-ignored, not honoured.
+Every config carries a `$schema` line; any editor that understands JSON Schema
+validates fields and completes names as you type.
 
 ## Adding a chain
 
-Anything in `networks` appears in the chain picker. Robinhood Chain and Solana
-ship configured; append your own.
-
-**A local Anvil node:**
+Anything in `networks` appears in the chain picker. Any EVM chain is three
+fields:
 
 ```json
 {
@@ -161,37 +69,18 @@ ship configured; append your own.
 }
 ```
 
-Start it with `anvil`, restart the bot, and it is in the list. Any other EVM
-chain is the same three fields.
+The name drives the label — `robinhood-mainnet` shows as **Robinhood Chain**.
+To hide a chain, delete its entry.
 
-**A Solana endpoint** wants a websocket too, because providers often serve WS on
-a different host than HTTP:
+## No seed phrases
 
-```json
-{
-  "name": "solana-mainnet",
-  "chain_id": 900,
-  "rpc": ["https://your-endpoint/?api-key=…", "https://a-second-endpoint/?api-key=…"],
-  "ws": ["wss://your-endpoint/?api-key=…", "wss://a-second-ws/?api-key=…"]
-}
-```
+There is no field for one, deliberately. A config file gets backed up, synced,
+and pasted into bug reports — none of that should be able to cost you funds.
+Accounts are password-encrypted keystores; make or import them in the app
+with **W**.
 
-Both fields take one URL or a list — requests rotate across the whole `rpc`
-pool, and the launch feed hops to the next `ws` entry when a socket drops, so
-one provider's rate limit or outage does not cap you.
+## Keys stay off screen
 
-The name drives the label: `robinhood-mainnet` shows as **Robinhood Chain**, and
-anything not `-mainnet` is suffixed, so `robinhood-testnet` reads as **Robinhood
-Chain (testnet)**. Mainnets sort first.
-
-To hide a chain, delete its entry. There is no separate production list — what is
-in your config is what you see.
-
-## Keeping keys off screen
-
-Your config holds API keys, and a screenshot or a pasted log should not leak
-them. URLs are stripped of their query string before anything is printed, which
-is where providers put the key.
-
-A session log records addresses and amounts but never keys, passwords or private
-keys. Skim it anyway before attaching it to anything.
+The config holds API keys; screenshots and logs should not leak them. URLs are
+stripped of their query string before anything is printed, and session logs
+never record keys, passwords or private keys.

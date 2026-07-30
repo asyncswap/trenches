@@ -1686,7 +1686,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
     // logo when we return — no screen has to know about any other.
     crate::ui::image::clear();
     if verified.is_empty() {
-        draw_status(term, "\nNo verified pools configured (deployments.json → verified_pools).\n\nEsc to go back")?;
+        draw_status(term, "\nNo verified pools configured (config.json → verified_pools).\n\nEsc to go back")?;
         loop {
             crate::ui_alive();
             if event::poll(Duration::from_millis(200))? {

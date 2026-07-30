@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! Deployment registry (networks -> tokens -> pools) + accounts, loaded from
-//! deployments.json — the same hierarchical format as the Zig engine.
+//! config.json — networks, endpoints, and the app's few settings.
 //!
 //! Some schema fields (verified-pool metadata, explorer labels) mirror the JSON
 //! and aren't all read yet — they back the dormant Verified-pool feature.
@@ -357,20 +357,12 @@ mod onboarding_tests {
     }
 }
 
-/// Where the registry lives, in the order it is looked for.
+/// Where the config lives, in the order it is looked for.
 ///
 /// 1. `$TRENCHES_CONFIG`, for anyone running several profiles.
-/// 2. `~/.config/trenches/deployments.json` — the real home.
-/// 3. `./deployments.json`, only if it already exists.
-///
-/// The cwd came first historically, which was fine when the binary was run out
-/// of its own checkout and fatal the moment it was installed to `~/.local/bin`:
-/// a fresh user's first `trenches` died on a missing file in whatever directory
-/// their shell happened to be in.
-/// What the config file is called.
+/// 2. `./config.json`, so a checkout can carry its own settings.
+/// 3. `~/.config/trenches/config.json` — the real home.
 pub const CONFIG_NAME: &str = "config.json";
-/// What it used to be called. Read, never written.
-pub const LEGACY_NAME: &str = "deployments.json";
 
 pub fn config_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("TRENCHES_CONFIG") {
@@ -378,26 +370,13 @@ pub fn config_path() -> std::path::PathBuf {
             return std::path::PathBuf::from(p);
         }
     }
-    // A local `config.json` still wins, so a checkout can deliberately carry its
-    // own settings. A local `deployments.json` does NOT: that is the old name,
-    // a copy is lying around in every working tree, and letting it outrank the
-    // real config meant `--init` kept reporting a stray file in whatever folder
-    // the shell happened to be in.
+    // A local `config.json` wins, so a checkout can deliberately carry its
+    // own settings.
     let local = std::path::PathBuf::from(CONFIG_NAME);
     if local.exists() {
         return local;
     }
-    let canonical = config_dir().join(CONFIG_NAME);
-    if canonical.exists() {
-        return canonical;
-    }
-    // Only when nothing current exists: an old config in the config directory is
-    // still worth reading rather than starting someone from scratch.
-    let legacy = config_dir().join(LEGACY_NAME);
-    if legacy.exists() {
-        return legacy;
-    }
-    canonical
+    config_dir().join(CONFIG_NAME)
 }
 
 /// Where a fresh config is WRITTEN, ignoring whatever sits in the working
