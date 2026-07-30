@@ -37,7 +37,11 @@ solana = [
 # the provider stack, the features only un-gate the re-exports.
 alloy = { version = "0.8", features = ["full", "node-bindings", "signer-keystore", "signer-mnemonic", "json-rpc", "rpc-client"] }
 tokio = { version = "1", features = ["full"] }
-ratatui = "0.29"
+# `unstable-rendered-line-info` exposes Paragraph::line_count — the docs
+# reader needs the REAL number of laid-out rows to bound its scroll, and only
+# the widget's own word-wrapper knows it. "Unstable" means the API may change
+# between ratatui versions; the version is pinned, so that's a non-event.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 eyre = "0.6"

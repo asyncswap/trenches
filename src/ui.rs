@@ -321,7 +321,13 @@ fn docs_inner(
     // Written by the draw closure so the key handler can clamp against what was
     // actually laid out, rather than guessing.
     let mut max_scroll: u16 = 0;
+    // Mouse capture is on process-wide for highlight-to-copy, which takes the
+    // terminal's native selection with it — so this screen, like the
+    // dashboards, does its own: drag paints, release copies, wheel scrolls.
+    let mut msel = mouse::Selection::default();
+    let mut copy_armed = false;
     loop {
+        let mut grabbed: Option<String> = None;
         term.draw(|f| {
             widgets::paint_bg(f);
             image::clear();
@@ -361,32 +367,50 @@ fn docs_inner(
             let inner = block.inner(cols[1]);
             let body = markdown::render(DOCS[sel].1);
 
-            // Wrapping turns one long line into several, so the scroll limit has
-            // to count laid-out rows, not source lines. Without this the view
-            // scrolled forever into blank space below the text.
-            let wrapped: usize = body
-                .iter()
-                .map(|l| {
-                    let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-                    (w.max(1)).div_ceil(inner.width.max(1) as usize)
-                })
-                .sum();
+            // Wrapping turns one long line into several, so the scroll limit
+            // has to count laid-out rows, not source lines — and only the
+            // widget's own word-wrapper knows that number. Estimating it by
+            // dividing character counts undercounted (a word that doesn't fit
+            // moves WHOLE to the next row), which clamped the scroll short and
+            // cut the tail off longer pages.
+            let par = Paragraph::new(body).wrap(Wrap { trim: false });
+            let wrapped = par.line_count(inner.width.max(1));
             max_scroll = (wrapped as u16).saturating_sub(inner.height);
             scroll = scroll.min(max_scroll);
 
-            f.render_widget(
-                Paragraph::new(body)
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0))
-                    .block(block),
-                cols[1],
-            );
+            f.render_widget(par.scroll((scroll, 0)).block(block), cols[1]);
+            mouse::paint(f, &msel);
+            if copy_armed {
+                if let Some((a, b)) = msel.region() {
+                    grabbed = Some(mouse::selected_text(f.buffer_mut(), a, b));
+                }
+            }
         })?;
+        if let Some(t) = grabbed {
+            copy_armed = false;
+            msel.clear();
+            if !t.is_empty() {
+                mouse::copy(&t);
+            }
+        }
 
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
+            let ev = event::read()?;
+            if let Event::Mouse(m) = ev {
+                use crossterm::event::MouseEventKind as K;
+                match m.kind {
+                    K::ScrollDown => scroll = scroll.saturating_add(2).min(max_scroll),
+                    K::ScrollUp => scroll = scroll.saturating_sub(2),
+                    _ => {
+                        if msel.on_mouse(m) {
+                            copy_armed = true; // extracted on the next frame
+                        }
+                    }
+                }
+            }
+            if let Event::Key(k) = ev {
                 let switch = |forward: bool, sel: &mut usize, scroll: &mut u16| {
                     *sel = if forward {
                         (*sel + 1) % DOCS.len()
