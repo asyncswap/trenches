@@ -1007,10 +1007,11 @@ async fn solana_app(
     // Optional, exactly like the EVM side. Esc goes on WITHOUT an account and
     // the dashboard opens read-only: prices, launches and the tape are worth
     // seeing before committing a key to the machine, and `W` unlocks one at any
-    // point. Skipped entirely when there is nothing to unlock — an empty list
-    // you have to Esc past is a question with no answer standing in the way.
+    // point. This loop only runs when `W` asked for it, so it must show even
+    // with nothing to unlock: the screen offers create/import, and gating it
+    // on existing keystores made `W` a silent no-op on a fresh machine.
     let mut unlocked: Option<solana_keypair::Keypair> = None;
-    while ask_account && !wallet::list_keystores().is_empty() {
+    while ask_account {
         let Some(ks) = wallet_screen(terminal, config::ChainKind::Solana)? else {
             break;
         };
@@ -1412,13 +1413,15 @@ async fn chain_session_on(
     // list — a seed phrase in a config file is not an account we are willing to
     // offer, so the only accounts are encrypted keystores.
     //
-    // Optional, and skipped entirely when there is nothing to unlock. Esc goes
-    // on WITHOUT an account: the dashboard is worth looking at before you commit
-    // a key to it — prices, launches, the tape — and making an unlock the price
-    // of entry means anyone who just wants to watch hands over a password first.
-    // `W` unlocks one at any point.
+    // Optional. Esc goes on WITHOUT an account: the dashboard is worth looking
+    // at before you commit a key to it — prices, launches, the tape — and
+    // making an unlock the price of entry means anyone who just wants to watch
+    // hands over a password first. `W` brings this up at any point — and it
+    // must come up even with nothing to unlock, because the screen offers
+    // create/import; gating it on existing keystores made `W` a silent no-op
+    // on a machine with no ~/.foundry/keystores and no config keystores.
     let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = None;
-    while ask_account && !wallet::list_keystores().is_empty() {
+    while ask_account {
         let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
             break;
         };
