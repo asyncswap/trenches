@@ -951,9 +951,9 @@ impl SolBot {
         let mut fresh = fresh;
         if let Some(prev_close) = self.hist.last().map(|c| c.c) {
             if let Some(f) = fresh.first_mut() {
+                // Open only — stretching h/l to the previous session's close
+                // drew a chart-height wick line on the seam candle.
                 f.o = prev_close;
-                f.h = f.h.max(prev_close);
-                f.l = f.l.min(prev_close);
             }
         }
         self.hist.extend(fresh);

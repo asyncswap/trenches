@@ -245,7 +245,9 @@ pub fn fold_candles(base: &[Candle], iv_secs: u64) -> Vec<Candle> {
                         out.push(Candle { o: kc, h: kc, l: kc, c: kc, v: 0.0, t: kt + g * iv });
                     }
                 }
-                out.push(Candle { o, h: c.h.max(o), l: c.l.min(o), c: c.c, v: c.v, t: b });
+                // Same rule as candles_of: the chained open lives in the
+                // body, never in the wick range.
+                out.push(Candle { o, h: c.h, l: c.l, c: c.c, v: c.v, t: b });
             }
         }
     }
@@ -321,11 +323,13 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize, no
             // A new candle opens where the previous one CLOSED, not at its own
             // first trade — that's the grammar every charting tool taught:
             // price is continuous, so a gap between close and next-open reads
-            // as candles jumping around. The chained open joins the range, so
-            // the body/wick covers the ground from prev-close to first trade.
+            // as candles jumping around. The BODY (open..close) covers that
+            // ground by construction; high/low stay the candle's own trades —
+            // stretching them to the chained open painted a full-height
+            // one-column wick line whenever the gap dwarfed the real range.
             None => {
                 let o = out.last().map_or(p, |k| k.c);
-                Candle { o, h: o.max(p), l: o.min(p), c: p, v, t: b }
+                Candle { o, h: p, l: p, c: p, v, t: b }
             }
             Some(k) => Candle { o: k.o, h: k.h.max(p), l: k.l.min(p), c: p, v: k.v + v, ..k },
         });
@@ -394,7 +398,7 @@ mod candle_tests {
         assert_eq!((f[0].o, f[0].h, f[0].c), (1.0, 5.0, 3.0));
         assert_eq!((f[1].o, f[1].c, f[1].v), (3.0, 3.0, 0.0), "silent hour is flat");
         assert_eq!(f[2].o, 3.0, "opens where the flat closed");
-        assert_eq!(f[2].l, 3.0, "range covers the chained open");
+        assert_eq!(f[2].l, 8.0, "wick stays the candle's own trades");
     }
 
     #[test]
@@ -416,7 +420,10 @@ mod candle_tests {
         let c = candles_of(&pts, 10, 100, None);
         assert_eq!(c.len(), 2);
         assert_eq!(c[1].o, 5.0);
-        assert_eq!(c[1].l, 5.0);
+        // The BODY spans the chained ground (open 5, close 9); the wick range
+        // stays the candle's own trades — a chained-open wick painted a
+        // full-height line whenever a gap dwarfed the real range.
+        assert_eq!(c[1].l, 9.0);
         assert_eq!(c[1].c, 9.0);
         assert!(c[1].up());
     }
