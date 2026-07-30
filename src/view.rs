@@ -181,7 +181,8 @@ pub struct AxisView {
 }
 
 /// One OHLC candle — the unit TradingView made everyone fluent in.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Serialized as the per-coin candle history, so a chart survives a restart.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Candle {
     pub o: f64,
     pub h: f64,
@@ -215,6 +216,53 @@ pub struct CandleView {
     /// lines at each fill's PRICE, the way TradingView draws a position:
     /// where you got in and out, readable against where price is now.
     pub trades: Vec<(i64, f64, bool)>,
+}
+
+/// Re-bucket candles into a coarser interval — the cheap path for big
+/// intervals: history is aggregated ONCE into 1m candles and stored; a 4h or
+/// 1d chart folds those instead of re-walking every trade ever seen. Gaps
+/// between stored candles flat-fill and every bucket opens at the previous
+/// close, same grammar as `candles_of`.
+pub fn fold_candles(base: &[Candle], iv_secs: u64) -> Vec<Candle> {
+    let iv = iv_secs.max(1) as i64;
+    let mut out: Vec<Candle> = Vec::new();
+    for c in base {
+        let b = c.t - c.t.rem_euclid(iv);
+        match out.last_mut() {
+            Some(k) if k.t == b => {
+                k.h = k.h.max(c.h);
+                k.l = k.l.min(c.l);
+                k.c = c.c;
+                k.v += c.v;
+            }
+            prev => {
+                let o = prev.as_ref().map_or(c.o, |k| k.c);
+                if let Some(k) = prev {
+                    // Flat-fill silent buckets between the last one and this.
+                    let gaps = ((b - k.t) / iv - 1).max(0);
+                    let (kc, kt) = (k.c, k.t);
+                    for g in 1..=gaps {
+                        out.push(Candle { o: kc, h: kc, l: kc, c: kc, v: 0.0, t: kt + g * iv });
+                    }
+                }
+                out.push(Candle { o, h: c.h.max(o), l: c.l.min(o), c: c.c, v: c.v, t: b });
+            }
+        }
+    }
+    out
+}
+
+/// Extend `out` with flat candles up to `now`'s bucket — at most half of
+/// `max`, so live silence shows without draining real history out of the
+/// window. The tail end of `candles_of`, shared so folded charts extend too.
+pub fn extend_flat_to_now(out: &mut Vec<Candle>, iv_secs: u64, now: i64, max: usize) {
+    let iv = iv_secs.max(1) as i64;
+    let Some(last) = out.last().copied() else { return };
+    let nb = now - now.rem_euclid(iv);
+    let gaps = ((nb - last.t) / iv).clamp(0, (max / 2) as i64);
+    for k in 1..=gaps {
+        out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t: last.t + k * iv });
+    }
 }
 
 /// Aggregate raw trades into time-bucketed candles, oldest-first.
@@ -281,16 +329,8 @@ pub fn candles_of(points: &[(i64, f64, f64)], interval_secs: u64, max: usize, no
     if let Some(k) = cur {
         out.push(k);
     }
-    if let (Some(now), Some(last)) = (now, out.last().copied()) {
-        // At most HALF the window of live flat — enough that quiet reads as
-        // quiet, never so much that it drains the real candles out of the
-        // window. A coin reopened a day after its last trade used to show
-        // 240 flats and none of the saved history the tape had just loaded.
-        let nb = now - now.rem_euclid(iv);
-        let gaps = ((nb - last.t) / iv).clamp(0, (max / 2) as i64);
-        for k in 1..=gaps {
-            out.push(Candle { o: last.c, h: last.c, l: last.c, c: last.c, v: 0.0, t: last.t + k * iv });
-        }
+    if let Some(now) = now {
+        extend_flat_to_now(&mut out, interval_secs, now, max);
     }
     if out.len() > max {
         out.drain(..out.len() - max);
@@ -328,6 +368,20 @@ mod candle_tests {
         assert_eq!(c.last().unwrap().t, 150);
         // And without a clock, nothing is invented.
         assert_eq!(candles_of(&pts, 10, 100, None).len(), 1);
+    }
+
+    #[test]
+    fn folding_minute_candles_into_hours_keeps_the_story() {
+        // Three 1m candles across two hour-buckets, with a silent hour after
+        // the first: fold must group, flat-fill, and chain the opens.
+        let m = |t: i64, o: f64, h: f64, l: f64, c: f64| Candle { o, h, l, c, v: 1.0, t };
+        let base = [m(0, 1.0, 4.0, 1.0, 2.0), m(60, 2.0, 5.0, 2.0, 3.0), m(7200, 9.0, 9.0, 8.0, 8.5)];
+        let f = fold_candles(&base, 3600);
+        assert_eq!(f.len(), 3);
+        assert_eq!((f[0].o, f[0].h, f[0].c), (1.0, 5.0, 3.0));
+        assert_eq!((f[1].o, f[1].c, f[1].v), (3.0, 3.0, 0.0), "silent hour is flat");
+        assert_eq!(f[2].o, 3.0, "opens where the flat closed");
+        assert_eq!(f[2].l, 3.0, "range covers the chained open");
     }
 
     #[test]

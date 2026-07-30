@@ -155,6 +155,46 @@ fn save_coins(coins: &[SeenCoin]) {
     }
 }
 
+/// Where one coin's sealed 1-minute candles live. The tape ring holds the
+/// newest 500 trades; everything older survives HERE, aggregated once —
+/// which is what lets a 4h or 1d chart exist at all, and keeps the chart
+/// from re-walking every trade on every frame.
+fn candles_path(mint: &Pubkey) -> String {
+    format!("{}/candles-{mint}.json", crate::state_dir())
+}
+
+/// The most sealed minutes kept per coin — a week. ~800KB of JSON at worst,
+/// bounded so neither the file nor the fold ever grows without limit.
+const HIST_MAX: usize = 10_080;
+
+fn load_candles(mint: &Pubkey) -> Vec<crate::view::Candle> {
+    std::fs::read_to_string(candles_path(mint))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Debounced, like the tape file — and derived data: a lost write is only
+/// a re-aggregation away, so no salvage ceremony is needed here.
+fn save_candles(mint: &Pubkey, hist: &[crate::view::Candle]) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed().as_secs() < 5) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    if let Ok(text) = serde_json::to_string(hist) {
+        let path = candles_path(mint);
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 /// Where one coin's tape history lives. The trades you watched — and MADE —
 /// reload into the Trades view the moment the coin is selected again; the
 /// live feed then merges on top (the (signature, event) dedup absorbs the
@@ -309,9 +349,18 @@ struct TapeCache {
     /// Every signature already inspected, including ones that decoded to
     /// nothing — otherwise those get re-fetched forever.
     seen: std::collections::HashSet<String>,
+    /// Unanswered-fetch attempts per signature. Bandwidth is metered: a
+    /// transaction no endpoint serves gets a handful of retries, then counts
+    /// as seen rather than being re-downloaded every round until it scrolls
+    /// out of the window.
+    tries: std::collections::HashMap<String, u8>,
     /// How many signatures to ask for next round.
     depth: u32,
 }
+
+/// Give an unanswered signature this many rounds before writing it off.
+/// Covers commitment lag and a throttled batch; gives up on the truly gone.
+const TAPE_FETCH_TRIES: u8 = 5;
 
 impl TapeCache {
     /// Point the cache at a coin, dropping another coin's history.
@@ -320,7 +369,17 @@ impl TapeCache {
             self.mint = mint;
             self.rows.clear();
             self.seen.clear();
+            self.tries.clear();
             self.depth = TAPE_DEPTH;
+            // Seed from the coin's saved history: those transactions are
+            // already on disk, and against a metered RPC plan, re-downloading
+            // a window of trades the app already has is pure waste.
+            if let Some(m) = mint {
+                for row in load_tape_history(&m) {
+                    self.seen.insert(row.signature.clone());
+                    self.rows.push(row);
+                }
+            }
         }
     }
 
@@ -348,6 +407,16 @@ impl TapeCache {
     fn absorb(&mut self, batch: discover::TapeBatch) {
         self.retune(batch.fresh_total);
         self.seen.extend(batch.scanned);
+        // Unanswered signatures get a bounded number of retries, then count
+        // as seen — re-asking forever is bandwidth the tape never gets back.
+        for sig in batch.unanswered {
+            let n = self.tries.entry(sig.clone()).or_insert(0);
+            *n += 1;
+            if *n >= TAPE_FETCH_TRIES {
+                self.seen.insert(sig.clone());
+                self.tries.remove(&sig);
+            }
+        }
         discover::merge_tape(&mut self.rows, batch.rows);
         // Bound `seen` alongside the rows it guards.
         if self.seen.len() > discover::TAPE_RING * 4 {
@@ -497,7 +566,22 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .ok();
-    let candles = crate::view::candles_of(&points, bot.chart_iv, 240, now);
+    // Two sources, one grammar. Sub-minute charts read the live ring — their
+    // whole window is minutes of the newest trades, which the ring always
+    // covers. Minute-and-up charts fold the sealed 1m history, which reaches
+    // back days where the ring holds barely an hour of a busy coin.
+    let candles = if bot.chart_iv >= 60 && !bot.hist.is_empty() {
+        let mut c = crate::view::fold_candles(&bot.hist, bot.chart_iv);
+        if let Some(n) = now {
+            crate::view::extend_flat_to_now(&mut c, bot.chart_iv, n, 240);
+        }
+        if c.len() > 240 {
+            c.drain(..c.len() - 240);
+        }
+        c
+    } else {
+        crate::view::candles_of(&points, bot.chart_iv, 240, now)
+    };
     let sym = bot
         .meta
         .as_ref()
@@ -607,6 +691,11 @@ pub struct SolBot {
     pub orders: VecDeque<SolOrder>,
     pub logs: VecDeque<String>,
     pub tape: Vec<SolSwap>,
+    /// Sealed 1-minute candles for the selected coin — the tape ring's past,
+    /// aggregated once and persisted. Big-interval charts fold THIS instead
+    /// of re-walking trades, and it reaches back further than 500 rows ever
+    /// could. Updated incrementally as the tape absorbs.
+    pub hist: Vec<crate::view::Candle>,
     /// Unix seconds the selected coin launched, carried over from the trenches
     /// row so the Market panel can show its age like the EVM side does.
     pub launched_at: Option<i64>,
@@ -686,6 +775,7 @@ impl SolBot {
             orders: VecDeque::new(),
             logs: VecDeque::new(),
             tape: Vec::new(),
+            hist: Vec::new(),
             launched_at: None,
             sol_usd: 0.0,
             risk: super::rugcheck::RugCheck::new(rc),
@@ -841,6 +931,38 @@ impl SolBot {
 
     /// Copy the latest background snapshot into the bot. Pure memory work — no
     /// awaits — so it can run every frame without ever stalling the UI.
+    /// Fold the tape's trades into sealed 1m candles and splice them over
+    /// `hist`. The ring is authoritative for every minute it still covers —
+    /// re-folding while trades are in the ring lets late arrivals correct a
+    /// minute; once a minute scrolls out of the ring, its last fold stands.
+    fn reseal_candles(&mut self) {
+        let points: Vec<(i64, f64, f64)> = self
+            .tape
+            .iter()
+            .rev()
+            .filter(|s| !s.kind.is_lp() && s.tokens > 0.0)
+            .filter_map(|s| s.block_time.map(|t| (t, s.sol / s.tokens, s.sol)))
+            .collect();
+        let fresh = crate::view::candles_of(&points, 60, usize::MAX, None);
+        let Some(first) = fresh.first() else { return };
+        self.hist.retain(|c| c.t < first.t);
+        // Stitch the seam: the fold had no context before the ring, so its
+        // first candle opens at its own first trade — chain it to history.
+        let mut fresh = fresh;
+        if let Some(prev_close) = self.hist.last().map(|c| c.c) {
+            if let Some(f) = fresh.first_mut() {
+                f.o = prev_close;
+                f.h = f.h.max(prev_close);
+                f.l = f.l.min(prev_close);
+            }
+        }
+        self.hist.extend(fresh);
+        if self.hist.len() > HIST_MAX {
+            let cut = self.hist.len() - HIST_MAX;
+            self.hist.drain(..cut);
+        }
+    }
+
     fn absorb(&mut self, snap: &Snapshot) {
         self.sol = snap.sol;
         self.slot = snap.slot;
@@ -870,6 +992,8 @@ impl SolBot {
         if !added.is_empty() {
             if let Some(m) = snap.mint {
                 save_tape_history(&m, &self.tape);
+                self.reseal_candles();
+                save_candles(&m, &self.hist);
             }
         }
         if !first_fill {
@@ -2293,6 +2417,10 @@ pub async fn run(
                     // session are on disk, and the live feed dedups on top.
                     discover::merge_tape(&mut bot.tape, load_tape_history(&p.mint));
                     discover::merge_tape(&mut bot.tape, p.seed);
+                    // Sealed candles from past sessions, then bring them
+                    // current with whatever the tape already holds.
+                    bot.hist = load_candles(&p.mint);
+                    bot.reseal_candles();
                     *target.lock().unwrap() = Some(tgt);
                     view = Panel::Tape;
                     scroll = 0;

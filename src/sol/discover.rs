@@ -995,6 +995,12 @@ const MAX_TX_PER_READ: usize = 50;
 pub struct TapeBatch {
     pub rows: Vec<SolSwap>,
     pub scanned: Vec<String>,
+    /// Signatures asked for whose transaction came back null this round —
+    /// usually "not queryable yet" or a throttled batch. They stay unseen so
+    /// the next round retries, but the caller counts attempts: bandwidth is
+    /// metered, and a transaction no endpoint will ever serve must not be
+    /// re-downloaded every 1.5s forever.
+    pub unanswered: Vec<String>,
     /// New signatures the window held, before the fetch budget was applied.
     /// Saturation is judged on this, not on what was fetched — otherwise a
     /// budget-capped read looks permanently saturated and the window ratchets
@@ -1018,7 +1024,7 @@ pub async fn pool_tape(
     let curve = bonding_curve_pda(mint);
     let sigs = match rpc.signatures_for(&curve, limit).await {
         Ok(s) => s,
-        Err(_) => return TapeBatch { rows: Vec::new(), scanned: Vec::new(), fresh_total: 0 },
+        Err(_) => return TapeBatch { rows: Vec::new(), scanned: Vec::new(), unanswered: Vec::new(), fresh_total: 0 },
     };
     // A confirmed transaction never changes, so fetching one twice buys nothing.
     // This is the single biggest RPC cost in the app — the window barely moves
@@ -1026,7 +1032,7 @@ pub async fn pool_tape(
     let mut sigs: Vec<String> = sigs.into_iter().filter(|s| !skip.contains(s)).collect();
     let fresh_total = sigs.len();
     if sigs.is_empty() {
-        return TapeBatch { rows: Vec::new(), scanned: Vec::new(), fresh_total: 0 };
+        return TapeBatch { rows: Vec::new(), scanned: Vec::new(), unanswered: Vec::new(), fresh_total: 0 };
     }
     // Newest first from the RPC, so truncating keeps the most recent trades and
     // defers the older backlog to later rounds.
@@ -1039,11 +1045,15 @@ pub async fn pool_tape(
     // the market moved. Unanswered signatures now stay fresh and are asked
     // for again next round.
     let mut scanned = Vec::new();
+    let mut unanswered = Vec::new();
     let mut fetched: Vec<(String, serde_json::Value)> = Vec::new();
     for (tx, sig) in rpc.transactions(&sigs).await.into_iter().zip(sigs) {
-        if let Some(t) = tx {
-            scanned.push(sig.clone());
-            fetched.push((sig, t));
+        match tx {
+            Some(t) => {
+                scanned.push(sig.clone());
+                fetched.push((sig, t));
+            }
+            None => unanswered.push(sig),
         }
     }
 
@@ -1051,7 +1061,7 @@ pub async fn pool_tape(
     for (sig, tx) in fetched {
         out.extend(curve_swaps_in_tx(&tx, &sig, mint, trader));
     }
-    TapeBatch { rows: out, scanned, fresh_total }
+    TapeBatch { rows: out, scanned, unanswered, fresh_total }
 }
 
 /// Every curve TradeEvent for `mint` inside ONE transaction. Pure, so both
@@ -1277,12 +1287,12 @@ pub async fn amm_tape(
 ) -> TapeBatch {
     let sigs = match rpc.signatures_for(pool, limit).await {
         Ok(s) => s,
-        Err(_) => return TapeBatch { rows: Vec::new(), scanned: Vec::new(), fresh_total: 0 },
+        Err(_) => return TapeBatch { rows: Vec::new(), scanned: Vec::new(), unanswered: Vec::new(), fresh_total: 0 },
     };
     let mut sigs: Vec<String> = sigs.into_iter().filter(|s| !skip.contains(s)).collect();
     let fresh_total = sigs.len();
     if sigs.is_empty() {
-        return TapeBatch { rows: Vec::new(), scanned: Vec::new(), fresh_total: 0 };
+        return TapeBatch { rows: Vec::new(), scanned: Vec::new(), unanswered: Vec::new(), fresh_total: 0 };
     }
     // Newest first from the RPC, so truncating keeps the most recent trades and
     // defers the older backlog to later rounds.
@@ -1292,11 +1302,15 @@ pub async fn amm_tape(
     // (not yet queryable, or a throttled batch) stays fresh for next round —
     // marking it seen threw its trade away forever.
     let mut scanned = Vec::new();
+    let mut unanswered = Vec::new();
     let mut fetched: Vec<(String, serde_json::Value)> = Vec::new();
     for (tx, sig) in rpc.transactions(&sigs).await.into_iter().zip(sigs) {
-        if let Some(t) = tx {
-            scanned.push(sig.clone());
-            fetched.push((sig, t));
+        match tx {
+            Some(t) => {
+                scanned.push(sig.clone());
+                fetched.push((sig, t));
+            }
+            None => unanswered.push(sig),
         }
     }
 
@@ -1397,7 +1411,7 @@ pub async fn amm_tape(
             }
         }
     }
-    TapeBatch { rows: out, scanned, fresh_total }
+    TapeBatch { rows: out, scanned, unanswered, fresh_total }
 }
 
 /// First 6 and last 4 of a pubkey — enough to match against an explorer's
