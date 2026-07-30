@@ -2053,13 +2053,16 @@ pub async fn run(
                         view = Panel::Chart;
                         scroll = 0;
                     }
+                    // Status only, not note(): stepping through six intervals
+                    // is browsing, not an event — it was filling the log ring
+                    // with a "candles: 5s" line per keypress.
                     KeyCode::Char(',') => {
                         bot.chart_iv = crate::view::iv_step(bot.chart_iv, false);
-                        bot.note(format!("candles: {}", crate::view::iv_label(bot.chart_iv)));
+                        bot.status = format!("candles: {}", crate::view::iv_label(bot.chart_iv));
                     }
                     KeyCode::Char('.') => {
                         bot.chart_iv = crate::view::iv_step(bot.chart_iv, true);
-                        bot.note(format!("candles: {}", crate::view::iv_label(bot.chart_iv)));
+                        bot.status = format!("candles: {}", crate::view::iv_label(bot.chart_iv));
                     }
                     KeyCode::Up => {
                         let n = match view {
