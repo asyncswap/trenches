@@ -1705,7 +1705,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     let total = bot.orders.len();
     let title = if total > h {
         format!(
-            " Orders {}–{} of {} ↑/↓ scroll  ·  {} ",
+            " My Orders {}–{} of {} ↑/↓ scroll  ·  {} ",
             scroll + 1,
             (scroll + h).min(total),
             total,
@@ -1714,7 +1714,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
     } else {
         // The trader is the same wallet on every row, so it belongs in the
         // title once rather than eating 44 columns per line.
-        format!(" Orders ({total}) ")
+        format!(" My Orders ({total}) ")
     };
     let mut t = TableView::new(
         title,

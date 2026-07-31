@@ -4008,10 +4008,13 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         let scroll = orders_scroll.min(total.saturating_sub(1));
         // Built as a chain-agnostic TableView and drawn by the shared widget —
         // same code path as the Solana orders panel.
+        // "My Orders", not "Orders": this panel is YOUR sends, while the tape
+        // beside it is everyone's. One word saves reading two panels to work
+        // out which is which.
         let title = if total > h {
-            format!(" Orders {}–{} of {} ↑/↓ scroll ", scroll + 1, (scroll + h).min(total), total)
+            format!(" My Orders {}–{} of {} ↑/↓ scroll ", scroll + 1, (scroll + h).min(total), total)
         } else {
-            format!(" Orders ({total}) ")
+            format!(" My Orders ({total}) ")
         };
         let mut t = view::TableView::new(
             title,
