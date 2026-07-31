@@ -418,6 +418,50 @@ impl Bot {
         1.0 - (self.slippage_pct.max(1.0) * 5.0).min(50.0) / 100.0
     }
 
+    /// A floor under the floor: the least `min_out` may be, whatever this
+    /// poll's pool read claims.
+    ///
+    /// `min_out` is derived from `expected`, and `expected` comes from ONE
+    /// endpoint's view of `slot0` and `liquidity`. An endpoint that understates
+    /// the pool — by fault or by design — hands back a min_out of dust, the
+    /// pre-flight still passes because a low minimum is always executable, and
+    /// the swap goes out with effectively no slippage protection for a
+    /// sandwich to take. The endpoint best placed to feed that number is also
+    /// the one best placed to trade against it.
+    ///
+    /// `ref_price` is a 60-sample moving average of earlier polls, so a single
+    /// bad response barely moves it: it is the cheapest thing here the current
+    /// answer did not author. Anchoring to it costs no extra RPC, which matters
+    /// on a metered endpoint.
+    ///
+    /// Deliberately generous. A launch really can lose most of its value in
+    /// seconds and an exit still has to go through, so this does not police
+    /// volatility — it rules out the catastrophic shape only, a floor at a
+    /// fraction of what every recent read said the pool was worth. Returns 0
+    /// when there is no usable reference, which leaves the old behaviour.
+    fn reference_floor(&self, amount_in: f64, buying: bool) -> f64 {
+        reference_floor_of(self.ref_price, amount_in, buying)
+    }
+
+    /// `min_out` for a trade, never below what recent history says it is worth.
+    /// Warns when the anchor binds — that means this poll's pool read disagreed
+    /// with the last sixty by an order of magnitude, which is worth seeing.
+    fn guarded_min_out(&mut self, expected: f64, amount_in: f64, buying: bool, floor: f64) -> f64 {
+        let quoted = expected * floor;
+        let anchor = self.reference_floor(amount_in, buying);
+        if anchor > quoted {
+            self.logline(&format!(
+                "slippage floor raised {quoted:.8} -> {anchor:.8}: this pool read is far below the 60-sample reference"
+            ));
+            crate::events::warn(
+                "A pool read disagreed with recent history, so the slippage floor was anchored to the reference instead",
+                &[("quoted", format!("{quoted:.8}")), ("floor", format!("{anchor:.8}"))],
+            );
+            return anchor;
+        }
+        quoted
+    }
+
     pub fn price(&self) -> f64 {
         if self.r0 > 0.0 {
             self.r1 / self.r0
@@ -1386,7 +1430,7 @@ impl Bot {
 
         // Floor sits below the quote by the configured tolerance. Clamped to a
         // 1% minimum so "0" can never mean "no protection".
-        let min_out = expected * self.slip_floor();
+        let min_out = self.guarded_min_out(expected, amount_in, buying, self.slip_floor());
         // amount_in / min_out are HUMAN units — scale to base units using EACH
         // side's real decimals. A buy spends ETH (18) for token; a sell spends
         // token for ETH, so the two swap over. Without the scaling a sub-1.0
@@ -1593,7 +1637,8 @@ impl Bot {
         }
         let wei_in = Wei::rounded(eth_in); // ETH in — 18-dec
         // Token OUT: scale by the token's real decimals, not a blanket 1e18.
-        let wei_min = Wei::of_token(tok_out * self.slip_floor(), self.pool.token_decimals);
+        let buy_min = self.guarded_min_out(tok_out, eth_in, true, self.slip_floor());
+        let wei_min = Wei::of_token(buy_min, self.pool.token_decimals);
         let (to1, data1, val1) = build_swap(bk, tok, bf, true, wei_in, wei_min, self.trader);
         let label1 = format!(
             "ARB BUY ~{:.6} ETH @ {:.6} [{}]",
@@ -1661,7 +1706,8 @@ impl Bot {
         let bal_now = IERC20::new(tok, provider).balanceOf(self.trader).call().await.map(|b| Wei::exact(b._0)).unwrap_or(Wei::MAX);
         // Token IN: real decimals. ETH out stays 18-dec.
         let s_wei_in = Wei::of_token(got, self.pool.token_decimals).min(bal_now);
-        let s_wei_min = Wei::rounded(eth_out * self.slip_floor());
+        let sell_min = self.guarded_min_out(eth_out, got, false, self.slip_floor());
+        let s_wei_min = Wei::rounded(sell_min);
         let (to2, data2, val2) = build_swap(sk, tok, sf, false, s_wei_in, s_wei_min, self.trader);
         let label2 = format!(
             "ARB SELL {:.4} {} -> ~{:.6} ETH [{}]",
@@ -2184,7 +2230,7 @@ impl Bot {
         };
         // A full dump moves price more than a sized trade, so it gets extra
         // room on top of the configured tolerance — but still derived from it.
-        let min_out = expected * self.slip_floor_dump();
+        let min_out = self.guarded_min_out(expected, amount_in, false, self.slip_floor_dump());
         // Selling the tracked token for ETH: token side uses its real decimals.
         let wei_in = Wei::of_token(amount_in, self.pool.token_decimals).min(sell_cap); // exact balance, no STF
         let wei_min = Wei::rounded(min_out);
@@ -2743,6 +2789,25 @@ fn eth_of_label(label: &str) -> Option<f64> {
         .and_then(|s| s.parse::<f64>().ok())
 }
 
+/// Share of the reference-implied output that `min_out` may not go under.
+/// Generous on purpose — see [`Bot::reference_floor`].
+const DISASTER_FLOOR: f64 = 0.10;
+
+/// The reference-anchored floor, as a free function so it can be checked
+/// without standing up a bot. `p_ref` is tokens per ETH.
+fn reference_floor_of(p_ref: f64, amount_in: f64, buying: bool) -> f64 {
+    if p_ref <= 0.0 || amount_in <= 0.0 {
+        return 0.0;
+    }
+    // A buy takes ETH in and gets tokens; a sell takes tokens and gets ETH.
+    let ref_out = if buying { amount_in * p_ref } else { amount_in / p_ref };
+    if ref_out.is_finite() && ref_out > 0.0 {
+        ref_out * DISASTER_FLOOR
+    } else {
+        0.0
+    }
+}
+
 fn wei_to_f64(x: U256) -> f64 {
     // Overflow-safe (a token balance could exceed u128): parse the decimal.
     x.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
@@ -2990,5 +3055,65 @@ mod decimals_tests {
             -held,
             "this is the number that appeared on screen when a failed read became 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod slippage_anchor_tests {
+    use super::*;
+
+    /// The attack this exists for: an endpoint reports a pool worth a
+    /// thousandth of what every recent read said, `min_out` collapses to dust,
+    /// the pre-flight passes because a low minimum is always executable, and
+    /// the swap goes out with no protection left for a sandwich to take.
+    #[test]
+    fn a_wildly_understated_quote_cannot_collapse_the_floor() {
+        let p_ref = 1_000.0; // tokens per ETH, 60-sample average
+        let amount_in = 1.0; // buying with 1 ETH
+
+        // An honest read: ~1000 tokens out. The anchor must not bind.
+        let honest = 1_000.0;
+        let quoted = honest * 0.97; // 3% tolerance
+        assert!(
+            reference_floor_of(p_ref, amount_in, true) < quoted,
+            "the anchor must not interfere with an ordinary quote"
+        );
+
+        // A lying read: 1 token out. The floor derived from it is dust.
+        let lie = 1.0;
+        let dust = lie * 0.97;
+        let anchor = reference_floor_of(p_ref, amount_in, true);
+        assert!(anchor > dust, "the anchor must override a dust floor");
+        assert!(anchor >= 100.0, "at 10% of a 1000-token reference, {anchor} is too low");
+    }
+
+    /// It must NOT police ordinary volatility. A launch can lose most of its
+    /// value in seconds and the exit still has to go through — a floor that
+    /// reverts an exit is its own kind of loss.
+    #[test]
+    fn a_real_crash_still_exits() {
+        let p_ref = 1_000.0;
+        let tokens_in = 1_000.0; // selling 1000 tokens; reference says ~1 ETH
+
+        // Price has genuinely halved: the quote is ~0.5 ETH.
+        let quoted = 0.5 * 0.97;
+        assert!(
+            reference_floor_of(p_ref, tokens_in, false) < quoted,
+            "a 50% move must still trade"
+        );
+        // Even a 3/4 collapse clears the anchor.
+        let hard = 0.25 * 0.97;
+        assert!(reference_floor_of(p_ref, tokens_in, false) < hard, "a 75% move must still trade");
+    }
+
+    /// With no reference — a fresh pool, an empty sample window — the anchor
+    /// returns 0 and the previous behaviour stands. It must never invent a
+    /// floor out of nothing.
+    #[test]
+    fn no_reference_means_no_anchor() {
+        assert_eq!(reference_floor_of(0.0, 1.0, true), 0.0);
+        assert_eq!(reference_floor_of(-1.0, 1.0, false), 0.0);
+        assert_eq!(reference_floor_of(1_000.0, 0.0, true), 0.0);
+        assert_eq!(reference_floor_of(f64::INFINITY, 1.0, true), 0.0);
     }
 }
