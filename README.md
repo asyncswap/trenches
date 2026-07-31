@@ -4,10 +4,11 @@ A terminal bot for trading memecoins.
 
 **[trenches.sh](https://trenches.sh)**
 
-> **the trenches** *(n.)* — the high-risk, high-volatility end of crypto,
-> where memecoins launch and die by the minute. A **trencher** is someone who
-> spends their time down there: hunting new launches, reading the tape, in
-> and out before the chart decides. This is their terminal.
+> **trencher** *(n.)* — "someone who spends a lot of time hunting and trading
+> newly launched meme coins in the 'trenches'—the high-risk, high-volatility
+> part of crypto." — *ChatGPT*
+>
+> This is their terminal.
 
 ![Trenches trading on Robinhood Chain: wallet and pool state above a live trade tape, with your own fills starred](./screenshot.png)
 
