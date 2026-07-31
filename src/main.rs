@@ -962,6 +962,12 @@ async fn main() -> eyre::Result<()> {
                     }
                     std::fs::write(&path, config::starter_json())?;
                 }
+                // This is the installer's path on a fresh machine, and it
+                // writes the file itself rather than going through the loader
+                // — so it needs the same 0600 the rest of the config handling
+                // applies. Unconditional: an existing config predating that
+                // rule is exactly the one still sitting world-readable.
+                config::owner_only(&path);
                 std::fs::create_dir_all(state_dir())?;
                 // Boxed, and coloured where colour will land.
                 //

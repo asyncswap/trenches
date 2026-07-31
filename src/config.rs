@@ -601,7 +601,7 @@ pub fn set_network_field(network: &str, field: &str, value: &str) -> eyre::Resul
 /// keys you pay for. Set on the temp file BEFORE the rename, so the published
 /// path is never briefly world-readable. Best effort: a filesystem that cannot
 /// represent the mode is not a reason to refuse to save.
-fn owner_only(path: &std::path::Path) {
+pub fn owner_only(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -639,6 +639,12 @@ pub fn network_names() -> Vec<String> {
 impl Registry {
     pub fn load(path: &str) -> eyre::Result<Registry> {
         let bytes = std::fs::read_to_string(path)?;
+        // Tighten on READ, not only on write. Setting the mode when saving does
+        // nothing for a config that already exists and is never saved again —
+        // which is every config written before this, holding its API keys
+        // world-readable in perpetuity. Cheap, idempotent, and the one moment
+        // the app is guaranteed to touch the file.
+        owner_only(std::path::Path::new(path));
         Ok(serde_json::from_str(&bytes)?)
     }
 
