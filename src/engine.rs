@@ -2306,11 +2306,29 @@ impl Bot {
 /// status bar (the full text is always in the log ring / session file).
 fn short_err(e: &str) -> String {
     let one: String = e.split('\n').next().unwrap_or(e).trim().to_string();
-    if one.chars().count() > 160 {
-        format!("{}…", one.chars().take(160).collect::<String>())
-    } else {
-        one
+    if one.chars().count() <= 160 {
+        return one;
     }
+    // Keep the TAIL of revert data, not just the head.
+    //
+    // A v4 revert arrives as WrappedError(address,bytes4,bytes,bytes) — the
+    // failing currency, then the selector that failed, then the reason. All of
+    // that lives past the 160th character, so truncating from the front threw
+    // away the entire diagnosis and left `data: "0x90bfb865…"`, which says
+    // only "something inside the pool reverted". Chasing one of these took
+    // five round trips to the chain to recover what the line already had.
+    if let Some(at) = one.find("0x") {
+        let (head, hex) = one.split_at(at);
+        let hex: String = hex.chars().take_while(|c| c.is_ascii_hexdigit() || *c == 'x').collect();
+        if hex.len() > 74 {
+            // Enough for the selector and the first two words, then the tail.
+            let front: String = hex.chars().take(74).collect();
+            let back: String = hex.chars().skip(hex.chars().count().saturating_sub(64)).collect();
+            let head: String = head.chars().take(90).collect();
+            return format!("{head}{front}…{back}");
+        }
+    }
+    format!("{}…", one.chars().take(160).collect::<String>())
 }
 
 /// Best-effort ERC-20 symbol (falls back to "TKN" if the token has none).
