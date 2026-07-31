@@ -569,12 +569,18 @@ pub const MINE_MARK: &str = "⭐";
 
 /// Compact elapsed time: `42s`, `7m`, `3h`.
 pub fn age_compact(secs: f64) -> String {
+    // Seconds, minutes, hours, DAYS. Stopping at minutes turned an
+    // eight-hour-old launch into "507m", which nobody reads as a duration —
+    // you have to divide it in your head to find out you are looking at
+    // yesterday.
     if secs < 60.0 {
         format!("{secs:.0}s")
     } else if secs < 3600.0 {
         format!("{}m", (secs / 60.0) as u64)
-    } else {
+    } else if secs < 86_400.0 {
         format!("{}h", (secs / 3600.0) as u64)
+    } else {
+        format!("{}d", (secs / 86_400.0) as u64)
     }
 }
 
@@ -762,5 +768,31 @@ mod usd_tag_tests {
         assert_eq!(usd_tag(1.0, 9_001.0).as_deref(), Some("($9.00k)"));
         assert_eq!(usd_tag(2.0, 1_000_000.0).as_deref(), Some("($2.00M)"));
         assert_eq!(usd_tag(0.5, 100.0).as_deref(), Some("($50.00)"));
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    use super::*;
+
+    /// Minutes stop at an hour. "507m" is not a duration anyone reads — you
+    /// have to divide it in your head to discover you are looking at yesterday.
+    #[test]
+    fn an_age_climbs_through_the_units() {
+        assert_eq!(age_compact(45.0), "45s");
+        assert_eq!(age_compact(60.0), "1m");
+        assert_eq!(age_compact(183.0 * 60.0), "3h");
+        assert_eq!(age_compact(507.0 * 60.0), "8h");
+        assert_eq!(age_compact(86_400.0), "1d");
+        assert_eq!(age_compact(3.0 * 86_400.0), "3d");
+    }
+
+    /// The boundaries land on the unit above, not one short of it.
+    #[test]
+    fn the_boundaries_are_clean() {
+        assert_eq!(age_compact(59.0), "59s");
+        assert_eq!(age_compact(3_599.0), "59m");
+        assert_eq!(age_compact(3_600.0), "1h");
+        assert_eq!(age_compact(86_399.0), "23h");
     }
 }

@@ -2101,7 +2101,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                 // Real age from the current block captured at each metrics refresh
                 // (~2s), so it ticks up instead of being relative to the newest pool.
                 let s = age_secs(r) as u64;
-                if s < 60 { format!("{s}s") } else { format!("{}m", s / 60) }
+                crate::view::age_compact(s as f64)
             };
             let mine = if r.my_bal > 0.0 { "●" } else { "" };
             let active = r.tx_per_sec >= HOT_TX_PER_SEC;

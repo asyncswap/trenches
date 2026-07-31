@@ -3516,7 +3516,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     mkt.push(Line::from(vec![mlbl("Mkt Cap"), Span::raw(format!("${:.2}M", bot.market_cap_usd() / 1e6))]));
     if let Some(lb) = bot.pons_launch() {
         let s = block.saturating_sub(lb) / 10; // ~10 blocks/sec since graduation
-        let a = if s < 60 { format!("{s}s") } else if s < 3600 { format!("{}m", s / 60) } else { format!("{}h", s / 3600) };
+        let a = view::age_compact(s as f64);
         let since = if matches!(bot.pool.kind, engine::PoolKind::FlaunchV4 { .. }) {
             "since flaunch"
         } else {
@@ -3892,7 +3892,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let age = |blk: u64| -> String {
                 let d = block.saturating_sub(blk);
                 let secs = d / 10;
-                if secs < 60 { format!("{secs}s") } else { format!("{}m", secs / 60) }
+                view::age_compact(secs as f64)
             };
             // Single-market mode shows only the active venue's swaps; arb mode
             // keeps the merged v3+v4 tape.
