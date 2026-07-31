@@ -85,7 +85,10 @@ pub fn log(level: Level, what: &str, details: &[(&str, String)]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let line = render(now, level, what, details);
+    // Redact at the sink, not at each call site: an error string that quotes a
+    // keyed RPC URL reaches the panel, the session file and any bug report
+    // pasted from it, and a new call site should not have to remember.
+    let line = crate::net::redact(&render(now, level, what, details));
 
     if let Ok(mut r) = ring().lock() {
         push_collapsed(&mut r, line.clone());

@@ -2241,6 +2241,7 @@ async fn screen_trenches(
         }
 
         crate::ui_alive();
+        crate::ui_phase_set("the Solana screen, waiting for a key");
 
         if event::poll(Duration::from_millis(150))? {
             let evt = event::read()?;
@@ -2414,6 +2415,7 @@ pub async fn run(
         }
 
         crate::ui_alive();
+        crate::ui_phase_set("the Solana dashboard, waiting for a key");
 
         if event::poll(Duration::from_millis(100))? {
             let evt = event::read()?;
@@ -2439,6 +2441,9 @@ pub async fn run(
                 }
             }
             if let Event::Key(k) = evt {
+                // Any await a key arm does holds the UI; name the key so a
+                // freeze report says which action was responsible.
+                crate::ui_phase_set(&format!("the {:?} key's action on Solana", k.code));
                 if show_help {
                     show_help = false;
                     if k.code == KeyCode::Char('?') {

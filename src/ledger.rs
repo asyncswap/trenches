@@ -98,14 +98,21 @@ impl Fill {
 
 /// Where one account's fills live. Per account, because PnL is per wallet —
 /// two wallets' trades in one file could only ever be added up wrongly.
-pub fn path(account: &str) -> String {
-    // Account labels come from config and can hold anything; keep the filename
-    // to characters that survive every filesystem we run on.
-    let safe: String = account
+/// Account labels come from config and can hold anything — including the
+/// slashes of a Foundry keystore path, and the default `"(no account)"`. Keep
+/// the filename to characters that survive every filesystem we run on.
+///
+/// Public so every per-account file agrees: `daily-` used the raw label and so
+/// silently failed to write for any account the ledger was happily renaming.
+pub fn safe_account(account: &str) -> String {
+    account
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect();
-    format!("{}/fills-{}.jsonl", crate::state_dir(), safe)
+        .collect()
+}
+
+pub fn path(account: &str) -> String {
+    format!("{}/fills-{}.jsonl", crate::state_dir(), safe_account(account))
 }
 
 /// Append one fill. Failures are swallowed on purpose: a full disk must not

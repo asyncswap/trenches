@@ -252,6 +252,75 @@ fn ui_beat_ms() -> u64 {
     UI_BEAT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What the UI thread is doing right now, so a freeze can be NAMED rather than
+/// just counted. Process-wide for the same reason the heartbeat is: the freeze
+/// watchdog used to live inside the EVM dashboard, which meant a hang anywhere
+/// else — the Solana app, discovery, a picker — produced no record at all, and
+/// "it froze" was the entire bug report.
+static UI_PHASE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn ui_phase_set(p: &str) {
+    let mut g = lock(&UI_PHASE);
+    g.clear();
+    g.push_str(p);
+}
+
+fn ui_phase_get() -> String {
+    lock(&UI_PHASE).clone()
+}
+
+/// Watch the UI heartbeat and record any freeze, wherever it happened.
+///
+/// Spawned once for the process. Reads the phase WHILE stuck — reading it after
+/// recovery named whatever ran next instead (always "idle", which explained
+/// nothing).
+pub fn spawn_ui_watchdog() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stalled: u64 = 0;
+        let mut own_gap: u64 = 0;
+        let mut held = String::new();
+        let mut last_wake = ui_epoch().elapsed().as_millis() as u64;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let now = ui_epoch().elapsed().as_millis() as u64;
+            // If the watchdog ITSELF skipped time, the whole process was paused
+            // — system sleep, a stopped terminal, a debugger — and no operation
+            // in the app is to blame.
+            own_gap = own_gap.max(now.saturating_sub(last_wake));
+            last_wake = now;
+            let gap = now.saturating_sub(ui_beat_ms());
+            if gap >= 1_000 {
+                if stalled < 1_000 {
+                    held = ui_phase_get();
+                }
+                stalled = gap;
+                continue;
+            }
+            if stalled >= 1_000 {
+                // Logged on recovery, with the whole duration — one line per
+                // freeze, not one per watchdog tick.
+                let secs = format!("{:.1}s", stalled as f64 / 1000.0);
+                if own_gap * 2 >= stalled {
+                    trace(&format!("ui: whole process paused {secs} (sleep/suspend)"));
+                    events::info(
+                        "The whole app was paused — system sleep or a suspended terminal, not a slow operation",
+                        &[("for", secs)],
+                    );
+                } else {
+                    let during = if held.is_empty() { "unlabelled".to_string() } else { held.clone() };
+                    trace(&format!("ui: stalled {secs} in {during}"));
+                    events::warn(
+                        "The screen froze because a slow operation held the UI thread",
+                        &[("for", secs), ("during", during)],
+                    );
+                }
+            }
+            stalled = 0;
+            own_gap = 0;
+        }
+    })
+}
+
 /// Delete all but the newest KEEP_LOGS of each per-session log family
 /// (`session-*.log`, `evm-trace-*.log`, `sol-trace-*.log`). The timestamps in
 /// the names sort lexically, so "newest" is a sort, not a stat.
@@ -283,9 +352,31 @@ fn prune_session_logs() {
 /// what the app BELIEVED — decimals, quote currency, token ordering. Every
 /// pricing bug so far has come from one of those being wrong, and none of them
 /// were visible on screen until the number was already nonsense.
+/// Lock a mutex, recovering from poisoning rather than panicking.
+///
+/// Every mutex these wrap guards a CACHE — RPC facts, the shared endpoint pool,
+/// the event ring. If some thread panicked while holding one, the worst case is
+/// stale data; but `.lock().unwrap()` turns that single panic into a
+/// process-wide kill switch that fires on the NEXT call, and this app can be
+/// holding an open position when it does. Take the data and carry on.
+pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 pub fn trace(msg: &str) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
+    // The trace file is what people attach to bug reports, and a transport
+    // error arrives here with the failing URL — key and all — still in it.
+    // Cheap check first: the hot polling lines carry no URL, and this runs
+    // about ten times a second.
+    let owned;
+    let msg: &str = if msg.contains("://") {
+        owned = crate::net::redact(msg);
+        &owned
+    } else {
+        msg
+    };
     struct Trace {
         w: std::io::BufWriter<std::fs::File>,
         last_flush: std::time::Instant,
@@ -989,6 +1080,10 @@ async fn main() -> eyre::Result<()> {
     // Old per-session logs pile up forever otherwise — a state dir was found
     // in the wild holding 500+ trace files. Keep the newest handful of each.
     prune_session_logs();
+    // One watchdog for the whole process, not one per dashboard. A freeze in
+    // the Solana app, in discovery, or in a picker used to go unrecorded
+    // entirely, because the only watchdog lived inside the EVM session.
+    let _ui_watchdog = spawn_ui_watchdog();
     events::info(
         "Trenches started",
         &[("version", update::full())],
@@ -1596,6 +1691,29 @@ async fn app(
             false,
         ));
 
+    // The chain the endpoint says it is must be the chain we configured.
+    //
+    // `with_recommended_fillers()` installs a ChainIdFiller, which takes the
+    // chainId it SIGNS with from eth_chainId — the endpoint's own answer. The
+    // configured chain_id was only ever used to look the network up, so an
+    // endpoint pointed at (or lying about) another chain got transactions
+    // signed for that chain instead, and a same-address/same-nonce approve or
+    // swap can then be replayed there. Checked once, before a key can sign.
+    match provider.get_chain_id().await {
+        Ok(live) if live != net.chain_id => {
+            eyre::bail!(
+                "{} is configured as chain {} but the endpoint reports {live}. \
+                 Refusing to sign: check the rpc setting for this network.",
+                net.name,
+                net.chain_id
+            );
+        }
+        Ok(_) => {}
+        // Unreachable is the RPC layer's problem to report and retry; it is
+        // not evidence of a wrong chain, so it must not block the session.
+        Err(e) => trace(&format!("chain id check skipped: {e}")),
+    }
+
     // Per-session log in a .bot/ folder (created if missing).
     std::fs::create_dir_all(state_dir())?;
     let secs = std::time::SystemTime::now()
@@ -2080,59 +2198,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // block counter, everything. "The app froze and came back" was
     // undiagnosable without a line saying how long it froze and what held it.
     ui_alive();
-    let ui_phase: Arc<Mutex<String>> = Arc::new(Mutex::new("startup".into()));
-    let _watchdog = {
-        let phase = ui_phase.clone();
-        AbortOnDrop(tokio::spawn(async move {
-            let mut stalled: u64 = 0;
-            let mut own_gap: u64 = 0;
-            // The phase is read WHILE stuck — the loop is holding whatever
-            // label it froze in. Reading it after recovery named whatever ran
-            // next instead (always "idle", which explained nothing).
-            let mut held = String::new();
-            let mut last_wake = ui_epoch().elapsed().as_millis() as u64;
-            loop {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                let now = ui_epoch().elapsed().as_millis() as u64;
-                // If the watchdog ITSELF skipped time, the whole process was
-                // paused — system sleep, a stopped terminal, a debugger — and
-                // no operation in the app is to blame.
-                own_gap = own_gap.max(now.saturating_sub(last_wake));
-                last_wake = now;
-                let gap = now.saturating_sub(ui_beat_ms());
-                if gap >= 1_000 {
-                    if stalled < 1_000 {
-                        held = phase.lock().unwrap().clone();
-                    }
-                    stalled = gap;
-                    continue;
-                }
-                if stalled >= 1_000 {
-                    // Logged on recovery, with the whole duration — one line
-                    // per freeze, not one per watchdog tick.
-                    let secs = format!("{:.1}s", stalled as f64 / 1000.0);
-                    if own_gap * 2 >= stalled {
-                        trace(&format!("ui: whole process paused {secs} (sleep/suspend)"));
-                        events::info(
-                            "The whole app was paused — system sleep or a suspended terminal, not a slow operation",
-                            &[("for", secs)],
-                        );
-                    } else {
-                        trace(&format!("ui: stalled {secs} in {held}"));
-                        events::warn(
-                            "The screen froze because a slow operation held the UI thread",
-                            &[("for", secs), ("during", held.clone())],
-                        );
-                    }
-                }
-                stalled = 0;
-                own_gap = 0;
-            }
-        }))
-    };
+    // The watchdog is process-wide now (spawned in main), so this loop only
+    // has to say what it is doing.
     macro_rules! phase {
         ($p:expr) => {
-            *ui_phase.lock().unwrap() = String::from($p);
+            crate::ui_phase_set(::std::convert::AsRef::<str>::as_ref(&$p));
         };
     }
 

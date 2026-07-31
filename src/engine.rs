@@ -456,7 +456,7 @@ impl Bot {
     }
 
     fn daily_path(&self) -> String {
-        format!("{}/daily-{}.json", crate::state_dir(), self.account)
+        format!("{}/daily-{}.json", crate::state_dir(), crate::ledger::safe_account(&self.account))
     }
 
     /// On the first good balance read (and on a day rollover), set/roll the
@@ -1039,6 +1039,8 @@ impl Bot {
 
     /// Log a line AND surface it as the dashboard status (user feedback).
     pub fn note(&mut self, s: String) {
+        // Errors reach here with the failing URL, key and all, still attached.
+        let s = crate::net::redact(&s);
         self.logline(&s);
         self.status = s;
     }
@@ -1844,22 +1846,50 @@ impl Bot {
         let amount0_max = (a0 * 1.02) as u128;
         let amount1_max = (a1 * 1.5) as u128;
 
-        // Skip re-approving if the ERC-20 allowance to Permit2 is already set
-        // (approvals persist on-chain across sessions; re-sending would hit a
-        // "nonce too low" and waste a round-trip).
+        // What the PositionManager actually needs to move for THIS add.
+        use alloy::primitives::aliases::{U160, U48};
+        let need160: U160 = U256::from(amount1_max).min(U256::from(U160::MAX)).to();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let now48 = U48::from(now_secs);
+
+        // Approvals persist on-chain across sessions, so ask the chain rather
+        // than trusting a session flag — re-sending would hit "nonce too low"
+        // and waste a round-trip.
         if !self.lp_permit2_done {
             let erc = IERC20::new(self.pool.token, provider);
-            if let Ok(a) = erc.allowance(self.trader, PERMIT2).call().await {
-                if a._0 >= U256::from(u128::MAX) {
-                    self.lp_permit2_done = true;
-                }
+            let p2 = IPermit2::new(PERMIT2, provider);
+            let erc_ok = erc
+                .allowance(self.trader, PERMIT2)
+                .call()
+                .await
+                .map(|a| a._0 >= U256::from(amount1_max))
+                .unwrap_or(false);
+            // An exact grant gets SPENT, and it expires. Both have to still
+            // cover this add or it needs approving again.
+            let p2_ok = p2
+                .allowance(self.trader, self.pool.token, POSITION_MANAGER)
+                .call()
+                .await
+                .map(|a| a.amount >= need160 && a.expiration > now48)
+                .unwrap_or(false);
+            if erc_ok && p2_ok {
+                self.lp_permit2_done = true;
             }
         }
         if !self.lp_permit2_done {
             let erc = IERC20::new(self.pool.token, provider);
             let p2 = IPermit2::new(PERMIT2, provider);
-            let amount160 = alloy::primitives::aliases::U160::MAX;
-            let expiration48 = alloy::primitives::aliases::U48::from(v4::FAR_DEADLINE);
+            // EXACT amount, and an hour to use it — not U160::MAX until 2100.
+            // An unlimited, effectively permanent grant to a contract that can
+            // move the token is exactly what `ensure_ur_allowance` refuses to
+            // hand the router; the LP path had no reason to be different. The
+            // ERC-20 leg to PERMIT2 stays MAX because that IS the Permit2
+            // pattern — Permit2 is what bounds the spender, and it now does.
+            let amount160 = need160;
+            let expiration48 = U48::from(now_secs.saturating_add(3600));
             self.note("approving token for Permit2…".into());
             // Fire both approvals (broadcast immediately, no wait between).
             let sent = async {
@@ -1999,6 +2029,16 @@ impl Bot {
             .with_to(POSITION_MANAGER)
             .with_input(data)
             .with_from(self.trader);
+        // Pre-flight, like every other send path. A burn is the one call that
+        // went out unsimulated, and a revert costs gas AND leaves the position
+        // out of the cache until the next reap puts it back.
+        if let Err(e) = provider.call(&tx).await {
+            self.skips += 1;
+            self.positions.push(token_id); // undo the optimistic removal above
+            self.push_order(label, OrderStatus::Skipped, None);
+            self.note(format!("Closing the position would revert. {}", short_err(&e.to_string())));
+            return Ok(());
+        }
         let nonce = self.take_nonce(provider).await?;
         let tx = tx.with_nonce(nonce);
         match provider.send_transaction(tx).await {

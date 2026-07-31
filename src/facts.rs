@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::lock;
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
@@ -81,14 +83,14 @@ const WRITE_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 fn save() {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     {
-        let mut last = LAST.lock().unwrap();
+        let mut last = lock(&LAST);
         if last.is_some_and(|t| t.elapsed() < WRITE_EVERY) {
             return;
         }
         *last = Some(std::time::Instant::now());
     }
     let text = {
-        let map = store().lock().unwrap();
+        let map = lock(store());
         serde_json::to_string(&*map)
     };
     if let Ok(text) = text {
@@ -102,11 +104,11 @@ fn save() {
 }
 
 pub fn get(token: Address) -> Option<Facts> {
-    store().lock().unwrap().get(&token).cloned()
+    lock(store()).get(&token).cloned()
 }
 
 fn put(token: Address, facts: Facts) {
-    store().lock().unwrap().insert(token, facts);
+    lock(store()).insert(token, facts);
     save();
 }
 

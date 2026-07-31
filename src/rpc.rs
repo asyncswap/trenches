@@ -35,6 +35,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::lock;
 use std::time::{Duration, Instant};
 
 use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
@@ -133,7 +135,7 @@ pub struct Balanced(Arc<Inner>);
 static SHARED: Mutex<Option<Balanced>> = Mutex::new(None);
 
 pub fn set_shared(b: &Balanced) {
-    *SHARED.lock().unwrap() = Some(b.clone());
+    *lock(&SHARED) = Some(b.clone());
 }
 
 /// The shared pool's chunk choice, for scanners that run before or without
@@ -143,7 +145,7 @@ pub fn shared_log_chunk(default: u64) -> u64 {
 }
 
 pub fn shared() -> Option<Balanced> {
-    SHARED.lock().unwrap().clone()
+    lock(&SHARED).clone()
 }
 
 /// The RPC URLs a network offers. `rpc_pool()` already merges the `rpc` union
@@ -282,13 +284,13 @@ impl Inner {
     }
 
     fn cache_get(&self, key: &'static str, ttl: Duration) -> Option<Box<RawValue>> {
-        let cache = self.cache.lock().unwrap();
+        let cache = lock(&self.cache);
         let (at, raw) = cache.get(key)?;
         (at.elapsed() < ttl).then(|| raw.clone())
     }
 
     fn cache_put(&self, key: &'static str, raw: Box<RawValue>) {
-        self.cache.lock().unwrap().insert(key, (Instant::now(), raw));
+        lock(&self.cache).insert(key, (Instant::now(), raw));
     }
 
     async fn send(self: Arc<Self>, req: RequestPacket) -> Result<ResponsePacket, TransportError> {
@@ -355,11 +357,22 @@ impl Inner {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok());
-            let bytes = match resp.bytes().await {
+            // Refuse an absurd body before buffering it. A getLogs answer runs
+            // to a few MB; anything past the cap is a broken or hostile
+            // endpoint, and reading it unbounded would OOM a process that is
+            // holding trading keys. Declared length is only a hint, so the
+            // streamed read is capped too.
+            const MAX_BODY: usize = 64 * 1024 * 1024;
+            if resp.content_length().is_some_and(|n| n > MAX_BODY as u64) {
+                ep.bench(COOLDOWN_BROKEN, "response too large");
+                last_err = Some(TransportErrorKind::custom_str("response body over cap"));
+                continue;
+            }
+            let bytes = match read_capped(resp, MAX_BODY).await {
                 Ok(b) => b,
                 Err(e) => {
                     ep.bench(COOLDOWN_BROKEN, "body read failed");
-                    last_err = Some(TransportErrorKind::custom(e));
+                    last_err = Some(TransportErrorKind::custom_str(&e));
                     continue;
                 }
             };
@@ -489,6 +502,27 @@ fn packet_rate_limited(packet: &ResponsePacket) -> bool {
 /// How long a 429 should bench the endpoint: the Retry-After header if given,
 /// else "reset in N seconds" parsed from the body, else the default. Capped —
 /// no reply gets to bench an endpoint for five minutes.
+/// Read a response body, refusing to buffer more than `cap` bytes.
+///
+/// `resp.bytes()` grows a buffer to whatever the peer sends. Chunked responses
+/// carry no length to check up front, so the ceiling has to be enforced while
+/// reading.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(c)) => {
+                if buf.len() + c.len() > cap {
+                    return Err("response body over cap".into());
+                }
+                buf.extend_from_slice(&c);
+            }
+            Ok(None) => return Ok(buf),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 fn limited_cooldown(body: &str, retry_after: Option<u64>) -> Duration {
     // A zero is not a hint, it is a shrug — this chain's endpoint sends
     // `Retry-After: 0` WITH a 429, which parsed into a zero-second bench:

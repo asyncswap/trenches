@@ -60,9 +60,97 @@ pub fn metadata_url(uri: &str) -> Option<String> {
     public_host(&url).then_some(url)
 }
 
+/// Strip secrets out of any string that might quote a URL.
+///
+/// `reqwest`'s error `Display` embeds the whole request URL, and the transport
+/// wrapper carries it through verbatim — so one unreachable endpoint puts its
+/// API key into the status line, the events panel, the session log and the
+/// trace file. The keys live in the path (`/v2/<KEY>`), the query
+/// (`?api-key=<KEY>`) and occasionally the userinfo, so only the scheme and
+/// host survive: enough to say WHICH endpoint failed, nothing that authorises
+/// anyone to use it.
+///
+/// This matters more than a tidy log: docs/privacy.md promises keys are
+/// stripped, and the issue template asks people to paste these files in public.
+pub fn redact(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    loop {
+        let Some(rel) = s[i..].find("://") else {
+            out.push_str(&s[i..]);
+            return out;
+        };
+        let sep = i + rel;
+        // Walk back over the scheme name.
+        let mut start = sep;
+        while start > i {
+            let c = b[start - 1];
+            if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if start == sep {
+            // "://" with no scheme in front of it — not a URL.
+            out.push_str(&s[i..sep + 3]);
+            i = sep + 3;
+            continue;
+        }
+        out.push_str(&s[i..sep + 3]); // everything before, plus "scheme://"
+        let rest = &s[sep + 3..];
+        // The URL runs to the first character that cannot be in one. `)` counts:
+        // reqwest renders "error sending request for url (https://…)".
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '(' | '"' | '\'' | '<' | '>' | '`' | '|' | '\\'))
+            .unwrap_or(rest.len());
+        let url = &rest[..end];
+        let auth_end = url.find(['/', '?', '#']).unwrap_or(url.len());
+        // Drop any userinfo; keep the host (and its port).
+        let authority = &url[..auth_end];
+        out.push_str(authority.rsplit('@').next().unwrap_or(authority));
+        if auth_end < url.len() {
+            out.push_str("/…");
+        }
+        i = sep + 3 + end;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_url_in_an_error_keeps_its_host_and_loses_its_secrets() {
+        // The exact shape reqwest produces, with a key in the path.
+        let e = "error sending request for url (https://base-mainnet.g.alchemy.com/v2/SECRET_KEY_123)";
+        let r = redact(e);
+        assert!(!r.contains("SECRET_KEY_123"), "the key survived: {r}");
+        assert!(r.contains("base-mainnet.g.alchemy.com"), "the host should survive: {r}");
+
+        // A key in the query, and one in the userinfo.
+        for (raw, secret) in [
+            ("https://rpc.example.com/?api-key=SHHH", "SHHH"),
+            ("https://mainnet.helius-rpc.com/?key=SHHH", "SHHH"),
+            ("https://user:SHHH@rpc.example.com/v1", "SHHH"),
+        ] {
+            let r = redact(raw);
+            assert!(!r.contains(secret), "{raw} leaked through as {r}");
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_ordinary_text_alone() {
+        for plain in ["no url here", "ratio 3:1 and a (paren)", "", "://"] {
+            assert_eq!(redact(plain), plain, "{plain:?} should pass through");
+        }
+        // Several URLs in one line all get handled, and surrounding text stays.
+        let r = redact("a https://h1.example/v2/K1 then https://h2.example/v2/K2 end");
+        assert!(!r.contains("K1") && !r.contains("K2"), "{r}");
+        assert!(r.starts_with("a ") && r.ends_with(" end"), "{r}");
+        assert!(r.contains("h1.example") && r.contains("h2.example"), "{r}");
+    }
 
     #[test]
     fn a_metadata_uri_cannot_point_at_the_machine_itself() {

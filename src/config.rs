@@ -589,8 +589,26 @@ pub fn set_network_field(network: &str, field: &str, value: &str) -> eyre::Resul
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
+    owner_only(&tmp);
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// Make a file readable by its owner alone.
+///
+/// This file holds RPC API keys in plaintext, and at the default umask it is
+/// created world-readable — every other account on the machine can read the
+/// keys you pay for. Set on the temp file BEFORE the rename, so the published
+/// path is never briefly world-readable. Best effort: a filesystem that cannot
+/// represent the mode is not a reason to refuse to save.
+fn owner_only(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// The names of the networks in the config, for a picker.
@@ -639,6 +657,7 @@ impl Registry {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, starter_json())?;
+        owner_only(&path); // it will hold API keys the moment anyone edits it
         let reg = Registry::load(&path.to_string_lossy())?;
         Ok((reg, path, true))
     }
