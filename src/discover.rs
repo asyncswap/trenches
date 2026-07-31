@@ -48,10 +48,18 @@ const MIN_MKTCAP_ETH: f64 = 2.0; // Discovery hides pools below this market cap
 
 // Tiered discovery: small-caps must be FRESH, "big fish" show at ANY age.
 const FRESH_MAX_SECS: f64 = 120.0; // ≥2 ETH caps only show if this fresh (≤2 min)
-const BIG_MKTCAP_ETH: f64 = 16.0; // ≈ $30k @ ~$1.88k/ETH — big fish, shown at any age
+// Discovery shows EVERYTHING. These were 16.0 ETH of market cap and 1.5 ETH
+// pooled, which is a guess about what someone wants to trade — and we do not
+// know that yet. A launch worth looking at is small by definition, so the
+// threshold was hiding the thing the screen exists to find. They stay as named
+// constants, at zero, because the plan is to let the user set them.
+const BIG_MKTCAP_ETH: f64 = 0.0;
 const BIG_LOOKBACK: u64 = 36_000; // ~60 min of blocks to sweep for big fish
 const BIG_SCAN_CAP: usize = 900; // safety cap on candidates per big-fish sweep
-const BIG_POOL_MIN_ETH: f64 = 1.5; // cheap pre-filter: skip near-empty pools before mkt-cap
+// Still a PRE-filter, not a quality bar: it decides which pools are worth a
+// market-cap lookup, and the RPC budget is metered. A pool holding literally
+// nothing cannot be traded, so a dust floor costs no discovery and saves calls.
+const BIG_POOL_MIN_ETH: f64 = 0.0000001;
 const BIG_EVERY: u32 = 8; // run the big-fish sweep every N cycles (~10 s), not every cycle
 const BATCH_SIZE: usize = 100; // eth_calls per JSON-RPC batch request
 const TAB_NAMES: [&str; 2] = ["Discovery", "Verified"]; // Discovery screen tabs
