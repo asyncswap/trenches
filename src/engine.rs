@@ -768,8 +768,63 @@ impl Bot {
     /// the router. Returns Ok(true) when both cover `need`, Ok(false) when an
     /// approval was sent but has not mined yet (retry the sell shortly).
     async fn ensure_ur_allowance<P: Provider>(&mut self, provider: &P, need: U256) -> eyre::Result<bool> {
+        let tok = self.pool.token;
+        self.ensure_ur_allowance_for(provider, tok, need).await
+    }
+
+    /// Get a Flaunch buy ready: hold flETH, and let the router pull it.
+    ///
+    /// Flaunch pools pair the coin against flETH, and the working route on this
+    /// chain does ONE v4 hop out of flETH — it does not reach flETH through a
+    /// v4 pool the way we used to try. So a buy wraps first, then swaps.
+    ///
+    /// `Ok(false)` means a step went out and has not mined; press again in a
+    /// moment, the same contract `ensure_v3_allowance` uses.
+    async fn ready_flaunch_buy<P: Provider>(&mut self, provider: &P, wei_in: u128) -> eyre::Result<bool> {
+        let need = U256::from(wei_in);
+        let held = IERC20::new(FLETH, provider)
+            .balanceOf(self.trader)
+            .call()
+            .await
+            .map(|b| b._0)
+            .unwrap_or(U256::ZERO);
+        if held < need {
+            // flETH does NOT wrap like WETH: the argument is an amount of some
+            // OTHER token to pull in, so it is 0 and the ETH rides as value.
+            self.note("Wrapping ETH into flETH for the Flaunch pool".into());
+            let tx = TransactionRequest::default()
+                .with_to(FLETH)
+                .with_input(v4::fleth_deposit_calldata())
+                .with_value(need - held)
+                .with_gas_limit(120_000)
+                .with_from(self.trader);
+            let nonce = self.take_nonce(provider).await?;
+            let sent = provider.send_transaction(tx.with_nonce(nonce)).await;
+            let hash = *self.spent_nonce(sent)?.tx_hash();
+            for _ in 0..8u32 {
+                if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        // The router pulls flETH through Permit2, exactly as it pulls the coin
+        // on a sell.
+        self.ensure_ur_allowance_for(provider, FLETH, need).await
+    }
+
+    /// The same Permit2 pair for ANY currency the router must pull from us.
+    ///
+    /// A Flaunch buy pays in flETH, not the coin, so the approvals it needs are
+    /// on flETH — simulating without them returns Permit2's AllowanceExpired.
+    async fn ensure_ur_allowance_for<P: Provider>(
+        &mut self,
+        provider: &P,
+        token: Address,
+        need: U256,
+    ) -> eyre::Result<bool> {
         use alloy::primitives::aliases::{U160, U48};
-        let erc = IERC20::new(self.pool.token, provider);
+        let erc = IERC20::new(token, provider);
         let p2 = IPermit2::new(PERMIT2, provider);
         let erc_ok = erc
             .allowance(self.trader, PERMIT2)
@@ -786,7 +841,7 @@ impl Bot {
         );
         let need160: U160 = need.min(U256::from(U160::MAX)).to();
         let p2_ok = p2
-            .allowance(self.trader, self.pool.token, UNIVERSAL_ROUTER)
+            .allowance(self.trader, token, UNIVERSAL_ROUTER)
             .call()
             .await
             .map(|a| a.amount >= need160 && a.expiration > now48)
@@ -805,7 +860,7 @@ impl Bot {
             let expiration48 = U48::from(v4::FAR_DEADLINE);
             let nonce = self.take_nonce(provider).await?;
             let sent = p2
-                .approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
+                .approve(token, UNIVERSAL_ROUTER, need160, expiration48)
                 .gas(120_000)
                 .nonce(nonce)
                 .send()
@@ -1332,6 +1387,24 @@ impl Bot {
                     Ok(true) => self.ur_permit2_done = true,
                     Ok(false) => { self.note("Approval is still confirming. Try the sell again shortly".into()); return Ok(()); }
                     Err(e) => { self.note(format!("Approval failed. {}", short_err(&e.to_string()))); return Ok(()); }
+                }
+            }
+        }
+
+        // A Flaunch BUY pays in flETH, so it has to hold some and let the router
+        // pull it — before the routing pre-flight, or every simulated Flaunch
+        // buy reverts the way they all did.
+        if buying && self.has_flaunch_route() {
+            let wei_in = Wei::rounded(amount_in).raw();
+            match self.ready_flaunch_buy(provider, wei_in).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.note("Preparing flETH for the Flaunch pool. Try the buy again shortly".into());
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.note(format!("Could not prepare flETH. {}", short_err(&e.to_string())));
+                    return Ok(());
                 }
             }
         }
@@ -2971,10 +3044,15 @@ fn build_swap(
         ),
         // `fee` is deliberately unused: the Flaunch pool key's fee is 0 (the
         // hook charges its cut), and the builder hardcodes the key layout.
+        // ONE v4 hop, flETH <-> coin. The two-hop version that reached flETH
+        // through a pool on FLETH_HOOKS is what reverted on every buy; a real
+        // working trade on this chain does no such hop. Value is ZERO because
+        // the input currency is flETH, wrapped beforehand — see
+        // `ready_flaunch_buy`.
         PoolKind::FlaunchV4 { .. } => (
             UNIVERSAL_ROUTER,
-            v4::flaunch_swap_calldata(token, buying, wi, wm),
-            value,
+            v4::flaunch_hop_calldata(token, buying, wi, wm),
+            U256::ZERO,
         ),
         PoolKind::V3 { .. } => {
             let d = if buying {
