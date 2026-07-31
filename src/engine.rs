@@ -1418,9 +1418,20 @@ impl Bot {
         // for gas USED, so the headroom is free; sells carry the unwrap → larger cap.
         // Also skips a per-tx estimate round-trip, so sends are a touch faster.
         // Flaunch swaps traverse TWO hooked pools (flETH + the Flaunch hook's
-        // fee machinery), so they get more headroom in both directions.
+        // fee machinery), so they get much more headroom in both directions.
+        //
+        // 500k was not enough and that is what broke every Flaunch buy. The
+        // symptom pointed everywhere but here: running out of gas INSIDE the
+        // hook surfaces as WrappedError(hook, afterSwap, HookCallFailed) — or
+        // ERC20TransferFailed, depending how far it got — which reads as a
+        // hook rejecting the trade, not as a cap set too low. The route, the
+        // calldata and the quote were all fine; the same bytes that reverted
+        // at 500k succeed at 837k. A real hand-made buy used 837,560.
+        //
+        // Gas is billed on what is USED, so headroom costs nothing. Being shy
+        // here cost an afternoon.
         let gas_limit = match route.kind {
-            PoolKind::FlaunchV4 { .. } => if buying { 500_000 } else { 650_000 },
+            PoolKind::FlaunchV4 { .. } => if buying { 1_400_000 } else { 1_600_000 },
             _ => if buying { 300_000 } else { 450_000 },
         };
         let tx = TransactionRequest::default()
@@ -2234,7 +2245,9 @@ impl Bot {
         // Sell + unwrapWETH9 → generous gas cap so the WETH withdraw never OOGs.
         // A Flaunch dump crosses two hooked pools, so it gets more headroom.
         let dump_gas = match route.kind {
-            PoolKind::FlaunchV4 { .. } => 650_000,
+            // Same lesson as the sized trade: 650k was not enough, and an OOG
+            // inside the hook reads as the hook refusing the trade.
+            PoolKind::FlaunchV4 { .. } => 1_600_000,
             _ => 450_000,
         };
         let tx = TransactionRequest::default().with_to(to).with_input(data).with_gas_limit(dump_gas).with_from(self.trader);

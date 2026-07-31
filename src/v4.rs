@@ -280,3 +280,17 @@ mod flaunch_swap_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod _probe2 {
+    use super::*;
+    #[test]
+    fn dump_pair() {
+        let t: Address = "0x8a5B9feb491e6C344Dd2702DcC056f60C354230B".parse().unwrap();
+        let a = 854_537_310_374_830u128;
+        for (tag, m) in [("OURS", 10_410_711_766_844_823_172_022_272u128),
+                         ("THEIRS", 10_197_463_432_112_615_282_331_528u128)] {
+            println!("{tag}=0x{}", alloy::hex::encode(flaunch_swap_calldata(t, true, a, m)));
+        }
+    }
+}
