@@ -1834,6 +1834,7 @@ async fn app(
         lp_permit2_done: false,
         v3_covered: false,
         own_txs: engine::Bot::load_own_txs(trader),
+        drain_watch: Vec::new(),
         ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
         meta: engine::Meta::default(),
@@ -2418,6 +2419,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 }
                 phase!("settling pending orders");
                 let _ = tokio::time::timeout(Duration::from_secs(3), bot.reap(provider)).await;
+                // Did a coin we just bought take the balance back? Only fires
+                // when a buy is due a re-check, so it costs nothing otherwise.
+                phase!("checking a recent buy for a drain");
+                let _ = tokio::time::timeout(Duration::from_secs(2), bot.check_drains(provider)).await;
                 // YOUR confirmed trades are guaranteed a tape row. The tape is
                 // built from getLogs, and this chain's public endpoint can
                 // answer a window thinly while rate limited — when that window

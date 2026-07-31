@@ -279,6 +279,8 @@ pub struct Bot {
     /// persisted (mytx-<address>.txt), so the tape's "your trade" mark
     /// survives a restart instead of living and dying with the order list.
     pub own_txs: std::collections::HashSet<TxHash>,
+    /// Buys waiting to be re-checked for a drain. See [`Bot::watch_for_drain`].
+    pub drain_watch: Vec<DrainWatch>,
     // Permit2 + UniversalRouter allowances cover the full position (Flaunch
     // sells settle the coin through Permit2, which needs both grants).
     pub ur_permit2_done: bool,
@@ -291,6 +293,24 @@ pub struct Bot {
     /// which those placeholders satisfy.
     pub pool_launch_block: Option<u64>,
     pub status: String, // last action result, shown in the dashboard
+}
+
+/// A confirmed buy, to be looked at again shortly.
+///
+/// The tokens arriving is not the same as keeping them. A coin can confirm the
+/// buy, hand over the balance, and take it back seconds later — which is
+/// exactly what happened on 2026-07-31: 34,230 tokens delivered, 5,670,304
+/// base units left fifteen seconds on, and the sell moved dust for nothing.
+/// No pre-trade simulation catches that, because inside one transaction the
+/// drain has not happened yet.
+#[derive(Clone, Copy)]
+pub struct DrainWatch {
+    pub token: Address,
+    /// Balance right after the buy confirmed — the number to compare against.
+    pub had: U256,
+    /// When it becomes worth re-reading.
+    pub due: Instant,
+    pub hash: TxHash,
 }
 
 /// One token's open cost basis, as persisted between sessions. Keyed by token
@@ -1033,6 +1053,56 @@ impl Bot {
     fn settle_order(&mut self, hash: TxHash, status: OrderStatus) {
         if let Some(o) = self.orders.iter_mut().find(|o| o.hash == Some(hash)) {
             o.status = status;
+        }
+    }
+
+    /// Re-read the balance of a coin we bought a moment ago, and say so loudly
+    /// if it went missing.
+    ///
+    /// The one check that catches the drain-later scam. A honeypot that blocks
+    /// selling can be found by simulating a sell; a coin that lets the buy
+    /// through and then takes the balance back cannot, because inside a single
+    /// transaction it has not taken anything yet. Only time reveals it.
+    ///
+    /// Cheap — one balanceOf per buy, once — and it cannot be faked, because it
+    /// reads the same number the sell will size from. Purely informational: it
+    /// never blocks a trade, it tells you the money already went.
+    pub async fn check_drains<P: Provider>(&mut self, provider: &P) {
+        let now = Instant::now();
+        let due: Vec<DrainWatch> =
+            self.drain_watch.iter().copied().filter(|w| w.due <= now).collect();
+        if due.is_empty() {
+            return;
+        }
+        self.drain_watch.retain(|w| w.due > now);
+        for w in due {
+            let Ok(bal) = IERC20::new(w.token, provider).balanceOf(self.trader).call().await else {
+                continue; // a failed read is not evidence of anything
+            };
+            let now_bal = bal._0;
+            if now_bal >= w.had {
+                continue;
+            }
+            // A tenth is well outside any rounding, and nothing legitimate
+            // shrinks a holding you are simply sitting on.
+            let lost = w.had - now_bal;
+            let pct = (lost.saturating_mul(U256::from(100)) / w.had.max(U256::from(1))).to::<u128>();
+            if pct < 10 {
+                continue;
+            }
+            self.note(format!(
+                "WARNING: {} took back {pct}% of your balance after the buy. This coin drains its holders — treat the position as gone",
+                self.pool.sym
+            ));
+            crate::events::error(
+                "A coin reduced your balance after the buy landed",
+                &[
+                    ("coin", self.pool.sym.clone()),
+                    ("token", format!("{:#x}", w.token)),
+                    ("lost", format!("{pct}%")),
+                    ("buy", format!("{:#x}", w.hash)),
+                ],
+            );
         }
     }
 
@@ -1795,6 +1865,28 @@ impl Bot {
                                 recv_eth = Some(fill_eth); // key number: ETH actually received
                             }
                             self.apply_fill(side, fill_eth, fill_tok, p.hash);
+                            match side {
+                                // Look again in a moment: did the coin let us
+                                // keep what it just handed over?
+                                Side::Buy => {
+                                    let had = IERC20::new(self.pool.token, provider)
+                                        .balanceOf(self.trader)
+                                        .call()
+                                        .await
+                                        .map(|b| b._0)
+                                        .unwrap_or(U256::ZERO);
+                                    if !had.is_zero() {
+                                        self.drain_watch.push(DrainWatch {
+                                            token: self.pool.token,
+                                            had,
+                                            due: Instant::now() + std::time::Duration::from_secs(8),
+                                            hash: p.hash,
+                                        });
+                                    }
+                                }
+                                // We spent it ourselves — nothing to accuse.
+                                Side::Sell => self.drain_watch.retain(|w| w.token != self.pool.token),
+                            }
                             // Pre-approve the exit the moment a buy confirms, so the
                             // later v3 sell carries an exact-amount allowance and
                             // fires instantly (no approve tx in the sell path).
@@ -3343,6 +3435,36 @@ mod realized_cost_tests {
         for (tok, qty, c) in [(-1.0, 10.0, 1.0), (10.0, -5.0, 1.0), (0.0, 0.0, -3.0)] {
             let (_, cost) = realized_cost(tok, qty, c);
             assert!(cost >= 0.0, "realized_cost({tok},{qty},{c}) = {cost}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// The real numbers from the coin that took the money on 2026-07-31:
+    /// 34,230.249532 tokens delivered by the buy, 5,670,304 base units left a
+    /// few seconds later. That is the shape the check exists to name.
+    #[test]
+    fn a_drained_balance_is_far_past_the_threshold() {
+        let had = U256::from(34_230_249_532_000_000_000_000u128);
+        let now = U256::from(5_670_304u128);
+        let lost = had - now;
+        let pct = (lost * U256::from(100) / had).to::<u128>();
+        assert_eq!(pct, 99, "a drain should read as ~100% gone, got {pct}%");
+        assert!(pct >= 10, "and comfortably past the alert threshold");
+    }
+
+    /// Ordinary holding does not shrink. Dust-level noise must stay quiet, or
+    /// the warning becomes something you learn to ignore.
+    #[test]
+    fn ordinary_noise_stays_quiet() {
+        let had = U256::from(1_000_000_000_000_000_000u128);
+        for still in [had, had - U256::from(1u8), had * U256::from(97u8) / U256::from(100u8)] {
+            let lost = had.saturating_sub(still);
+            let pct = (lost * U256::from(100) / had).to::<u128>();
+            assert!(pct < 10, "{pct}% should not warn");
         }
     }
 }
