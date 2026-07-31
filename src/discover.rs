@@ -857,7 +857,7 @@ async fn v4_rows<L: Provider>(
         let grad = Grad {
             token: *token,
             kind: engine::PoolKind::V4 { pool_id: *id, tick_spacing: *tick_spacing },
-            quote: quote.clone(),
+            quote: *quote,
             sym,
             fee: *fee,
             launch_block: *block,
@@ -924,7 +924,7 @@ async fn verified_rows(
         let grad = Grad {
             token: p.token,
             kind: engine::PoolKind::V4 { pool_id: p.pool_id, tick_spacing: p.tick_spacing },
-            quote: p.quote.clone(),
+            quote: p.quote,
             sym: p.sym.clone(),
             fee: p.fee,
             launch_block: 0,
@@ -1760,7 +1760,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
                         return Ok(Some(Grad {
                             token: v.token,
                             kind: engine::PoolKind::V4 { pool_id: v.pool_id, tick_spacing: v.tick_spacing },
-                            quote: v.quote.clone(),
+                            quote: v.quote,
                             sym: v.sym.clone(),
                             fee: v.fee,
                             launch_block: 0,

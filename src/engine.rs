@@ -293,6 +293,22 @@ pub struct Bot {
     pub status: String, // last action result, shown in the dashboard
 }
 
+/// One token's open cost basis, as persisted between sessions. Keyed by token
+/// address in `basis-evm-<trader>.json`; absent means no open position.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Basis {
+    pub qty: f64,
+    pub cost: f64,
+    #[serde(default)]
+    pub entry_at: Option<u64>,
+    #[serde(default)]
+    pub entry_mc: f64,
+    #[serde(default)]
+    pub entry_pooled_eth: f64,
+    #[serde(default)]
+    pub entry_tx: Option<String>,
+}
+
 /// On-chain socials/metadata for a Pons launch token (all empty for non-Pons).
 /// Serde because the facts cache (src/facts.rs) mirrors it to disk.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -334,14 +350,6 @@ pub async fn fetch_token_meta<P: Provider>(provider: &P, token: Address) -> Meta
     Meta { logo, description, twitter, telegram, website, discord, farcaster }
 }
 
-/// Rewrite an ipfs:// URI to a public-gateway URL; anything else passes through.
-fn ipfs_to_http(uri: &str) -> String {
-    match uri.strip_prefix("ipfs://") {
-        Some(cid) => format!("https://ipfs.io/ipfs/{cid}"),
-        None => uri.to_string(),
-    }
-}
-
 /// Fetch a Flaunch coin's metadata JSON from its launch tokenUri (ipfs://…).
 /// Unlike Pons, the socials live off-chain: the JSON carries image, description
 /// and the social URLs. Any failure (gateway down, bad JSON) returns an empty
@@ -355,7 +363,10 @@ pub async fn fetch_flaunch_meta(token_uri: &str) -> Meta {
         Ok(c) => c,
         Err(_) => return Meta::default(),
     };
-    let json: serde_json::Value = match client.get(ipfs_to_http(token_uri)).send().await {
+    // The URI is attacker-written on-chain data — the guard decides whether
+    // it is fetchable at all, and refuses anything aimed at this machine.
+    let Some(url) = crate::net::metadata_url(token_uri) else { return Meta::default() };
+    let json: serde_json::Value = match client.get(url).send().await {
         Ok(r) => match r.json().await {
             Ok(j) => j,
             Err(_) => return Meta::default(),
@@ -374,7 +385,7 @@ pub async fn fetch_flaunch_meta(token_uri: &str) -> Meta {
         // detail panes hold a URL a person can actually open.
         logo: {
             let img = s(&["image", "imageIpfs"]);
-            if img.is_empty() { img } else { ipfs_to_http(&img) }
+            crate::net::metadata_url(&img).unwrap_or_default()
         },
         description: s(&["description"]),
         twitter: s(&["twitterUrl", "twitter"]),
@@ -398,7 +409,7 @@ impl Bot {
     /// Multiplier that turns a quote into a minimum-output floor.
     /// Clamped to 1% so a zero can never mean "no protection".
     pub fn slip_floor(&self) -> f64 {
-        1.0 - self.slippage_pct.max(1.0).min(90.0) / 100.0
+        1.0 - self.slippage_pct.clamp(1.0, 90.0) / 100.0
     }
 
     /// The floor for a full liquidation, which eats more of the curve than a
@@ -663,6 +674,8 @@ impl Bot {
                 }
             }
         }
+        // Basis changed; get it on disk before anything can kill the process.
+        self.save_basis();
     }
 
     /// Potential profit (ETH) from selling the ENTIRE current holding right now
@@ -711,6 +724,18 @@ impl Bot {
         Ok(n)
     }
 
+    /// `take_nonce` advances the local counter optimistically, so a send that
+    /// then fails leaves a hole: the number is never spent, and every later tx
+    /// is signed one ahead of the chain — stalling in the mempool forever while
+    /// the UI cheerfully reports SENT. Pass the send's result through here so a
+    /// failure hands the nonce back and the next `take_nonce` resyncs.
+    fn spent_nonce<T, E>(&mut self, sent: Result<T, E>) -> Result<T, E> {
+        if sent.is_err() {
+            self.nonce = None;
+        }
+        sent
+    }
+
     /// Ensure the token's allowance to SwapRouter02 covers `need` wei, using an
     /// EXACT-amount approval — never MAX (no-infinite-approval policy). If the
     /// current allowance is short, approve exactly `need`. Returns Ok(true) when
@@ -726,7 +751,8 @@ impl Bot {
         }
         self.note(format!("Approving {} for the router", self.pool.sym));
         let nonce = self.take_nonce(provider).await?;
-        let hash = *erc.approve(SWAP_ROUTER_02, need).gas(120_000).nonce(nonce).send().await?.tx_hash();
+        let sent = erc.approve(SWAP_ROUTER_02, need).gas(120_000).nonce(nonce).send().await;
+        let hash = *self.spent_nonce(sent)?.tx_hash();
         for _ in 0..6u32 {
             if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
                 return Ok(true);
@@ -773,19 +799,19 @@ impl Bot {
         let mut last = None;
         if !erc_ok {
             let nonce = self.take_nonce(provider).await?;
-            last = Some(*erc.approve(PERMIT2, U256::MAX).gas(120_000).nonce(nonce).send().await?.tx_hash());
+            let sent = erc.approve(PERMIT2, U256::MAX).gas(120_000).nonce(nonce).send().await;
+            last = Some(*self.spent_nonce(sent)?.tx_hash());
         }
         if !p2_ok {
             let expiration48 = U48::from(v4::FAR_DEADLINE);
             let nonce = self.take_nonce(provider).await?;
-            last = Some(
-                *p2.approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
-                    .gas(120_000)
-                    .nonce(nonce)
-                    .send()
-                    .await?
-                    .tx_hash(),
-            );
+            let sent = p2
+                .approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
+                .gas(120_000)
+                .nonce(nonce)
+                .send()
+                .await;
+            last = Some(*self.spent_nonce(sent)?.tx_hash());
         }
         if let Some(hash) = last {
             for _ in 0..6u32 {
@@ -871,6 +897,74 @@ impl Bot {
     /// wallets on one machine never read each other's history.
     fn orders_path(trader: Address) -> String {
         format!("{}/orders-evm-{trader}.jsonl", crate::state_dir())
+    }
+
+    fn basis_path(trader: Address) -> String {
+        format!("{}/basis-evm-{trader}.json", crate::state_dir())
+    }
+
+    fn load_basis_map(trader: Address) -> std::collections::BTreeMap<String, Basis> {
+        if trader.is_zero() {
+            return Default::default();
+        }
+        std::fs::read_to_string(Self::basis_path(trader))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the open position's cost basis, keyed by token so several
+    /// positions coexist and switching pools cannot cross-contaminate them.
+    ///
+    /// Orders and the tape were already durable while this — the state the
+    /// ACCOUNTING depends on — lived only in memory. A restart mid-position
+    /// therefore reopened with a zero basis, and the next sell booked its
+    /// entire proceeds as profit into the permanent ledger.
+    pub fn save_basis(&self) {
+        if self.trader.is_zero() || self.pool.token.is_zero() {
+            return;
+        }
+        let _ = std::fs::create_dir_all(crate::state_dir());
+        let mut all = Self::load_basis_map(self.trader);
+        let key = format!("{:#x}", self.pool.token);
+        if self.bought_qty <= 1e-12 && self.bought_cost <= 1e-12 {
+            all.remove(&key); // position closed — don't grow the file forever
+        } else {
+            all.insert(
+                key,
+                Basis {
+                    qty: self.bought_qty,
+                    cost: self.bought_cost,
+                    entry_at: self.entry_at,
+                    entry_mc: self.entry_mc,
+                    entry_pooled_eth: self.entry_pooled_eth,
+                    entry_tx: self.entry_tx.map(|h| format!("{h:#x}")),
+                },
+            );
+        }
+        let Ok(out) = serde_json::to_string(&all) else {
+            return;
+        };
+        let path = Self::basis_path(self.trader);
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Load the saved basis for the CURRENT pool's token, or zero it when that
+    /// token has no open position. Replaces the bare `bought_qty = 0.0` resets:
+    /// basis is per-token, and now it survives the process.
+    pub fn restore_basis(&mut self) {
+        let b = Self::load_basis_map(self.trader)
+            .remove(&format!("{:#x}", self.pool.token))
+            .unwrap_or_default();
+        self.bought_qty = b.qty;
+        self.bought_cost = b.cost;
+        self.entry_at = b.entry_at;
+        self.entry_mc = b.entry_mc;
+        self.entry_pooled_eth = b.entry_pooled_eth;
+        self.entry_tx = b.entry_tx.and_then(|s| s.parse().ok());
     }
 
     /// Persist the queue, capped alongside the in-memory ring. A restart
@@ -1126,7 +1220,7 @@ impl Bot {
                 continue;
             }
             self.logline(&format!("route {venue}: out {out:.8}"));
-            if best.as_ref().map_or(true, |(_, b)| out > *b) {
+            if best.as_ref().is_none_or(|(_, b)| out > *b) {
                 best = Some((r, out));
             }
         }
@@ -1182,7 +1276,7 @@ impl Bot {
         let mut sell_cap: Wei = Wei::MAX;
         if !buying {
             if let Ok(b) = IERC20::new(self.pool.token, provider).balanceOf(self.trader).call().await {
-                amount_in = amount_in.min(wei_to_f64(b._0));
+                amount_in = amount_in.min(units_to_f64(b._0, self.pool.token_decimals));
                 sell_cap = Wei::exact(b._0);
             }
         }
@@ -1378,6 +1472,7 @@ impl Bot {
     /// Pre-flight + send a prepared swap (already-encoded calldata), recording it
     /// in the orders queue and the pending list (for cost-basis + reaping).
     /// Returns the tx hash on a successful send. Shared by the arb legs.
+    #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
     async fn send_raw<P: Provider>(
         &mut self,
         provider: &P,
@@ -1507,7 +1602,7 @@ impl Bot {
             .balanceOf(self.trader)
             .call()
             .await
-            .map(|b| wei_to_f64(b._0))
+            .map(|b| units_to_f64(b._0, self.pool.token_decimals))
             .unwrap_or(self.token_bal);
         if self.send_raw(provider, to1, data1, val1, label1, Some(Side::Buy), eth_in, tok_out).await.is_none() {
             return Ok(());
@@ -1518,7 +1613,7 @@ impl Bot {
         for _ in 0..40u32 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(b) = erc.balanceOf(self.trader).call().await {
-                let now = wei_to_f64(b._0);
+                let now = units_to_f64(b._0, self.pool.token_decimals);
                 if now > bal_before + tok_out * 0.5 {
                     got = now - bal_before;
                     break;
@@ -1580,10 +1675,20 @@ impl Bot {
 
     /// Reap pending txs: confirmed -> trades, reverted -> fails.
     pub async fn reap<P: Provider>(&mut self, provider: &P) {
-        let mut still = Vec::new();
-        for p in self.pending.drain(..).collect::<Vec<_>>() {
-            match provider.get_transaction_receipt(p.hash).await {
+        // Cancel-safety: this runs under a timeout, so the future can be dropped
+        // at any await. A hash must therefore stay in `self.pending` until its
+        // receipt is in hand — draining up front meant one slow endpoint cost
+        // every in-flight tx: the fill, its ledger row, and the duplicate-buy
+        // guard, which reads `self.pending` and would wave a second buy through.
+        let mut idx = 0;
+        while idx < self.pending.len() {
+            let hash = self.pending[idx].hash;
+            match provider.get_transaction_receipt(hash).await {
                 Ok(Some(rc)) => {
+                    // Receipt in hand. Settling is synchronous from here — the
+                    // one await left (pre_approve_exit) is an optimisation the
+                    // sell path can redo — so removing now strands nothing.
+                    let p = self.pending.remove(idx);
                     if rc.status() {
                         self.trades += 1;
                         self.settle_order(p.hash, OrderStatus::Confirmed);
@@ -1623,7 +1728,11 @@ impl Bot {
                             if side == Side::Sell && weth_out > U256::ZERO {
                                 fill_eth = wei_to_f64(weth_out); // real ETH received
                             } else if side == Side::Buy && tok_in > U256::ZERO {
-                                fill_tok = wei_to_f64(tok_in); // real tokens received
+                                // The token side is NOT 18-dec by assumption: a
+                                // 6-dec token read through wei_to_f64 lands 1e12
+                                // low, understating bought_qty and inflating
+                                // avg_basis for the life of the position.
+                                fill_tok = units_to_f64(tok_in, self.pool.token_decimals); // real tokens received
                             }
                             if side == Side::Sell {
                                 recv_eth = Some(fill_eth); // key number: ETH actually received
@@ -1686,10 +1795,9 @@ impl Bot {
                         self.logline(&format!("REVERTED {}  tx {}", p.label, p.hash));
                     }
                 }
-                _ => still.push(p),
+                _ => idx += 1,
             }
         }
-        self.pending = still;
     }
 
     /// Open a v4 liquidity position sized to `eth_wei` at the current range.
@@ -1998,7 +2106,7 @@ impl Bot {
             .map(|b| b._0)
             .unwrap_or(U256::ZERO);
         let sell_cap = Wei::exact(bal_u256);
-        let amount_in = wei_to_f64(bal_u256);
+        let amount_in = units_to_f64(bal_u256, self.pool.token_decimals);
         if amount_in <= 0.0 {
             self.skips += 1;
             self.push_order("SELL ALL".into(), OrderStatus::Skipped, None);
@@ -2590,7 +2698,7 @@ fn side_str(s: Side) -> &'static str {
 fn eth_of_label(label: &str) -> Option<f64> {
     let idx = label.find(" ETH")?;
     label[..idx]
-        .rsplit(|c: char| c == ' ' || c == '~')
+        .rsplit([' ', '~'])
         .find(|s| !s.is_empty())
         .and_then(|s| s.parse::<f64>().ok())
 }

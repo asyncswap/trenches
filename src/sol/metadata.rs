@@ -145,66 +145,14 @@ pub async fn token_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
     Some(meta)
 }
 
-/// True when the URL's host is a public name — not loopback, not a private
-/// or link-local range, not a bare `.local`. Blocks the SSRF shape where a
-/// coin's metadata URI points at something only the user's machine can reach.
-fn public_host(url: &str) -> bool {
-    let rest = match url.split_once("://") {
-        Some((_, r)) => r,
-        None => return false,
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Strip credentials and port; keep the host.
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host).trim_matches(['[', ']']);
-    if host.is_empty() {
-        return false;
-    }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return false;
-    }
-    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                !(v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_unspecified()
-                    || v4.octets()[0] == 0
-                    // Carrier-grade NAT and the cloud metadata neighbourhood.
-                    || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
-            }
-            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
-        };
-    }
-    true
-}
-
 /// The socials, from the URI's off-chain JSON. The POINTER is on chain; the
 /// contents are one HTTP fetch away — pump.fun writes twitter/telegram/website
 /// keys when the creator fills them in. Best-effort with a short timeout:
 /// a coin whose metadata host is down is still a coin.
 async fn fetch_socials(uri: Option<&str>) -> Vec<(&'static str, String)> {
     let Some(uri) = uri else { return Vec::new() };
-    // ipfs:// travels over a public gateway; anything else must be https to
-    // a PUBLIC host. The URI is attacker-controlled — whoever launched the
-    // coin wrote it — so an unguarded fetch turns "look at this token" into
-    // "make my machine request an address of the attacker's choosing",
-    // including localhost and LAN services (a Solana validator's own RPC
-    // listens on 8899). Plaintext http is refused for the same reason a
-    // wallet refuses it: the answer steers what the screen says.
-    let url = if let Some(cid) = uri.strip_prefix("ipfs://") {
-        format!("https://ipfs.io/ipfs/{}", cid.trim_start_matches('/'))
-    } else if uri.starts_with("https://") {
-        uri.to_string()
-    } else {
-        return Vec::new();
-    };
-    if !public_host(&url) {
-        return Vec::new();
-    }
+    // The URI is attacker-controlled — whoever launched the coin wrote it.
+    let Some(url) = crate::net::metadata_url(uri) else { return Vec::new() };
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(3_000))
         .build()
@@ -236,27 +184,6 @@ async fn fetch_socials(uri: Option<&str>) -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_metadata_uri_cannot_point_at_the_machine_itself() {
-        // Whoever launched the coin wrote this string. It must never be able
-        // to aim the fetch at something only this machine can reach.
-        for bad in [
-            "https://localhost/x.json",
-            "https://127.0.0.1/x.json",
-            "https://[::1]/x.json",
-            "https://10.0.0.5/x.json",
-            "https://192.168.1.7:8899/x.json",
-            "https://169.254.169.254/latest/meta-data",
-            "https://nas.local/x.json",
-            "https://user@127.0.0.1/x.json",
-            "https://100.64.0.1/x.json",
-        ] {
-            assert!(!public_host(bad), "{bad} should be refused");
-        }
-        for ok in ["https://ipfs.io/ipfs/Qm123", "https://example.com/meta.json"] {
-            assert!(public_host(ok), "{ok} should be allowed");
-        }
-    }
 
     fn encode(key: u8, name: &str, symbol: &str) -> Vec<u8> {
         let mut v = vec![key];

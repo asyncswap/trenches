@@ -60,12 +60,7 @@ impl Level {
     /// Recover the level from a rendered line, for colouring on screen.
     pub fn of(line: &str) -> Option<Level> {
         let body = line.get(11..)?; // past "[HH:MM:SS] "
-        for l in [Level::Action, Level::Trade, Level::Warn, Level::Error, Level::Info] {
-            if body.starts_with(l.tag().trim_end()) {
-                return Some(l);
-            }
-        }
-        None
+        [Level::Action, Level::Trade, Level::Warn, Level::Error, Level::Info].into_iter().find(|&l| body.starts_with(l.tag().trim_end()))
     }
 }
 
@@ -197,6 +192,12 @@ pub fn action(what: &str, details: &[(&str, String)]) {
 }
 
 /// An order, a fill, or money accounted for.
+///
+/// Only the Solana session reports trades through the event log today — the
+/// EVM side speaks through its own order queue — so an EVM-only build has no
+/// caller. It stays because the level exists and the next caller shouldn't
+/// have to re-add it.
+#[cfg_attr(not(feature = "solana"), allow(dead_code))]
 pub fn trade(what: &str, details: &[(&str, String)]) {
     log(Level::Trade, what, details);
 }

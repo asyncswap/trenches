@@ -96,7 +96,7 @@ fn ensure_contrast_all(fg: Color, backgrounds: &[Color], primary: Color) -> Colo
     let passes = |c: Color| {
         backgrounds
             .iter()
-            .all(|bg| contrast(c, *bg).map_or(true, |r| r >= MIN_CONTRAST))
+            .all(|bg| contrast(c, *bg).is_none_or(|r| r >= MIN_CONTRAST))
     };
     if passes(fg) {
         return fg;

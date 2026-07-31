@@ -114,6 +114,7 @@ pub fn flaunch_swap_calldata(token: Address, buy: bool, amount_in: u128, min_out
 }
 
 /// Build PositionManager.modifyLiquidities() calldata to open a position.
+#[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 pub fn add_liquidity_calldata(
     token: Address,
     fee: u32,

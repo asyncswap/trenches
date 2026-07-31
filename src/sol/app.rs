@@ -431,6 +431,7 @@ impl TapeCache {
 /// and only the bonding curve is re-read for the selected coin — its token
 /// program and fee recipient never change. Sequential reads on the UI thread
 /// were costing ~18 round trips a tick, which is where the 10s stalls came from.
+#[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 async fn poller(
     rpc: Rpc,
     trader: Pubkey,
@@ -502,7 +503,7 @@ async fn poller(
         }
         tick += 1;
         let ws_live = unix_ms().saturating_sub(ws_alive.load(std::sync::atomic::Ordering::Relaxed)) < 45_000;
-        let poll_tape = !ws_live || tick % 20 == 0;
+        let poll_tape = !ws_live || tick.is_multiple_of(20);
 
         // Fire the independent reads together. The priority estimate rides
         // along in the same round so auto mode costs no extra latency, and is
@@ -711,6 +712,10 @@ pub struct SolOrder {
     pub at: std::time::Instant,
     pub action: &'static str,
     pub sol: f64,
+    /// Tokens this order moves. Set on sells (the amount sent in) so settlement
+    /// can retire the matching SLICE of cost basis; 0 on buys, whose fill size
+    /// is not known until it lands.
+    pub tokens: f64,
     pub state: OrderState,
     pub sig: Option<String>,
     /// Market cap (SOL) at order time — the entry point, as on the EVM side.
@@ -1093,7 +1098,14 @@ impl SolBot {
             .unwrap_or(true)
     }
 
-    fn push_order(&mut self, action: &'static str, sol: f64, state: OrderState, sig: Option<String>) {
+    fn push_order(
+        &mut self,
+        action: &'static str,
+        sol: f64,
+        tokens: f64,
+        state: OrderState,
+        sig: Option<String>,
+    ) {
         let (mc, pooled) = self
             .coin
             .as_ref()
@@ -1103,6 +1115,7 @@ impl SolBot {
             at: std::time::Instant::now(),
             action,
             sol,
+            tokens,
             state,
             sig,
             mc,
@@ -1188,6 +1201,7 @@ impl SolBot {
                 at,
                 action: if matches!(s.kind, discover::SwapKind::Buy) { "BUY" } else { "SELL" },
                 sol: s.sol,
+                tokens: s.tokens,
                 state: OrderState::Confirmed,
                 sig: Some(s.signature.clone()),
                 mc: s.mkt_cap_sol,
@@ -1284,8 +1298,8 @@ impl SolBot {
         let Ok(statuses) = self.rpc.signatures_ok(&sigs).await else { return };
         for ((i, sig), status) in pending.into_iter().zip(statuses) {
             let Some(ok) = status else { continue };
-            let (action, sol) = match self.orders.get(i) {
-                Some(o) => (o.action, o.sol),
+            let (action, sol, sold_tok) = match self.orders.get(i) {
+                Some(o) => (o.action, o.sol, o.tokens),
                 None => continue,
             };
             if let Some(o) = self.orders.get_mut(i) {
@@ -1363,7 +1377,17 @@ impl SolBot {
                 );
                 self.note(format!("Buy for {sol:.6} SOL confirmed, signature {short}"));
             } else {
-                let pnl = sol - self.bought_cost;
+                // Retire only the slice of basis this sell actually consumed.
+                // Zeroing the whole basis on a partial sell booked the entire
+                // position's cost against a fraction of its proceeds — a fat
+                // loss on a position still mostly open — and then handed the
+                // remaining bag a zero basis, so its exit read as pure profit.
+                // Mirrors the EVM `apply_fill`. A sell beyond the tracked
+                // inventory is free-bag: zero cost, all profit.
+                let from_basis = if sold_tok > 0.0 { sold_tok.min(self.bought_qty) } else { self.bought_qty };
+                let avg = if self.bought_qty > 1e-12 { self.bought_cost / self.bought_qty } else { 0.0 };
+                let cost = from_basis * avg;
+                let pnl = sol - cost;
                 self.realized_pnl += pnl;
                 self.last_fill_pnl = Some(pnl);
                 // The permanent record — `realized_pnl` is this session only.
@@ -1379,7 +1403,7 @@ impl SolBot {
                             .unwrap_or_else(|| self.coin.as_ref().map(|c| short_mint(&c.mint)).unwrap_or_default()),
                         token: self.coin.as_ref().map(|c| c.mint.to_string()).unwrap_or_default(),
                         pnl,
-                        cost: self.bought_cost,
+                        cost,
                         proceeds: sol,
                         quote_sym: "SOL".into(),
                         quote_usd: self.sol_usd,
@@ -1387,9 +1411,12 @@ impl SolBot {
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
                     },
                 );
-                self.bought_cost = 0.0;
-                self.bought_qty = 0.0;
-                self.entry_at = None;
+                self.bought_cost = (self.bought_cost - cost).max(0.0);
+                self.bought_qty = (self.bought_qty - from_basis).max(0.0);
+                // Only a closed position restarts the clock.
+                if self.bought_qty <= 1e-12 {
+                    self.entry_at = None;
+                }
                 crate::events::trade(
                     "CONFIRMED SELL",
                     &[
@@ -2659,11 +2686,11 @@ pub async fn run(
                             };
                             match sent {
                                 Ok(sig) => {
-                                    bot.push_order("BUY", sol, OrderState::Pending, Some(sig.clone()));
+                                    bot.push_order("BUY", sol, 0.0, OrderState::Pending, Some(sig.clone()));
                                     bot.note(format!("Buy for {sol:.6} SOL sent, signature {sig}"));
                                 }
                                 Err(e) => {
-                                    bot.push_order("BUY", sol, OrderState::Failed, None);
+                                    bot.push_order("BUY", sol, 0.0, OrderState::Failed, None);
                                     bot.fails += 1;
                                     bot.note(format!("Buy failed. {e}"));
                                 }
@@ -2724,11 +2751,11 @@ pub async fn run(
                             };
                             match sent {
                                 Ok(sig) => {
-                                    bot.push_order("SELL", est, OrderState::Pending, Some(sig.clone()));
+                                    bot.push_order("SELL", est, tokens, OrderState::Pending, Some(sig.clone()));
                                     bot.note(format!("Sell for about {est:.6} SOL sent, signature {sig}"));
                                 }
                                 Err(e) => {
-                                    bot.push_order("SELL", est, OrderState::Failed, None);
+                                    bot.push_order("SELL", est, tokens, OrderState::Failed, None);
                                     bot.fails += 1;
                                     bot.note(format!("Sell failed. {e}"));
                                 }

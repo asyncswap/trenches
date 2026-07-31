@@ -147,10 +147,9 @@ fn b58_decode(s: &str) -> Option<Vec<u8>> {
             carry >>= 8;
         }
     }
-    // Leading '1's are leading zero bytes.
-    for _ in s.bytes().take_while(|&c| c == b'1') {
-        out.push(0);
-    }
+    // Leading '1's are leading zero bytes — one per '1', appended as a run.
+    let leading_zeros = s.bytes().take_while(|&c| c == b'1').count();
+    out.resize(out.len() + leading_zeros, 0);
     out.reverse();
     Some(out)
 }
@@ -1307,6 +1306,7 @@ fn decode_amm_lp_event(data: &[u8]) -> Option<(SwapKind, AmmLpEvent)> {
 /// AMM pool — so reading the curve returned the same handful of launch-day
 /// trades forever while the coin traded live elsewhere. Signatures come from the
 /// pool account, which every swap must reference.
+#[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 pub async fn amm_tape(
     rpc: &Rpc,
     pool: &Pubkey,

@@ -303,13 +303,18 @@ pub fn endpoints_screen(term: &mut Term) -> eyre::Result<()> {
 /// here rather than starting.
 pub fn start_screen(
     term: &mut Term,
-    new_wallet: &mut dyn FnMut(&mut Term) -> eyre::Result<()>,
+    new_wallet: &mut MakeWallet<'_>,
 ) -> eyre::Result<bool> {
     docs_inner(term, true, Some(new_wallet))
 }
 
 /// The docs, opened with `D` from inside a session. Esc returns to where you
 /// came from.
+/// A callback the docs screen can hand the terminal to so the reader can make
+/// an account without leaving the page. Named because the bare shape —
+/// `dyn FnMut(&mut Term) -> Result<()>` — says nothing about what it does.
+pub type MakeWallet<'a> = dyn FnMut(&mut Term) -> eyre::Result<()> + 'a;
+
 pub fn docs(term: &mut Term) -> eyre::Result<()> {
     docs_inner(term, false, None).map(|_| ())
 }
@@ -317,7 +322,7 @@ pub fn docs(term: &mut Term) -> eyre::Result<()> {
 fn docs_inner(
     term: &mut Term,
     start: bool,
-    mut new_wallet: Option<&mut dyn FnMut(&mut Term) -> eyre::Result<()>>,
+    mut new_wallet: Option<&mut MakeWallet<'_>>,
 ) -> eyre::Result<bool> {
     let (mut sel, mut scroll) = (0usize, 0u16);
     // Written by the draw closure so the key handler can clamp against what was
@@ -866,7 +871,7 @@ pub fn chat_screen(
         }
 
         let busy = streaming.is_some();
-        let blink = (t0.elapsed().as_millis() / 500) % 2 == 0;
+        let blink = (t0.elapsed().as_millis() / 500).is_multiple_of(2);
         term.draw(|f| {
             let area = f.area();
             let chunks = ratatui::layout::Layout::default()

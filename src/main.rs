@@ -6,6 +6,7 @@
 
 mod agent;
 mod config;
+mod net;
 mod contracts;
 mod discover;
 mod engine;
@@ -1077,21 +1078,26 @@ async fn solana_app(
     // with nothing to unlock: the screen offers create/import, and gating it
     // on existing keystores made `W` a silent no-op on a fresh machine.
     let mut unlocked: Option<solana_keypair::Keypair> = None;
-    while ask_account {
-        let Some(ks) = wallet_screen(terminal, config::ChainKind::Solana)? else {
-            break;
-        };
-        let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
-            continue;
-        };
-        match sol::wallet::keypair_from_keystore(&ks, &pass) {
-            Ok(kp) => {
-                save_last_wallet(&ks);
-                unlocked = Some(kp);
+    // `ask_account` decides WHETHER to ask at all; the loop then runs until an
+    // unlock succeeds or the user backs out. It is deliberately not a
+    // condition the body re-evaluates.
+    if ask_account {
+        loop {
+            let Some(ks) = wallet_screen(terminal, config::ChainKind::Solana)? else {
                 break;
-            }
-            Err(e) => {
-                ui::select(terminal, &format!("Could not unlock: {e}"), &["Back".into()])?;
+            };
+            let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
+                continue;
+            };
+            match sol::wallet::keypair_from_keystore(&ks, &pass) {
+                Ok(kp) => {
+                    save_last_wallet(&ks);
+                    unlocked = Some(kp);
+                    break;
+                }
+                Err(e) => {
+                    ui::select(terminal, &format!("Could not unlock: {e}"), &["Back".into()])?;
+                }
             }
         }
     }
@@ -1337,177 +1343,181 @@ async fn app(
             .and_then(|n| reg.networks.iter().position(|x| x.name == n));
 
         loop {
-            let exit = match resume.take() {
-                Some(i) => {
-                    save_last_chain(&reg.networks[i].name);
-                    events::action("Resumed last chain", &[("chain", reg.networks[i].name.clone())]);
-                    chain_session_on(terminal, reg, &reg.networks[i], i, false, None).await?
+                let exit = match resume.take() {
+                    Some(i) => {
+                        save_last_chain(&reg.networks[i].name);
+                        events::action("Resumed last chain", &[("chain", reg.networks[i].name.clone())]);
+                        chain_session_on(terminal, reg, &reg.networks[i], i, false, None).await?
+                    }
+                    None => chain_session(terminal, reg, None).await?,
+                };
+                match exit {
+                    Exit::ChangeChain => continue,
+                    Exit::Docs => break,
+                    _ => return Ok(()),
                 }
-                None => chain_session(terminal, reg, None).await?,
-            };
-            match exit {
-                Exit::ChangeChain => continue,
-                Exit::Docs => break,
-                _ => return Ok(()),
             }
         }
     }
-}
 
-async fn chain_session(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    reg: &Registry,
-    keep_net: Option<usize>,
-) -> eyre::Result<Exit> {
-    // 1) Chain: just the names, mainnets first. The logo beside the list says
-    // which chain it is; an id and a pool count are numbers you never pick by.
-    struct Pick {
-        idx: usize,
-        name: String,
-        mainnet: bool,
-    }
-    let picks: Vec<Pick> = reg
-        .networks
-        .iter()
-        .enumerate()
-        .map(|(idx, n)| {
-            let env = view::network_env(&n.name);
-            let base = view::pretty_network(n.name.split(['-', '_']).next().unwrap_or(&n.name));
-            // "Robinhood Chain" is what it is called; "Solana" already reads as
-            // a chain, so only the one that needs it gets the suffix.
-            let base = if base.eq_ignore_ascii_case("robinhood") {
-                "Robinhood Chain".to_string()
-            } else {
-                base
-            };
-            Pick {
-                idx,
-                name: if env.eq_ignore_ascii_case("mainnet") { base } else { format!("{base} ({})", env.to_lowercase()) },
-                mainnet: env.eq_ignore_ascii_case("mainnet"),
+    async fn chain_session(
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        reg: &Registry,
+        keep_net: Option<usize>,
+    ) -> eyre::Result<Exit> {
+        // 1) Chain: just the names, mainnets first. The logo beside the list says
+        // which chain it is; an id and a pool count are numbers you never pick by.
+        struct Pick {
+            idx: usize,
+            name: String,
+            mainnet: bool,
+        }
+        let picks: Vec<Pick> = reg
+            .networks
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| {
+                let env = view::network_env(&n.name);
+                let base = view::pretty_network(n.name.split(['-', '_']).next().unwrap_or(&n.name));
+                // "Robinhood Chain" is what it is called; "Solana" already reads as
+                // a chain, so only the one that needs it gets the suffix.
+                let base = if base.eq_ignore_ascii_case("robinhood") {
+                    "Robinhood Chain".to_string()
+                } else {
+                    base
+                };
+                Pick {
+                    idx,
+                    name: if env.eq_ignore_ascii_case("mainnet") { base } else { format!("{base} ({})", env.to_lowercase()) },
+                    mainnet: env.eq_ignore_ascii_case("mainnet"),
+                }
+            })
+            .collect();
+
+        // Wide enough that a chain name has room around it rather than filling its
+        // box edge to edge. The mark beside it is square and sized off the row
+        // count, so widening this does not stretch the logo.
+        const COLS: &[u16] = &[44];
+        // Mainnets first, then test and local. No divider row: the ordering already
+        // groups them, and a rule just costs a line.
+        let (mut rows, mut back): (Vec<ui::PickRow>, Vec<Option<usize>>) = (Vec::new(), Vec::new());
+        for main in [true, false] {
+            for p in picks.iter().filter(|p| p.mainnet == main) {
+                rows.push(ui::PickRow::new([p.name.clone()]));
+                back.push(Some(p.idx));
             }
-        })
-        .collect();
-
-    // Wide enough that a chain name has room around it rather than filling its
-    // box edge to edge. The mark beside it is square and sized off the row
-    // count, so widening this does not stretch the logo.
-    const COLS: &[u16] = &[44];
-    // Mainnets first, then test and local. No divider row: the ordering already
-    // groups them, and a rule just costs a line.
-    let (mut rows, mut back): (Vec<ui::PickRow>, Vec<Option<usize>>) = (Vec::new(), Vec::new());
-    for main in [true, false] {
-        for p in picks.iter().filter(|p| p.mainnet == main) {
-            rows.push(ui::PickRow::new([p.name.clone()]));
-            back.push(Some(p.idx));
         }
-    }
-    // Keyed on the NETWORK, not the chain family: a local anvil node is EVM but
-    // is not Robinhood, and showing their feather next to it is just wrong.
-    let names: Vec<String> = reg.networks.iter().map(|n| n.name.clone()).collect();
-    let brand = |row: usize| {
-        back.get(row)
-            .copied()
-            .flatten()
-            .and_then(|i| names.get(i))
-            .map(|n| n.to_lowercase())
-    };
-    let _ = keep_net;
-    // The chain picker is the first thing drawn, so it is where a waiting
-    // update gets said. One line, no prompt to dismiss, no blocking.
-    let title = match update::available() {
-        Some(v) => format!("Select chain          ▲ {v} available — curl -fsSL https://trenches.sh/install | sh"),
-        None => "Select chain".to_string(),
-    };
-    let chosen = ui::select_table(
-        terminal,
-        &title,
-        &[],
-        COLS,
-        &rows,
-        |row| brand(row).as_deref().and_then(ui::logo::for_network),
-        |row| brand(row).as_deref().and_then(ui::image::for_network),
-    )?;
-    let (net_idx, net) = match chosen.and_then(|r| back.get(r).copied().flatten()) {
-        Some(i) => {
-            // Remembered only once it is actually chosen, so a chain you looked
-            // at and backed out of is not where you land next time.
-            save_last_chain(&reg.networks[i].name);
-            events::action("Selected chain", &[("chain", reg.networks[i].name.clone())]);
-            (i, &reg.networks[i])
-        }
-        // Esc on the first screen means back, not quit. `q` is how you leave,
-        // and it asks first.
-        None => return Ok(Exit::Docs),
-    };
-    chain_session_on(terminal, reg, net, net_idx, false, None).await
-}
-
-/// The session for one already-chosen network.
-async fn chain_session_on(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    reg: &Registry,
-    net: &config::Network,
-    _net_idx: usize,
-    // False on the way in, true when `W` sent us back round. A first run should
-    // reach the dashboard without being asked for a password it may not need —
-    // watching costs nothing and unlocking is one keypress away.
-    ask_account: bool,
-    // The pool that was on screen before an account change, if this is one.
-    // None on a fresh session.
-    resume_pool: Option<SelPool>,
-) -> eyre::Result<Exit> {
-
-    // Solana networks take an entirely separate path: different signing curve,
-    // different venues, different engine. Only the UI components are shared.
-    if net.kind.is_solana() {
-        #[cfg(feature = "solana")]
-        {
-            return solana_app(terminal, reg, net, false).await;
-        }
-        #[cfg(not(feature = "solana"))]
-        {
-            ui::select(
-                terminal,
-                "Solana support is not compiled in",
-                &["Rebuild with:  cargo build --release --features solana".to_string()],
-            )?;
-            return Ok(Exit::ChangeChain);
-        }
+        // Keyed on the NETWORK, not the chain family: a local anvil node is EVM but
+        // is not Robinhood, and showing their feather next to it is just wrong.
+        let names: Vec<String> = reg.networks.iter().map(|n| n.name.clone()).collect();
+        let brand = |row: usize| {
+            back.get(row)
+                .copied()
+                .flatten()
+                .and_then(|i| names.get(i))
+                .map(|n| n.to_lowercase())
+        };
+        let _ = keep_net;
+        // The chain picker is the first thing drawn, so it is where a waiting
+        // update gets said. One line, no prompt to dismiss, no blocking.
+        let title = match update::available() {
+            Some(v) => format!("Select chain          ▲ {v} available — curl -fsSL https://trenches.sh/install | sh"),
+            None => "Select chain".to_string(),
+        };
+        let chosen = ui::select_table(
+            terminal,
+            &title,
+            &[],
+            COLS,
+            &rows,
+            |row| brand(row).as_deref().and_then(ui::logo::for_network),
+            |row| brand(row).as_deref().and_then(ui::image::for_network),
+        )?;
+        let (net_idx, net) = match chosen.and_then(|r| back.get(r).copied().flatten()) {
+            Some(i) => {
+                // Remembered only once it is actually chosen, so a chain you looked
+                // at and backed out of is not where you land next time.
+                save_last_chain(&reg.networks[i].name);
+                events::action("Selected chain", &[("chain", reg.networks[i].name.clone())]);
+                (i, &reg.networks[i])
+            }
+            // Esc on the first screen means back, not quit. `q` is how you leave,
+            // and it asks first.
+            None => return Ok(Exit::Docs),
+        };
+        chain_session_on(terminal, reg, net, net_idx, false, None).await
     }
 
-    // 2) Account: keystores on disk, or make one. There is no separate account
-    // list — a seed phrase in a config file is not an account we are willing to
-    // offer, so the only accounts are encrypted keystores.
-    //
-    // Optional. Esc goes on WITHOUT an account: the dashboard is worth looking
-    // at before you commit a key to it — prices, launches, the tape — and
-    // making an unlock the price of entry means anyone who just wants to watch
-    // hands over a password first. `W` brings this up at any point — and it
-    // must come up even with nothing to unlock, because the screen offers
-    // create/import; gating it on existing keystores made `W` a silent no-op
-    // on a machine with no ~/.foundry/keystores and no config keystores.
-    let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = None;
-    while ask_account {
-        let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
-            break;
-        };
-        let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
-            continue;
-        };
-        let Some(path) = wallet::keystore_path(&ks) else {
-            ui::select(terminal, &format!("{ks} is no longer on disk"), &["Back".into()])?;
-            continue;
-        };
-        match alloy::signers::local::LocalSigner::decrypt_keystore(&path, &pass) {
-            Ok(sg) => {
-                // Only after a successful unlock: a mistyped password should
-                // not change which wallet comes up next time.
-                save_last_wallet(&ks);
-                unlocked = Some((ks, sg));
+    /// The session for one already-chosen network.
+    async fn chain_session_on(
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        reg: &Registry,
+        net: &config::Network,
+        _net_idx: usize,
+        // False on the way in, true when `W` sent us back round. A first run should
+        // reach the dashboard without being asked for a password it may not need —
+        // watching costs nothing and unlocking is one keypress away.
+        ask_account: bool,
+        // The pool that was on screen before an account change, if this is one.
+        // None on a fresh session.
+        resume_pool: Option<SelPool>,
+    ) -> eyre::Result<Exit> {
+
+        // Solana networks take an entirely separate path: different signing curve,
+        // different venues, different engine. Only the UI components are shared.
+        if net.kind.is_solana() {
+            #[cfg(feature = "solana")]
+            {
+                return solana_app(terminal, reg, net, false).await;
+            }
+            #[cfg(not(feature = "solana"))]
+            {
+                ui::select(
+                    terminal,
+                    "Solana support is not compiled in",
+                    &["Rebuild with:  cargo build --release --features solana".to_string()],
+                )?;
+                return Ok(Exit::ChangeChain);
+            }
+        }
+
+        // 2) Account: keystores on disk, or make one. There is no separate account
+        // list — a seed phrase in a config file is not an account we are willing to
+        // offer, so the only accounts are encrypted keystores.
+        //
+        // Optional. Esc goes on WITHOUT an account: the dashboard is worth looking
+        // at before you commit a key to it — prices, launches, the tape — and
+        // making an unlock the price of entry means anyone who just wants to watch
+        // hands over a password first. `W` brings this up at any point — and it
+        // must come up even with nothing to unlock, because the screen offers
+        // create/import; gating it on existing keystores made `W` a silent no-op
+        // on a machine with no ~/.foundry/keystores and no config keystores.
+        let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = None;
+        // As on the Solana side: whether to ask is decided once, then the loop
+        // runs until an unlock lands or the user steps back.
+        if ask_account {
+            loop {
+            let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
                 break;
-            }
-            Err(_) => {
-                ui::select(terminal, "Wrong password for that wallet", &["Back".into()])?;
+            };
+            let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
+                continue;
+            };
+            let Some(path) = wallet::keystore_path(&ks) else {
+                ui::select(terminal, &format!("{ks} is no longer on disk"), &["Back".into()])?;
+                continue;
+            };
+            match alloy::signers::local::LocalSigner::decrypt_keystore(&path, &pass) {
+                Ok(sg) => {
+                    // Only after a successful unlock: a mistyped password should
+                    // not change which wallet comes up next time.
+                    save_last_wallet(&ks);
+                    unlocked = Some((ks, sg));
+                    break;
+                }
+                Err(_) => {
+                    ui::select(terminal, "Wrong password for that wallet", &["Back".into()])?;
+                }
             }
         }
     }
@@ -1661,6 +1671,10 @@ async fn chain_session_on(
     };
 
     let _ = log_path;
+    // A position open when the last session ended is still open now, and its
+    // cost basis has to come back with it — a zero basis books the next sell's
+    // entire proceeds as profit, permanently, into the ledger.
+    bot.restore_basis();
     bot.load_daily(); // restore today's PnL baseline across restarts
     // Today's figure comes from the ledger, so it has to be read before the
     // first render — otherwise the wallet shows zero for a day that already
@@ -1786,6 +1800,7 @@ fn build_verified(net: &config::Network) -> Vec<discover::VerifiedPool> {
 }
 
 
+#[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 async fn run<P: Provider + Clone + Send + Sync + 'static>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     provider: &P,
@@ -2275,7 +2290,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 }
                 phase!("telemetry");
                 tele_ctr += 1;
-                if tele_ctr % 4 == 0 { bot.telemetry(block.load(Ordering::Relaxed), bot.last_read_ms); }
+                if tele_ctr.is_multiple_of(4) { bot.telemetry(block.load(Ordering::Relaxed), bot.last_read_ms); }
                 // Refresh the USD feed every ~60s (120 * 500ms) so quote values
                 // track — in the BACKGROUND. This await used to sit on the UI
                 // thread, and a slow CoinGecko froze the whole screen for up to
@@ -2590,8 +2605,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let blank = blank_pool(&bot.net.clone());
                             bot.pool = to_poolcfg(&blank);
                             bot.routes.clear();
-                            bot.bought_qty = 0.0;
-                            bot.bought_cost = 0.0;
+                            bot.restore_basis();
                             bot.lp_permit2_done = false;
                             bot.v3_covered = false;
                             bot.ur_permit2_done = false;
@@ -2725,8 +2739,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     let p = held[i].0.clone();
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
-                                    bot.bought_qty = 0.0;
-                                    bot.bought_cost = 0.0;
+                                    bot.restore_basis();
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
                                     bot.ur_permit2_done = false;
@@ -2812,7 +2825,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                         label: pool_label(false, g.kind.proto(), &quote_sym, &g.sym, g.fee, ""),
                                         kind: g.kind,
                                         token: g.token, sym: g.sym.clone(), fee: g.fee, owned: false,
-                                        quote: g.quote.clone(), quote_sym,
+                                        quote: g.quote, quote_sym,
                                     };
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
@@ -2824,8 +2837,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     if let engine::PoolKind::V3 { pool_addr, .. } = g.kind {
                                         discover::remember(g.token, pool_addr, g.launch_block);
                                     }
-                                    bot.bought_qty = 0.0; // reset cost basis — realized is per-token, not cross-token
-                                    bot.bought_cost = 0.0;
+                                    bot.restore_basis(); // basis is per-token, and survives restarts
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
                                     bot.ur_permit2_done = false;
@@ -2961,15 +2973,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     1 => {
                                         // Add an existing pool for a wallet-selected pair.
                                         match pick_pair(terminal, provider, &assets, bot.trader).await? {
-                                            Pick::Token(token, sym) => match fee_tier_select(terminal)? {
-                                                Some((fee, spacing)) => Some(SelPool {
+                                            Pick::Token(token, sym) => fee_tier_select(terminal)?.map(|(fee, spacing)| SelPool {
                                                     label: pool_label(false, "v4", "ETH", &sym, fee, ""),
                                                     kind: engine::PoolKind::V4 { pool_id: compute_pool_id(token, fee, spacing), tick_spacing: spacing },
                                                     token, sym, fee, owned: false,
                                                     quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                 }),
-                                                None => None,
-                                            },
                                             Pick::NeedsEth => { bot.status = "select ETH + one token".into(); None }
                                             Pick::Cancelled => None,
                                         }
@@ -3002,8 +3011,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 if let Some(p) = new_pool {
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
-                                    bot.bought_qty = 0.0; // reset cost basis — realized is per-token, not cross-token
-                                    bot.bought_cost = 0.0;
+                                    bot.restore_basis(); // basis is per-token, and survives restarts
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
                                     bot.ur_permit2_done = false;
@@ -3058,6 +3066,7 @@ enum Panel {
 
 /// Draws the dashboard and returns where the header logo goes, so the caller
 /// can place a real terminal image there after the frame.
+#[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders_scroll: usize, tape: &[engine::Swap], show_help: bool) -> Option<Rect> {
     // Paint the theme background FIRST. Without this a light theme renders dark
     // text on the terminal's own dark background — unreadable.

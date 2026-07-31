@@ -81,7 +81,7 @@ fn glyph_width(c: char) -> usize {
 /// Whether the pixel at (`x`, `py`) of this glyph is set, where `py` indexes the
 /// six-row box rather than the glyph itself.
 fn lit(c: char, x: usize, py: usize) -> bool {
-    if py < TOP_PAD || py >= TOP_PAD + GLYPH_ROWS {
+    if !(TOP_PAD..TOP_PAD + GLYPH_ROWS).contains(&py) {
         return false;
     }
     glyph(c)

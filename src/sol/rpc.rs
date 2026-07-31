@@ -120,8 +120,7 @@ impl Rpc {
         // the round returns nothing — which the tape cannot distinguish from
         // "no trades happened". A brief pause is usually all it takes.
         for pass in 0..2 {
-            for hop in 0..order.len() {
-                let i = order[hop];
+            for (hop, &i) in order.iter().enumerate() {
                 let url = &self.urls[i];
                 if !allow(url) {
                     continue;

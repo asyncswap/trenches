@@ -595,7 +595,7 @@ pub fn pretty_network(name: &str) -> String {
 /// The chain is already named by the logo beside it, so repeating it in the
 /// title is noise — what still matters is which environment you are trading.
 pub fn network_env(name: &str) -> String {
-    let last = name.split(['-', '_']).filter(|s| !s.is_empty()).next_back().unwrap_or(name);
+    let last = name.split(['-', '_']).rfind(|s| !s.is_empty()).unwrap_or(name);
     pretty_network(last)
 }
 

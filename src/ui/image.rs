@@ -117,6 +117,7 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
 /// it — and re-sent only on a real change.
 #[derive(Default)]
 pub struct Placement {
+    #[allow(clippy::type_complexity)] // the shape IS the cache entry; a type alias would hide it, not simplify it
     shown: Option<(usize, u16, u16, u16, u16, (u16, u16), u64)>,
 }
 
@@ -139,6 +140,7 @@ impl Placement {
     /// its own coordinates do not change — without the terminal size in the key
     /// the placement would look unchanged and never be re-emitted, leaving the
     /// header blank until something else forced it.
+    #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
     pub fn show(&mut self, png: &'static [u8], id: usize, x: u16, y: u16, w: u16, h: u16, term: (u16, u16)) {
         let key = (id, x, y, w, h, term, generation());
         if self.shown == Some(key) || !supported() {
