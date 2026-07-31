@@ -626,8 +626,7 @@ impl Bot {
                 }
             }
             Side::Sell => {
-                let from_basis = tok.min(self.bought_qty);
-                let cost = from_basis * self.avg_basis();
+                let (from_basis, cost) = realized_cost(tok, self.bought_qty, self.bought_cost);
                 let realized = eth - cost; // free-bag portion has zero cost
 
                 self.last_fill_pnl = Some(realized); // this sell's return, on its own
@@ -2830,6 +2829,36 @@ pub fn burn_amounts(liquidity: f64, sqrt_p: f64, tick_lower: i32, tick_upper: i3
     }
 }
 
+/// What a sale of `tok` tokens costs against the open position: the inventory it
+/// consumes, and the money that inventory was bought with.
+///
+/// ONE implementation, used by both chains. This arithmetic existed twice —
+/// once here and once in the Solana settle path — and the copies drifted: the
+/// Solana one retired the entire basis on a PARTIAL sell, booking a whole
+/// position's cost against a fifth of its proceeds.
+///
+/// Two rules:
+///
+/// - A sale beyond the tracked inventory is free-bag: zero cost, all profit.
+/// - Closing out realises the WHOLE remaining basis, not just the slice the
+///   tokens account for. Inventory is learned from a polled balance that lags,
+///   and a buy can confirm having delivered ~nothing at all — a honeypot, a
+///   blocked transfer, a fill the poll has not seen yet. In every one of those
+///   the money left the wallet, so the exit has to book it. Without this the
+///   cost came out ~0 and a real loss was reported as a profit equal to the
+///   entire proceeds, while the money sat stranded in the basis forever.
+///
+/// Returns `(inventory_consumed, cost)`.
+pub fn realized_cost(tok: f64, bought_qty: f64, bought_cost: f64) -> (f64, f64) {
+    let from_basis = if tok > 0.0 { tok.min(bought_qty) } else { bought_qty };
+    let avg = if bought_qty > 1e-12 { bought_cost / bought_qty } else { 0.0 };
+    let mut cost = from_basis * avg;
+    if (bought_qty - from_basis) <= 1e-12 {
+        cost = cost.max(bought_cost);
+    }
+    (from_basis, cost.max(0.0))
+}
+
 fn wei_to_f64(x: U256) -> f64 {
     // Overflow-safe (a token balance could exceed u128): parse the decimal.
     x.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
@@ -3171,5 +3200,71 @@ mod position_info_tests {
         assert_eq!(burn_amounts(1e12, 0.0, -60, 60), (0.0, 0.0));
         assert_eq!(burn_amounts(1e12, 1.0, 60, 60), (0.0, 0.0), "an empty range returns nothing");
         assert_eq!(burn_amounts(1e12, 1.0, 60, -60), (0.0, 0.0), "an inverted range returns nothing");
+    }
+}
+
+#[cfg(test)]
+mod realized_cost_tests {
+    use super::*;
+
+    /// The shape that reported a loss as a profit, from a real trade: bought
+    /// catwifhat for 0.000329 SOL, sold for 0.000008, and the balance poll had
+    /// not caught up — so the inventory read as zero and the exit booked a cost
+    /// of zero. The panel showed +0.000008 realised on a position that lost
+    /// almost all of its money.
+    #[test]
+    fn a_stale_balance_cannot_turn_a_loss_into_a_profit() {
+        let (_, cost) = realized_cost(0.0, 0.0, 0.000329);
+        assert!((cost - 0.000329).abs() < 1e-12, "closing must realise the whole basis, got {cost}");
+        let pnl = 0.000008 - cost;
+        assert!(pnl < 0.0, "this trade lost money; {pnl:+.9} says otherwise");
+    }
+
+    /// A buy that confirmed and delivered nothing — honeypot, blocked transfer,
+    /// a tax that rounds the fill away. The money still left the wallet.
+    #[test]
+    fn a_honeypot_books_what_was_actually_spent() {
+        let (_, cost) = realized_cost(0.0, 0.0, 0.000552);
+        assert!((cost - 0.000552).abs() < 1e-12, "got {cost}");
+        assert!((0.0 - cost) < 0.0, "a total loss must read as a loss");
+    }
+
+    /// A partial sell retires a PROPORTIONAL slice. The Solana copy used to
+    /// zero the whole basis here, charging a full position's cost against a
+    /// fifth of its proceeds and leaving the rest of the bag at zero cost.
+    #[test]
+    fn a_partial_sell_retires_only_its_share() {
+        let (from, cost) = realized_cost(200.0, 1000.0, 1.0);
+        assert!((from - 200.0).abs() < 1e-9);
+        assert!((cost - 0.2).abs() < 1e-9, "a fifth of the position costs a fifth, got {cost}");
+    }
+
+    /// A full exit realises exactly what was paid — no more, no less.
+    #[test]
+    fn a_full_exit_realises_the_whole_basis_exactly() {
+        let (from, cost) = realized_cost(1000.0, 1000.0, 1.0);
+        assert!((from - 1000.0).abs() < 1e-9);
+        assert!((cost - 1.0).abs() < 1e-12, "got {cost}");
+    }
+
+    /// Selling MORE than was bought: the excess is free bag, and free bag has
+    /// no cost. It must not invent one, and must not double-charge the basis.
+    #[test]
+    fn the_free_bag_is_free() {
+        let (from, cost) = realized_cost(5000.0, 1000.0, 1.0);
+        assert!((from - 1000.0).abs() < 1e-9, "cannot consume more inventory than exists");
+        assert!((cost - 1.0).abs() < 1e-12, "got {cost}");
+        // Nothing bought at all: an airdrop sold is pure profit.
+        let (_, cost) = realized_cost(5000.0, 0.0, 0.0);
+        assert_eq!(cost, 0.0);
+    }
+
+    /// Cost is never negative, whatever nonsense arrives.
+    #[test]
+    fn cost_never_goes_negative() {
+        for (tok, qty, c) in [(-1.0, 10.0, 1.0), (10.0, -5.0, 1.0), (0.0, 0.0, -3.0)] {
+            let (_, cost) = realized_cost(tok, qty, c);
+            assert!(cost >= 0.0, "realized_cost({tok},{qty},{c}) = {cost}");
+        }
     }
 }
