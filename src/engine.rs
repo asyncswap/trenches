@@ -1036,6 +1036,34 @@ impl Bot {
         }
     }
 
+    /// Gas for a send: ask the node, then add real headroom — never below the
+    /// venue's floor.
+    ///
+    /// A fixed table is what broke every Flaunch buy: 500,000 against a real
+    /// need of 837,000. A table cannot know what a hook deployed tomorrow will
+    /// cost, and being shy in it fails in the worst possible way — an OOG
+    /// inside a hook is reported as the hook refusing the trade, so the number
+    /// is the last thing anyone suspects.
+    ///
+    /// The node's estimate alone is not the answer either, which is why the
+    /// table existed: it prices the SIMULATED state with no buffer, and lands
+    /// under the real need on a block that touches cold storage.
+    ///
+    /// So both. Estimate, add 60%, and never go under the floor. Bounded, so a
+    /// slow node cannot hold up a send — on timeout the floor stands, which is
+    /// exactly the old behaviour.
+    async fn gas_for<P: Provider>(provider: &P, tx: &TransactionRequest, floor: u64) -> u64 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(600),
+            provider.estimate_gas(tx),
+        )
+        .await
+        {
+            Ok(Ok(est)) => (est.saturating_mul(16) / 10).max(floor),
+            _ => floor,
+        }
+    }
+
     /// Log a line AND surface it as the dashboard status (user feedback).
     pub fn note(&mut self, s: String) {
         // Errors reach here with the failing URL, key and all, still attached.
@@ -1434,6 +1462,14 @@ impl Bot {
             PoolKind::FlaunchV4 { .. } => if buying { 1_400_000 } else { 1_600_000 },
             _ => if buying { 300_000 } else { 450_000 },
         };
+        // The floor above is a safety net; ask the node what this actually
+        // costs and take the larger.
+        let probe = TransactionRequest::default()
+            .with_to(to)
+            .with_input(data.clone())
+            .with_value(value)
+            .with_from(self.trader);
+        let gas_limit = Self::gas_for(provider, &probe, gas_limit).await;
         let tx = TransactionRequest::default()
             .with_to(to)
             .with_input(data)
@@ -2250,6 +2286,8 @@ impl Bot {
             PoolKind::FlaunchV4 { .. } => 1_600_000,
             _ => 450_000,
         };
+        let probe = TransactionRequest::default().with_to(to).with_input(data.clone()).with_from(self.trader);
+        let dump_gas = Self::gas_for(provider, &probe, dump_gas).await;
         let tx = TransactionRequest::default().with_to(to).with_input(data).with_gas_limit(dump_gas).with_from(self.trader);
         // Report the sell in ETH numeraire (expected proceeds), not token units.
         let label = format!("SELL ALL for {:.6} ETH @ {:.6} [{} {}] liq_eth={:.6}", expected, self.price(), route.kind.proto(), route.label, self.r0);

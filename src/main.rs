@@ -2136,7 +2136,17 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     if b >= from {
                         // Only advance the scan cursor when the fetch SUCCEEDS —
                         // otherwise a timeout/error would skip those blocks' events.
-                        if let Ok(Ok(sw)) = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pref, from, b)).await {
+                        let scan = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pref, from, b)).await;
+                        // Say what the scan DID. An empty tape next to a moving
+                        // chart has three possible causes — the window, the
+                        // fetch, the decode — and no way to tell them apart
+                        // from the outside.
+                        match &scan {
+                            Ok(Ok(v)) => trace(&format!("tape: {}..{} -> {} swap(s)", from, b, v.len())),
+                            Ok(Err(e)) => trace(&format!("tape: {}..{} FAILED {e}", from, b)),
+                            Err(_) => trace(&format!("tape: {}..{} timed out after 1500ms", from, b)),
+                        }
+                        if let Ok(Ok(sw)) = scan {
                             // The head `b` and these logs can come from DIFFERENT
                             // endpoints, and their views of the chain differ by
                             // ~10 blocks here. Trusting `b` skipped the blocks
