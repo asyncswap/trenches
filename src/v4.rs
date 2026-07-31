@@ -168,10 +168,21 @@ pub fn add_liquidity_calldata(
 }
 
 /// Build calldata to close (burn) a position, returning both tokens.
-pub fn close_liquidity_calldata(token_id: U256, token: Address, owner: Address) -> Bytes {
+pub fn close_liquidity_calldata(
+    token_id: U256,
+    token: Address,
+    owner: Address,
+    amount0_min: u128,
+    amount1_min: u128,
+) -> Bytes {
     // BURN_POSITION(tokenId, amount0Min, amount1Min, hookData),
     // TAKE_PAIR(currency0=ETH, currency1=token, recipient).
-    let burn = (token_id, 0u128, 0u128, Bytes::new()).abi_encode_params();
+    //
+    // These were both 0 — "give me whatever you like". A burn is a withdrawal
+    // at the CURRENT price, so anyone who moves the pool through the position's
+    // range in the seconds before it mines converts the whole position into the
+    // depreciating side, and a zero minimum accepts it.
+    let burn = (token_id, amount0_min, amount1_min, Bytes::new()).abi_encode_params();
     let take = (Address::ZERO, token, owner).abi_encode_params();
 
     let actions = Bytes::from(vec![BURN_POSITION, TAKE_PAIR]);

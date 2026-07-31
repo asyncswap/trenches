@@ -2070,7 +2070,41 @@ impl Bot {
         // Optimistically drop it from the owned cache so rapid removes step to
         // the next position (re-added on revert; see reap).
         self.positions.retain(|x| *x != token_id);
-        let data = v4::close_liquidity_calldata(token_id, self.pool.token, self.trader);
+
+        // Price the burn before asking for it. The position's RANGE is the one
+        // input we do not keep — it lives in the PositionManager — and without
+        // it there is no way to say what the position should return, which is
+        // why the minimums used to be zero.
+        //
+        // Liquidity comes from the chain rather than `pos_liq`: the cache is
+        // seeded at mint and a position may predate this session entirely. Two
+        // reads, only on a burn, which is rare.
+        let pm = IPositionManager::new(POSITION_MANAGER, provider);
+        let cb_info = pm.getPoolAndPositionInfo(token_id);
+        let cb_liq = pm.getPositionLiquidity(token_id);
+        let (info, liq) = tokio::join!(cb_info.call(), cb_liq.call());
+        let (mut amount0_min, mut amount1_min) = (0u128, 0u128);
+        match (info, liq) {
+            (Ok(i), Ok(l)) => {
+                let (lo, hi) = position_ticks(i.info);
+                let (a0, a1) = burn_amounts(u128_to_f64(l.liquidity), self.sqrt_price, lo, hi);
+                let floor = self.slip_floor();
+                amount0_min = (a0 * floor).max(0.0) as u128;
+                amount1_min = (a1 * floor).max(0.0) as u128;
+                self.logline(&format!(
+                    "burn #{token_id}: range {lo}..{hi} L={} expects {a0:.0}/{a1:.0} base units, min {amount0_min}/{amount1_min}",
+                    l.liquidity
+                ));
+            }
+            // Never let a failed read block an exit. A burn with zero minimums
+            // is the old behaviour, and it is still better than a position that
+            // cannot be closed because one call did not answer.
+            _ => self.logline(&format!(
+                "burn #{token_id}: could not read the position's range, falling back to no minimum"
+            )),
+        }
+        let data =
+            v4::close_liquidity_calldata(token_id, self.pool.token, self.trader, amount0_min, amount1_min);
         let tx = TransactionRequest::default()
             .with_to(POSITION_MANAGER)
             .with_input(data)
@@ -2808,6 +2842,59 @@ fn reference_floor_of(p_ref: f64, amount_in: f64, buying: bool) -> f64 {
     }
 }
 
+/// Unpack `(tickLower, tickUpper)` from a v4 `PositionInfo` word.
+///
+/// The PositionManager packs a position's identity into one 256-bit value:
+///
+/// ```text
+///   bits 0..8     hasSubscriber flag
+///   bits 8..32    tickLower, int24
+///   bits 32..56   tickUpper, int24
+///   bits 56..256  poolId
+/// ```
+///
+/// The ticks are SIGNED 24-bit, so they need sign-extending — get that wrong
+/// and the range comes out garbage, which would make every burn either revert
+/// or accept any price. The tests below check this against positions read from
+/// the live PositionManager.
+pub fn position_ticks(info: U256) -> (i32, i32) {
+    let field = |shift: u32| -> i32 {
+        let raw = ((info >> shift) & U256::from(0xFF_FFFFu32)).to::<u32>();
+        // Sign-extend 24 bits into i32.
+        if raw & 0x80_0000 != 0 {
+            raw as i32 - (1 << 24)
+        } else {
+            raw as i32
+        }
+    };
+    (field(8), field(32))
+}
+
+/// What burning a position returns at the current price: `(amount0, amount1)`
+/// in BASE units, currency0 first (ETH, since address(0) sorts first).
+///
+/// Standard concentrated-liquidity math, the inverse of what `add_liquidity`
+/// does to size a mint. Out of range the position is entirely one asset.
+pub fn burn_amounts(liquidity: f64, sqrt_p: f64, tick_lower: i32, tick_upper: i32) -> (f64, f64) {
+    if liquidity <= 0.0 || sqrt_p <= 0.0 || tick_lower >= tick_upper {
+        return (0.0, 0.0);
+    }
+    let sa = 1.0001f64.powf(tick_lower as f64 / 2.0);
+    let sb = 1.0001f64.powf(tick_upper as f64 / 2.0);
+    if !(sa.is_finite() && sb.is_finite()) || sa <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if sqrt_p <= sa {
+        // Below the range: all currency0.
+        (liquidity * (sb - sa) / (sa * sb), 0.0)
+    } else if sqrt_p >= sb {
+        // Above the range: all currency1.
+        (0.0, liquidity * (sb - sa))
+    } else {
+        (liquidity * (sb - sqrt_p) / (sqrt_p * sb), liquidity * (sqrt_p - sa))
+    }
+}
+
 fn wei_to_f64(x: U256) -> f64 {
     // Overflow-safe (a token balance could exceed u128): parse the decimal.
     x.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
@@ -3115,5 +3202,99 @@ mod slippage_anchor_tests {
         assert_eq!(reference_floor_of(-1.0, 1.0, false), 0.0);
         assert_eq!(reference_floor_of(1_000.0, 0.0, true), 0.0);
         assert_eq!(reference_floor_of(f64::INFINITY, 1.0, true), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod position_info_tests {
+    use super::*;
+
+    /// Golden fixtures read from the live PositionManager at
+    /// 0x58daec3116aae6D93017bAAea7749052E8a04fA7 on Robinhood Chain (4663).
+    /// Each row is (tokenId, info word, the pool's tickSpacing).
+    ///
+    /// The packing is not something to take on faith: get a shift or the sign
+    /// extension wrong and every burn either reverts forever — an LP position
+    /// that cannot be closed — or carries a minimum that protects nothing.
+    /// These are real positions, and the ticks they decode to have to be
+    /// multiples of their own pool's spacing, which garbage would not be.
+    const LIVE: [(u64, &str, i32); 4] = [
+        (1, "99134477747744576331124276523330408125618109158205249198501709068689164618752", 60),
+        (2, "91770821714008159108971951424986858529462063330423066963910699009089042009088", 60),
+        (100, "77553772612823546114485122681908446081810649955699010580230426773650349338624", 16),
+        (5000, "73425788000603542092939738578519431528834314299135160480130727973746147799040", 600),
+    ];
+
+    #[test]
+    fn real_positions_decode_to_ticks_their_own_pool_could_have_made() {
+        const MAX_TICK: i32 = 887_272;
+        for (id, word, spacing) in LIVE {
+            let info: U256 = word.parse().expect("fixture parses");
+            let (lo, hi) = position_ticks(info);
+            assert!(lo < hi, "#{id}: {lo}..{hi} is not an ordered range");
+            assert!(lo.abs() <= MAX_TICK && hi.abs() <= MAX_TICK, "#{id}: {lo}..{hi} out of range");
+            // The decisive check. A pool with this spacing can only mint ticks
+            // that are multiples of it, so a wrong layout fails here.
+            assert_eq!(lo % spacing, 0, "#{id}: lower {lo} is not a multiple of {spacing}");
+            assert_eq!(hi % spacing, 0, "#{id}: upper {hi} is not a multiple of {spacing}");
+        }
+    }
+
+    /// Positions 1 and 2 are full-range mints on a spacing-60 pool, which has
+    /// exactly one correct answer: MAX_TICK floored to the spacing, 887220.
+    /// Nothing but the right layout lands on that number.
+    #[test]
+    fn a_full_range_position_decodes_to_the_canonical_bounds() {
+        for (id, word, _) in LIVE.iter().take(2) {
+            let info: U256 = word.parse().unwrap();
+            assert_eq!(position_ticks(info), (-887_220, 887_220), "#{id} is a full-range mint");
+        }
+    }
+
+    /// Negative ticks are the sign-extension case, and a pool priced under 1.0
+    /// lives entirely in them — dropping the sign would read -202320 as
+    /// +16575216, a range the pool never had.
+    #[test]
+    fn negative_ticks_survive_sign_extension() {
+        let info: U256 = LIVE[2].1.parse().unwrap();
+        let (lo, hi) = position_ticks(info);
+        assert_eq!((lo, hi), (-202_320, -202_240));
+        assert!(lo < 0 && hi < 0, "both bounds are below tick zero");
+    }
+
+    /// A burn returns one asset when the price has left the range, and both
+    /// while it is inside — and it must round-trip the sizing `add_liquidity`
+    /// does, or the minimum it produces is wrong in one direction or the other.
+    #[test]
+    fn burn_amounts_track_where_the_price_sits() {
+        let (lo, hi) = (-600i32, 600i32);
+        let sa = 1.0001f64.powf(lo as f64 / 2.0);
+        let sb = 1.0001f64.powf(hi as f64 / 2.0);
+        let l = 1e15;
+
+        // Below the range: all currency0, no currency1.
+        let (a0, a1) = burn_amounts(l, sa * 0.9, lo, hi);
+        assert!(a0 > 0.0 && a1 == 0.0, "below range is entirely currency0, got {a0}/{a1}");
+
+        // Above it: the mirror image.
+        let (a0, a1) = burn_amounts(l, sb * 1.1, lo, hi);
+        assert!(a0 == 0.0 && a1 > 0.0, "above range is entirely currency1, got {a0}/{a1}");
+
+        // Inside: both, and consistent with how add_liquidity sizes a mint.
+        let sp = 1.0;
+        let (a0, a1) = burn_amounts(l, sp, lo, hi);
+        assert!(a0 > 0.0 && a1 > 0.0, "in range holds both, got {a0}/{a1}");
+        let minted_l = a0 * (sp * sb) / (sb - sp);
+        assert!((minted_l - l).abs() / l < 1e-9, "round trip lost liquidity: {minted_l} vs {l}");
+        assert!((a1 - l * (sp - sa)).abs() / a1 < 1e-9, "currency1 disagrees with the mint math");
+    }
+
+    /// Nonsense in, zero out — never a minimum invented from a bad read.
+    #[test]
+    fn a_broken_position_asks_for_nothing() {
+        assert_eq!(burn_amounts(0.0, 1.0, -60, 60), (0.0, 0.0));
+        assert_eq!(burn_amounts(1e12, 0.0, -60, 60), (0.0, 0.0));
+        assert_eq!(burn_amounts(1e12, 1.0, 60, 60), (0.0, 0.0), "an empty range returns nothing");
+        assert_eq!(burn_amounts(1e12, 1.0, 60, -60), (0.0, 0.0), "an inverted range returns nothing");
     }
 }

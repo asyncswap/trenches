@@ -165,6 +165,11 @@ sol! {
         function nextTokenId() external view returns (uint256);
         function ownerOf(uint256 tokenId) external view returns (address);
         function balanceOf(address owner) external view returns (uint256);
+        // `info` is bit-packed; see `engine::position_ticks` for the layout.
+        // Needed to price a burn: without the position's range there is no way
+        // to say what it should return, and no way to set a minimum.
+        function getPoolAndPositionInfo(uint256 tokenId) external view returns (PoolKey poolKey, uint256 info);
+        function getPositionLiquidity(uint256 tokenId) external view returns (uint128 liquidity);
     }
 
     // v4 PoolKey and the v4 Router exact-input params (for planner encoding).
