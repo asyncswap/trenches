@@ -2132,7 +2132,21 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     // the next read starts from a window that can succeed.
                     if tape_relive.swap(false, Ordering::Relaxed) { last_swap_block = 0; last_swap_block_b = 0; }
                     // Scan a recent window for new swaps on this pool (cap range).
+                    // Never ask for more blocks than the endpoint will serve.
+                    //
+                    // This chain's free tier caps eth_getLogs at TEN blocks and
+                    // answers anything wider with a 400. That turned one missed
+                    // scan into a permanent one: `from` only advances on
+                    // success, so a failure widened the window, which
+                    // guaranteed the next failure. The tape sat empty while the
+                    // chart moved, and the request was never even served.
+                    //
+                    // Clamping to the live edge is the right trade anyway — a
+                    // tape is for what is happening now, and re-anchoring beats
+                    // replaying history nobody is watching.
+                    const MAX_LOG_SPAN: u64 = 9; // inclusive range => 10 blocks
                     let from = if last_swap_block == 0 { b.saturating_sub(200) } else { last_swap_block + 1 };
+                    let from = from.max(b.saturating_sub(MAX_LOG_SPAN));
                     if b >= from {
                         // Only advance the scan cursor when the fetch SUCCEEDS —
                         // otherwise a timeout/error would skip those blocks' events.
@@ -2206,7 +2220,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     // (matches gmgn's token-aggregate view across venues).
                     if let Some(pb) = pref_b {
                         if pb.token != tape_b_key { last_swap_block_b = 0; tape_b_key = pb.token; }
+                        // Same 10-block ceiling as pool A.
                         let from_b = if last_swap_block_b == 0 { b.saturating_sub(200) } else { last_swap_block_b + 1 };
+                        let from_b = from_b.max(b.saturating_sub(9));
                         if b >= from_b {
                             if let Ok(Ok(sw)) = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pb, from_b, b)).await {
                                 // Same observed-block rule + dedup as pool A.
