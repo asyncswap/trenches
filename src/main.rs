@@ -3896,7 +3896,15 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             };
             // Single-market mode shows only the active venue's swaps; arb mode
             // keeps the merged v3+v4 tape.
-            let pool_is_v4 = matches!(bot.pool.kind, engine::PoolKind::V4 { .. });
+            // FlaunchV4 IS v4 — its swaps decode with is_v4 = true, from the same
+            // PoolManager. Leaving it out of this match meant every Flaunch row
+            // was fetched, decoded, stored, and then dropped one line before
+            // rendering: the panel said "no trades on this pool yet" while the
+            // trace said "1 swap(s)" for the very trade you had just made.
+            let pool_is_v4 = matches!(
+                bot.pool.kind,
+                engine::PoolKind::V4 { .. } | engine::PoolKind::FlaunchV4 { .. }
+            );
             let shown: Vec<&engine::Swap> =
                 tape.iter().filter(|s| bot.arb_mode || s.is_v4 == pool_is_v4).collect();
             let scroll = orders_scroll.min(shown.len().saturating_sub(1));
