@@ -33,6 +33,15 @@ pub const CU_LIMIT_TRADE: u32 = 200_000;
 /// unwrap in the same transaction. pump's client uses 200k for the swap alone.
 pub const CU_LIMIT_AMM: u32 = 300_000;
 
+/// Base fee for a one-signature transaction, in lamports — fixed by the runtime.
+pub const SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+
+/// Rent-exempt minimum for an SPL token account (165 bytes), in lamports. The
+/// first buy of a coin creates the buyer's associated token account and funds
+/// it with this, and it only comes back when the account is closed — so a buy
+/// has to be able to cover it on top of the fees.
+pub const ATA_RENT_LAMPORTS: u64 = 2_039_280;
+
 /// `SetComputeUnitLimit` — instruction tag 2, then the limit as u32 LE.
 pub fn set_cu_limit(units: u32) -> Instruction {
     let mut data = Vec::with_capacity(5);

@@ -895,11 +895,40 @@ fn pct(frac: f64) -> String {
     if (p - p.round()).abs() < 1e-9 { format!("{}", p.round()) } else { format!("{p:.2}").trim_end_matches('0').trim_end_matches('.').to_string() }
 }
 
+/// The SOL a buy must leave behind, given what the next trade's priority fee
+/// will cost: rent for the token account the buy creates, plus the fees for
+/// TWO transactions — the buy, and the sell that has to be able to follow it.
+/// A position you cannot exit is a worse outcome than an entry you never took.
+///
+/// Slack goes on the fee side only: the rent figure is exact, the priority
+/// estimate is not and can be bumped between sizing and send.
+///
+/// Free function so it can be checked without standing up a bot.
+fn reserve_for_buy(priority_sol: f64) -> f64 {
+    let per_tx = super::lamports_to_sol(super::tx::SIGNATURE_FEE_LAMPORTS) + priority_sol;
+    super::lamports_to_sol(super::tx::ATA_RENT_LAMPORTS) + per_tx * 2.0 * 1.25
+}
+
 impl SolBot {
-    /// What a buy would spend right now: the fraction of the live balance,
-    /// less a little headroom so fees never turn 100% into "not enough SOL".
+    /// What a buy would spend right now: the fraction of the live balance, less
+    /// the headroom a trade actually needs so fees never turn 100% into "not
+    /// enough SOL".
     fn buy_size_sol(&self) -> f64 {
-        (self.sol * self.buy_frac).min((self.sol - 0.01).max(0.0))
+        (self.sol * self.buy_frac).min((self.sol - self.buy_reserve_sol()).max(0.0))
+    }
+
+    /// SOL a buy has to leave behind: the signature fee, the priority fee the
+    /// NEXT trade will really pay, and rent for the token account a first buy
+    /// creates — plus a little slack so a priority bump between sizing and send
+    /// cannot make the transaction unaffordable.
+    ///
+    /// Derived rather than a round number. This was a flat 0.01 SOL, roughly
+    /// four times the true cost, and because it lands in a `min` it behaves as
+    /// a floor rather than a buffer: any wallet holding less than the reserve
+    /// sized EVERY buy to exactly zero, whatever percentage was selected, and
+    /// the only symptom was "buy size must be > 0".
+    fn buy_reserve_sol(&self) -> f64 {
+        reserve_for_buy(self.priority_fee_sol())
     }
 
     pub fn new(rpc: Rpc, signer: Keypair, rc: &crate::config::RugCheck, net: &str) -> SolBot {
@@ -2662,6 +2691,16 @@ pub async fn run(
                         let (sol, slip, cu) = (bot.buy_size_sol(), bot.slippage_pct, bot.cu_price_micro);
                         if bot.coin.is_none() {
                             bot.note("No coin is selected");
+                        } else if sol <= 0.0 {
+                            // Name the REASON, not the symptom. "buy size must
+                            // be > 0" sent you looking at the percentage, when
+                            // the percentage was never the problem: the balance
+                            // is under the reserve, so every size is zero.
+                            let need = bot.buy_reserve_sol();
+                            bot.note(format!(
+                                "Balance {:.6} SOL is under the {need:.6} SOL a buy must leave for fees and token-account rent. Add SOL to trade",
+                                bot.sol
+                            ));
                         } else if sol > bot.sol {
                             // Refuse locally rather than burning a fee on a
                             // transaction the node will reject anyway.
@@ -2903,6 +2942,41 @@ mod priority_tests {
         assert_eq!(cu, 1, "halving must floor at 1, not reach 0");
         cu = (cu.max(1) * 2).min(10_000_000);
         assert_eq!(cu, 2, "doubling from the floor must actually raise it");
+    }
+
+    /// The reserve has to cover what a buy really costs — and no more. A flat
+    /// 0.01 SOL was roughly four times the true figure, and since it lands in a
+    /// `min` it acts as a floor: a wallet holding less than the reserve sized
+    /// EVERY buy to zero, at any percentage, reporting only "buy size must be
+    /// > 0". A wallet with a few thousandths of a SOL must be able to trade.
+    #[test]
+    fn the_buy_reserve_covers_the_real_cost_without_freezing_small_wallets() {
+        let priority = tx::priority_fee_sol(240_085, tx::CU_LIMIT_AMM);
+        let reserve = super::reserve_for_buy(priority);
+
+        // Above the unavoidable floor: token-account rent plus the signature.
+        let unavoidable =
+            super::super::lamports_to_sol(tx::SIGNATURE_FEE_LAMPORTS + tx::ATA_RENT_LAMPORTS);
+        assert!(reserve > unavoidable, "{reserve} would not cover rent + fee ({unavoidable})");
+        assert!(reserve > unavoidable + priority, "the priority fee must be reserved too");
+        // Enough left over to SELL: an entry you cannot exit is the worse bug.
+        let exit = super::super::lamports_to_sol(tx::SIGNATURE_FEE_LAMPORTS) + priority;
+        assert!(
+            reserve > unavoidable + priority + exit,
+            "{reserve} leaves nothing to pay for the sell"
+        );
+
+        // ...and well under the old flat figure, which is the whole point.
+        assert!(reserve < 0.01, "{reserve} is no better than the flat 0.01 it replaced");
+
+        // The wallet that could not buy at all: ~0.005 SOL, every size zero.
+        let sol = 0.005;
+        assert!(
+            (sol - 0.01f64).max(0.0) == 0.0,
+            "the old reserve zeroed this wallet — that is the bug being fixed"
+        );
+        let sized = (sol * 0.05).min((sol - reserve).max(0.0));
+        assert!(sized > 0.0, "a 0.005 SOL wallet must be able to place a 5% buy");
     }
 
     /// One setting must cost more on the venue that uses more compute, and the
