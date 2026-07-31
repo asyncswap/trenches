@@ -541,6 +541,24 @@ pub fn usd_compact(x: f64) -> String {
     }
 }
 
+/// The dollar tag that rides beside a figure in the native currency:
+/// `(~$12.34)`, or `(~-$12.34)` for a loss.
+///
+/// The sign goes OUTSIDE the dollar sign — `-$12.34`, not `$-12.34` — because
+/// the second reads as a typo at a glance, and a loss is the number you least
+/// want to misread.
+///
+/// `None` when there is no rate yet or there is nothing to price: an
+/// approximate zero is noise, and a made-up rate is worse than no number.
+pub fn usd_tag(amount: f64, rate: f64) -> Option<String> {
+    if rate <= 0.0 || amount == 0.0 || !amount.is_finite() || !rate.is_finite() {
+        return None;
+    }
+    let v = amount * rate;
+    let sign = if v < 0.0 { "-" } else { "" };
+    Some(format!("(~{sign}{})", usd_compact(v.abs())))
+}
+
 /// Marker for our own rows on a tape.
 ///
 /// Emoji presentation (U+2B50) rather than the text-weight `★` (U+2605): the
@@ -711,5 +729,38 @@ mod eth_format_tests {
     #[test]
     fn the_sign_survives() {
         assert_eq!(eth(-0.000_062), "-0.000062");
+    }
+}
+
+#[cfg(test)]
+mod usd_tag_tests {
+    use super::*;
+
+    /// A loss reads as -$12.34, never $-12.34 — the second scans as a typo,
+    /// and the losing number is the one you least want to misread.
+    #[test]
+    fn a_loss_puts_the_sign_before_the_dollar() {
+        assert_eq!(usd_tag(-0.01, 1_234.0).as_deref(), Some("(~-$12.34)"));
+        assert_eq!(usd_tag(0.01, 1_234.0).as_deref(), Some("(~$12.34)"));
+    }
+
+    /// No rate, no number. An approximate zero is noise, and inventing a rate
+    /// to fill the column would be worse than leaving it empty.
+    #[test]
+    fn nothing_to_price_shows_nothing() {
+        assert_eq!(usd_tag(1.0, 0.0), None, "no rate yet");
+        assert_eq!(usd_tag(1.0, -5.0), None, "a negative rate is not a rate");
+        assert_eq!(usd_tag(0.0, 1_234.0), None, "zero is not worth approximating");
+        assert_eq!(usd_tag(f64::NAN, 1_234.0), None);
+        assert_eq!(usd_tag(1.0, f64::INFINITY), None);
+    }
+
+    /// It rides on the compact scale the tables already use, so a wallet and a
+    /// tape row never disagree about what $9,001 is called.
+    #[test]
+    fn it_uses_the_same_scale_as_every_other_table() {
+        assert_eq!(usd_tag(1.0, 9_001.0).as_deref(), Some("(~$9.00k)"));
+        assert_eq!(usd_tag(2.0, 1_000_000.0).as_deref(), Some("(~$2.00M)"));
+        assert_eq!(usd_tag(0.5, 100.0).as_deref(), Some("(~$50.00)"));
     }
 }

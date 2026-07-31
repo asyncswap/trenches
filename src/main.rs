@@ -3580,6 +3580,28 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         .block(ui::widgets::themed_block(" Wallet [W] "));
         f.render_widget(empty, cols[wallet_col]);
     } else {
+    // The PnL rows are denominated in the pool's quote currency, so they price
+    // off the quote's own rate — for a stock pool that is USDG, not ETH. Falls
+    // back to the ETH rate, which is what the quote is on every ETH pool.
+    let quote_rate = if bot.pool.quote_usd > 0.0 { bot.pool.quote_usd } else { bot.eth_usd };
+    // Label, value, colour — plus the dollar figure beside it, dimmed, so the
+    // native number stays the one being read and the dollars are the aside.
+    let pnl_row = |label: &str, v: f64, color| {
+        let mut spans = vec![
+            lbl(label),
+            Span::styled(
+                format!("{v:+.6} {}", bot.pool.quote_sym),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(tag) = view::usd_tag(v, quote_rate) {
+            spans.push(Span::styled(
+                format!("  {tag}"),
+                Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
+            ));
+        }
+        Line::from(spans)
+    };
     let wallet = Paragraph::new(vec![
         // "Which account am I?" belongs with the balances, not in the header.
         Line::from(vec![
@@ -3626,44 +3648,29 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             lbl("Inventory"),
             Span::raw(format!("{:.2} {} (bought)", bot.bought_qty, bot.pool.sym)),
         ]),
-        Line::from(vec![
-            lbl("Realized"),
-            Span::styled(
-                format!("{:+.6} {}", bot.realized_pnl, bot.pool.quote_sym),
-                Style::default().fg(real_color).add_modifier(Modifier::BOLD),
+        pnl_row("Realized", bot.realized_pnl, real_color),
+        match bot.last_fill_pnl {
+            Some(v) => pnl_row(
+                "Last Fill",
+                v,
+                if v >= 0.0 {
+                    ui::widgets::tone_color(view::Tone::Good)
+                } else {
+                    ui::widgets::tone_color(view::Tone::Bad)
+                },
             ),
-        ]),
-        Line::from(vec![
-            lbl("Last Fill"),
-            match bot.last_fill_pnl {
-                Some(v) => Span::styled(
-                    format!("{:+.6} {}", v, bot.pool.quote_sym),
-                    Style::default()
-                        .fg(if v >= 0.0 { ui::widgets::tone_color(view::Tone::Good) } else { ui::widgets::tone_color(view::Tone::Bad) })
-                        .add_modifier(Modifier::BOLD),
-                ),
-                None => Span::styled(
+            None => Line::from(vec![
+                lbl("Last Fill"),
+                Span::styled(
                     "—".to_string(),
                     Style::default()
                         .fg(ui::widgets::tone_color(view::Tone::Dim))
                         .add_modifier(Modifier::BOLD),
                 ),
-            },
-        ]),
-        Line::from(vec![
-            lbl("PnL/Day"),
-            Span::styled(
-                format!("{:+.6} {}", bot.daily_pnl(), bot.pool.quote_sym),
-                Style::default().fg(day_color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            lbl("PnL/Sesh"),
-            Span::styled(
-                format!("{pnl:+.6} {}", bot.pool.quote_sym),
-                Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
+            ]),
+        },
+        pnl_row("PnL/Day", bot.daily_pnl(), day_color),
+        pnl_row("PnL/Sesh", pnl, pnl_color),
         // Profit above Activity: the guard and edge belong with the PnL lines
         // above them, and Activity reads as the running tally at the bottom.
         Line::from(vec![lbl("Edge"), edge_span]),
