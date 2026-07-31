@@ -542,7 +542,7 @@ pub fn usd_compact(x: f64) -> String {
 }
 
 /// The dollar tag that rides beside a figure in the native currency:
-/// `(~$12.34)`, or `(~-$12.34)` for a loss.
+/// `($12.34)`, or `(-$12.34)` for a loss.
 ///
 /// The sign goes OUTSIDE the dollar sign — `-$12.34`, not `$-12.34` — because
 /// the second reads as a typo at a glance, and a loss is the number you least
@@ -556,7 +556,7 @@ pub fn usd_tag(amount: f64, rate: f64) -> Option<String> {
     }
     let v = amount * rate;
     let sign = if v < 0.0 { "-" } else { "" };
-    Some(format!("(~{sign}{})", usd_compact(v.abs())))
+    Some(format!("({sign}{})", usd_compact(v.abs())))
 }
 
 /// Marker for our own rows on a tape.
@@ -740,8 +740,8 @@ mod usd_tag_tests {
     /// and the losing number is the one you least want to misread.
     #[test]
     fn a_loss_puts_the_sign_before_the_dollar() {
-        assert_eq!(usd_tag(-0.01, 1_234.0).as_deref(), Some("(~-$12.34)"));
-        assert_eq!(usd_tag(0.01, 1_234.0).as_deref(), Some("(~$12.34)"));
+        assert_eq!(usd_tag(-0.01, 1_234.0).as_deref(), Some("(-$12.34)"));
+        assert_eq!(usd_tag(0.01, 1_234.0).as_deref(), Some("($12.34)"));
     }
 
     /// No rate, no number. An approximate zero is noise, and inventing a rate
@@ -759,8 +759,8 @@ mod usd_tag_tests {
     /// tape row never disagree about what $9,001 is called.
     #[test]
     fn it_uses_the_same_scale_as_every_other_table() {
-        assert_eq!(usd_tag(1.0, 9_001.0).as_deref(), Some("(~$9.00k)"));
-        assert_eq!(usd_tag(2.0, 1_000_000.0).as_deref(), Some("(~$2.00M)"));
-        assert_eq!(usd_tag(0.5, 100.0).as_deref(), Some("(~$50.00)"));
+        assert_eq!(usd_tag(1.0, 9_001.0).as_deref(), Some("($9.00k)"));
+        assert_eq!(usd_tag(2.0, 1_000_000.0).as_deref(), Some("($2.00M)"));
+        assert_eq!(usd_tag(0.5, 100.0).as_deref(), Some("($50.00)"));
     }
 }

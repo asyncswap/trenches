@@ -1529,7 +1529,7 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
     p.spans(vec![
         lbl("SOL"),
         Cell::new(if bot.sol_usd > 0.0 && bot.sol > 0.0 {
-            format!("{:.6}  (~${:.2})", bot.sol, bot.sol * bot.sol_usd)
+            format!("{:.6}  (${:.2})", bot.sol, bot.sol * bot.sol_usd)
         } else {
             format!("{:.6}", bot.sol)
         }),
@@ -1649,7 +1649,7 @@ fn market_panel(bot: &SolBot) -> PanelView {
             ]);
             let pooled = c.pooled_sol();
             let pooled_usd = if bot.sol_usd > 0.0 {
-                format!("  (~{})", crate::view::usd_compact(pooled * bot.sol_usd))
+                format!("  ({})", crate::view::usd_compact(pooled * bot.sol_usd))
             } else {
                 String::new()
             };

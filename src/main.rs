@@ -152,7 +152,7 @@ fn buy_size_status(bot: &engine::Bot) -> String {
     let usd = stake * bot.eth_usd;
     if bot.eth > 0.0 && bot.eth_usd > 0.0 {
         format!(
-            "Buy size {:.1}% \u{2248} {} ETH (~{})",
+            "Buy size {:.1}% \u{2248} {} ETH ({})",
             bot.buy_frac * 100.0,
             view::eth(stake),
             view::usd_compact(usd)
@@ -3513,7 +3513,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // One piece of information per row — priced in the pool's quote currency.
     mkt.push(Line::from(vec![mlbl("Price"), Span::raw(format!("{:.4} {}/{}", bot.price(), bot.pool.sym, bot.pool.quote_sym))]));
     mkt.push(Line::from(vec![mlbl("Tick"), Span::raw(format!("{}", bot.tick))]));
-    mkt.push(Line::from(vec![mlbl("Mkt Cap"), Span::raw(format!("~${:.2}M", bot.market_cap_usd() / 1e6))]));
+    mkt.push(Line::from(vec![mlbl("Mkt Cap"), Span::raw(format!("${:.2}M", bot.market_cap_usd() / 1e6))]));
     if let Some(lb) = bot.pons_launch() {
         let s = block.saturating_sub(lb) / 10; // ~10 blocks/sec since graduation
         let a = if s < 60 { format!("{s}s") } else if s < 3600 { format!("{}m", s / 60) } else { format!("{}h", s / 3600) };
@@ -3607,7 +3607,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             mb.push(Line::from(format!("{:<9}{:.4} {}/{}", "Price", pbp, pb.sym, pb.quote_sym)));
             mb.push(Line::from(format!("{:<9}{}", "Tick", bot.mkt_b.tick)));
             let mcap_b = if pbp > 0.0 { bot.mkt_b.supply / pbp * pb.quote_usd } else { 0.0 };
-            mb.push(Line::from(format!("{:<9}~${:.2}M", "Mkt Cap", mcap_b / 1e6)));
+            mb.push(Line::from(format!("{:<9}${:.2}M", "Mkt Cap", mcap_b / 1e6)));
             mb.push(Line::from(format!("{:<9}{} {}", "Pooled", view::eth(bot.mkt_b.r0), pb.quote_sym)));
             mb.push(Line::from(format!("{:<9}{:.0} {}", "Pooled", bot.mkt_b.r1, pb.sym)));
             let gap = bot.arb_gap_pct();
@@ -3728,7 +3728,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let mut spans = vec![lbl("ETH"), Span::raw(view::eth(bot.eth))];
             if bot.eth_usd > 0.0 && bot.eth > 0.0 {
                 spans.push(Span::styled(
-                    format!("  (~{})", view::usd_compact(bot.eth * bot.eth_usd)),
+                    format!("  ({})", view::usd_compact(bot.eth * bot.eth_usd)),
                     Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
                 ));
             }
