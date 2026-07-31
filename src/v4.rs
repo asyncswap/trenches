@@ -280,3 +280,66 @@ mod flaunch_swap_tests {
         }
     }
 }
+
+
+/// Wrap ETH into flETH: `deposit{value: amount}(0)`.
+///
+/// Not the WETH shape. flETH's `deposit` takes an amount of a DIFFERENT token
+/// to pull in (which needs an allowance, and reverts without one); passing 0
+/// means "just wrap the ETH I sent". Confirmed against the chain — `deposit()`
+/// with no argument reverts, and `deposit(amount)` fails on allowance.
+pub fn fleth_deposit_calldata() -> Bytes {
+    IFLETH::depositCall { _amount: U256::ZERO }.abi_encode().into()
+}
+
+/// Unwrap flETH back to ETH.
+pub fn fleth_withdraw_calldata(amount: u128) -> Bytes {
+    IFLETH::withdrawCall { _amount: U256::from(amount) }.abi_encode().into()
+}
+
+/// A Flaunch swap as the chain actually does one: a SINGLE v4 hop between flETH
+/// and the coin, with flETH obtained separately.
+///
+/// The two-hop version this replaces tried to reach flETH through a v4 pool on
+/// FLETH_HOOKS as the first leg, and that leg is what failed — the Flaunch hook
+/// then reverted with HookCallFailed, or the coin's transfer failed, depending
+/// on where it gave up. A real working buy on this chain (tx 0x3d54cbcc…) does
+/// no such hop: it obtains flETH by other means and then makes ONE v4 swap,
+/// flETH -> coin, fee 0, spacing 60, hooks = the Flaunch position manager.
+///
+/// The router pulls `currencyIn` from the caller through Permit2, so flETH
+/// needs the same approval pair the sell side already arranges for the coin.
+pub fn flaunch_hop_calldata(token: Address, buy: bool, amount_in: u128, min_out: u128) -> Bytes {
+    let (input_cur, output_cur, hop_cur) =
+        if buy { (FLETH, token, token) } else { (token, FLETH, FLETH) };
+    let path = vec![PathKey {
+        intermediateCurrency: hop_cur,
+        // Flaunch charges its cut in the hook; the pool fee really is 0.
+        fee: alloy::primitives::aliases::U24::ZERO,
+        tickSpacing: FLAUNCH_TICK_SPACING.try_into().unwrap(),
+        hooks: FLAUNCH_PM,
+        hookData: Bytes::new(),
+    }];
+    let params0 = ExactInputParams {
+        currencyIn: input_cur,
+        path,
+        minHopPriceX36: vec![],
+        amountIn: amount_in,
+        amountOutMinimum: min_out,
+    }
+    .abi_encode();
+    let params1 = (input_cur, U256::from(amount_in)).abi_encode_params();
+    let params2 = (output_cur, U256::from(min_out)).abi_encode_params();
+
+    let actions = Bytes::from(vec![SWAP_EXACT_IN, SETTLE_ALL, TAKE_ALL]);
+    let params: Vec<Bytes> = vec![params0.into(), params1.into(), params2.into()];
+    let v4_input = (actions, params).abi_encode_params();
+
+    IUniversalRouter::executeCall {
+        commands: Bytes::from(vec![V4_SWAP]),
+        inputs: vec![v4_input.into()],
+        deadline: U256::from(FAR_DEADLINE),
+    }
+    .abi_encode()
+    .into()
+}
