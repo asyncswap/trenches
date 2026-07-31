@@ -772,6 +772,35 @@ impl Bot {
         self.ensure_ur_allowance_for(provider, tok, need).await
     }
 
+    /// Turn any flETH we hold back into ETH.
+    ///
+    /// Flaunch pools quote in flETH, so a sell lands there rather than in ETH.
+    /// Redeemable 1:1, and the wallet only ever spends ETH, so this runs
+    /// straight after a confirmed sell. Best effort: failing to unwrap is a
+    /// nuisance, not a lost position, and the balance is still there next time.
+    async fn unwrap_fleth<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
+        let held = IERC20::new(FLETH, provider)
+            .balanceOf(self.trader)
+            .call()
+            .await
+            .map(|b| b._0)
+            .unwrap_or(U256::ZERO);
+        if held.is_zero() {
+            return Ok(());
+        }
+        let amount: u128 = held.min(U256::from(u128::MAX)).to();
+        let tx = TransactionRequest::default()
+            .with_to(FLETH)
+            .with_input(v4::fleth_withdraw_calldata(amount))
+            .with_gas_limit(120_000)
+            .with_from(self.trader);
+        let nonce = self.take_nonce(provider).await?;
+        let sent = provider.send_transaction(tx.with_nonce(nonce)).await;
+        let hash = *self.spent_nonce(sent)?.tx_hash();
+        self.logline(&format!("unwrapping {amount} flETH back to ETH  tx {hash}"));
+        Ok(())
+    }
+
     /// Get a Flaunch buy ready: hold flETH, and let the router pull it.
     ///
     /// Flaunch pools pair the coin against flETH, and the working route on this
@@ -1818,6 +1847,15 @@ impl Bot {
                             if side == Side::Buy {
                                 if let Err(e) = self.pre_approve_exit(provider).await {
                                     self.note(format!("Pre approval failed. {}", short_err(&e.to_string())));
+                                }
+                            }
+                            // A Flaunch sell pays out in flETH, not ETH — the
+                            // pool's quote side IS flETH. Unwrap it, or the
+                            // proceeds sit in a token the wallet never spends
+                            // and the ETH balance never moves after a sell.
+                            if side == Side::Sell && matches!(self.pool.kind, PoolKind::FlaunchV4 { .. }) {
+                                if let Err(e) = self.unwrap_fleth(provider).await {
+                                    self.note(format!("flETH did not unwrap. {}", short_err(&e.to_string())));
                                 }
                             }
                         }
