@@ -2145,13 +2145,24 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     // Clamping to the live edge is the right trade anyway — a
                     // tape is for what is happening now, and re-anchoring beats
                     // replaying history nobody is watching.
-                    const MAX_LOG_SPAN: u64 = 9; // inclusive range => 10 blocks
-                    let from = if last_swap_block == 0 { b.saturating_sub(200) } else { last_swap_block + 1 };
-                    let from = from.max(b.saturating_sub(MAX_LOG_SPAN));
+                    // A FRESH pool asks for real history, in slices the
+                    // endpoint will serve; a live tape asks only for what is
+                    // new. Without the backfill a quiet coin shows an empty
+                    // tape forever — correct, and useless.
+                    let seeding = last_swap_block == 0;
+                    let from = if seeding { b.saturating_sub(200) } else { last_swap_block + 1 };
                     if b >= from {
                         // Only advance the scan cursor when the fetch SUCCEEDS —
                         // otherwise a timeout/error would skip those blocks' events.
-                        let scan = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pref, from, b)).await;
+                        // 20 slices covers the 200-block seed; a live window
+                        // needs one or two. Longer budget while seeding,
+                        // because it is once per pool and worth waiting for.
+                        let (calls, budget) = if seeding { (20, 6_000) } else { (3, 1_500) };
+                        let scan = tokio::time::timeout(
+                            Duration::from_millis(budget),
+                            engine::read_swaps_chunked(&provider, pref, from, b, calls),
+                        )
+                        .await;
                         // Say what the scan DID. An empty tape next to a moving
                         // chart has three possible causes — the window, the
                         // fetch, the decode — and no way to tell them apart
@@ -2221,11 +2232,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     // (matches gmgn's token-aggregate view across venues).
                     if let Some(pb) = pref_b {
                         if pb.token != tape_b_key { last_swap_block_b = 0; tape_b_key = pb.token; }
-                        // Same 10-block ceiling as pool A.
-                        let from_b = if last_swap_block_b == 0 { b.saturating_sub(200) } else { last_swap_block_b + 1 };
-                        let from_b = from_b.max(b.saturating_sub(9));
+                        let seeding_b = last_swap_block_b == 0;
+                        let from_b = if seeding_b { b.saturating_sub(200) } else { last_swap_block_b + 1 };
                         if b >= from_b {
-                            if let Ok(Ok(sw)) = tokio::time::timeout(Duration::from_millis(1500), engine::read_swaps(&provider, pb, from_b, b)).await {
+                            let (calls_b, budget_b) = if seeding_b { (20, 6_000) } else { (3, 1_500) };
+                            if let Ok(Ok(sw)) = tokio::time::timeout(
+                                Duration::from_millis(budget_b),
+                                engine::read_swaps_chunked(&provider, pb, from_b, b, calls_b),
+                            )
+                            .await
+                            {
                                 // Same observed-block rule + dedup as pool A.
                                 let observed = sw.iter().map(|s| s.block).max().unwrap_or(0);
                                 let mut t = tape.lock().unwrap();

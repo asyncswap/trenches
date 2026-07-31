@@ -2766,6 +2766,48 @@ async fn attribute_to_senders<P: Provider>(provider: &P, swaps: &mut [Swap]) {
     }
 }
 
+/// The widest span a single `eth_getLogs` may cover.
+///
+/// This chain's free tier refuses anything over ten blocks with a 400, and a
+/// refused request looks exactly like a quiet market from the outside — which
+/// is how an empty tape sat next to a moving chart for an afternoon. Asking in
+/// slices the endpoint will actually serve is not an optimisation, it is the
+/// difference between a tape and no tape.
+pub const MAX_LOG_SPAN: u64 = 10;
+
+/// Read swaps over ANY span, in windows the endpoint will serve.
+///
+/// Walks BACKWARDS from the newest block so the most recent trades arrive
+/// first: if the budget runs out, or an endpoint starts refusing, what you have
+/// is the live end of the tape rather than ancient history.
+pub async fn read_swaps_chunked<P: Provider>(
+    provider: &P,
+    pref: PoolRef,
+    from_block: u64,
+    to_block: u64,
+    max_calls: usize,
+) -> eyre::Result<Vec<Swap>> {
+    let mut out = Vec::new();
+    let mut hi = to_block;
+    for _ in 0..max_calls {
+        if hi < from_block {
+            break;
+        }
+        let lo = hi.saturating_sub(MAX_LOG_SPAN - 1).max(from_block);
+        match read_swaps(provider, pref, lo, hi).await {
+            Ok(mut v) => out.append(&mut v),
+            // One refused window must not cost the others.
+            Err(e) => crate::trace(&format!("tape chunk {lo}..{hi} failed: {e}")),
+        }
+        if lo == from_block {
+            break;
+        }
+        hi = lo.saturating_sub(1);
+    }
+    out.sort_by_key(|s| s.block);
+    Ok(out)
+}
+
 pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u64, to_block: u64) -> eyre::Result<Vec<Swap>> {
     use alloy::primitives::I256;
     use alloy::rpc::types::Filter;
