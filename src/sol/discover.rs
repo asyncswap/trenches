@@ -77,6 +77,22 @@ pub fn clean_text(s: &str, max: usize) -> String {
     let cleaned: String = s
         .chars()
         .filter(|c| !c.is_control() && *c != '\u{1b}')
+        // Bidi overrides and invisibles are NOT `is_control` — they are
+        // format characters — so they passed this filter while being able to
+        // rewrite what a name LOOKS like on screen. A coin called
+        // "SAFE\u{202E}gnp" renders as something else entirely, which in a
+        // trading app is a spoofing primitive, not a curiosity. The
+        // Trojan-Source class, applied to token metadata.
+        .filter(|c| {
+            !matches!(*c,
+                '\u{200B}'..='\u{200F}'   // zero-width + LRM/RLM
+                | '\u{202A}'..='\u{202E}' // embeddings and overrides
+                | '\u{2060}'..='\u{2064}' // word-joiner family
+                | '\u{2066}'..='\u{2069}' // isolates
+                | '\u{FEFF}'              // BOM / zero-width no-break
+                | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            )
+        })
         .take(max)
         .collect();
     let t = cleaned.trim();
@@ -631,6 +647,24 @@ mod ws_url_tests {
     fn http_urls_convert_and_normalise_together() {
         assert_eq!(ws_url_from_http("https://us.fluxrpc.com?key=k"), "wss://us.fluxrpc.com/?key=k");
         assert_eq!(ws_url_from_http("http://localhost:8899"), "ws://localhost:8899");
+    }
+}
+
+#[cfg(test)]
+mod text_safety_tests {
+    #[test]
+    fn a_coin_name_cannot_rewrite_what_it_looks_like() {
+        // Bidi overrides and invisibles are format characters, not control
+        // characters — they passed the old filter and could make a scam
+        // token render as something else on screen.
+        let hostile = "SAFE\u{202E}gnp\u{200B}COIN\u{2066}x";
+        let out = super::clean_text(hostile, 32);
+        assert!(!out.contains('\u{202E}'), "bidi override survived: {out:?}");
+        assert!(!out.contains('\u{200B}'), "zero-width survived: {out:?}");
+        assert!(!out.contains('\u{2066}'), "isolate survived: {out:?}");
+        assert_eq!(out, "SAFEgnpCOINx");
+        // Ordinary non-ASCII names are untouched.
+        assert_eq!(super::clean_text("皮皮 Pipi", 32), "皮皮 Pipi");
     }
 }
 
