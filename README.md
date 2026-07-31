@@ -4,6 +4,9 @@ A terminal bot for trading memecoins.
 
 **[trenches.sh](https://trenches.sh)**
 
+> **the trenches** *(n.)* — where memecoins launch, run and die by the minute:
+> the fastest and riskiest corner of crypto.
+>
 > **trencher** *(n.)* — "someone who spends a lot of time hunting and trading
 > newly launched meme coins in the 'trenches'—the high-risk, high-volatility
 > part of crypto." — *ChatGPT*
