@@ -1413,9 +1413,10 @@ impl SolBot {
                 // remaining bag a zero basis, so its exit read as pure profit.
                 // Mirrors the EVM `apply_fill`. A sell beyond the tracked
                 // inventory is free-bag: zero cost, all profit.
-                let from_basis = if sold_tok > 0.0 { sold_tok.min(self.bought_qty) } else { self.bought_qty };
-                let avg = if self.bought_qty > 1e-12 { self.bought_cost / self.bought_qty } else { 0.0 };
-                let cost = from_basis * avg;
+                // Same function the EVM settle path uses — see the comment on
+                // `realized_cost`. These were two copies and they had drifted.
+                let (from_basis, cost) =
+                    crate::engine::realized_cost(sold_tok, self.bought_qty, self.bought_cost);
                 let pnl = sol - cost;
                 self.realized_pnl += pnl;
                 self.last_fill_pnl = Some(pnl);
@@ -1766,7 +1767,10 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
 }
 
 fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
-    let mut p = PanelView::new(" Logs ");
+    let mut p = PanelView::new(match crate::session_log_name() {
+        n if n.is_empty() => " Logs ".to_string(),
+        n => format!(" Logs — ~/.trenches/{n} "),
+    });
 
     // Both streams, as on the EVM side: what the bot did, and what the
     // machinery reported. Both carry an [HH:MM:SS] stamp, so a stable sort on
@@ -2164,10 +2168,24 @@ async fn screen_trenches(
     // Keep the visible rows live. Without this a coin discovered at 20% bonded
     // showed 20% forever while it actually filled — the one number that says
     // "this launch is working" was frozen at discovery.
+    // [R] asks for a sweep now; `refreshing` says one is in flight. Without the
+    // second, a refresh on a slow endpoint is indistinguishable from a screen
+    // that has stopped caring — you press R and nothing visibly happens.
+    let refresh_now = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let refreshing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (f4, s4, rpc4) = (found.clone(), stop.clone(), rpc.clone());
+    let (rn4, rf4) = (refresh_now.clone(), refreshing.clone());
     let refresher = tokio::spawn(async move {
         while !s4.load(std::sync::atomic::Ordering::Relaxed) {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // Sliced, so [R] does not wait out the rest of the interval.
+            for _ in 0..30u32 {
+                if s4.load(std::sync::atomic::Ordering::Relaxed)
+                    || rn4.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             let mints: Vec<Pubkey> = {
                 let rows = f4.lock().unwrap();
                 rows.iter().map(|r| r.launch.mint).collect()
@@ -2175,6 +2193,7 @@ async fn screen_trenches(
             if mints.is_empty() {
                 continue;
             }
+            rf4.store(true, std::sync::atomic::Ordering::Relaxed);
             let curves: Vec<Pubkey> = mints.iter().map(super::bonding_curve_pda).collect();
             let mut fresh: Vec<Option<super::pumpfun::BondingCurve>> = Vec::new();
             // 100 keys per request is the RPC's hard cap.
@@ -2201,6 +2220,8 @@ async fn screen_trenches(
                     row.curve = curve;
                 }
             }
+            drop(rows);
+            rf4.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     });
 
@@ -2222,10 +2243,19 @@ async fn screen_trenches(
             });
         }
         let mut table = discover::table_view(&rows, sol_usd, Some(risk), warn_score);
+        // Say out loud whether a sweep is running. A refresh you cannot see is
+        // the same complaint as a screen that never refreshes.
+        let busy = refreshing.load(std::sync::atomic::Ordering::Relaxed);
+        table.title = if busy {
+            format!("{}  ·  refreshing…", table.title.trim_end())
+        } else {
+            format!("{}  ·  [R] refresh", table.title.trim_end())
+        };
         // Replace the generic note with what the feed is actually doing.
         if rows.is_empty() {
             let status = feed.lock().map(|f| f.clone()).unwrap_or_default();
-            table.empty_note = format!("{status}\nnew launches appear the moment they are created  ·  esc to go back");
+            let hint = if busy { "refreshing now…" } else { "[R] to search again" };
+            table.empty_note = format!("{status}\nnew launches appear the moment they are created  ·  {hint}  ·  esc to go back");
         }
         let n = rows.len();
         let mut grabbed: Option<String> = None;
@@ -2259,6 +2289,11 @@ async fn screen_trenches(
                 }
             }
             if let Event::Key(k) = evt {
+                // Ask for a sweep now rather than waiting out the interval.
+                if matches!(k.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+                    refresh_now.store(true, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 match cursor.on_key(k.code, n) {
                     ui::widgets::Nav::Enter => break rows
                         .get(cursor.sel)

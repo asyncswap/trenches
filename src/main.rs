@@ -203,6 +203,15 @@ fn load_evm_tape(token: &alloy::primitives::Address) -> std::collections::VecDeq
             }
         }
     }
+    // Retire placeholders whose real log has since landed. A confirmed order is
+    // injected as a placeholder (eth_wei == 0, price rebuilt from order-time
+    // facts) so your own fill shows even when a throttled endpoint answers the
+    // window thinly — but the merge used to key on eth_wei, so the real log
+    // never matched it and ONE swap persisted as two rows at different prices.
+    // Saved tapes still carry those pairs; drop the placeholder side on load.
+    let real: std::collections::HashSet<_> =
+        out.iter().filter(|s| s.eth_wei != 0).map(|s| s.tx).collect();
+    out.retain(|s| s.eth_wei != 0 || !real.contains(&s.tx));
     while out.len() > 400 {
         out.pop_front();
     }
@@ -361,6 +370,27 @@ fn prune_session_logs() {
 /// stale data; but `.lock().unwrap()` turns that single panic into a
 /// process-wide kill switch that fires on the NEXT call, and this app can be
 /// holding an open position when it does. Take the data and carry on.
+/// The session log's filename, so the Logs panel can name the file someone is
+/// about to be asked to attach to a bug report. Reading a screen and then
+/// hunting `~/.trenches` for which of twenty files it was is a step nobody
+/// should have to take.
+static SESSION_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn set_session_log(path: &str) {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut g = lock(&SESSION_LOG);
+    g.clear();
+    g.push_str(&name);
+}
+
+/// `session-….log`, or empty before one exists.
+pub fn session_log_name() -> String {
+    lock(&SESSION_LOG).clone()
+}
+
 pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -1743,6 +1773,7 @@ async fn app(
         .as_secs();
     let log_path = format!("{}/session-{secs}.log", state_dir());
     let log = std::fs::File::create(&log_path)?;
+    set_session_log(&log_path);
 
     let mut bot = Bot {
         trader,
@@ -2120,6 +2151,23 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 t.iter().map(|s| (s.tx, s.block, s.eth_wei)).collect();
                             let mut added = false;
                             for s in sw {
+                                // A confirmed order is injected as a PLACEHOLDER
+                                // before its log arrives, so your own fill shows
+                                // up even when a throttled endpoint answers the
+                                // window thinly. That row carries eth_wei == 0
+                                // and a price reconstructed from order-time
+                                // facts — which is why it never matched this
+                                // dedup key, and one swap rendered as two rows
+                                // with different prices and pooled depth.
+                                //
+                                // The real log is authoritative, so retire the
+                                // placeholder rather than sitting beside it.
+                                // Matched on tx AND the zero marker, so a
+                                // genuine multi-hop (two real logs, one tx)
+                                // still keeps both legs.
+                                if s.eth_wei != 0 {
+                                    t.retain(|x| !(x.tx == s.tx && x.eth_wei == 0));
+                                }
                                 if !have.contains(&(s.tx, s.block, s.eth_wei)) {
                                     t.push_back(s);
                                     added = true;
@@ -2157,6 +2205,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 let have: std::collections::HashSet<_> =
                                     t.iter().map(|s| (s.tx, s.block, s.eth_wei)).collect();
                                 for s in sw {
+                                    // Same placeholder retirement as pool A.
+                                    if s.eth_wei != 0 {
+                                        t.retain(|x| !(x.tx == s.tx && x.eth_wei == 0));
+                                    }
                                     if !have.contains(&(s.tx, s.block, s.eth_wei)) {
                                         t.push_back(s);
                                     }
@@ -3704,10 +3756,15 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let candles = view::candles_of(&points, bot.chart_iv, 240, Some((block / 10) as i64));
             // Our own fills: any tape row whose tx is in the persisted
             // own-transaction set, on the same block/10 clock as the points.
+            // One entry line per FILL, not per tape row. A duplicated row drew a
+            // second marker for the same trade at a different price, which reads
+            // as an entry you never took.
+            let mut seen_fill = std::collections::HashSet::new();
             let trades: Vec<(i64, f64, bool)> = tape
                 .iter()
                 .filter(|s| bot.own_txs.contains(&s.tx) && s.price > 0.0)
                 .filter(|s| matches!(s.action, engine::TapeAction::Buy | engine::TapeAction::Sell))
+                .filter(|s| seen_fill.insert(s.tx))
                 .map(|s| ((s.block / 10) as i64, 1.0 / s.price, matches!(s.action, engine::TapeAction::Buy)))
                 .collect();
             let cv = view::CandleView {
@@ -3769,8 +3826,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         if lines.is_empty() {
             lines.push(Line::from("  (no log lines yet)"));
         }
+        let log_title = match session_log_name() {
+            n if n.is_empty() => " Logs ".to_string(),
+            n => format!(" Logs — ~/.trenches/{n} "),
+        };
         let logs = Paragraph::new(lines)
-            .block(ui::widgets::with_panel_menu(ui::widgets::themed_block(" Logs ")));
+            .block(ui::widgets::with_panel_menu(ui::widgets::themed_block(&log_title)));
         f.render_widget(logs, mid_area);
         }
         Panel::Tape => {
