@@ -2276,7 +2276,7 @@ mod flaunch_discovery_tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let c = cands.iter().find(|c| c.flaunch_at <= now).expect("a live launch");
-        let data = crate::v4::flaunch_hop_calldata(c.token, true, 1_000_000_000_000_000, 0);
+        let data = crate::v4::flaunch_swap_calldata(c.token, true, 1_000_000_000_000_000, 0);
         // A funded holder: the flETH contract itself always carries ETH.
         let from = crate::contracts::FLETH;
         let tx = alloy::rpc::types::TransactionRequest::default()

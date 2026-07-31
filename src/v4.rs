@@ -64,6 +64,55 @@ pub fn swap_calldata(
     .into()
 }
 
+/// Build UniversalRouter.execute() calldata for a Flaunch coin: a two-hop v4
+/// exact-in through flETH, since Flaunch pools pair against flETH rather than
+/// native ETH. buy = ETH -> flETH (flETH hook pool) -> coin (Flaunch hook
+/// pool), with `amount_in` sent as value; sell runs the same path backwards
+/// and settles the coin through Permit2.
+pub fn flaunch_swap_calldata(token: Address, buy: bool, amount_in: u128, min_out: u128) -> Bytes {
+    let hop = |currency: Address, hooks: Address| PathKey {
+        intermediateCurrency: currency,
+        // The real pool fee is 0 — Flaunch charges its cut in the hook.
+        fee: alloy::primitives::aliases::U24::ZERO,
+        tickSpacing: FLAUNCH_TICK_SPACING.try_into().unwrap(),
+        hooks,
+        hookData: Bytes::new(),
+    };
+    let (input_cur, output_cur, path) = if buy {
+        (Address::ZERO, token, vec![hop(FLETH, FLETH_HOOKS), hop(token, FLAUNCH_PM)])
+    } else {
+        (token, Address::ZERO, vec![hop(FLETH, FLAUNCH_PM), hop(Address::ZERO, FLETH_HOOKS)])
+    };
+
+    let params0 = ExactInputParams {
+        currencyIn: input_cur,
+        path,
+        minHopPriceX36: vec![], // no per-hop limits; amountOutMinimum guards the trade
+        amountIn: amount_in,
+        amountOutMinimum: min_out,
+    }
+    .abi_encode();
+
+    // SETTLE_ALL(inputCurrency, amountIn), TAKE_ALL(outputCurrency, minOut).
+    let params1 = (input_cur, U256::from(amount_in)).abi_encode_params();
+    let params2 = (output_cur, U256::from(min_out)).abi_encode_params();
+
+    let actions = Bytes::from(vec![SWAP_EXACT_IN, SETTLE_ALL, TAKE_ALL]);
+    let params: Vec<Bytes> = vec![params0.into(), params1.into(), params2.into()];
+    let v4_input = (actions, params).abi_encode_params();
+
+    let commands = Bytes::from(vec![V4_SWAP]);
+    let inputs: Vec<Bytes> = vec![v4_input.into()];
+
+    IUniversalRouter::executeCall {
+        commands,
+        inputs,
+        deadline: U256::from(FAR_DEADLINE),
+    }
+    .abi_encode()
+    .into()
+}
+
 /// Build PositionManager.modifyLiquidities() calldata to open a position.
 #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 pub fn add_liquidity_calldata(
@@ -176,17 +225,25 @@ mod flaunch_swap_tests {
     const AMOUNT_IN: u128 = 1_000_000_000_000_000; // 0.001 ETH
     const MIN_OUT: u128 = 12_345_678_901_234_567_890;
 
-    /// One hop, flETH <-> coin, hooked on the Flaunch position manager.
-    ///
-    /// The two-hop shape this replaced came from the Flaunch SDK and encoded
-    /// cleanly, but reverted on every real buy: its first leg reaches flETH
-    /// through a pool on FLETH_HOOKS, and a working trade on this chain
-    /// (0x3d54cbcc…) does no such hop. Byte-equality against the SDK fixture
-    /// went with it — matching an encoding that does not execute is not a test.
+    // Golden fixtures generated with viem's encodeAbiParameters using the
+    // Flaunch SDK's exact ABI shapes (universalRouter.ts, the robinhood
+    // hop-price-limit variant) for the same token/amounts. Byte equality here
+    // means the router parses our calldata exactly as it parses the SDK's.
+    const SDK_BUY: &str = "0x3593564c000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000f4865700000000000000000000000000000000000000000000000000000000000000000110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004a0000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000003070c0f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000003a000000000000000000000000000000000000000000000000000000000000002c00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000028000000000000000000000000000000000000000000000000000038d7ea4c68000000000000000000000000000000000000000000000000000ab54a98ceb1f0ad200000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000043c1117dafa3a3d0c7148eb48b301300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c000000000000000000000000ea22ae03085caf74ac3393f9902539fbe978688800000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000005cf8e499c7c466c7e2cf127bdf129f57151e65dc00000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000038d7ea4c6800000000000000000000000000000000000000000000000000000000000000000400000000000000000000000001111111111111111111111111111111111111111000000000000000000000000000000000000000000000000ab54a98ceb1f0ad2";
+    const SDK_SELL: &str = "0x3593564c000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000f4865700000000000000000000000000000000000000000000000000000000000000000110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004a0000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000003070c0f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000003a000000000000000000000000000000000000000000000000000000000000002c00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000028000000000000000000000000000000000000000000000000000038d7ea4c68000000000000000000000000000000000000000000000000000ab54a98ceb1f0ad200000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000043c1117dafa3a3d0c7148eb48b301300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000005cf8e499c7c466c7e2cf127bdf129f57151e65dc00000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c000000000000000000000000ea22ae03085caf74ac3393f9902539fbe978688800000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000038d7ea4c6800000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ab54a98ceb1f0ad2";
+
+    #[test]
+    fn flaunch_calldata_matches_sdk_fixture() {
+        let buy = flaunch_swap_calldata(TOKEN, true, AMOUNT_IN, MIN_OUT);
+        assert_eq!(format!("0x{}", alloy::hex::encode(&buy)), SDK_BUY);
+        let sell = flaunch_swap_calldata(TOKEN, false, AMOUNT_IN, MIN_OUT);
+        assert_eq!(format!("0x{}", alloy::hex::encode(&sell)), SDK_SELL);
+    }
+
     #[test]
     fn flaunch_calldata_decodes_back() {
         for buy in [true, false] {
-            let data = flaunch_hop_calldata(TOKEN, buy, AMOUNT_IN, MIN_OUT);
+            let data = flaunch_swap_calldata(TOKEN, buy, AMOUNT_IN, MIN_OUT);
             let call = IUniversalRouter::executeCall::abi_decode(&data, true).unwrap();
             assert_eq!(call.commands.as_ref(), [V4_SWAP]);
             assert_eq!(call.deadline, U256::from(FAR_DEADLINE));
@@ -204,83 +261,22 @@ mod flaunch_swap_tests {
             assert_eq!(p.amountIn, AMOUNT_IN);
             assert_eq!(p.amountOutMinimum, MIN_OUT);
             assert!(p.minHopPriceX36.is_empty());
-            // ONE hop. Two was the shape that reverted.
-            assert_eq!(p.path.len(), 1);
+            assert_eq!(p.path.len(), 2);
             let spacing: alloy::primitives::aliases::I24 =
                 FLAUNCH_TICK_SPACING.try_into().unwrap();
             for hop in &p.path {
                 assert_eq!(hop.fee, alloy::primitives::aliases::U24::ZERO);
                 assert_eq!(hop.tickSpacing, spacing);
             }
-            // Both directions hop between flETH and the coin on the Flaunch
-            // hook — never through FLETH_HOOKS, and never out of native ETH.
-            assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks),
-                       (if buy { TOKEN } else { FLETH }, FLAUNCH_PM));
-            assert_eq!(p.currencyIn, if buy { FLETH } else { TOKEN });
-            assert_ne!(p.currencyIn, Address::ZERO, "the input is never native ETH");
+            if buy {
+                assert_eq!(p.currencyIn, Address::ZERO);
+                assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks), (FLETH, FLETH_HOOKS));
+                assert_eq!((p.path[1].intermediateCurrency, p.path[1].hooks), (TOKEN, FLAUNCH_PM));
+            } else {
+                assert_eq!(p.currencyIn, TOKEN);
+                assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks), (FLETH, FLAUNCH_PM));
+                assert_eq!((p.path[1].intermediateCurrency, p.path[1].hooks), (Address::ZERO, FLETH_HOOKS));
+            }
         }
     }
-}
-
-
-/// Wrap ETH into flETH: `deposit{value: amount}(0)`.
-///
-/// Not the WETH shape. flETH's `deposit` takes an amount of a DIFFERENT token
-/// to pull in (which needs an allowance, and reverts without one); passing 0
-/// means "just wrap the ETH I sent". Confirmed against the chain — `deposit()`
-/// with no argument reverts, and `deposit(amount)` fails on allowance.
-pub fn fleth_deposit_calldata() -> Bytes {
-    IFLETH::depositCall { _amount: U256::ZERO }.abi_encode().into()
-}
-
-/// Unwrap flETH back to ETH.
-pub fn fleth_withdraw_calldata(amount: u128) -> Bytes {
-    IFLETH::withdrawCall { _amount: U256::from(amount) }.abi_encode().into()
-}
-
-/// A Flaunch swap as the chain actually does one: a SINGLE v4 hop between flETH
-/// and the coin, with flETH obtained separately.
-///
-/// The two-hop version this replaces tried to reach flETH through a v4 pool on
-/// FLETH_HOOKS as the first leg, and that leg is what failed — the Flaunch hook
-/// then reverted with HookCallFailed, or the coin's transfer failed, depending
-/// on where it gave up. A real working buy on this chain (tx 0x3d54cbcc…) does
-/// no such hop: it obtains flETH by other means and then makes ONE v4 swap,
-/// flETH -> coin, fee 0, spacing 60, hooks = the Flaunch position manager.
-///
-/// The router pulls `currencyIn` from the caller through Permit2, so flETH
-/// needs the same approval pair the sell side already arranges for the coin.
-pub fn flaunch_hop_calldata(token: Address, buy: bool, amount_in: u128, min_out: u128) -> Bytes {
-    let (input_cur, output_cur, hop_cur) =
-        if buy { (FLETH, token, token) } else { (token, FLETH, FLETH) };
-    let path = vec![PathKey {
-        intermediateCurrency: hop_cur,
-        // Flaunch charges its cut in the hook; the pool fee really is 0.
-        fee: alloy::primitives::aliases::U24::ZERO,
-        tickSpacing: FLAUNCH_TICK_SPACING.try_into().unwrap(),
-        hooks: FLAUNCH_PM,
-        hookData: Bytes::new(),
-    }];
-    let params0 = ExactInputParams {
-        currencyIn: input_cur,
-        path,
-        minHopPriceX36: vec![],
-        amountIn: amount_in,
-        amountOutMinimum: min_out,
-    }
-    .abi_encode();
-    let params1 = (input_cur, U256::from(amount_in)).abi_encode_params();
-    let params2 = (output_cur, U256::from(min_out)).abi_encode_params();
-
-    let actions = Bytes::from(vec![SWAP_EXACT_IN, SETTLE_ALL, TAKE_ALL]);
-    let params: Vec<Bytes> = vec![params0.into(), params1.into(), params2.into()];
-    let v4_input = (actions, params).abi_encode_params();
-
-    IUniversalRouter::executeCall {
-        commands: Bytes::from(vec![V4_SWAP]),
-        inputs: vec![v4_input.into()],
-        deadline: U256::from(FAR_DEADLINE),
-    }
-    .abi_encode()
-    .into()
 }

@@ -148,14 +148,6 @@ sol! {
         function unwrapWETH9(uint256 amountMinimum, address recipient) external payable;
     }
 
-    // flETH — deposit takes the amount of a DIFFERENT token to pull in; pass 0
-    // and send ETH as value to simply wrap it.
-    #[sol(rpc)]
-    interface IFLETH {
-        function deposit(uint256 _amount) external payable;
-        function withdraw(uint256 _amount) external;
-    }
-
     #[sol(rpc)]
     interface IPermit2 {
         function approve(address token, address spender, uint160 amount, uint48 expiration) external;
