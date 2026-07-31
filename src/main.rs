@@ -27,6 +27,8 @@ mod v4;
 mod view;
 mod wallet;
 
+use zeroize::Zeroizing;
+
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -1181,10 +1183,12 @@ async fn solana_app(
             let Some(ks) = wallet_screen(terminal, config::ChainKind::Solana)? else {
                 break;
             };
-            let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
+            let Some(pass) =
+                ui::password(terminal, &format!("Password for {ks}"))?.map(Zeroizing::new)
+            else {
                 continue;
             };
-            match sol::wallet::keypair_from_keystore(&ks, &pass) {
+            match sol::wallet::keypair_from_keystore(&ks, pass.as_str()) {
                 Ok(kp) => {
                     save_last_wallet(&ks);
                     unlocked = Some(kp);
@@ -1274,18 +1278,23 @@ fn wallet_screen(
         let Some(name) = ui::input(terminal, "Wallet name", "e.g. robin — becomes the file name")? else {
             continue;
         };
+        // Zeroizing: a pasted key or seed phrase is the whole wallet, and a
+        // plain String leaves it in the heap for whatever reads that page next
+        // — a core dump, swap, another allocation. Wrapping at the SOURCE means
+        // every path out of this loop scrubs it, including the `continue`s.
         let secret = match i {
-            1 => ui::password(terminal, "Private key (hidden)")?,
-            2 => ui::password(terminal, "Seed phrase (hidden)")?,
+            1 => ui::password(terminal, "Private key (hidden)")?.map(Zeroizing::new),
+            2 => ui::password(terminal, "Seed phrase (hidden)")?.map(Zeroizing::new),
             _ => None,
         };
         if i > 0 && secret.is_none() {
             continue;
         }
-        let Some(pass) = ui::password(terminal, "Password for the new keystore")? else {
+        let Some(pass) = ui::password(terminal, "Password for the new keystore")?.map(Zeroizing::new)
+        else {
             continue;
         };
-        let Some(again) = ui::password(terminal, "Password again")? else {
+        let Some(again) = ui::password(terminal, "Password again")?.map(Zeroizing::new) else {
             continue;
         };
         if pass != again {
@@ -1302,8 +1311,12 @@ fn wallet_screen(
                 config::ChainKind::Solana => {
                     Err(eyre::eyre!("import a Solana key from its seed phrase instead"))
                 }
-                _ => wallet::import_private_key(&name, secret.as_deref().unwrap_or(""), &pass)
-                    .map(|a| a.to_string()),
+                _ => wallet::import_private_key(
+                    &name,
+                    secret.as_ref().map(|s| s.as_str()).unwrap_or(""),
+                    pass.as_str(),
+                )
+                .map(|a| a.to_string()),
             },
             2 => {
                 // One phrase holds many accounts; taking index 0 silently is
@@ -1311,7 +1324,7 @@ fn wallet_screen(
                 let idx = ui::input(terminal, "Account index", "0 is the first account")?
                     .and_then(|t| t.trim().parse::<u32>().ok())
                     .unwrap_or(0);
-                let phrase = secret.as_deref().unwrap_or("");
+                let phrase = secret.as_ref().map(|s| s.as_str()).unwrap_or("");
                 // The chains derive DIFFERENTLY from the same phrase: Ethereum
                 // is secp256k1 on m/44'/60', Solana is ed25519 SLIP-0010 on
                 // m/44'/501'/n'/0'. Using the Ethereum path for a Solana import
@@ -1319,12 +1332,13 @@ fn wallet_screen(
                 match kind {
                     #[cfg(feature = "solana")]
                     config::ChainKind::Solana => {
-                        sol::wallet::create_keystore(phrase, idx, &name, &pass)
+                        sol::wallet::create_keystore(phrase, idx, &name, pass.as_str())
                     }
-                    _ => wallet::import_mnemonic(&name, phrase, idx, &pass).map(|a| a.to_string()),
+                    _ => wallet::import_mnemonic(&name, phrase, idx, pass.as_str())
+                        .map(|a| a.to_string()),
                 }
             }
-            _ => wallet::create_keystore(&name, &pass).map(|a| a.to_string()),
+            _ => wallet::create_keystore(&name, pass.as_str()).map(|a| a.to_string()),
         };
         match made {
             Ok(addr) => {
@@ -1595,14 +1609,16 @@ async fn app(
             let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
                 break;
             };
-            let Some(pass) = ui::password(terminal, &format!("Password for {ks}"))? else {
+            let Some(pass) =
+                ui::password(terminal, &format!("Password for {ks}"))?.map(Zeroizing::new)
+            else {
                 continue;
             };
             let Some(path) = wallet::keystore_path(&ks) else {
                 ui::select(terminal, &format!("{ks} is no longer on disk"), &["Back".into()])?;
                 continue;
             };
-            match alloy::signers::local::LocalSigner::decrypt_keystore(&path, &pass) {
+            match alloy::signers::local::LocalSigner::decrypt_keystore(&path, pass.as_str()) {
                 Ok(sg) => {
                     // Only after a successful unlock: a mistyped password should
                     // not change which wallet comes up next time.
