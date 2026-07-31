@@ -128,12 +128,20 @@ fn is_fire(r: &Row) -> bool {
 
 fn sort_rows(rows: &mut [Row]) {
     rows.sort_by(|a, b| {
-        // 🔥 fire pools (hot + cap ≥ 4 ETH) first, then largest market cap,
-        // freshest, metadata, tx/sec.
-        is_fire(b)
-            .cmp(&is_fire(a))
+        // NEWEST first, always. This ranked by market cap, which is the wrong
+        // way round for a screen you watch to catch launches: the biggest cap
+        // is by definition the one that already ran, and a brand-new mint —
+        // the only kind you can still get in front of — started at the bottom
+        // of the list. Now that discovery shows every pool it finds, ranking
+        // by size would bury the small new ones under everything that already
+        // happened.
+        //
+        // The rest only break ties between pools from the same block.
+        b.grad
+            .launch_block
+            .cmp(&a.grad.launch_block)
+            .then(is_fire(b).cmp(&is_fire(a)))
             .then(b.mkt_cap_eth.partial_cmp(&a.mkt_cap_eth).unwrap_or(std::cmp::Ordering::Equal))
-            .then(b.grad.launch_block.cmp(&a.grad.launch_block))
             .then(b.grad.meta.score().cmp(&a.grad.meta.score()))
             .then(b.tx_per_sec.partial_cmp(&a.tx_per_sec).unwrap_or(std::cmp::Ordering::Equal))
     });

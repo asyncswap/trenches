@@ -2092,6 +2092,80 @@ fn trench_cache() -> Arc<Mutex<Vec<TrenchRow>>> {
     CACHE.get_or_init(Default::default).clone()
 }
 
+/// What the launch feed is doing, process-wide — the screen only reports it.
+fn feed_status() -> Arc<Mutex<String>> {
+    static ST: std::sync::OnceLock<Arc<Mutex<String>>> = std::sync::OnceLock::new();
+    ST.get_or_init(|| Arc::new(Mutex::new("connecting to the launch feed…".to_string()))).clone()
+}
+
+/// Start the launch feed ONCE for the process, and leave it running.
+///
+/// It used to be spawned by the trenches screen and aborted on the way out, so
+/// the moment you left to trade something the feed stopped. The row cache
+/// survived, which made this hard to see — you came back to everything you had
+/// found and assumed nothing had happened while you were gone. But the
+/// websocket only reports launches that occur AFTER it subscribes, so every
+/// launch during a trade was missed permanently. Nothing could backfill it.
+///
+/// Now it outlives the screen, and the screen is a view onto a feed that never
+/// stopped. Idempotent: called on every entry, subscribes only the first time.
+pub fn ensure_launch_feed(rpc: &Rpc, ws_urls: &[String]) {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.get().is_some() {
+        return;
+    }
+    let _ = STARTED.set(());
+    let (found, status) = (trench_cache(), feed_status());
+    let (rpc2, ws2) = (rpc.clone(), ws_urls.to_vec());
+    tokio::spawn(async move {
+        let st2 = status.clone();
+        let r = discover::watch_launches_ha(
+            &rpc2,
+            &ws2,
+            |launch| {
+                let (f3, rpc3) = (found.clone(), rpc2.clone());
+                super::trace(&format!("launch {}", launch.mint));
+                tokio::spawn(async move {
+                    let rows = discover::enrich(&rpc3, vec![launch]).await;
+                    super::trace(&format!("enrich -> {} row(s)", rows.len()));
+                    let mut cur = f3.lock().unwrap();
+                    for row in rows {
+                        // The cache outlives the screen, so the same mint can
+                        // arrive again — refresh it in place, don't double it.
+                        match cur.iter_mut().find(|r| r.launch.mint == row.launch.mint) {
+                            Some(slot) => *slot = row,
+                            None => cur.push(row),
+                        }
+                    }
+                    // Bounded: the list only ever grew, and the sweep re-reads
+                    // every row it holds — an afternoon of launches made each
+                    // pass cost more than the last, forever.
+                    if cur.len() > TRENCH_MAX {
+                        discover::sort_newest_first(&mut cur);
+                        cur.truncate(TRENCH_MAX);
+                    }
+                });
+                true // runs for the life of the session
+            },
+            move |msg| {
+                super::trace(&format!("feed: {msg}"));
+                if let Ok(mut f) = st2.lock() {
+                    *f = msg;
+                }
+            },
+        )
+        .await;
+        // A failed websocket must not look like an idle one — that read as
+        // "watching…" forever with no hint anything was wrong.
+        if let Err(e) = r {
+            super::trace(&format!("feed DOWN: {e}"));
+            if let Ok(mut f) = status.lock() {
+                *f = format!("launch feed down: {e}");
+            }
+        }
+    });
+}
+
 async fn screen_trenches(
     term: &mut Term,
     rpc: &Rpc,
@@ -2109,61 +2183,12 @@ async fn screen_trenches(
     // a brand-new mint happened to launch, because the websocket feed only
     // reports launches that happen AFTER it subscribes. Now returning shows
     // everything found before, instantly.
+    // The feed is already running — started with the session, not with this
+    // screen — so this is a VIEW onto it. Leaving no longer stops it.
+    ensure_launch_feed(rpc, ws_urls);
     let found: Arc<Mutex<Vec<TrenchRow>>> = trench_cache();
+    let feed: Arc<Mutex<String>> = feed_status();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // What the feed is doing right now. Shown in the empty state so a stalled
-    // websocket reads as a stalled websocket instead of as a quiet market.
-    let feed: Arc<Mutex<String>> = Arc::new(Mutex::new("connecting to the launch feed…".to_string()));
-
-    let (f2, s2, rpc2, ws2, fe2) =
-        (found.clone(), stop.clone(), rpc.clone(), ws_urls.to_vec(), feed.clone());
-    let handle = tokio::spawn(async move {
-        let fe3 = fe2.clone();
-        let r = discover::watch_launches_ha(
-            &rpc2,
-            &ws2,
-            |launch| {
-                let (f3, rpc3) = (f2.clone(), rpc2.clone());
-                super::trace(&format!("launch {}", launch.mint));
-                tokio::spawn(async move {
-                    let rows = discover::enrich(&rpc3, vec![launch]).await;
-                    super::trace(&format!("enrich -> {} row(s)", rows.len()));
-                    let mut cur = f3.lock().unwrap();
-                    for row in rows {
-                        // The cache survives re-entry, so the same mint can
-                        // arrive again — refresh it in place, don't double it.
-                        match cur.iter_mut().find(|r| r.launch.mint == row.launch.mint) {
-                            Some(slot) => *slot = row,
-                            None => cur.push(row),
-                        }
-                    }
-                    // Bounded: the list only ever grew, and the 3s refresher
-                    // re-reads every row it holds — an afternoon of launches
-                    // made each sweep cost more than the last, forever.
-                    if cur.len() > TRENCH_MAX {
-                        discover::sort_newest_first(&mut cur);
-                        cur.truncate(TRENCH_MAX);
-                    }
-                });
-                !s2.load(std::sync::atomic::Ordering::Relaxed)
-            },
-            move |msg| {
-                super::trace(&format!("feed: {msg}"));
-                if let Ok(mut f) = fe3.lock() {
-                    *f = msg;
-                }
-            },
-        )
-        .await;
-        // The old code discarded this. A failed websocket then looked exactly
-        // like an idle one — the screen said "watching…" forever with no hint.
-        if let Err(e) = r {
-            super::trace(&format!("feed DOWN: {e}"));
-            if let Ok(mut f) = fe2.lock() {
-                *f = format!("launch feed down: {e}");
-            }
-        }
-    });
 
     // Keep the visible rows live. Without this a coin discovered at 20% bonded
     // showed 20% forever while it actually filled — the one number that says
@@ -2305,8 +2330,10 @@ async fn screen_trenches(
         }
     };
 
+    // Only the screen's own work stops here. The launch feed keeps running —
+    // that is the entire point: leaving to trade must not cost you the
+    // launches that happen while you are gone.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    handle.abort();
     refresher.abort();
     Ok(result)
 }
@@ -2326,6 +2353,10 @@ pub async fn run(
     net: &str,
 ) -> eyre::Result<crate::Exit> {
     let rpc = Rpc::new_pool(rpc_urls.clone());
+    // Start listening for launches NOW, not when the trenches screen is first
+    // opened — otherwise the feed misses everything that happens before you
+    // think to look, which is most of them.
+    ensure_launch_feed(&rpc, &ws_explicit);
     // Providers frequently host WS on a separate domain, so explicit settings
     // win over deriving from the HTTP URLs.
     // Candidates in preference order: every explicit endpoint first (the feed
