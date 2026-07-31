@@ -958,15 +958,43 @@ fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
     CACHE.get_or_init(Default::default).clone()
 }
 
-/// Merge fresh rows + big fish (dedup by pool, fresh wins), sort, publish.
+/// How long a discovered pool stays on the screen without being re-seen.
+/// ~10 blocks/sec, so this is about two hours.
+const ROW_TTL_BLOCKS: u64 = 72_000;
+/// Ceiling on the list, so a busy day cannot grow it without bound.
+const ROW_MAX: usize = 400;
+
+/// Fold fresh rows + big fish INTO what is already on screen, then sort.
+///
+/// This used to replace the list outright, and that is why pools appeared,
+/// vanished, and came back minutes later. `fresh` covers only what the last
+/// scan window saw — on an endpoint that caps getLogs at ten blocks that is
+/// eighty blocks, about EIGHT SECONDS of chain — and the big-fish sweep only
+/// runs every few rounds. Anything discovered outside that sliver was dropped
+/// on the next round and had to be re-found.
+///
+/// A pool that existed a moment ago still exists. Keep it, refresh it when it
+/// is seen again, and let it go only when it has aged out.
 fn merge_publish(shared: &Arc<Mutex<Vec<Row>>>, fresh: &[Row], big: &[Row]) {
-    let mut seen = std::collections::HashSet::new();
-    let mut merged: Vec<Row> = Vec::new();
+    let mut cur = shared.lock().unwrap();
+    let head = fresh
+        .iter()
+        .chain(big.iter())
+        .map(|r| r.head_block)
+        .chain(cur.iter().map(|r| r.head_block))
+        .max()
+        .unwrap_or(0);
     for r in fresh.iter().chain(big.iter()) {
-        if seen.insert(r.grad.pool_key()) { merged.push(r.clone()); }
+        match cur.iter_mut().find(|x| x.grad.pool_key() == r.grad.pool_key()) {
+            Some(slot) => *slot = r.clone(), // re-seen: take the newer metrics
+            None => cur.push(r.clone()),
+        }
     }
-    sort_rows(&mut merged);
-    *shared.lock().unwrap() = merged;
+    // Age out on the LAUNCH block, not the last time we happened to look at
+    // it: a quiet pool is old, not missing.
+    cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
+    sort_rows(&mut cur);
+    cur.truncate(ROW_MAX);
 }
 
 /// Tokens discovery has seen before, newest first.
