@@ -4418,19 +4418,38 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // For LP add/remove, show the tick range in the price column.
                 let is_lp = matches!(s.action, engine::TapeAction::Add | engine::TapeAction::Remove);
                 let mid = if is_lp {
+                    // A position at the tick extremes is not a range, it is
+                    // every price there is. Uniswap's usable bounds are about
+                    // ±887272, and converting those gives a floor of
+                    // effectively zero against a ceiling in the tens of
+                    // millions — two numbers that look like information and
+                    // carry none. Say what it means instead.
+                    const UNBOUNDED: i32 = 887_000;
+                    let lo_open = s.tick_lo <= -UNBOUNDED;
+                    let hi_open = s.tick_hi >= UNBOUNDED;
                     // A range is two prices. Ticks are how the pool stores
                     // them, not how anyone reads them.
                     match (tick_usd(bot, s.tick_lo), tick_usd(bot, s.tick_hi)) {
+                        _ if lo_open && hi_open => "full range".to_string(),
                         (Some(a), Some(b)) => {
                             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                            // Bracketed, both sides carrying their own dollar
-                            // sign: a bare second number reads as a quantity,
-                            // and a range is two prices or it is nothing.
-                            format!(
-                                "[{}, {}]",
-                                view::usd_price_brief(lo),
-                                view::usd_price_brief(hi)
-                            )
+                            // One open side is a half-line, and an arrow says
+                            // so in less space than a fabricated bound.
+                            if lo_open {
+                                format!("up to {}", view::usd_price_brief(hi))
+                            } else if hi_open {
+                                format!("{} and up", view::usd_price_brief(lo))
+                            } else {
+                                // Bracketed, both sides carrying their own
+                                // dollar sign: a bare second number reads as a
+                                // quantity, and a range is two prices or it is
+                                // nothing.
+                                format!(
+                                    "[{}, {}]",
+                                    view::usd_price_brief(lo),
+                                    view::usd_price_brief(hi)
+                                )
+                            }
                         }
                         // Orientation unknown for this venue: the raw ticks are
                         // still true, and true beats a converted guess. No

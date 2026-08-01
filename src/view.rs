@@ -575,6 +575,12 @@ pub fn usd_price(x: f64) -> String {
 /// end of its column and gets truncated mid-number — which is how the second
 /// bound lost its dollar sign.
 pub fn usd_price_brief(x: f64) -> String {
+    // Past a thousand, a price is read in magnitude rather than in digits, and
+    // an LP bound can run to eight figures. `$63205347.123` is not a number
+    // anyone reads; `$63.21M` is.
+    if x >= 1_000.0 && x.is_finite() {
+        return usd_compact(x);
+    }
     let s = usd_price_sig(x, 2);
     // `$0.020` says nothing `$0.02` does not.
     if s.contains('.') && !s.contains('\u{2080}') && s.ends_with('0') {
@@ -901,5 +907,26 @@ mod usd_price_tests {
     fn nothing_is_not_priced() {
         assert_eq!(usd_price(0.0), "—");
         assert_eq!(usd_price(f64::NAN), "—");
+    }
+}
+
+#[cfg(test)]
+mod lp_bound_tests {
+    use super::usd_price_brief;
+
+    /// An LP bound can run to eight figures. Digits stop being readable long
+    /// before that, and the column is nineteen wide.
+    #[test]
+    fn a_large_bound_is_written_in_magnitude() {
+        assert_eq!(usd_price_brief(63_205_347.0), "$63.21M");
+        assert_eq!(usd_price_brief(8_210.0), "$8.21k");
+    }
+
+    /// Small bounds keep their significant digits — that is the end of the
+    /// range anyone is actually reading.
+    #[test]
+    fn a_small_bound_keeps_its_digits() {
+        assert_eq!(usd_price_brief(0.02), "$0.02");
+        assert_eq!(usd_price_brief(0.000_002_56), "$0.0₅26");
     }
 }
