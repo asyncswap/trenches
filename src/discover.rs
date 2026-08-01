@@ -1710,20 +1710,10 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             let before = cur.len();
             if head > 0 {
                 cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
-                // NO dead-launch prune here.
-                //
-                // It was tried and reverted the same day. The test was "old,
-                // no pooled depth, no trades", which reads as "nobody came" —
-                // but `pooled_eth` and `tx_per_sec` are only populated for the
-                // rows a round actually re-measures, so a row that was simply
-                // not refreshed this pass carries zeros that mean "not
-                // measured", not "empty". The prune could not tell those apart
-                // and deleted live launches, Flaunch ones especially, since
-                // they hold liquidity single-sided until the first buy.
-                //
-                // Distinguishing them needs a "last measured" stamp per row.
-                // Until there is one, the TTL above is the honest bound: age
-                // is a fact the row carries itself.);
+                // No metric-based prune. Whether a launch has depth or trades
+                // is not what makes it stale — a session shows what launched
+                // during it, and that is decided on the way in, not by a test
+                // applied to every row on the way past.
             }
             sort_rows(&mut cur);
             // Newest first, so the truncation drops the oldest.

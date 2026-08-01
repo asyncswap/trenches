@@ -550,16 +550,29 @@ pub fn spawn_ui_watchdog() -> tokio::task::JoinHandle<()> {
 /// Delete all but the newest KEEP_LOGS of each per-session log family
 /// (`session-*.log`, `evm-trace-*.log`, `sol-trace-*.log`). The timestamps in
 /// the names sort lexically, so "newest" is a sort, not a stat.
-/// Delete this run's logs on the way out.
+/// Wipe this run's scratch state on the way out: logs, and the discovered
+/// launches.
 ///
-/// Nothing to prune, nothing to age out, nothing to configure: the logs exist
-/// for the session that is running, and the session is over.
-fn clear_logs() {
+/// The launch list is the point. Discovery was carrying the last two hours
+/// across restarts, because it seeds itself from `discovered-*.json` — so a
+/// brand-new session opened onto an hour of launches that had already
+/// happened. Opening the app should show what is launching now.
+///
+/// The files still exist DURING a session: leaving the discovery screen and
+/// coming back re-reads them, which is what stops the list emptying every time
+/// you go off to trade something. They only die with the process.
+///
+/// Nothing here is a record anyone keeps — trades, fills, basis and tapes live
+/// in different files and are never touched.
+fn clear_session_state() {
     let Ok(dir) = std::fs::read_dir(state_dir()) else { return };
     for e in dir.flatten() {
         let n = e.file_name();
         let n = n.to_string_lossy();
-        if n.ends_with(".log") && ["session-", "evm-trace-", "sol-trace-"].iter().any(|f| n.starts_with(f)) {
+        let log = n.ends_with(".log")
+            && ["session-", "evm-trace-", "sol-trace-"].iter().any(|f| n.starts_with(f));
+        let discovered = n.starts_with("discovered-") && n.ends_with(".json");
+        if log || discovered {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -1454,9 +1467,9 @@ async fn main() -> eyre::Result<()> {
     disable_raw_mode()?;
     let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
     std::io::stdout().execute(LeaveAlternateScreen)?;
-    // Last thing, after the terminal is back: the logs were for the session
-    // that just ended.
-    clear_logs();
+    // Last thing, after the terminal is back. The next run starts on what is
+    // launching then, not on what launched now.
+    clear_session_state();
     res
 }
 
