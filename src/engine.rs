@@ -369,6 +369,8 @@ pub struct Bot {
     /// line is written on change, not ten times a second forever.
     pub last_market_trace: Option<(std::time::Instant, i32)>,
     /// Candle interval for the chart panel, seconds. , and . walk the ladder.
+    /// Chart y axis: false = price, true = market cap. See the `m` key.
+    pub chart_mcap: bool,
     pub chart_iv: u64,
 
     // arb mode: a second pool for the same token, side-by-side + gap.

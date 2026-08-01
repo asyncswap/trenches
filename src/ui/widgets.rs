@@ -743,6 +743,17 @@ pub fn with_panel_menu(block: Block<'static>) -> Block<'static> {
 /// between "a chart" and "a bar of blobs" at dashboard heights. One candle
 /// per column: full cells for the body, a thin │ for the wick, green up and
 /// red down, exactly the grammar TradingView taught everyone.
+/// One y-axis label: a quantity with its unit, or money with its symbol.
+fn axis_text(v: f64, range: f64, cv: &crate::view::CandleView) -> String {
+    if cv.money {
+        // Market caps span cents to millions on the same screen, so the
+        // compact form is the only one that fits a thirteen-column axis.
+        crate::view::usd_compact(v)
+    } else {
+        format!("{} {}", price_label(v, range), cv.unit)
+    }
+}
+
 pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
     let mut block = themed_block_line(Line::from(cv.title.clone()));
     if let Some(k) = cv.active_key {
@@ -788,7 +799,12 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
     let (lo, hi) = (lo - pad, hi + pad);
     let range = hi - lo;
 
-    let rows = inner.height;
+    // One row at the bottom belongs to the time axis. A chart without one
+    // shows shape and hides WHEN — you cannot tell a move that happened over
+    // an hour from one that happened in the last ninety seconds, which is the
+    // difference between a trend and a spike.
+    let axis_row = inner.y + inner.height - 1;
+    let rows = inner.height.saturating_sub(1).max(1);
     let pixels = rows as i32 * 2;
     let py = |p: f64| -> i32 {
         // Pixel 0 is the TOP; higher price = smaller pixel index.
@@ -893,7 +909,7 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
         }
         // No arrow: the dashed rule and the coloured, bold label already say
         // "this is the live price" — the ▸ only cost label room.
-        let txt = format!("{} {}", price_label(last.c, range), cv.unit);
+        let txt = axis_text(last.c, range, cv);
         buf.set_string(
             inner.x + inner.width - AXIS_W + 1,
             y,
@@ -913,13 +929,42 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
         }
         let frac = (y - inner.y) as f64 / (rows.saturating_sub(1)).max(1) as f64;
         let price = hi - range * frac;
-        let txt = format!("{} {}", price_label(price, range), cv.unit);
+        let txt = axis_text(price, range, cv);
         buf.set_string(
             inner.x + inner.width - AXIS_W + 1,
             y,
             txt.chars().take(AXIS_W as usize - 1).collect::<String>(),
             Style::default().fg(tone_color(Tone::Dim)),
         );
+    }
+
+    // The time axis: how long ago each column was.
+    //
+    // Relative, not wall clock. A candle chart is read as "how far back does
+    // this go", and relative answers that without a timezone — and without
+    // making a five-second interval print a clock time that repeats four
+    // times across the row.
+    {
+        let secs_per = cv.interval_secs.max(1) as i64;
+        let mut last_end: u16 = 0;
+        for (i, c) in shown.iter().enumerate() {
+            // Every fourth column, so labels never collide at any width.
+            if i % 4 != 0 && i + 1 != shown.len() {
+                continue;
+            }
+            let ago = (cv.now_t - c.t).max(0) * secs_per / secs_per.max(1);
+            let txt = if i + 1 == shown.len() {
+                "now".to_string()
+            } else {
+                format!("-{}", crate::view::age_compact(ago as f64))
+            };
+            let x = inner.x + (i * PITCH) as u16;
+            if x < last_end || x + txt.chars().count() as u16 > inner.x + chart_w as u16 {
+                continue;
+            }
+            buf.set_string(x, axis_row, &txt, Style::default().fg(tone_color(Tone::Dim)));
+            last_end = x + txt.chars().count() as u16 + 1;
+        }
     }
 
     // Name each trade line at its right end — "buy" green, "sell" red — so
@@ -1586,7 +1631,7 @@ mod candle_render_tests {
     use ratatui::backend::TestBackend;
 
     fn cv(candles: Vec<crate::view::Candle>) -> crate::view::CandleView {
-        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL", active_key: None, trades: Vec::new() }
+        crate::view::CandleView { title: " t ".into(), candles, interval_secs: 5, unit: "SOL".to_string(), money: false, now_t: 0, active_key: None, trades: Vec::new() }
     }
 
     #[test]
@@ -1684,7 +1729,7 @@ mod candle_gallery {
             }
         }
         let ck = crate::view::candles_of(&pts, 15, 240, None);
-        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL", active_key: None, trades: Vec::new() };
+        let cv = crate::view::CandleView { title: " GALLERY · 15s ".into(), candles: ck, interval_secs: 15, unit: "SOL".to_string(), money: false, now_t: 0, active_key: None, trades: Vec::new() };
         let mut term = Terminal::new(TestBackend::new(140, 34)).unwrap();
         term.draw(|f| candles(f, f.area(), &cv)).unwrap();
         println!("{}", dump(term.backend().buffer()));

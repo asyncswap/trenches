@@ -199,6 +199,18 @@ pub struct Candle {
 }
 
 impl Candle {
+    /// The same candle in a different unit.
+    ///
+    /// Price to market cap is multiplication by supply, so every level scales
+    /// together and the shape is untouched — which is why the chart can switch
+    /// units without recomputing anything from the tape. Volume is quote-side
+    /// and is deliberately NOT scaled: it is already money.
+    pub fn scaled(self, k: f64) -> Candle {
+        Candle { o: self.o * k, h: self.h * k, l: self.l * k, c: self.c * k, ..self }
+    }
+}
+
+impl Candle {
     pub fn up(&self) -> bool {
         self.c >= self.o
     }
@@ -210,8 +222,15 @@ pub struct CandleView {
     pub title: String,
     pub candles: Vec<Candle>,
     pub interval_secs: u64,
-    /// Unit label for the y axis ("SOL" / "ETH").
-    pub unit: &'static str,
+    /// Unit label for the y axis ("SOL" / "ETH"), or "" when the values are
+    /// money and carry their own symbol.
+    pub unit: String,
+    /// Values are money — format them as money rather than as a raw quantity.
+    pub money: bool,
+    /// The newest candle's bucket, on the same clock as `Candle::t`. Lets the
+    /// x axis say how long ago each column was without knowing what that clock
+    /// means.
+    pub now_t: i64,
     /// When set, the panel menu ([t] Trades · [v] Candles · …) rides the top
     /// border with this key highlighted — every view names its siblings.
     pub active_key: Option<char>,

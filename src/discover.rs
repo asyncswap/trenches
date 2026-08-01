@@ -1092,10 +1092,6 @@ fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
 const ROW_TTL_BLOCKS: u64 = 72_000;
 /// Ceiling on the list, so a busy day cannot grow it without bound.
 const ROW_MAX: usize = 400;
-/// How long a launch has to attract a buy before it stops earning a row.
-/// ~10 blocks/sec, so about ten minutes — long enough that a slow start is
-/// not mistaken for a dead one.
-const DEAD_GRACE_BLOCKS: u64 = 6_000;
 
 /// Tokens discovery has seen before, newest first.
 ///
@@ -1695,18 +1691,20 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             let before = cur.len();
             if head > 0 {
                 cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
-                // A launch nobody ever bought is not a launch worth a row.
+                // NO dead-launch prune here.
                 //
-                // The list is capped, so every dead entry costs a live one.
-                // A Flaunch coin holds its liquidity single-sided until the
-                // first buy, so zero pooled is CORRECT and expected for the
-                // first few minutes — which is exactly why this is age-gated
-                // rather than applied on sight. Past the grace period, no
-                // depth and no trades means nobody came.
-                cur.retain(|r| {
-                    let age = head.saturating_sub(r.grad.launch_block);
-                    age <= DEAD_GRACE_BLOCKS || r.pooled_eth > 0.0 || r.tx_per_sec > 0.0
-                });
+                // It was tried and reverted the same day. The test was "old,
+                // no pooled depth, no trades", which reads as "nobody came" —
+                // but `pooled_eth` and `tx_per_sec` are only populated for the
+                // rows a round actually re-measures, so a row that was simply
+                // not refreshed this pass carries zeros that mean "not
+                // measured", not "empty". The prune could not tell those apart
+                // and deleted live launches, Flaunch ones especially, since
+                // they hold liquidity single-sided until the first buy.
+                //
+                // Distinguishing them needs a "last measured" stamp per row.
+                // Until there is one, the TTL above is the honest bound: age
+                // is a fact the row carries itself.);
             }
             sort_rows(&mut cur);
             // Newest first, so the truncation drops the oldest.
@@ -1850,7 +1848,25 @@ fn trenches_title(rows: usize) -> Line<'static> {
     } else {
         format!(" Trenches Bot v{v}  [j/k] select  [Enter] trade  [Esc] back ")
     };
-    Line::from(vec![Span::raw(" "), health_dot(), Span::raw(text)])
+    // Whether the live feed is up, and how much it has delivered.
+    //
+    // Without this there is no way to tell a quiet chain from a websocket that
+    // was never configured — both look like a list that stopped growing, and
+    // only one of them is worth doing something about. Silence is the thing a
+    // status light exists to break.
+    let (live, n) = crate::launch_stream::status();
+    let feed = if live {
+        Span::styled(
+            format!("· live ({n}) "),
+            Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Good)),
+        )
+    } else {
+        Span::styled(
+            "· polling only ",
+            Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Warn)),
+        )
+    };
+    Line::from(vec![Span::raw(" "), health_dot(), Span::raw(text), feed])
 }
 
 /// Green answering, yellow refusing some, red nothing getting through.

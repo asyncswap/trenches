@@ -682,7 +682,11 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
         title: format!(" {}/SOL {} candle [,] [.] ", sym, crate::view::iv_label(bot.chart_iv)),
         candles,
         interval_secs: bot.chart_iv,
-        unit: "SOL",
+        unit: "SOL".to_string(),
+        money: false,
+        // Solana swaps carry a real block time, so "now" is the wall clock —
+        // no block-derived pseudo-clock to convert from.
+        now_t: crate::ledger::now() as i64,
         active_key: None,
         trades,
     }

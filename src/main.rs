@@ -2059,6 +2059,7 @@ async fn app(
         account: account.clone(),
         pool: to_poolcfg(&pool),
         last_market_trace: None,
+        chart_mcap: false,
         chart_iv: 60, // the canonical minute candle — see the sol side's note
         arb_mode: false,
         pool_b: None,
@@ -3105,6 +3106,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
                         // Straight to the chart; , . walk the candle interval.
                         KeyCode::Char('c') | KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
+                        // Price or market cap — one series, two units.
+                        KeyCode::Char('m') => {
+                            bot.chart_mcap = !bot.chart_mcap;
+                            view = Panel::Chart;
+                            bot.status = if bot.chart_mcap {
+                                "chart: market cap".into()
+                            } else {
+                                "chart: price".into()
+                            };
+                        }
                         KeyCode::Char(',') => { bot.chart_iv = view::iv_step(bot.chart_iv, false); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
                         KeyCode::Char('.') => { bot.chart_iv = view::iv_step(bot.chart_iv, true); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
                         // Scroll the active panel (↑ older, ↓ newer) — orders or tape.
@@ -4355,15 +4366,41 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 .filter(|s| seen_fill.insert(s.tx))
                 .map(|s| ((s.block / 10) as i64, 1.0 / s.price, matches!(s.action, engine::TapeAction::Buy)))
                 .collect();
+            // Market cap is price times supply — a LINEAR rescale, so the
+            // candles keep their exact shape and only the axis changes. That
+            // is the whole reason it can be a toggle rather than a second
+            // chart: it is the same series read in a unit people actually
+            // compare launches in.
+            let mcap_mul = if bot.chart_mcap && bot.token_supply > 0.0 {
+                bot.token_supply * if bot.pool.quote_usd > 0.0 { bot.pool.quote_usd } else { 1.0 }
+            } else {
+                1.0
+            };
+            let money = bot.chart_mcap && bot.token_supply > 0.0 && bot.pool.quote_usd > 0.0;
+            let candles = if (mcap_mul - 1.0).abs() > f64::EPSILON {
+                candles.into_iter().map(|c| c.scaled(mcap_mul)).collect()
+            } else {
+                candles
+            };
+            let trades: Vec<(i64, f64, bool)> =
+                trades.into_iter().map(|(t, p, b)| (t, p * mcap_mul, b)).collect();
             let cv = view::CandleView {
                 title: format!(
-                    " {}/ETH {} candle [,] [.] ",
+                    " {} {} · {} candle · [m] {} · [,] [.] ",
                     bot.pool.sym,
-                    view::iv_label(bot.chart_iv)
+                    if bot.chart_mcap { "market cap" } else { "price" },
+                    view::iv_label(bot.chart_iv),
+                    if bot.chart_mcap { "price" } else { "market cap" },
                 ),
                 candles,
                 interval_secs: bot.chart_iv,
-                unit: "ETH",
+                unit: if bot.chart_mcap && !money {
+                    bot.pool.quote_sym.clone()
+                } else {
+                    "ETH".to_string()
+                },
+                money,
+                now_t: (block / 10) as i64,
                 active_key: Some('c'),
                 trades,
             };
@@ -4876,7 +4913,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 36] = [
+        let items: [(&str, &str); 37] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
@@ -4900,6 +4937,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "↑ ↓|scroll"),
             ("", "c  v|candlestick chart"),
             ("", ",  .|candle interval −/+"),
+            ("", "m|chart: price / market cap"),
             ("", "L|PnL calendar"),
             ("SIZE", ""),
             ("", "[  ]|buy size −/+"),

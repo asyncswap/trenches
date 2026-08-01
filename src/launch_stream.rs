@@ -31,6 +31,23 @@ use alloy::rpc::types::Log;
 
 use crate::lock;
 
+/// The running stream, for anything that only wants to know whether it is up.
+///
+/// A global rather than a threaded parameter: the discovery title is drawn
+/// from three call sites that have no other reason to know a websocket exists,
+/// and passing one through all of them would be plumbing for a status light.
+static CURRENT: Mutex<Option<LaunchStream>> = Mutex::new(None);
+
+/// Whether the feed is connected, and how many launches it has delivered.
+/// `(false, 0)` when there is no stream at all — unconfigured reads the same
+/// as disconnected here, which is correct: neither is delivering.
+pub fn status() -> (bool, u64) {
+    lock(&CURRENT)
+        .as_ref()
+        .map(|s| (s.is_live(), s.delivered()))
+        .unwrap_or((false, 0))
+}
+
 /// What the discovery loop reads from.
 #[derive(Clone, Default)]
 pub struct LaunchStream {
@@ -81,6 +98,7 @@ pub fn spawn(
     stop: Arc<AtomicBool>,
 ) -> LaunchStream {
     let stream = LaunchStream::default();
+    *lock(&CURRENT) = Some(stream.clone());
     if urls.is_empty() {
         // Said once, plainly. Without a websocket the app still works — it
         // just falls back to the polled scan, which cannot promise it saw
