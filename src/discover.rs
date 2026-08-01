@@ -1082,39 +1082,6 @@ const ROW_TTL_BLOCKS: u64 = 72_000;
 /// Ceiling on the list, so a busy day cannot grow it without bound.
 const ROW_MAX: usize = 400;
 
-/// Fold fresh rows + big fish INTO what is already on screen, then sort.
-///
-/// This used to replace the list outright, and that is why pools appeared,
-/// vanished, and came back minutes later. `fresh` covers only what the last
-/// scan window saw — on an endpoint that caps getLogs at ten blocks that is
-/// eighty blocks, about EIGHT SECONDS of chain — and the big-fish sweep only
-/// runs every few rounds. Anything discovered outside that sliver was dropped
-/// on the next round and had to be re-found.
-///
-/// A pool that existed a moment ago still exists. Keep it, refresh it when it
-/// is seen again, and let it go only when it has aged out.
-fn merge_publish(shared: &Arc<Mutex<Vec<Row>>>, fresh: &[Row], big: &[Row]) {
-    let mut cur = shared.lock().unwrap();
-    let head = fresh
-        .iter()
-        .chain(big.iter())
-        .map(|r| r.head_block)
-        .chain(cur.iter().map(|r| r.head_block))
-        .max()
-        .unwrap_or(0);
-    for r in fresh.iter().chain(big.iter()) {
-        match cur.iter_mut().find(|x| x.grad.pool_key() == r.grad.pool_key()) {
-            Some(slot) => *slot = r.clone(), // re-seen: take the newer metrics
-            None => cur.push(r.clone()),
-        }
-    }
-    // Age out on the LAUNCH block, not the last time we happened to look at
-    // it: a quiet pool is old, not missing.
-    cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
-    sort_rows(&mut cur);
-    cur.truncate(ROW_MAX);
-}
-
 /// Tokens discovery has seen before, newest first.
 ///
 /// The launch window is ten minutes wide, so without this the screen could only
@@ -1643,10 +1610,37 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 None => cur.push(row),
             }
         }
-        // One re-rank per round. The order is then stable until the next one.
+        // Age out, cap, then re-rank — once per round, in that order.
+        //
+        // This was written, documented and never called. It lived in
+        // `merge_publish`, which nothing invoked, and `#![allow(dead_code)]` at
+        // the top of this module meant the compiler never said so. The rows
+        // above are inserted and refreshed by token and otherwise kept
+        // forever, which is why a Flaunch launch nobody bought was still on
+        // the screen three hours later, and why the list had no ceiling.
+        //
+        // The reference is the LIVE head, not the newest `head_block` among
+        // the rows. That distinction matters: `head_block` is stamped on a row
+        // when it is seen, so a list that stops being refreshed would carry
+        // its own frozen clock and could never age itself out. The clock has
+        // to come from outside the thing being timed.
         {
             let mut cur = shared.lock().unwrap();
+            let before = cur.len();
+            if head > 0 {
+                cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
+            }
             sort_rows(&mut cur);
+            // Newest first, so the truncation drops the oldest.
+            cur.truncate(ROW_MAX);
+            if cur.len() < before {
+                crate::trace(&format!(
+                    "discovery: {} rows aged out or capped ({} -> {})",
+                    before - cur.len(),
+                    before,
+                    cur.len()
+                ));
+            }
         }
         tokio::time::sleep(Duration::from_millis(2000)).await;
     }

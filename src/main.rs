@@ -3904,14 +3904,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     mkt.push(Line::from(vec![
         mlbl("Price"),
         Span::raw(if bot.price() > 0.0 && bot.pool.quote_usd > 0.0 {
-            format!(
-                "{} / {}   ({:.4} {}/{})",
-                view::usd_price(bot.pool.quote_usd / bot.price()),
-                bot.pool.sym,
-                bot.price(),
-                bot.pool.sym,
-                bot.pool.quote_sym
-            )
+            // The money price alone. The pool's own tokens-per-ETH ratio was
+            // shown beside it for one build and read as clutter: it is the
+            // input to this number, not a second opinion about it, and the
+            // Tick line below already says where the pool sits in its own
+            // coordinates.
+            format!("{} / {}", view::usd_price(bot.pool.quote_usd / bot.price()), bot.pool.sym)
         } else {
             format!("{:.4} {}/{}", bot.price(), bot.pool.sym, bot.pool.quote_sym)
         }),
@@ -3938,7 +3936,16 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // token's entire supply, which is the giveaway. Flag it when that happens
     // rather than presenting a number that cannot be true as exit liquidity.
     let notional = bot.token_supply > 0.0 && bot.r1 > bot.token_supply;
-    mkt.push(Line::from(vec![mlbl("Pooled"), Span::raw(format!("{} {}", view::eth(bot.r0), bot.pool.quote_sym))]));
+    // Depth in the quote asset AND in money. The ETH figure is what the pool
+    // holds; the money figure is what it means — and how deep a pool is decides
+    // whether a position can be got out of, which is a question asked in money.
+    mkt.push(Line::from(vec![
+        mlbl("Pooled"),
+        Span::raw(match view::usd_tag(bot.r0, bot.pool.quote_usd) {
+            Some(tag) => format!("{} {}  {tag}", view::eth(bot.r0), bot.pool.quote_sym),
+            None => format!("{} {}", view::eth(bot.r0), bot.pool.quote_sym),
+        }),
+    ]));
     mkt.push(Line::from(vec![
         mlbl("Pooled"),
         Span::styled(
@@ -4023,7 +4030,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             mb.push(Line::from(format!("{:<9}{}", "Tick", bot.mkt_b.tick)));
             let mcap_b = if pbp > 0.0 { bot.mkt_b.supply / pbp * pb.quote_usd } else { 0.0 };
             mb.push(Line::from(format!("{:<9}{}", "Mkt Cap", view::usd_compact(mcap_b))));
-            mb.push(Line::from(format!("{:<9}{} {}", "Pooled", view::eth(bot.mkt_b.r0), pb.quote_sym)));
+            mb.push(Line::from(match view::usd_tag(bot.mkt_b.r0, pb.quote_usd) {
+                Some(tag) => {
+                    format!("{:<9}{} {}  {tag}", "Pooled", view::eth(bot.mkt_b.r0), pb.quote_sym)
+                }
+                None => format!("{:<9}{} {}", "Pooled", view::eth(bot.mkt_b.r0), pb.quote_sym),
+            }));
             mb.push(Line::from(format!("{:<9}{:.0} {}", "Pooled", bot.mkt_b.r1, pb.sym)));
             let gap = bot.arb_gap_pct();
             mb.push(Line::from(vec![
