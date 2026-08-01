@@ -390,8 +390,27 @@ fn build_row(
 }
 
 /// Seconds since a row's pool graduated (from the block delta at measure time).
+/// The newest head any round has seen. The clock every age is measured
+/// against.
+static LIVE_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_head(h: u64) {
+    LIVE_HEAD.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How old a launch is, against the LIVE head rather than the row's own.
+///
+/// `head_block` is stamped on a row when it is measured, and only some rows
+/// are re-measured each round. Reading age from it means a row refreshed two
+/// minutes ago reports the age it had two minutes ago — so a list sorted
+/// newest-first displays 1m, 1m, 2m, 1m, 2m, which looks like broken sorting
+/// and is actually every row telling the time from a different clock.
+///
+/// Same mistake as the row TTL had: a clock cannot live inside the thing it is
+/// timing. Falls back to the row's own stamp only before any head is known.
 fn age_secs(r: &Row) -> f64 {
-    r.head_block.saturating_sub(r.grad.launch_block) as f64 * SECS_PER_BLOCK
+    let head = LIVE_HEAD.load(std::sync::atomic::Ordering::Relaxed).max(r.head_block);
+    head.saturating_sub(r.grad.launch_block) as f64 * SECS_PER_BLOCK
 }
 
 // ---- Flaunch launch discovery ----
@@ -1273,6 +1292,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // `launch_stream`. Empty ws config makes this a no-op and the scan carries
     // on exactly as before.
     let stream = crate::launch_stream::spawn(
+        crate::chain_id(),
         crate::ws_pool(),
         vec![PONS_FACTORY, FLAUNCH_PM, PONS_V2_FACTORY],
         vec![
@@ -1280,7 +1300,6 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
             IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
         ],
-        stop.clone(),
     );
 
     while !stop.load(Ordering::Relaxed) {
@@ -1325,6 +1344,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // limits. While it rests, SKIP the scan and leave the cursor alone —
         // asking anyway is what kept it benched forever, and the unmoved
         // cursor means the skipped blocks are scanned the moment it is back.
+        note_head(head);
         // Whatever the socket pushed since the last round, FIRST — before the
         // scan, and regardless of whether the scan runs at all.
         //
@@ -1864,22 +1884,7 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // was never configured — both look like a list that stopped growing, and
     // only one of them is worth doing something about. Silence is the thing a
     // status light exists to break.
-    let (live, n) = crate::launch_stream::status();
-    let feed = if live {
-        // "live (5)" read as five live tokens, which is the one thing it does
-        // not mean — the list below is the tokens. This is the websocket: that
-        // it is connected, and how many launches it has pushed. Say both.
-        Span::styled(
-            format!("· websocket connected · {n} pushed "),
-            Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Good)),
-        )
-    } else {
-        Span::styled(
-            "· no websocket · polling only ",
-            Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Warn)),
-        )
-    };
-    Line::from(vec![Span::raw(" "), health_dot(), Span::raw(text), feed])
+    Line::from(vec![Span::raw(" "), health_dot(), Span::raw(text)])
 }
 
 /// Green answering, yellow refusing some, red nothing getting through.

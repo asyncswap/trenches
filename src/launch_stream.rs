@@ -36,7 +36,19 @@ use crate::lock;
 /// A global rather than a threaded parameter: the discovery title is drawn
 /// from three call sites that have no other reason to know a websocket exists,
 /// and passing one through all of them would be plumbing for a status light.
-static CURRENT: Mutex<Option<LaunchStream>> = Mutex::new(None);
+struct Live {
+    /// Which chain this subscription is watching. A stream pointed at the
+    /// chain you just left is worse than none: it delivers launches that
+    /// belong to a different list.
+    chain: u64,
+    stream: LaunchStream,
+    /// Owned here, not by the caller. The discovery SCREEN comes and goes; the
+    /// feed is meant to outlive it and end with the app or with a chain
+    /// switch, so its stop flag cannot belong to whoever happened to start it.
+    stop: Arc<AtomicBool>,
+}
+
+static CURRENT: Mutex<Option<Live>> = Mutex::new(None);
 
 /// Whether the feed is connected, and how many launches it has delivered.
 /// `(false, 0)` when there is no stream at all — unconfigured reads the same
@@ -44,7 +56,7 @@ static CURRENT: Mutex<Option<LaunchStream>> = Mutex::new(None);
 pub fn status() -> (bool, u64) {
     lock(&CURRENT)
         .as_ref()
-        .map(|s| (s.is_live(), s.delivered()))
+        .map(|l| (l.stream.is_live(), l.stream.delivered()))
         .unwrap_or((false, 0))
 }
 
@@ -92,13 +104,34 @@ impl LaunchStream {
 /// stays about the transport: what counts as a launch belongs with the
 /// decoders, in one place.
 pub fn spawn(
+    chain: u64,
     urls: Vec<String>,
     addresses: Vec<alloy::primitives::Address>,
     topics: Vec<alloy::primitives::B256>,
-    stop: Arc<AtomicBool>,
 ) -> LaunchStream {
+    // ONE subscription per chain, however many times this is called.
+    //
+    // The discovery task starts each time that screen opens, so this used to
+    // open a fresh socket on every visit while the previous one lived on.
+    // Providers count connections, so a few trips in and out of the screen was
+    // a few sockets against the same account — and the delivered counter
+    // restarting at zero was the visible half of it.
+    {
+        let mut cur = lock(&CURRENT);
+        match cur.as_ref() {
+            // Same chain: the existing feed is the feed.
+            Some(l) if l.chain == chain => return l.stream.clone(),
+            // Different chain: stop the old one before starting another, or
+            // switching chains would leave a socket behind on every switch.
+            Some(l) => l.stop.store(true, Ordering::Relaxed),
+            None => {}
+        }
+        *cur = None;
+    }
     let stream = LaunchStream::default();
-    *lock(&CURRENT) = Some(stream.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+    *lock(&CURRENT) =
+        Some(Live { chain, stream: stream.clone(), stop: stop.clone() });
     if urls.is_empty() {
         // Said once, plainly. Without a websocket the app still works — it
         // just falls back to the polled scan, which cannot promise it saw

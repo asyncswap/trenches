@@ -550,6 +550,21 @@ pub fn spawn_ui_watchdog() -> tokio::task::JoinHandle<()> {
 /// Delete all but the newest KEEP_LOGS of each per-session log family
 /// (`session-*.log`, `evm-trace-*.log`, `sol-trace-*.log`). The timestamps in
 /// the names sort lexically, so "newest" is a sort, not a stat.
+/// Delete this run's logs on the way out.
+///
+/// Nothing to prune, nothing to age out, nothing to configure: the logs exist
+/// for the session that is running, and the session is over.
+fn clear_logs() {
+    let Ok(dir) = std::fs::read_dir(state_dir()) else { return };
+    for e in dir.flatten() {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        if n.ends_with(".log") && ["session-", "evm-trace-", "sol-trace-"].iter().any(|f| n.starts_with(f)) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn prune_session_logs() {
     const KEEP_LOGS: usize = 20;
     let Ok(dir) = std::fs::read_dir(state_dir()) else { return };
@@ -1371,7 +1386,7 @@ async fn main() -> eyre::Result<()> {
     // so a slow or absent network delays nothing. It only ever reports.
     update::spawn_check();
     // Old per-session logs pile up forever otherwise — a state dir was found
-    // in the wild holding 500+ trace files. Keep the newest handful of each.
+    // Logs are cleared on exit, so this only catches what a crash left behind.
     prune_session_logs();
     // One watchdog for the whole process, not one per dashboard. A freeze in
     // the Solana app, in discovery, or in a picker used to go unrecorded
@@ -1439,6 +1454,9 @@ async fn main() -> eyre::Result<()> {
     disable_raw_mode()?;
     let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
     std::io::stdout().execute(LeaveAlternateScreen)?;
+    // Last thing, after the terminal is back: the logs were for the session
+    // that just ended.
+    clear_logs();
     res
 }
 
