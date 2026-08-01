@@ -346,7 +346,7 @@ fn build_row(
     token: Address,
     pool_addr: Address,
     block: u64,
-    f: &crate::token_metadata_eth::TokenMetadata,
+    f: &crate::token_metadata_chain_id::TokenMetadata,
     sqrt: f64,
     liq: f64,
     my_bal: f64,
@@ -496,7 +496,7 @@ fn fl_meta(token: Address, token_uri: &str) -> engine::TokenSocials {
     }
     // A restart keeps what an earlier session fetched: the metadata file holds
     // the metadata, so the IPFS gateway is asked once per token, ever.
-    if let Some(f) = crate::token_metadata_eth::get(token) {
+    if let Some(f) = crate::token_metadata_chain_id::get(token) {
         if !f.socials.is_empty() {
             if let Ok(mut cache) = fl_meta_cache().lock() {
                 cache.insert(token, f.socials.clone());
@@ -515,7 +515,7 @@ fn fl_meta(token: Address, token_uri: &str) -> engine::TokenSocials {
             let meta = engine::fetch_flaunch_meta(&uri).await;
             if !meta.is_empty() {
                 let m2 = meta.clone();
-                crate::token_metadata_eth::merge(token, move |f| f.socials = m2);
+                crate::token_metadata_chain_id::merge(token, move |f| f.socials = m2);
             }
             if let Ok(mut cache) = fl_meta_cache().lock() {
                 cache.insert(token, meta);
@@ -544,7 +544,7 @@ fn build_v2_row(
     my_bal: f64,
     head: u64,
 ) -> Row {
-    let f = crate::token_metadata_eth::get(c.token);
+    let f = crate::token_metadata_chain_id::get(c.token);
     let sym = f.as_ref().map(|f| f.sym.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| {
         format!("0x{}", &alloy::hex::encode(c.token.as_slice())[..6])
     });
@@ -558,7 +558,7 @@ fn build_v2_row(
             token: c.pair_token,
             // The QUOTE asset's decimals, not the launch token's. USDG is 6,
             // and reading a 6-dec reserve as 18 shows the price as 0.000000.
-            decimals: crate::token_metadata_eth::get(c.pair_token).and_then(|f| f.decimals).unwrap_or(18),
+            decimals: crate::token_metadata_chain_id::get(c.pair_token).and_then(|f| f.decimals).unwrap_or(18),
         }
     };
     let qd = quote.decimals() as i32;
@@ -591,7 +591,7 @@ fn build_v2_row(
 
 fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: usize, head: u64) -> Row {
     let socials = fl_meta(c.token, &c.token_uri);
-    let supply = crate::token_metadata_eth::get(c.token).map(|f| f.supply).unwrap_or(0.0);
+    let supply = crate::token_metadata_chain_id::get(c.token).map(|f| f.supply).unwrap_or(0.0);
     let grad = Grad {
         token: c.token,
         kind: engine::PoolKind::FlaunchV4 { pool_id: c.pool_id, coin_is_0: c.coin_is_0 },
@@ -1257,7 +1257,7 @@ const FACTS_PER_ROUND: usize = 4;
 ///   4. one batched `eth_call` for slot0/liquidity/balance of the rows that
 ///      are due a refresh,
 ///   5. immutable facts for tokens seen for the FIRST time (bounded, cached
-///      to disk by src/token_metadata_eth.rs, never asked again). Flaunch tokens carry
+///      to disk by src/token_metadata_chain_id.rs, never asked again). Flaunch tokens carry
 ///      symbol and metadata in the launch event itself, so only their total
 ///      supply ever needs a call.
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
@@ -1339,7 +1339,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         if from <= head && wide_ok {
             let (pons, fl, v2) = scan_launchpads(&provider, from, head).await;
             for c in pons {
-                crate::token_metadata_eth::record_launch(c.0, c.2);
+                crate::token_metadata_chain_id::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
                     known.push(c);
                 }
@@ -1446,9 +1446,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
                 break;
             }
-            let have = crate::token_metadata_eth::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0);
+            let have = crate::token_metadata_chain_id::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0);
             if !have {
-                crate::token_metadata_eth::ensure(&provider, *t, Some(*p)).await;
+                crate::token_metadata_chain_id::ensure(&provider, *t, Some(*p)).await;
                 fetched += 1;
             }
         }
@@ -1456,11 +1456,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
                 break;
             }
-            let have = crate::token_metadata_eth::get(c.token).is_some_and(|f| f.supply > 0.0);
+            let have = crate::token_metadata_chain_id::get(c.token).is_some_and(|f| f.supply > 0.0);
             if !have {
-                crate::token_metadata_eth::ensure_supply(&provider, c.token).await;
+                crate::token_metadata_chain_id::ensure_supply(&provider, c.token).await;
                 let (sym, block) = (c.sym.clone(), c.block);
-                crate::token_metadata_eth::merge(c.token, move |f| {
+                crate::token_metadata_chain_id::merge(c.token, move |f| {
                     if f.sym.is_empty() {
                         f.sym = sym;
                     }
@@ -1513,9 +1513,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // symbols come from the event; only the supply gates them.)
         due.retain(|d| match d {
             Due::Pons(t, _, _) => {
-                crate::token_metadata_eth::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
+                crate::token_metadata_chain_id::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
             }
-            Due::Fl(c) => crate::token_metadata_eth::get(c.token).is_some_and(|f| f.supply > 0.0),
+            Due::Fl(c) => crate::token_metadata_chain_id::get(c.token).is_some_and(|f| f.supply > 0.0),
             // A curve holds the whole supply, so its reserves ARE the numbers
             // worth showing — nothing to wait on.
             Due::V2(_) => true,
@@ -1604,7 +1604,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
             let row = match d {
                 Due::Pons(t, p, b) => {
-                    let Some(f) = crate::token_metadata_eth::get(*t) else { continue };
+                    let Some(f) = crate::token_metadata_chain_id::get(*t) else { continue };
                     let n = swap_count.get(&p.into_word()).copied().unwrap_or(0);
                     build_row(*t, *p, *b, &f, sqrt, liq, my_bal, n, head)
                 }
@@ -1915,7 +1915,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
                     let q = if v.quote.is_eth() {
                         "ETH".to_string()
                     } else {
-                        crate::token_metadata_eth::get(v.quote.addr())
+                        crate::token_metadata_chain_id::get(v.quote.addr())
                             .map(|f| f.sym)
                             .filter(|s| !s.is_empty())
                             .unwrap_or_else(|| "quote".to_string())
@@ -2350,7 +2350,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "source", "symbol", "pooled ETH", "mkt cap", "socials", "tx/sec", "age", "mine", "pool",
+        "", "source", "symbol", "pooled ETH", "mkt cap", "tx/sec", "age", "mine", "pool",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -2366,7 +2366,6 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
             let mine = if r.my_bal > 0.0 { "●" } else { "" };
             let active = r.tx_per_sec >= HOT_TX_PER_SEC;
             let fire = is_fire(r); // 🔥 only if active AND cap ≥ 4 ETH
-            let meta_full = r.grad.socials.score() >= 4;
             ratatui::widgets::Row::new(vec![
                 Cell::from(if fire { "🔥" } else { "" }),
                 Cell::from(venue_tag(&r.grad))
@@ -2374,8 +2373,6 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                 Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(format!("{:.4}", r.pooled_eth)),
                 Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
-                Cell::from(format!("{}/{}", r.grad.socials.score(), SOCIAL_FIELDS))
-                    .style(Style::default().fg(if meta_full { crate::ui::widgets::tone_color(crate::view::Tone::Good) } else { crate::ui::widgets::tone_color(crate::view::Tone::Normal) })),
                 Cell::from(format!("{:.2}", r.tx_per_sec))
                     .style(Style::default().fg(if active { crate::ui::widgets::tone_color(crate::view::Tone::Good) } else { crate::ui::widgets::tone_color(crate::view::Tone::Normal) })),
                 Cell::from(age),
@@ -2392,7 +2389,6 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
         Constraint::Length(12),
         Constraint::Length(11),
         Constraint::Length(11),
-        Constraint::Length(8),
         Constraint::Length(7),
         Constraint::Length(6),
         Constraint::Length(5),

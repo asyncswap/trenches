@@ -12,7 +12,7 @@ mod contracts;
 mod discover;
 mod engine;
 mod events;
-mod token_metadata_eth;
+mod token_metadata_chain_id;
 mod ledger;
 mod pnl;
 mod pricing;
@@ -80,7 +80,7 @@ struct SelPool {
 /// falls back to once the cache has nothing, and it is deliberately vague
 /// rather than confidently wrong.
 fn stable_symbol(addr: alloy::primitives::Address) -> String {
-    if let Some(f) = crate::token_metadata_eth::get(addr) {
+    if let Some(f) = crate::token_metadata_chain_id::get(addr) {
         if !f.sym.is_empty() {
             return f.sym;
         }
@@ -490,6 +490,21 @@ fn prune_session_logs() {
 /// should have to take.
 static SESSION_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// The chain this session signs on, for anything keyed per chain.
+///
+/// Set once, from the id the ENDPOINT reports, after that has been checked
+/// against the config — so a cache is never keyed by a chain the app only
+/// believed it was on.
+static CHAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_chain_id(id: u64) {
+    CHAIN_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn chain_id() -> u64 {
+    CHAIN_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_session_log(path: &str) {
     let name = std::path::Path::new(path)
         .file_name()
@@ -514,26 +529,6 @@ pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Read once from the OS. Orders are stamped in unix seconds — the only form
 /// that survives a restart and sorts correctly — but read back on the wall
 /// clock, because "was that me, ten minutes ago?" is a question about the room
-/// you were sitting in.
-fn tz_offset_secs() -> i64 {
-    use std::sync::OnceLock;
-    static OFF: OnceLock<i64> = OnceLock::new();
-    *OFF.get_or_init(|| {
-        std::process::Command::new("date")
-            .arg("+%z")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| {
-                let s = s.trim();
-                let sign = if s.starts_with('-') { -1 } else { 1 };
-                let h: i64 = s.get(1..3)?.parse().ok()?;
-                let m: i64 = s.get(3..5)?.parse().ok()?;
-                Some(sign * (h * 3600 + m * 60))
-            })
-            .unwrap_or(0)
-    })
-}
 
 pub fn trace(msg: &str) {
     use std::io::Write;
@@ -775,7 +770,7 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
         // The facts cache answers first — a coin picked from discovery (or
         // revisited) has its launch block and IPFS metadata on disk already,
         // so re-selecting it costs nothing.
-        if let Some(f) = token_metadata_eth::get(bot.pool.token) {
+        if let Some(f) = token_metadata_chain_id::get(bot.pool.token) {
             if f.launch_block.unwrap_or(0) > 0 && !f.socials.is_empty() {
                 bot.pool_launch_block = f.launch_block;
                 bot.socials = f.socials;
@@ -787,7 +782,7 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
                 bot.pool_launch_block = Some(fl.launch_block);
                 bot.socials = engine::fetch_flaunch_meta(&fl.token_uri).await;
                 let (meta, block) = (bot.socials.clone(), fl.launch_block);
-                token_metadata_eth::merge(bot.pool.token, move |f| {
+                token_metadata_chain_id::merge(bot.pool.token, move |f| {
                     if block > 0 {
                         f.launch_block = Some(block);
                     }
@@ -802,8 +797,8 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
             }
         }
     } else {
-        bot.socials = token_metadata_eth::ensure(provider, bot.pool.token, None).await.socials;
-        bot.pool_launch_block = token_metadata_eth::launch_block(provider, bot.pool.token).await;
+        bot.socials = token_metadata_chain_id::ensure(provider, bot.pool.token, None).await.socials;
+        bot.pool_launch_block = token_metadata_chain_id::launch_block(provider, bot.pool.token).await;
     }
 }
 
@@ -865,7 +860,7 @@ async fn refresh_token_decimals<P: Provider>(provider: &P, bot: &mut engine::Bot
     if bot.pool.token == alloy::primitives::Address::ZERO {
         return;
     }
-    match token_metadata_eth::decimals(provider, bot.pool.token).await {
+    match token_metadata_chain_id::decimals(provider, bot.pool.token).await {
         Some(d) => {
             if d != bot.pool.token_decimals {
                 bot.note(format!("{} uses {d} decimals", bot.pool.sym));
@@ -1904,10 +1899,15 @@ async fn app(
                 net.chain_id
             );
         }
-        Ok(_) => {}
+        Ok(live) => set_chain_id(live),
         // Unreachable is the RPC layer's problem to report and retry; it is
         // not evidence of a wrong chain, so it must not block the session.
-        Err(e) => trace(&format!("chain id check skipped: {e}")),
+        // The configured id is what everything else in this session is already
+        // working from, so key caches by it rather than by nothing.
+        Err(e) => {
+            trace(&format!("chain id check skipped: {e}"));
+            set_chain_id(net.chain_id);
+        }
     }
 
     // Per-session log in a .bot/ folder (created if missing).

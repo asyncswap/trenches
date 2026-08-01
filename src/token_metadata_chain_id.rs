@@ -68,27 +68,54 @@ impl TokenMetadata {
     }
 }
 
+/// Robinhood Chain mainnet. The one chain the legacy unkeyed file can have
+/// held, since it is the only one a production build has ever offered.
+const ROBINHOOD_MAINNET: u64 = 4663;
+
+/// One file per chain, because an address is only a token ON A CHAIN.
+///
+/// This used to be a single `tokenfacts-pons.json` for everything, on the
+/// reasoning that the metadata only ever came from Pons. That was true of
+/// where it came from and not of where it applied: mainnet is 4663, the
+/// testnet is 46630, and anvil is 31337, and the same address on two of them
+/// is two different tokens. Sharing one file let a testnet symbol, supply or
+/// decimals answer for a mainnet token — and on anvil, where addresses are
+/// deterministic, collisions are not a coincidence but the norm. Wrong
+/// decimals is not a cosmetic error; it is a trade sized by a factor of 1e12.
 fn path() -> String {
-    // Pons is Robinhood Chain's launchpad and this metadata only comes from
-    // there, so one file needs no chain key — same rule as the recents file.
-    //
-    // The FILENAME keeps the old word deliberately. Renaming it would orphan
-    // every cache already on disk and make the app re-interrogate the chain
-    // about every token it already knows — which is the exact traffic this
-    // module exists to prevent. A name is worth fixing; a name is not worth
-    // 150 tokens' worth of RPC on everyone's next launch.
-    format!("{}/tokenfacts-pons.json", crate::state_dir())
+    format!("{}/tokenmeta-{}.json", crate::state_dir(), crate::chain_id())
+}
+
+/// The pre-chain-id file. Read once, only on mainnet, only if the keyed file
+/// does not exist yet.
+///
+/// Migrating rather than orphaning: this cache exists to stop the app
+/// re-interrogating the chain about tokens it already knows, and dropping it
+/// for a rename would cost every user 150 tokens of RPC on their next launch.
+/// It is claimed for mainnet because that is the only chain a production build
+/// has ever offered, so that is the only chain it can be describing.
+fn legacy_path() -> Option<String> {
+    (crate::chain_id() == ROBINHOOD_MAINNET)
+        .then(|| format!("{}/tokenfacts-pons.json", crate::state_dir()))
 }
 
 fn store() -> &'static Mutex<HashMap<Address, TokenMetadata>> {
     static STORE: OnceLock<Mutex<HashMap<Address, TokenMetadata>>> = OnceLock::new();
     STORE.get_or_init(|| {
-        let map = std::fs::read_to_string(path())
-            .ok()
-            .and_then(|text| serde_json::from_str::<HashMap<Address, TokenMetadata>>(&text).ok())
+        let read = |p: String| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<HashMap<Address, TokenMetadata>>(&t).ok())
+        };
+        let map = read(path())
+            .or_else(|| legacy_path().and_then(read))
             .unwrap_or_default();
         if !map.is_empty() {
-            crate::trace(&format!("facts: loaded {} known tokens", map.len()));
+            crate::trace(&format!(
+                "token metadata: loaded {} known tokens for chain {}",
+                map.len(),
+                crate::chain_id()
+            ));
         }
         Mutex::new(map)
     })
