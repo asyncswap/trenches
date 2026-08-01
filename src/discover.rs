@@ -24,7 +24,8 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::{prelude::*, widgets::*};
 
 use crate::contracts::{
-    IERC20, IFlaunchPositionManager, IPonsFactory, IPonsV2Factory, IStateView, IV3Factory, IV3Pool,
+    IERC20, IFlaunchPositionManager, IPonsCurve, IPonsFactory, IPonsV2Factory, IStateView,
+    IV3Factory, IV3Pool,
     FLAUNCH_FEE_EST, FLAUNCH_PM, PONS_FACTORY, PONS_V2_FACTORY, POOL_MANAGER, STATE_VIEW,
     V3_FACTORY, WETH,
 };
@@ -254,7 +255,7 @@ async fn scan_launchpads<P: Provider>(
     provider: &P,
     from: u64,
     to: u64,
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>) {
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>) {
     let mut logs = Vec::new();
     let (from, chunk) = clamp_scan("launch scan", from, to, LOG_CHUNK);
     let mut start = from;
@@ -322,17 +323,8 @@ async fn scan_launchpads<P: Provider>(
             }
         }
     }
-    // Not routed anywhere yet — a v2 launch trades on a CURVE until it
-    // graduates, which is a venue the engine does not have. Seeing them is the
-    // first half; trading them is the second.
     if !v2.is_empty() {
         crate::trace(&format!("launch scan: {} pons v2 launch(es)", v2.len()));
-        for c in &v2 {
-            crate::trace(&format!(
-                "  pons v2 {:#x} curve {:#x} pair {:#x} threshold {}",
-                c.token, c.curve, c.pair_token, c.threshold
-            ));
-        }
     }
     crate::trace(&format!(
         "launch scan {from}..{to}: {ok} chunks ok, {failed} failed, {} pons + {} flaunch",
@@ -343,7 +335,7 @@ async fn scan_launchpads<P: Provider>(
     pons.truncate(MAX_SCAN);
     fl.sort_by(|a, b| b.block.cmp(&a.block));
     fl.truncate(MAX_SCAN);
-    (pons, fl)
+    (pons, fl, v2)
 }
 
 /// One row from cached facts + batch-read metrics. No RPC of its own: the
@@ -537,6 +529,66 @@ fn fl_meta(token: Address, token_uri: &str) -> engine::Meta {
 /// batched StateView reads, swap count from the shared tape, supply from the
 /// facts cache, symbol/meta from the launch event. No RPC of its own — the
 /// same contract `build_row` has for Pons rows.
+/// A row for a pons v2 launch still on its bonding curve.
+///
+/// `quote_reserve` includes the PHANTOM balance that sets the opening price, so
+/// it is the right number for price and the wrong one for depth. `raised` is
+/// what the curve actually holds, and that is what goes in the pooled column —
+/// otherwise every launch would look better funded than it is, by exactly the
+/// amount nobody deposited.
+fn build_v2_row(
+    c: &PonsV2Cand,
+    quote_reserve: f64,
+    token_reserve: f64,
+    raised: f64,
+    my_bal: f64,
+    head: u64,
+) -> Row {
+    let f = crate::facts::get(c.token);
+    let sym = f.as_ref().map(|f| f.sym.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        format!("0x{}", &alloy::hex::encode(c.token.as_slice())[..6])
+    });
+    let supply = f.as_ref().map(|f| f.supply).unwrap_or(0.0);
+    // Native quote is 18-dec like ETH; an ERC-20 quote carries its own, and
+    // the launch is priced in THAT asset rather than in ETH.
+    let quote = if c.pair_token == Address::ZERO {
+        engine::Quote::Eth
+    } else {
+        engine::Quote::Stable {
+            token: c.pair_token,
+            // The QUOTE asset's decimals, not the launch token's. USDG is 6,
+            // and reading a 6-dec reserve as 18 shows the price as 0.000000.
+            decimals: crate::facts::get(c.pair_token).and_then(|f| f.decimals).unwrap_or(18),
+        }
+    };
+    let qd = quote.decimals() as i32;
+    let pooled = raised / 10f64.powi(qd);
+    // Price is the reserve ratio, both sides in their own decimals.
+    let q = quote_reserve / 10f64.powi(qd);
+    let t = token_reserve / 1e18;
+    let quote_per_token = if t > 0.0 { q / t } else { 0.0 };
+    let grad = Grad {
+        token: c.token,
+        kind: engine::PoolKind::PonsCurve { curve: c.curve, quote: c.pair_token },
+        quote,
+        sym,
+        // The curve's own fee, read per launch when one is opened. Zero here
+        // means "not known yet", not "free".
+        fee: 0,
+        launch_block: c.block,
+        meta: engine::Meta::default(),
+    };
+    Row {
+        grad,
+        pooled_eth: pooled,
+        mkt_cap_eth: supply * quote_per_token,
+        tx_per_sec: 0.0,
+        my_bal,
+        head_block: head,
+        verified: false,
+    }
+}
+
 fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: usize, head: u64) -> Row {
     let meta = fl_meta(c.token, &c.token_uri);
     let supply = crate::facts::get(c.token).map(|f| f.supply).unwrap_or(0.0);
@@ -1226,6 +1278,10 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let mut known: Vec<(Address, Address, u64)> = load_recents();
     // Flaunch launches ride the same incremental window, in their own list.
     let mut known_fl: Vec<FlCand> = load_flaunch_recents();
+    // pons v2 launches still on their curve. Not persisted: a curve is a
+    // TRANSIENT state — it graduates into a pool and the entry stops being
+    // true — so a saved one would come back as a venue that no longer exists.
+    let mut known_v2: Vec<PonsV2Cand> = Vec::new();
     // The rolling swap tape: (block, pool key) per swap, across every
     // candidate pool at once, trimmed to the activity window. Feeds tx/sec.
     // Keyed by B256 so v3 pools (address, widened) and Flaunch pools (pool
@@ -1281,7 +1337,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // cursor means the skipped blocks are scanned the moment it is back.
         let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
         if from <= head && wide_ok {
-            let (pons, fl) = scan_launchpads(&provider, from, head).await;
+            let (pons, fl, v2) = scan_launchpads(&provider, from, head).await;
             for c in pons {
                 crate::facts::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
@@ -1291,6 +1347,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             for c in fl {
                 if !known_fl.iter().any(|k| k.token == c.token) {
                     known_fl.push(c);
+                }
+            }
+            for c in v2 {
+                if !known_v2.iter().any(|k| k.token == c.token) {
+                    known_v2.push(c);
                 }
             }
             scanned_to = Some(head);
@@ -1309,6 +1370,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known_fl.sort_by(|a, b| b.block.cmp(&a.block));
         known_fl.truncate(RECENTS_MAX);
         save_flaunch_recents(&known_fl);
+        known_v2.sort_by(|a, b| b.block.cmp(&a.block));
+        known_v2.truncate(RECENTS_MAX);
 
         // The swap tape, incrementally: one getLogs over every v3 candidate
         // pool at once, and one over the PoolManager filtered to every Flaunch
@@ -1419,6 +1482,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         enum Due {
             Pons(Address, Address, u64),
             Fl(FlCand),
+            /// A pons v2 launch on its curve. Refreshed by reading the curve
+            /// itself — there is no pool to read.
+            V2(PonsV2Cand),
         }
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1429,6 +1495,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         let mut due: Vec<Due> =
             known.iter().take(MAX_SCAN).map(|(t, p, b)| Due::Pons(*t, *p, *b)).collect();
         due.extend(fl_live.iter().take(MAX_SCAN).cloned().map(Due::Fl));
+        due.extend(known_v2.iter().take(MAX_SCAN).copied().map(Due::V2));
         let tail: Vec<Due> = known
             .iter()
             .skip(MAX_SCAN)
@@ -1449,6 +1516,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 crate::facts::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
             }
             Due::Fl(c) => crate::facts::get(c.token).is_some_and(|f| f.supply > 0.0),
+            // A curve holds the whole supply, so its reserves ARE the numbers
+            // worth showing — nothing to wait on.
+            Due::V2(_) => true,
         });
 
         // One batched eth_call for the whole refresh set: slot0 + liquidity
@@ -1470,6 +1540,16 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 Due::Fl(c) => {
                     calls.push((STATE_VIEW, IStateView::getSlot0Call { poolId: c.pool_id }.abi_encode()));
                     calls.push((STATE_VIEW, IStateView::getLiquidityCall { poolId: c.pool_id }.abi_encode()));
+                    if with_bal {
+                        calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
+                    }
+                }
+                // A curve answers for itself. Two reads fill the same two
+                // metric slots a pool uses: its reserves (price) and what it
+                // has actually raised (depth, and progress to graduation).
+                Due::V2(c) => {
+                    calls.push((c.curve, IPonsCurve::getReservesCall {}.abi_encode()));
+                    calls.push((c.curve, IPonsCurve::realQuoteReserveCall {}.abi_encode()));
                     if with_bal {
                         calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
                     }
@@ -1531,6 +1611,20 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 Due::Fl(c) => {
                     let n = swap_count.get(&c.pool_id).copied().unwrap_or(0);
                     build_fl_row(c, sqrt, liq, my_bal, n, head)
+                }
+                // The generic slots hold single numbers; a curve's first read
+                // returns TWO, so it is decoded from the raw response here
+                // rather than through the pool-shaped path above.
+                Due::V2(c) => {
+                    let raw = res.get(i * per).and_then(|o| o.as_ref());
+                    let (qr, tr) = match raw {
+                        Some(d) if d.len() >= 64 => (
+                            uf(U256::from_be_slice(&d[..32])),
+                            uf(U256::from_be_slice(&d[32..64])),
+                        ),
+                        _ => continue,
+                    };
+                    build_v2_row(c, qr, tr, liq, my_bal, head)
                 }
             };
             let mut cur = shared.lock().unwrap();

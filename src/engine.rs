@@ -1560,6 +1560,40 @@ impl Bot {
             }
         }
 
+        // A curve buy priced in an ERC-20 needs that asset approved TO THE
+        // CURVE — the curve pulls it, and there is no router and no Permit2 in
+        // the path. Without it the buy reverts inside transferFrom, which reads
+        // as the launch refusing the trade rather than as a missing approval.
+        if buying {
+            if let PoolKind::PonsCurve { curve, quote } = self.pool.kind {
+                if quote != Address::ZERO {
+                    let need = U256::from(Wei::rounded(amount_in).raw());
+                    let erc = IERC20::new(quote, provider);
+                    let have = erc
+                        .allowance(self.trader, curve)
+                        .call()
+                        .await
+                        .map(|a| a._0)
+                        .unwrap_or(U256::ZERO);
+                    if have < need {
+                        self.note("Approving the quote asset for this launch's curve".into());
+                        let nonce = self.take_nonce(provider).await?;
+                        // EXACT amount, like every other approval here. A curve
+                        // is a per-launch contract, which is the last place to
+                        // hand out an unlimited allowance.
+                        let sent = erc.approve(curve, need).gas(120_000).nonce(nonce).send().await;
+                        let hash = *self.spent_nonce(sent)?.tx_hash();
+                        for _ in 0..8u32 {
+                            if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+            }
+        }
+
         // Best-execution routing: simulate this trade on every candidate venue
         // and take the one that nets the most (fee tiers + depth + hook take).
         let (route, expected) = match self.best_venue(provider, amount_in, buying).await {
