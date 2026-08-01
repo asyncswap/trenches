@@ -395,6 +395,32 @@ pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Seconds east of UTC for the local timezone.
+///
+/// Read once from the OS. Orders are stamped in unix seconds — the only form
+/// that survives a restart and sorts correctly — but read back on the wall
+/// clock, because "was that me, ten minutes ago?" is a question about the room
+/// you were sitting in.
+fn tz_offset_secs() -> i64 {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<i64> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let s = s.trim();
+                let sign = if s.starts_with('-') { -1 } else { 1 };
+                let h: i64 = s.get(1..3)?.parse().ok()?;
+                let m: i64 = s.get(3..5)?.parse().ok()?;
+                Some(sign * (h * 3600 + m * 60))
+            })
+            .unwrap_or(0)
+    })
+}
+
 pub fn trace(msg: &str) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
@@ -3935,8 +3961,21 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 bot.pool.kind,
                 engine::PoolKind::V4 { .. } | engine::PoolKind::FlaunchV4 { .. }
             );
-            let shown: Vec<&engine::Swap> =
-                tape.iter().filter(|s| bot.arb_mode || s.is_v4 == pool_is_v4).collect();
+            // One row per TRANSACTION, whatever the log stream did.
+            //
+            // Belt and braces over the placeholder fix: a confirmed order is
+            // injected before its log arrives, and a swap can also be seen
+            // twice across an overlapping scan window. Either way the same
+            // trade rendering twice reads as two trades — which is exactly the
+            // shape that makes someone check whether their key has leaked.
+            // The tape is a record you make decisions from; it must not
+            // invent activity.
+            let mut seen_tx = std::collections::HashSet::new();
+            let shown: Vec<&engine::Swap> = tape
+                .iter()
+                .filter(|s| bot.arb_mode || s.is_v4 == pool_is_v4)
+                .filter(|s| seen_tx.insert(s.tx))
+                .collect();
             let scroll = orders_scroll.min(shown.len().saturating_sub(1));
             let mut t = view::TableView::new(
                 format!(" Trades ({}) ⭐ = you ", shown.len()),
@@ -4049,6 +4088,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         let mut t = view::TableView::new(
             title,
             vec![
+                // WHEN, first. This list is the record of what this bot sent,
+                // and the first question anyone asks of it is "was that me,
+                // just now?" — which is a time question.
+                view::Col::fixed("time", 9),
                 view::Col::fixed("status", 9),
                 view::Col::fixed("pool", 4),
                 // Orders carry full labels — "SELL ALL", "REMOVE LP #505",
@@ -4080,7 +4123,20 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 _ => view::Tone::Normal,
             };
             let (venue, vtone) = if o.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
+            // Local wall clock, because the question this answers is "was I at
+            // the keyboard then?" — and that is asked in the time on the wall,
+            // not in UTC or in blocks.
+            let when = if o.at > 0 {
+                let secs = (o.at % 86_400) as i64;
+                let local = (secs + tz_offset_secs()).rem_euclid(86_400);
+                format!("{:02}:{:02}:{:02}", local / 3600, (local % 3600) / 60, local % 60)
+            } else {
+                // Written before orders carried a time. Say so rather than
+                // showing a plausible-looking zero.
+                "—".to_string()
+            };
             t.push(vec![
+                view::Cell::toned(when, view::Tone::Dim),
                 view::Cell::bold(st, stone),
                 view::Cell::bold(venue, vtone),
                 view::Cell::bold(action, atone),

@@ -56,6 +56,17 @@ pub struct Order {
     /// The token this order traded — so a confirmed order can be matched to
     /// (or injected into) the CURRENT pool's tape, and never someone else's.
     pub token: Address,
+    /// Unix seconds when THIS bot sent it.
+    ///
+    /// The audit trail. Every order in this list was signed and broadcast by
+    /// this process on a keypress — nothing here trades on its own — so a
+    /// timestamp turns "did I do that?" into a question the record answers.
+    /// A transaction from your address that is NOT in this file, at a time you
+    /// were not at the keyboard, is the thing worth alarm.
+    ///
+    /// Defaulted for orders written before this field existed.
+    #[serde(default)]
+    pub at: u64,
 }
 
 /// Protocol-specific pool identity. A v4 pool is identified by its pool id +
@@ -952,7 +963,17 @@ impl Bot {
         if let Some(h) = hash {
             self.remember_own_tx(h);
         }
-        self.orders.push_back(Order { label, status, hash, mc, pooled: self.r0, eth, is_v4, token: self.pool.token });
+        self.orders.push_back(Order {
+            label,
+            status,
+            hash,
+            mc,
+            pooled: self.r0,
+            eth,
+            is_v4,
+            token: self.pool.token,
+            at: crate::ledger::now(),
+        });
         while self.orders.len() > 200 {
             self.orders.pop_front();
         }
