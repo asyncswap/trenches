@@ -2114,6 +2114,8 @@ async fn app(
         v3_covered: false,
         own_txs: engine::Bot::load_own_txs(trader),
         drain_watch: Vec::new(),
+        last_telemetry: None,
+        last_telemetry_at: None,
         bought_gas: 0.0,
         gas_burned: 0.0,
         buy_step_override: load_sizing().buy_step,

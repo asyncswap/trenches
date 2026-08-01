@@ -465,6 +465,10 @@ pub struct Bot {
     /// money. Kept apart from any position's basis because it belongs to none.
     /// Gas spent acquiring the position currently open, so a sell can report
     /// what the whole round trip cost rather than only its own half.
+    /// The last state line written, and when — so an unchanged one is not
+    /// written again. See `telemetry`.
+    pub last_telemetry: Option<String>,
+    pub last_telemetry_at: Option<Instant>,
     pub bought_gas: f64,
     pub gas_burned: f64,
     pub acting_key: String,
@@ -947,10 +951,49 @@ impl Bot {
 
     /// Write a machine-parseable telemetry line to the session log, so a
     /// running session can be monitored live (`tail -f .bot/session-*.log`).
+    /// Write the session's state line — but only when it says something new.
+    ///
+    /// This used to run every two seconds regardless. At 170 bytes a line that
+    /// is 7 MB a day, and on a quiet pool nearly all of it was the same numbers
+    /// with a different block number on the front — a log you cannot read
+    /// because the signal is buried in its own heartbeat.
+    ///
+    /// Not deleted, though. This is the line that showed a pool's liquidity
+    /// falling from 4.7 ETH to 1.4 while the skip counter climbed, which is how
+    /// a session that "just stopped working" became a diagnosis. What is worth
+    /// dropping is the repetition, not the record.
+    ///
+    /// So: written when a material field changes, and otherwise at most once
+    /// every five minutes. The heartbeat matters — a log that goes silent
+    /// because nothing changed looks exactly like a log that went silent
+    /// because the app died.
     pub fn telemetry(&mut self, block: u64, round_ms: f64) {
         // Once a window, not once a call: a rate is not something anyone can
         // see by watching individual calls scroll past.
         crate::rpcstats::maybe_report();
+        // Block and round_ms are deliberately NOT in the signature: they change
+        // every single call, so including them would make every line "new" and
+        // the check pointless.
+        let sig = format!(
+            "{:.8}|{:.6}|{:.6}|{:.4}|{:+.6}|{}|{}|{}|{}",
+            self.price(),
+            self.r0,
+            self.eth,
+            self.token_bal,
+            self.pnl(),
+            self.trades,
+            self.fails,
+            self.skips,
+            self.pending.len(),
+        );
+        let stale = self
+            .last_telemetry_at
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(300));
+        if self.last_telemetry.as_deref() == Some(sig.as_str()) && !stale {
+            return;
+        }
+        self.last_telemetry = Some(sig);
+        self.last_telemetry_at = Some(Instant::now());
         self.logline(&format!(
             "TELEMETRY block={} price={:.8} liq_eth={:.6} eth={:.6} {}={:.4} pnl={:+.6} trades={} fails={} skips={} pending={} round_ms={:.1}",
             block,
