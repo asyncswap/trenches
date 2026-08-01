@@ -4457,8 +4457,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                             )
                         }
                         // Orientation unknown for this venue: the raw ticks are
-                        // still true, and true beats a converted guess.
-                        _ => format!("tick [{}, {}]", s.tick_lo, s.tick_hi),
+                        // still true, and true beats a converted guess. No
+                        // "tick" prefix — the bounds carry a `$` when they are
+                        // prices, so the absence of one already says these are
+                        // not, and the word was spending five columns to
+                        // repeat what the numbers show.
+                        _ => format!("[{}, {}]", s.tick_lo, s.tick_hi),
                     }
                 } else if s.price > 0.0 && bot.pool.quote_usd > 0.0 {
                     // `price` is tokens per unit of quote, so the price OF a
