@@ -44,7 +44,6 @@ const CONCURRENCY: usize = 12; // in-flight RPC cap
 const RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const SOCIAL_FIELDS: u8 = 7; // logo, description, twitter, telegram, discord, website, farcaster
 const HOT_TX_PER_SEC: f64 = 1.0; // threshold for the 🔥 (active) marker + top-of-list
-const DISPLAY_MAX: usize = 10; // explore list shows only the top N (by rank)
 const HOT_MKTCAP_ETH: f64 = 5.0; // 🔥 fire needs cap ≥ this (and < 1 min old); bumped to top
 const MIN_MKTCAP_ETH: f64 = 2.0; // Discovery hides pools below this market cap
 
@@ -1767,7 +1766,12 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
         let rows = {
             let mut r = shared.lock().unwrap().clone();
             r.retain(|row| row.mkt_cap_eth >= MIN_MKTCAP_ETH); // hide anything under the min cap
-            r.truncate(DISPLAY_MAX); // keep the explore list short — top N by rank
+            // NOT truncated, and deliberately not sized to a screen either.
+            // The list was capped at ten while the pane had room for fifty, so
+            // a four-minute-old launch was already unreachable on the one
+            // screen whose job is showing what launched. Terminals differ; the
+            // table is stateful, so it shows what fits and scrolls for the
+            // rest, and the cap was the only thing stopping it.
             r
         };
         if rows.is_empty() {
@@ -1806,6 +1810,12 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
             }
             if let Event::Key(k) = evt {
                 match k.code {
+                    // A launchpad producing one a minute outgrows what j/k
+                    // can cross a row at a time.
+                    KeyCode::PageUp => sel = sel.saturating_sub(10),
+                    KeyCode::PageDown => sel = (sel + 10).min(rows.len().saturating_sub(1)),
+                    KeyCode::Home => sel = 0,
+                    KeyCode::End => sel = rows.len().saturating_sub(1),
                     KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
                     KeyCode::Down | KeyCode::Char('j') => {
                         if !rows.is_empty() {
@@ -2495,7 +2505,19 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
         .column_spacing(1)
         // Fixed-width count: a title that grows from "(1)" to "(12)" shifts
         // every word after it, so the header appears to jitter as launches land.
-        .block(crate::ui::widgets::themed_block_line(trenches_title(rows.len())));
+        .block(
+            crate::ui::widgets::themed_block_line(trenches_title(rows.len())).title_bottom(
+                // Where you are in a list that no longer fits. Bottom border,
+                // not the header: the header is fixed text, and a counter that
+                // ticks up there moves every word after it.
+                Line::from(format!(
+                    " {}/{}  ↑↓ jk · PgUp/PgDn · Home/End ",
+                    (sel + 1).min(rows.len().max(1)),
+                    rows.len()
+                ))
+                .right_aligned(),
+            ),
+        );
     f.render_stateful_widget(table, chunks[0], state);
 
     // Details box for the selected pool — the actual X / telegram / website.
