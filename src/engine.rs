@@ -390,6 +390,14 @@ pub struct Bot {
     /// survives a restart instead of living and dying with the order list.
     pub own_txs: std::collections::HashSet<TxHash>,
     /// The key currently being acted on, stamped onto any order it produces.
+    /// How much one press of `[` or `]` moves the buy size, when you have said.
+    ///
+    /// `None` means the app picks — finer on a bigger wallet, since the step is
+    /// a fraction of the balance and a fixed one gets coarser in real money the
+    /// more you hold. `;` and `'` set it, and once set it stays: a default that
+    /// is chosen for you is a convenience, a default that keeps overriding you
+    /// is a fault.
+    pub buy_step_override: Option<f64>,
     pub acting_key: String,
     /// Buys waiting to be re-checked for a drain. See [`Bot::watch_for_drain`].
     pub drain_watch: Vec<DrainWatch>,

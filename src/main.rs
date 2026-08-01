@@ -175,10 +175,47 @@ fn load_last_wallet() -> Option<String> {
 /// different thing every session, and a size control has to be predictable
 /// before it is clever.
 fn buy_step(bot: &engine::Bot) -> f64 {
+    if let Some(s) = bot.buy_step_override {
+        return s; // you said; that settles it
+    }
     let wallet_usd = bot.eth * bot.eth_usd;
     // With no USD feed there is nothing to judge "large" against; keep the
     // step that has always been there rather than guessing from raw ETH.
     if wallet_usd >= 1_000.0 { 0.001 } else { 0.005 }
+}
+
+/// The steps `;` and `'` move between, coarsest last.
+///
+/// A ladder rather than a multiplier: every rung is a number people already
+/// think in, and doubling from 0.5% would land on 0.8% and 1.6%, which nobody
+/// has ever wanted a trade size to be.
+const BUY_STEPS: [f64; 5] = [0.0001, 0.001, 0.005, 0.01, 0.05];
+
+/// Move the buy-size step one rung, and remember that you chose.
+fn nudge_buy_step(bot: &mut engine::Bot, coarser: bool) {
+    let now = buy_step(bot);
+    // Start from the rung nearest what is in effect, so the first press moves
+    // from where you are rather than from where the ladder happens to begin.
+    let i = BUY_STEPS
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            (a.1 - now).abs().partial_cmp(&(b.1 - now).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(2);
+    let next = if coarser {
+        (i + 1).min(BUY_STEPS.len() - 1)
+    } else {
+        i.saturating_sub(1)
+    };
+    bot.buy_step_override = Some(BUY_STEPS[next]);
+    // A finer step is pointless if the size cannot sit on it, and a coarser one
+    // must not leave the size off its own grid.
+    let step = BUY_STEPS[next];
+    bot.buy_frac = ((bot.buy_frac / step).round() * step).clamp(step, 1.0);
+    let msg = buy_size_status(bot);
+    setting(bot, "Buy step", pct_compact(step), msg);
 }
 
 /// A percentage with as few decimals as it needs: `5%`, `0.5%`, `0.1%`.
@@ -218,10 +255,11 @@ fn buy_size_status(bot: &engine::Bot) -> String {
     let usd = stake * bot.eth_usd;
     if bot.eth > 0.0 && bot.eth_usd > 0.0 {
         format!(
-            "Buy size {} \u{2248} {} ETH ({})",
+            "Buy size {} \u{2248} {} ETH ({}) \u{b7} [ ] move by {}",
             pct_compact(bot.buy_frac),
             view::eth(stake),
-            view::usd_compact(usd)
+            view::usd_compact(usd),
+            pct_compact(buy_step(bot))
         )
     } else if bot.eth > 0.0 {
         format!("Buy size {} \u{2248} {} ETH", pct_compact(bot.buy_frac), view::eth(stake))
@@ -1962,6 +2000,7 @@ async fn app(
         v3_covered: false,
         own_txs: engine::Bot::load_own_txs(trader),
         drain_watch: Vec::new(),
+        buy_step_override: None,
         acting_key: String::new(),
         ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
@@ -2977,6 +3016,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let msg = buy_size_status(bot);
                             setting(bot, "Buy size", pct_compact(bot.buy_frac), msg);
                         }
+                        // `;` finer, `'` coarser — adjacent keys for the two
+                        // directions of one setting, the way [ ] and ( ) pair.
+                        // The wallet-size default is a starting point, not a
+                        // rule: past a few thousand dollars 0.5% is a big jump,
+                        // but 0.1% is a lot of presses to cross a whole percent.
+                        KeyCode::Char(';') => nudge_buy_step(bot, false),
+                        KeyCode::Char('\'') => nudge_buy_step(bot, true),
                         KeyCode::Char('[') => {
                             let step = buy_step(bot);
                             bot.buy_frac = (((bot.buy_frac / step).round() - 1.0) * step).max(step);
@@ -4465,7 +4511,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 34] = [
+        let items: [(&str, &str); 35] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
@@ -4492,6 +4538,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "L|PnL calendar"),
             ("SIZE", ""),
             ("", "[  ]|buy size −/+"),
+            ("", ";  '|buy step finer/coarser"),
             ("", "(  )|sell size −/+"),
             ("", "{  }  0|slippage −/+"),
             ("MODE", ""),
