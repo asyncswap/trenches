@@ -812,6 +812,20 @@ impl Bot {
                 }
             }
             Side::Sell => {
+                // The allowance is GONE. Both routers are granted an exact
+                // amount, and this swap just spent it — so a flag saying "the
+                // router can pull this token" stopped being true the moment
+                // the transfer went through.
+                //
+                // It used to survive, because it was only ever cleared when the
+                // pool changed. That made the next sell skip the allowance
+                // check entirely and send a transaction the router could not
+                // fulfil: `STF`, SafeTransferFrom, over and over, on a wallet
+                // holding 163,373 tokens with two-millionths of one approved.
+                // No slippage or impact setting can fix a missing approval,
+                // which is why nothing the trader tried made any difference.
+                self.v3_covered = false;
+                self.ur_permit2_done = false;
                 // Proceeds are what you KEEP: the ETH out of the pool less the
                 // gas it cost to get it out.
                 let eth = eth - gas;
@@ -2032,7 +2046,23 @@ fn order_fields(o: &Order) -> Vec<String> {
         if let Err(e) = provider.call(&tx).await {
             self.skips += 1;
             self.push_order(label, OrderStatus::Skipped, None);
-            self.note(format!("Skipped the {} because it would revert. {}", side_str(side).to_lowercase(), short_err(&e.to_string())));
+            // An allowance failure is not "this token is broken", and saying
+            // so in ABI hex helped nobody: the trader spent that session
+            // changing slippage and impact settings, none of which can approve
+            // a token. Name it, and clear the flag so the next attempt
+            // re-approves instead of repeating the same doomed send.
+            let msg = e.to_string();
+            if is_transfer_failure(&msg) {
+                self.v3_covered = false;
+                self.ur_permit2_done = false;
+                self.note(format!(
+                    "The router's spending allowance for {} is used up, so the transfer was refused (STF). \
+                     Approving again — try the {} once more in a moment. This is not the token blocking you.",
+                    self.pool.sym, side_str(side).to_lowercase()
+                ));
+            } else {
+                self.note(format!("Skipped the {} because it would revert. {}", side_str(side).to_lowercase(), short_err(&msg)));
+            }
             return Ok(());
         }
 
@@ -2870,7 +2900,23 @@ fn order_fields(o: &Order) -> Vec<String> {
         if let Err(e) = provider.call(&tx).await {
             self.skips += 1;
             self.push_order(label, OrderStatus::Skipped, None);
-            self.note(format!("Skipped selling everything because it would revert. {}", short_err(&e.to_string())));
+            // An allowance failure is not "this token is broken", and saying
+            // so in ABI hex helped nobody: the trader spent that session
+            // changing slippage and impact settings, none of which can approve
+            // a token. Name it, and clear the flag so the next attempt
+            // re-approves instead of repeating the same doomed send.
+            let msg = e.to_string();
+            if is_transfer_failure(&msg) {
+                self.v3_covered = false;
+                self.ur_permit2_done = false;
+                self.note(format!(
+                    "The router's spending allowance for {} is used up, so the transfer was refused (STF). \
+                     Approving again — try the {} once more in a moment. This is not the token blocking you.",
+                    self.pool.sym, "sell"
+                ));
+            } else {
+                self.note(format!("Skipped the {} because it would revert. {}", "sell", short_err(&msg)));
+            }
             return Ok(());
         }
         let nonce = match self.take_nonce(provider).await {
@@ -2940,6 +2986,19 @@ fn order_fields(o: &Order) -> Vec<String> {
 
 /// Compress a multi-line RPC/revert error to a single readable line for the
 /// status bar (the full text is always in the log ring / session file).
+/// Whether a revert is the router failing to move the token.
+///
+/// `STF` and `TF` are Uniswap's `TransferHelper` reverts — SafeTransferFrom and
+/// SafeTransfer. They arrive as a bare three-character string inside an ABI
+/// blob, which tells a trader nothing, and the overwhelmingly common cause is
+/// an allowance that no longer covers the trade rather than anything wrong with
+/// the token.
+fn is_transfer_failure(e: &str) -> bool {
+    // Match the revert STRING, not the hex — the payload contains plenty of
+    // other characters and "TF" would hit almost anything.
+    e.contains("execution reverted: STF") || e.contains("execution reverted: TF")
+}
+
 fn short_err(e: &str) -> String {
     let one: String = e.split('\n').next().unwrap_or(e).trim().to_string();
     if one.chars().count() <= 160 {
@@ -4326,5 +4385,43 @@ mod pons_v2_pool_tests {
             erc20, TOKEN, 0, true, Wei::exact(U256::from(1_000u64)), Wei::ZERO, TOKEN,
         );
         assert_eq!(v, U256::ZERO, "an ERC-20 quote is pulled, not sent");
+    }
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::is_transfer_failure;
+
+    /// The exact string the RPC returned while a wallet holding 163,373 tokens
+    /// could not sell any of them.
+    #[test]
+    fn the_routers_transfer_reverts_are_recognised() {
+        let stf = "server returned an error response: error code 3: execution reverted: STF, data: \"0x08c379a0…\"";
+        let tf = "server returned an error response: error code 3: execution reverted: TF, data: \"0x08c379a0…\"";
+        assert!(is_transfer_failure(stf));
+        assert!(is_transfer_failure(tf));
+    }
+
+    /// Other reverts must keep their own diagnosis — telling somebody their
+    /// allowance ran out when the pool simply had no liquidity would send them
+    /// looking in the wrong place, which is the failure being fixed here.
+    #[test]
+    fn other_reverts_are_left_alone() {
+        for other in [
+            "execution reverted: Too little received",
+            "execution reverted: STP",
+            "execution reverted: LOK",
+            "server returned an error response: error code 3: execution reverted",
+        ] {
+            assert!(!is_transfer_failure(other), "{other} is not an allowance failure");
+        }
+    }
+
+    /// The payload of ANY revert is hex that contains stray letters; matching
+    /// on the bare token would flag everything.
+    #[test]
+    fn the_hex_payload_does_not_trigger_it() {
+        let unrelated = "execution reverted: Too little received, data: \"0x08c379a0STF00TF\"";
+        assert!(!is_transfer_failure(unrelated));
     }
 }
