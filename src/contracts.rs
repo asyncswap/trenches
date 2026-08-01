@@ -13,6 +13,23 @@ pub const STATE_VIEW: Address = address!("f3334192d15450cdd385c8b70e03f9a6bd9e67
 pub const UNIVERSAL_ROUTER: Address = address!("8876789976dEcBfCbBbe364623C63652db8C0904");
 pub const PERMIT2: Address = address!("000000000022D473030F116dDEE9F6B43aC78BA3");
 
+// pons v2. A launch no longer starts life as a pool: the whole supply sits on a
+// bonding CURVE, and a Uniswap v4 pool is created only at graduation, seeded
+// from what the curve collected. So a v2 launch trades in two different places
+// over its life, and `phase` on the factory record says which — 0 curve,
+// 1 swept (closed, pool not built yet), 2 pool, 3 rescued.
+//
+// The v1 factory below is a different contract with a different event; both are
+// live, so discovery has to watch both.
+pub const PONS_V2_FACTORY: Address = address!("7E1EAbd52Ae29598e6483F72dCf1a70b14284dB8");
+// The v4 hook every graduated v2 pool carries. The pool's own fee is ZERO —
+// the hook charges instead, so it can split the fee under the same policy the
+// curve used rather than paying a liquidity provider that does not exist.
+pub const PONS_V2_HOOK: Address = address!("8e99D2009D60A917e9B1c00C04C077b8c0c3a044");
+// Existing tokens placed straight into a v2-style pool, skipping the curve.
+pub const PONS_MIGRATION_FACTORY: Address = address!("050e5C224466e2d377a7E555E139D51268239b39");
+pub const PONS_MIGRATION_HOOK: Address = address!("107251FFCC1fc808643DC8dA345e901f59EC2044");
+
 // Pons launch factory — emits TokenLaunched on graduation (token + its v3 pool).
 pub const PONS_FACTORY: Address = address!("A5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB");
 
@@ -114,6 +131,64 @@ sol! {
         );
         // Empty answer (a token Flaunch never launched) reads tickSpacing == 0.
         function poolKey(address _token) external view returns (PoolKey key);
+    }
+
+    // ---- pons v2 ----
+    // A DIFFERENT event from v1's TokenLaunched, so the two are told apart by
+    // topic0 rather than by address alone. `curve` is where the launch trades
+    // until it graduates; there is no pool to read before then.
+    #[sol(rpc)]
+    interface IPonsV2Factory {
+        event TokenLaunched(
+            address indexed token,
+            address indexed curve,
+            address indexed deployer,
+            address pairToken,
+            uint256 launchConfigId,
+            uint256 graduationThreshold
+        );
+        function getLaunchedToken(address token) external view returns (PonsV2Launch);
+    }
+
+    // The factory's record of a launch. `phase` is authoritative for routing —
+    // do not infer it from balances or events.
+    struct PonsV2Launch {
+        address token;
+        address curve;
+        address deployer;
+        address creatorFeeRecipient;
+        address pairToken;
+        uint256 graduationThreshold;
+        uint24 poolFee;
+        int24 tickSpacing;
+        uint16 creatorTaxBps;
+        bool buybackEnabled;
+        uint8 phase;
+        uint256 sweptQuote;
+        uint256 sweptTokens;
+        uint256 sweptAt;
+        bool exists;
+    }
+
+    // The bonding curve a v2 launch trades on before graduation. `quoteReserve`
+    // includes a PHANTOM balance that sets the opening price without anyone
+    // depositing up front, so it always reads higher than what was actually
+    // collected — price is quoteReserve/tokenReserve, funds raised is
+    // realQuoteReserve.
+    #[sol(rpc)]
+    interface IPonsCurve {
+        function getReserves() external view returns (uint256 quoteReserve, uint256 tokenReserve);
+        function realQuoteReserve() external view returns (uint256);
+        function graduationThreshold() external view returns (uint256);
+        function sellableTokens() external view returns (uint256);
+        function readyToGraduate() external view returns (bool);
+        function graduated() external view returns (bool);
+        function feeBps() external view returns (uint256);
+        function creatorTaxBps() external view returns (uint256);
+        function isNativeQuote() external view returns (bool);
+        function pairToken() external view returns (address);
+        function buy(uint256 quoteIn, uint256 minTokensOut, address recipient) external payable returns (uint256 tokensOut);
+        function sell(uint256 tokensIn, uint256 minQuoteOut, address recipient) external returns (uint256 quoteOut);
     }
 
     // ---- Uniswap v3 ----

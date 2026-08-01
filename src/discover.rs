@@ -24,8 +24,9 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::{prelude::*, widgets::*};
 
 use crate::contracts::{
-    IERC20, IFlaunchPositionManager, IPonsFactory, IStateView, IV3Factory, IV3Pool,
-    FLAUNCH_FEE_EST, FLAUNCH_PM, PONS_FACTORY, POOL_MANAGER, STATE_VIEW, V3_FACTORY, WETH,
+    IERC20, IFlaunchPositionManager, IPonsFactory, IPonsV2Factory, IStateView, IV3Factory, IV3Pool,
+    FLAUNCH_FEE_EST, FLAUNCH_PM, PONS_FACTORY, PONS_V2_FACTORY, POOL_MANAGER, STATE_VIEW,
+    V3_FACTORY, WETH,
 };
 use crate::engine;
 
@@ -187,6 +188,43 @@ fn clamp_scan(what: &str, from: u64, to: u64, default_chunk: u64) -> (u64, u64) 
     (lo, chunk)
 }
 
+/// One pons v2 launch, as announced by the factory.
+///
+/// The pool does not exist yet. A v2 launch opens on a bonding curve holding
+/// the entire supply, and a Uniswap v4 pool is created only when the curve
+/// sells out — so `curve` is the only place to read a price from until then,
+/// and `phase` on the factory record says which of the two applies.
+#[derive(Clone, Copy, Debug)]
+pub struct PonsV2Cand {
+    pub token: Address,
+    pub curve: Address,
+    /// What the launch is priced in. Zero means native ETH; anything else is
+    /// an approved ERC-20, and then EVERYTHING — price, the graduation target,
+    /// creator payouts — is denominated in it rather than in ETH.
+    pub pair_token: Address,
+    pub threshold: U256,
+    pub block: u64,
+}
+
+fn decode_pons_v2_log(lg: &alloy::rpc::types::Log) -> Option<PonsV2Cand> {
+    let t = lg.topics();
+    if t.len() < 4 || t[0] != IPonsV2Factory::TokenLaunched::SIGNATURE_HASH {
+        return None;
+    }
+    let d = lg.data().data.as_ref();
+    // pairToken, launchConfigId, graduationThreshold — three words, unindexed.
+    if d.len() < 96 {
+        return None;
+    }
+    Some(PonsV2Cand {
+        token: Address::from_word(t[1]),
+        curve: Address::from_word(t[2]),
+        pair_token: Address::from_slice(&d[12..32]),
+        threshold: U256::from_be_slice(&d[64..96]),
+        block: lg.block_number.unwrap_or(0),
+    })
+}
+
 fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64)> {
     let topics = lg.topics();
     if topics.len() < 4 {
@@ -218,10 +256,13 @@ async fn scan_launchpads<P: Provider>(
     while start <= to {
         let end = (start + chunk - 1).min(to);
         let filter = Filter::new()
-            .address(vec![PONS_FACTORY, FLAUNCH_PM])
+            .address(vec![PONS_FACTORY, FLAUNCH_PM, PONS_V2_FACTORY])
             .event_signature(vec![
                 IPonsFactory::TokenLaunched::SIGNATURE_HASH,
                 IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
+                // v2's TokenLaunched is a DIFFERENT event from v1's, so both
+                // are matched by topic and told apart by it below.
+                IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
             ])
             .from_block(start)
             .to_block(end);
@@ -255,8 +296,15 @@ async fn scan_launchpads<P: Provider>(
     let mut seen = std::collections::HashSet::new();
     let mut pons = Vec::new();
     let mut fl = Vec::new();
+    let mut v2 = Vec::new();
     for lg in &logs {
-        if lg.address() == PONS_FACTORY {
+        if lg.address() == PONS_V2_FACTORY {
+            if let Some(c) = decode_pons_v2_log(lg) {
+                if seen.insert(c.token.into_word()) {
+                    v2.push(c);
+                }
+            }
+        } else if lg.address() == PONS_FACTORY {
             if let Some(c) = decode_pons_log(lg) {
                 if seen.insert(c.1.into_word()) {
                     pons.push(c);
@@ -266,6 +314,18 @@ async fn scan_launchpads<P: Provider>(
             if seen.insert(c.pool_id) {
                 fl.push(c);
             }
+        }
+    }
+    // Not routed anywhere yet — a v2 launch trades on a CURVE until it
+    // graduates, which is a venue the engine does not have. Seeing them is the
+    // first half; trading them is the second.
+    if !v2.is_empty() {
+        crate::trace(&format!("launch scan: {} pons v2 launch(es)", v2.len()));
+        for c in &v2 {
+            crate::trace(&format!(
+                "  pons v2 {:#x} curve {:#x} pair {:#x} threshold {}",
+                c.token, c.curve, c.pair_token, c.threshold
+            ));
         }
     }
     crate::trace(&format!(
@@ -2315,5 +2375,83 @@ mod flaunch_discovery_tests {
         let out = lp.call(&tx).await;
         println!("preflight {} -> {:?}", c.sym, out.as_ref().map(|b| b.len()));
         assert!(out.is_ok(), "buy preflight reverted: {:?}", out.err());
+    }
+}
+
+#[cfg(test)]
+mod pons_v2_tests {
+    use super::*;
+
+    /// v1 and v2 both call their event `TokenLaunched`, and both factories are
+    /// live. They MUST hash differently, or one launchpad's launches would be
+    /// decoded with the other's layout — silently, since the topic is all that
+    /// tells them apart.
+    #[test]
+    fn the_two_launch_events_cannot_be_confused() {
+        assert_ne!(
+            IPonsFactory::TokenLaunched::SIGNATURE_HASH,
+            IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
+            "v1 and v2 TokenLaunched must not share a topic"
+        );
+    }
+
+    /// A v2 log decodes to the token, its curve, and the asset it is priced in.
+    /// The curve matters most: before graduation there is no pool at all, so it
+    /// is the only place a price can come from.
+    #[test]
+    fn a_v2_launch_decodes_to_its_curve_and_quote_asset() {
+        use alloy::primitives::{address, b256, Bytes, LogData};
+        let token = address!("a1186a1bcde151634440e5f51ae998c61e465f5d");
+        let curve = address!("bc39b6502e1a6ab36e4a5c5026a35f08342a0a9c");
+        let pair = address!("5fc5360d0400a0fd4f2af552add042d716f1d168"); // USDG
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(pair.as_slice()); // pairToken
+        data.extend_from_slice(&[0u8; 32]); // launchConfigId
+        let mut thr = [0u8; 32];
+        thr[24..].copy_from_slice(&5_000_000_000_000_000_000u64.to_be_bytes());
+        data.extend_from_slice(&thr); // graduationThreshold
+
+        let lg = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: PONS_V2_FACTORY,
+                data: LogData::new_unchecked(
+                    vec![
+                        IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
+                        token.into_word(),
+                        curve.into_word(),
+                        b256!("0000000000000000000000000000000000000000000000000000000000000001"),
+                    ],
+                    Bytes::from(data),
+                ),
+            },
+            block_number: Some(42),
+            ..Default::default()
+        };
+
+        let c = decode_pons_v2_log(&lg).expect("should decode");
+        assert_eq!(c.token, token);
+        assert_eq!(c.curve, curve);
+        assert_eq!(c.pair_token, pair, "a launch priced in USDG, not ETH");
+        assert_eq!(c.threshold, U256::from(5_000_000_000_000_000_000u64));
+        assert_eq!(c.block, 42);
+    }
+
+    /// A truncated or foreign log must decode to nothing rather than to
+    /// garbage — this runs over every log the scan collects.
+    #[test]
+    fn a_foreign_log_is_refused() {
+        use alloy::primitives::{Bytes, LogData};
+        let lg = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: PONS_V2_FACTORY,
+                data: LogData::new_unchecked(
+                    vec![IPonsFactory::TokenLaunched::SIGNATURE_HASH],
+                    Bytes::from(vec![0u8; 96]),
+                ),
+            },
+            ..Default::default()
+        };
+        assert!(decode_pons_v2_log(&lg).is_none(), "wrong topic must not decode");
     }
 }
