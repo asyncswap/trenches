@@ -43,6 +43,21 @@ pub enum OrderStatus {
     Failed,
 }
 
+impl OrderStatus {
+    /// A stable name, safe to put in a proof. Derived Debug would work until
+    /// someone renames a variant, at which point every historic proof would
+    /// silently stop verifying.
+    pub fn label(&self) -> &'static str {
+        match self {
+            OrderStatus::Pending => "pending",
+            OrderStatus::Confirmed => "confirmed",
+            OrderStatus::Reverted => "reverted",
+            OrderStatus::Skipped => "skipped",
+            OrderStatus::Failed => "failed",
+        }
+    }
+}
+
 /// One user action in the orders queue — transitions pending -> confirmed/etc.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Order {
@@ -67,6 +82,22 @@ pub struct Order {
     /// Defaulted for orders written before this field existed.
     #[serde(default)]
     pub at: u64,
+    /// The key that caused this order.
+    ///
+    /// Nothing in this app trades without a keypress, so every order has one —
+    /// and recording WHICH turns "I don't remember doing that" into something
+    /// the file can answer. Empty on orders written before this existed.
+    #[serde(default)]
+    pub key: String,
+    /// Chained proof over this order's own fields and the proof before it.
+    /// See `verification`. Empty means unverified, not forged.
+    #[serde(default)]
+    pub proof: String,
+    /// Set on LOAD when this row's proof checked out. Not persisted — it is a
+    /// conclusion about the file, not a fact in it, and writing it down would
+    /// let a forger simply set it to true.
+    #[serde(skip)]
+    pub verified: bool,
 }
 
 /// Protocol-specific pool identity. A v4 pool is identified by its pool id +
@@ -337,6 +368,8 @@ pub struct Bot {
     /// persisted (mytx-<address>.txt), so the tape's "your trade" mark
     /// survives a restart instead of living and dying with the order list.
     pub own_txs: std::collections::HashSet<TxHash>,
+    /// The key currently being acted on, stamped onto any order it produces.
+    pub acting_key: String,
     /// Buys waiting to be re-checked for a drain. See [`Bot::watch_for_drain`].
     pub drain_watch: Vec<DrainWatch>,
     // Permit2 + UniversalRouter allowances cover the full position (Flaunch
@@ -973,6 +1006,9 @@ impl Bot {
             is_v4,
             token: self.pool.token,
             at: crate::ledger::now(),
+            key: self.acting_key.clone(),
+            proof: String::new(), // filled by save_orders, which knows the chain
+            verified: true,       // we just made it; nothing to distrust yet
         });
         while self.orders.len() > 200 {
             self.orders.pop_front();
@@ -985,6 +1021,26 @@ impl Bot {
     fn orders_path(trader: Address) -> String {
         format!("{}/orders-evm-{trader}.jsonl", crate::state_dir())
     }
+
+/// The fields a proof covers, in a fixed order.
+///
+/// The proof is only worth what it covers, so this is everything that would
+/// change the meaning of the row: what it did, when, on which token, for how
+/// much, at what price, which key caused it, and the transaction it became.
+/// Adding a field here invalidates every existing proof, which is correct —
+/// an old proof did not attest to the new field.
+fn order_fields(o: &Order) -> Vec<String> {
+    vec![
+        o.label.clone(),
+        format!("{}", o.status.label()),
+        o.hash.map(|h| format!("{h:#x}")).unwrap_or_default(),
+        format!("{:#x}", o.token),
+        format!("{:.18}", o.eth),
+        format!("{:.18}", o.mc),
+        o.at.to_string(),
+        o.key.clone(),
+    ]
+}
 
     fn basis_path(trader: Address) -> String {
         format!("{}/basis-evm-{trader}.json", crate::state_dir())
@@ -1061,9 +1117,17 @@ impl Bot {
             return;
         }
         let _ = std::fs::create_dir_all(crate::state_dir());
+        // Chain the proofs as the file is written, so the file itself is the
+        // record — not something recomputed from memory on read.
         let mut out = String::new();
+        let mut prev = String::new();
         for o in self.orders.iter() {
-            if let Ok(j) = serde_json::to_string(o) {
+            let mut o = o.clone();
+            let f = Self::order_fields(&o);
+            let refs: Vec<&str> = f.iter().map(|s| s.as_str()).collect();
+            o.proof = crate::verification::proof(&prev, &refs);
+            prev = o.proof.clone();
+            if let Ok(j) = serde_json::to_string(&o) {
                 out.push_str(&j);
                 out.push('\n');
             }
@@ -1091,6 +1155,31 @@ impl Bot {
                     }
                     out.push_back(o);
                 }
+            }
+        }
+        // Verify the chain as loaded. A row that fails is NOT dropped — the
+        // whole point is to show it and say it cannot be trusted, because a
+        // record that quietly disappears is worse than one flagged.
+        let chain: Vec<(String, Vec<String>)> =
+            out.iter().map(|o| (o.proof.clone(), Self::order_fields(o))).collect();
+        if let Some(i) = crate::verification::first_broken(&chain) {
+            crate::events::error(
+                "An order on disk does not match its proof — the file has been changed",
+                &[
+                    ("row", i.to_string()),
+                    ("action", out.get(i).map(|o| o.label.clone()).unwrap_or_default()),
+                    ("file", Self::orders_path(trader)),
+                ],
+            );
+            // Everything from the first break onward is suspect: a chain that
+            // breaks at i tells you nothing about i+1.
+            for o in out.iter_mut().skip(i) {
+                o.proof.clear();
+                o.verified = false;
+            }
+        } else {
+            for o in out.iter_mut() {
+                o.verified = !o.proof.is_empty();
             }
         }
         while out.len() > 200 {

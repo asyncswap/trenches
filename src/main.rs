@@ -5,6 +5,7 @@
 //! for a local Nitro node over ws:// or IPC (remote ~380ms -> local ~1ms).
 
 mod agent;
+mod verification;
 mod config;
 mod net;
 mod contracts;
@@ -1865,6 +1866,7 @@ async fn app(
         v3_covered: false,
         own_txs: engine::Bot::load_own_txs(trader),
         drain_watch: Vec::new(),
+        acting_key: String::new(),
         ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
         meta: engine::Meta::default(),
@@ -2857,8 +2859,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             prices.clear();
                             bot.status = "pool deselected — press [f] to find pools".into();
                         }
-                        KeyCode::Char('b') => { bot.status = "buying…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Buy)).await; }
-                        KeyCode::Char('s') => { bot.status = "selling…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Sell)).await; }
+                        KeyCode::Char('b') => { bot.acting_key = "b".into(); bot.status = "buying…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Buy)).await; }
+                        KeyCode::Char('s') => { bot.acting_key = "s".into(); bot.status = "selling…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Sell)).await; }
                         KeyCode::Char('a') => { bot.status = "adding LP…".into(); let wei = (bot.eth * bot.lp_frac * 1e18).max(0.0) as u128; let _ = tokio::time::timeout(Duration::from_secs(8), bot.add_liquidity(provider, wei)).await; }
                         KeyCode::Char('r') => { bot.status = "removing one LP…".into(); let _ = tokio::time::timeout(Duration::from_secs(8), bot.remove_liquidity(provider)).await; }
                         KeyCode::Char('x') => { bot.status = "closing ALL LP…".into(); let _ = tokio::time::timeout(Duration::from_secs(12), bot.close_all(provider)).await; }
@@ -2889,6 +2891,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.routes = routes_for(&pools, p.token);
                                 bot.v3_covered = false;
                                 bot.ur_permit2_done = false;
+                                bot.acting_key = "x".into();
                                 let _ = tokio::time::timeout(Duration::from_secs(10), bot.sell_all(provider)).await;
                                 swept += 1;
                             }
@@ -3033,6 +3036,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // Execute the two-leg arb: buy cheap pool, sell dear pool.
                         KeyCode::Char('e') => {
                             bot.status = "arb: executing…".into();
+                            bot.acting_key = "a".into();
                             let _ = tokio::time::timeout(Duration::from_secs(14), bot.arb(provider)).await;
                         }
                         KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('k') => {
@@ -4092,6 +4096,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // and the first question anyone asks of it is "was that me,
                 // just now?" — which is a time question.
                 view::Col::fixed("time", 9),
+                // One glyph for "this row still matches its proof". Silent
+                // when fine — a badge on every row teaches you to stop
+                // reading it; the only one worth noticing is the broken one.
+                view::Col::fixed("", 2),
+                // WHICH key caused it. Nothing here trades without one.
+                view::Col::fixed("key", 4),
                 view::Col::fixed("status", 9),
                 view::Col::fixed("pool", 4),
                 // Orders carry full labels — "SELL ALL", "REMOVE LP #505",
@@ -4101,6 +4111,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 view::Col::fixed("price / tick", 24),
                 view::Col::fixed("pooled ETH", 12),
                 view::Col::fixed("mkt cap $", 12),
+                // FULL, never truncated: the address is the only identifier a
+                // scammer cannot copy, so a shortened one is worse than none.
+                view::Col::fixed("token", 44),
                 view::Col::min("tx", 66),
             ],
         );
@@ -4137,6 +4150,17 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             };
             t.push(vec![
                 view::Cell::toned(when, view::Tone::Dim),
+                if o.verified || o.proof.is_empty() && o.at == 0 {
+                    // Verified, or too old to have a proof at all. Either way
+                    // there is nothing to shout about.
+                    view::Cell::new("")
+                } else {
+                    view::Cell::bold("⚠", view::Tone::Bad)
+                },
+                view::Cell::toned(
+                    if o.key.is_empty() { "—".to_string() } else { o.key.clone() },
+                    view::Tone::Info,
+                ),
                 view::Cell::bold(st, stone),
                 view::Cell::bold(venue, vtone),
                 view::Cell::bold(action, atone),
@@ -4144,6 +4168,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
                 view::Cell::new(price),
                 view::Cell::new(if o.pooled > 0.0 { view::eth(o.pooled) } else { String::new() }),
+                view::Cell::toned(format!("{:#x}", o.token), view::Tone::Dim),
                 view::Cell::new(if o.mc > 0.0 {
                     if bot.eth_usd > 0.0 {
                         view::usd_compact(o.mc * bot.eth_usd)
