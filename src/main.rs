@@ -12,7 +12,7 @@ mod contracts;
 mod discover;
 mod engine;
 mod events;
-mod facts;
+mod token_metadata_eth;
 mod ledger;
 mod pnl;
 mod pricing;
@@ -80,7 +80,7 @@ struct SelPool {
 /// falls back to once the cache has nothing, and it is deliberately vague
 /// rather than confidently wrong.
 fn stable_symbol(addr: alloy::primitives::Address) -> String {
-    if let Some(f) = crate::facts::get(addr) {
+    if let Some(f) = crate::token_metadata_eth::get(addr) {
         if !f.sym.is_empty() {
             return f.sym;
         }
@@ -775,35 +775,35 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
         // The facts cache answers first — a coin picked from discovery (or
         // revisited) has its launch block and IPFS metadata on disk already,
         // so re-selecting it costs nothing.
-        if let Some(f) = facts::get(bot.pool.token) {
-            if f.launch_block.unwrap_or(0) > 0 && !f.meta.is_empty() {
+        if let Some(f) = token_metadata_eth::get(bot.pool.token) {
+            if f.launch_block.unwrap_or(0) > 0 && !f.socials.is_empty() {
                 bot.pool_launch_block = f.launch_block;
-                bot.meta = f.meta;
+                bot.socials = f.socials;
                 return;
             }
         }
         match discover::fetch_flaunch_pool(provider, bot.pool.token).await {
             Some(fl) => {
                 bot.pool_launch_block = Some(fl.launch_block);
-                bot.meta = engine::fetch_flaunch_meta(&fl.token_uri).await;
-                let (meta, block) = (bot.meta.clone(), fl.launch_block);
-                facts::merge(bot.pool.token, move |f| {
+                bot.socials = engine::fetch_flaunch_meta(&fl.token_uri).await;
+                let (meta, block) = (bot.socials.clone(), fl.launch_block);
+                token_metadata_eth::merge(bot.pool.token, move |f| {
                     if block > 0 {
                         f.launch_block = Some(block);
                     }
                     if !meta.is_empty() {
-                        f.meta = meta;
+                        f.socials = meta;
                     }
                 });
             }
             None => {
                 bot.pool_launch_block = None;
-                bot.meta = Default::default();
+                bot.socials = Default::default();
             }
         }
     } else {
-        bot.meta = facts::ensure(provider, bot.pool.token, None).await.meta;
-        bot.pool_launch_block = facts::launch_block(provider, bot.pool.token).await;
+        bot.socials = token_metadata_eth::ensure(provider, bot.pool.token, None).await.socials;
+        bot.pool_launch_block = token_metadata_eth::launch_block(provider, bot.pool.token).await;
     }
 }
 
@@ -865,7 +865,7 @@ async fn refresh_token_decimals<P: Provider>(provider: &P, bot: &mut engine::Bot
     if bot.pool.token == alloy::primitives::Address::ZERO {
         return;
     }
-    match facts::decimals(provider, bot.pool.token).await {
+    match token_metadata_eth::decimals(provider, bot.pool.token).await {
         Some(d) => {
             if d != bot.pool.token_decimals {
                 bot.note(format!("{} uses {d} decimals", bot.pool.sym));
@@ -2004,7 +2004,7 @@ async fn app(
         acting_key: String::new(),
         ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
-        meta: engine::Meta::default(),
+        socials: engine::TokenSocials::default(),
         pool_launch_block: None,
         status: "ready".into(),
     };
@@ -3067,7 +3067,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             bot.lp_permit2_done = false;
                             bot.v3_covered = false;
                             bot.ur_permit2_done = false;
-                            bot.meta = Default::default();
+                            bot.socials = Default::default();
                             bot.pool_launch_block = None;
                             bot.arb_mode = false;
                             bot.pool_b = None;
@@ -3289,7 +3289,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     };
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
-                                    bot.meta = g.meta.clone(); // socials already read during discovery
+                                    bot.socials = g.socials.clone(); // socials already read during discovery
                                     bot.pool_launch_block = Some(g.launch_block); // for the age display
                                     // A picked token stays on the discovery list even after it
                                     // stops being a fresh graduation — so it is still there
@@ -3823,10 +3823,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         ),
     ]));
     // Token metadata (Pons socials) — confirm the details of what you're trading.
-    if !bot.meta.is_empty() {
-        mkt.push(Line::from(vec![mlbl("Socials"), Span::raw(format!("{}/7 filled", bot.meta.score()))])
+    if !bot.socials.is_empty() {
+        mkt.push(Line::from(vec![mlbl("Socials"), Span::raw(format!("{}/7 filled", bot.socials.score()))])
             .style(Style::default().fg(ui::widgets::tone_color(view::Tone::Normal))));
-        let m = &bot.meta;
+        let m = &bot.socials;
         if !m.website.trim().is_empty() { mkt.push(Line::from(vec![mlbl("Web"), Span::raw(m.website.clone())])); }
         if !m.twitter.trim().is_empty() { mkt.push(Line::from(vec![mlbl("X"), Span::raw(m.twitter.clone())])); }
         if !m.telegram.trim().is_empty() { mkt.push(Line::from(vec![mlbl("Telegram"), Span::raw(m.telegram.clone())])); }

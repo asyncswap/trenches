@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 AsyncSwap Labs, Inc.
-//! What never changes about a token, fetched once.
+//! What the CHAIN says about a token, fetched once and never again.
+//!
+//! Named for exactly which metadata it is, because there are three and they
+//! disagree. This one is EVM on-chain truth: symbol, decimals, total supply,
+//! pool fee, launch block — read from the contract, so a scam can no more lie
+//! about its `decimals()` than about its balance. `TokenSocials` beside it in
+//! `engine` is the opposite kind: logo, description, twitter, telegram, and
+//! whatever else the issuer chose to claim. And `sol::metadata` is Solana's
+//! Metaplex account, a third thing again.
+//!
+//! It used to be called `facts`, which said "true things" without saying which
+//! ones, and left the reader to discover that the metadata cache and the
+//! metadata column were unrelated.
 //!
 //! Discovery used to re-read the symbol, pool fee, socials and total supply of
 //! every remembered token on every 1.2-second round — seven RPC calls per
@@ -9,7 +21,7 @@
 //!
 //! This is the other half of the fix that `src/rpc.rs` starts: the transport
 //! spreads and paces the calls; this module makes most of them unnecessary.
-//! Facts are kept in memory and mirrored to disk, so a restart does not
+//! TokenMetadata are kept in memory and mirrored to disk, so a restart does not
 //! re-interrogate the chain about tokens it already knows.
 
 use std::collections::HashMap;
@@ -28,7 +40,7 @@ use crate::engine;
 /// The immutable facts for one token. Fields fill in as they are first
 /// needed — `fee` only once a pool is known, `launch_block` only if asked.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct Facts {
+pub struct TokenMetadata {
     #[serde(default)]
     pub sym: String,
     /// The v3 pool's fee tier. 0 = not fetched yet.
@@ -38,7 +50,7 @@ pub struct Facts {
     #[serde(default)]
     pub supply: f64,
     #[serde(default)]
-    pub meta: engine::Meta,
+    pub socials: engine::TokenSocials,
     /// The Pons graduation block. None = never asked, Some(0) = asked and the
     /// chain had no answer (not a Pons launch).
     #[serde(default)]
@@ -49,7 +61,7 @@ pub struct Facts {
     pub decimals: Option<u8>,
 }
 
-impl Facts {
+impl TokenMetadata {
     /// Everything the discovery table needs is present.
     fn complete_for(&self, pool: Option<Address>) -> bool {
         !self.sym.is_empty() && self.supply > 0.0 && (pool.is_none() || self.fee > 0)
@@ -57,17 +69,23 @@ impl Facts {
 }
 
 fn path() -> String {
-    // Pons is Robinhood Chain's launchpad and these facts only come from
+    // Pons is Robinhood Chain's launchpad and this metadata only comes from
     // there, so one file needs no chain key — same rule as the recents file.
+    //
+    // The FILENAME keeps the old word deliberately. Renaming it would orphan
+    // every cache already on disk and make the app re-interrogate the chain
+    // about every token it already knows — which is the exact traffic this
+    // module exists to prevent. A name is worth fixing; a name is not worth
+    // 150 tokens' worth of RPC on everyone's next launch.
     format!("{}/tokenfacts-pons.json", crate::state_dir())
 }
 
-fn store() -> &'static Mutex<HashMap<Address, Facts>> {
-    static STORE: OnceLock<Mutex<HashMap<Address, Facts>>> = OnceLock::new();
+fn store() -> &'static Mutex<HashMap<Address, TokenMetadata>> {
+    static STORE: OnceLock<Mutex<HashMap<Address, TokenMetadata>>> = OnceLock::new();
     STORE.get_or_init(|| {
         let map = std::fs::read_to_string(path())
             .ok()
-            .and_then(|text| serde_json::from_str::<HashMap<Address, Facts>>(&text).ok())
+            .and_then(|text| serde_json::from_str::<HashMap<Address, TokenMetadata>>(&text).ok())
             .unwrap_or_default();
         if !map.is_empty() {
             crate::trace(&format!("facts: loaded {} known tokens", map.len()));
@@ -103,11 +121,11 @@ fn save() {
     }
 }
 
-pub fn get(token: Address) -> Option<Facts> {
+pub fn get(token: Address) -> Option<TokenMetadata> {
     lock(store()).get(&token).cloned()
 }
 
-fn put(token: Address, facts: Facts) {
+fn put(token: Address, facts: TokenMetadata) {
     lock(store()).insert(token, facts);
     save();
 }
@@ -117,7 +135,7 @@ fn put(token: Address, facts: Facts) {
 /// The fetches are the same calls `full_row` used to make every round; the
 /// difference is they now happen a single time per token per lifetime of the
 /// facts file.
-pub async fn ensure<P: Provider>(provider: &P, token: Address, pool: Option<Address>) -> Facts {
+pub async fn ensure<P: Provider>(provider: &P, token: Address, pool: Option<Address>) -> TokenMetadata {
     let mut f = get(token).unwrap_or_default();
     if f.complete_for(pool) {
         return f;
@@ -143,8 +161,8 @@ pub async fn ensure<P: Provider>(provider: &P, token: Address, pool: Option<Addr
             .map(|s| s._0.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)
             .unwrap_or(0.0);
     }
-    if f.meta.is_empty() {
-        f.meta = engine::fetch_token_meta(provider, token).await;
+    if f.socials.is_empty() {
+        f.socials = engine::fetch_token_meta(provider, token).await;
     }
     put(token, f.clone());
     f
@@ -214,7 +232,7 @@ pub fn record_launch(token: Address, block: u64) {
 /// metadata blob fetched from IPFS — without asking the chain for anything.
 /// Flaunch launches use this: their PoolCreated event and tokenUri carry what
 /// Pons tokens need contract calls for.
-pub fn merge(token: Address, apply: impl FnOnce(&mut Facts)) {
+pub fn merge(token: Address, apply: impl FnOnce(&mut TokenMetadata)) {
     let mut f = get(token).unwrap_or_default();
     apply(&mut f);
     put(token, f);
@@ -247,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_fact_set_is_complete_only_when_everything_needed_is_present() {
-        let mut f = Facts { sym: "PONZI".into(), supply: 1e9, fee: 0, ..Default::default() };
+        let mut f = TokenMetadata { sym: "PONZI".into(), supply: 1e9, fee: 0, ..Default::default() };
         assert!(f.complete_for(None), "no pool means the fee is not needed");
         assert!(!f.complete_for(Some(Address::ZERO)), "a pool means the fee IS needed");
         f.fee = 10_000;

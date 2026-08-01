@@ -42,7 +42,7 @@ const ACTIVITY_WINDOW: u64 = 200; // ~20 s sample for tx/sec
 const MAX_SCAN: usize = 24; // newest launches to track (bounds RPC)
 const CONCURRENCY: usize = 12; // in-flight RPC cap
 const RPC_TIMEOUT: Duration = Duration::from_secs(6);
-const META_FIELDS: u8 = 7; // logo, description, twitter, telegram, discord, website, farcaster
+const SOCIAL_FIELDS: u8 = 7; // logo, description, twitter, telegram, discord, website, farcaster
 const HOT_TX_PER_SEC: f64 = 1.0; // threshold for the 🔥 (active) marker + top-of-list
 const DISPLAY_MAX: usize = 10; // explore list shows only the top N (by rank)
 const HOT_MKTCAP_ETH: f64 = 5.0; // 🔥 fire needs cap ≥ this (and < 1 min old); bumped to top
@@ -78,7 +78,7 @@ pub struct Grad {
     pub sym: String,
     pub fee: u32,
     pub launch_block: u64,
-    pub meta: engine::Meta, // on-chain socials/metadata (score() = filled fields)
+    pub socials: engine::TokenSocials, // on-chain socials/metadata (score() = filled fields)
 }
 
 impl Grad {
@@ -150,7 +150,7 @@ fn sort_rows(rows: &mut [Row]) {
             .cmp(&a.grad.launch_block)
             .then(is_fire(b).cmp(&is_fire(a)))
             .then(b.mkt_cap_eth.partial_cmp(&a.mkt_cap_eth).unwrap_or(std::cmp::Ordering::Equal))
-            .then(b.grad.meta.score().cmp(&a.grad.meta.score()))
+            .then(b.grad.socials.score().cmp(&a.grad.socials.score()))
             .then(b.tx_per_sec.partial_cmp(&a.tx_per_sec).unwrap_or(std::cmp::Ordering::Equal))
     });
 }
@@ -338,15 +338,15 @@ async fn scan_launchpads<P: Provider>(
     (pons, fl, v2)
 }
 
-/// One row from cached facts + batch-read metrics. No RPC of its own: the
-/// facts were fetched once ever, the metrics arrive from the round's single
+/// One row from cached on-chain metadata + batch-read metrics. No RPC of its own: the
+/// metadata was fetched once ever, the metrics arrive from the round's single
 /// batched `eth_call`, and the swap count from the round's single tape scan.
 #[allow(clippy::too_many_arguments)]
 fn build_row(
     token: Address,
     pool_addr: Address,
     block: u64,
-    f: &crate::facts::Facts,
+    f: &crate::token_metadata_eth::TokenMetadata,
     sqrt: f64,
     liq: f64,
     my_bal: f64,
@@ -360,7 +360,7 @@ fn build_row(
         sym: f.sym.clone(),
         fee: if f.fee > 0 { f.fee } else { 10_000 },
         launch_block: block,
-        meta: f.meta.clone(),
+        socials: f.socials.clone(),
     };
     // Pooled ETH = ETH virtual reserve of the active liquidity (L/√P) — the SAME
     // measure as the tape/telemetry liq_eth, so Discovery reconciles with them.
@@ -482,52 +482,52 @@ fn decode_flaunch_log(lg: &alloy::rpc::types::Log) -> Option<FlCand> {
 /// spawned task per coin, so a slow IPFS gateway only delays the socials
 /// column — the scan loop never waits on it. An entry (even an empty one)
 /// means "fetched or fetching": failures are not retried.
-fn fl_meta_cache() -> &'static Mutex<std::collections::HashMap<Address, engine::Meta>> {
-    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<Address, engine::Meta>>> =
+fn fl_meta_cache() -> &'static Mutex<std::collections::HashMap<Address, engine::TokenSocials>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<Address, engine::TokenSocials>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn fl_meta(token: Address, token_uri: &str) -> engine::Meta {
+fn fl_meta(token: Address, token_uri: &str) -> engine::TokenSocials {
     if let Ok(cache) = fl_meta_cache().lock() {
         if let Some(m) = cache.get(&token) {
             return m.clone();
         }
     }
-    // A restart keeps what an earlier session fetched: the facts file holds
+    // A restart keeps what an earlier session fetched: the metadata file holds
     // the metadata, so the IPFS gateway is asked once per token, ever.
-    if let Some(f) = crate::facts::get(token) {
-        if !f.meta.is_empty() {
+    if let Some(f) = crate::token_metadata_eth::get(token) {
+        if !f.socials.is_empty() {
             if let Ok(mut cache) = fl_meta_cache().lock() {
-                cache.insert(token, f.meta.clone());
+                cache.insert(token, f.socials.clone());
             }
-            return f.meta;
+            return f.socials;
         }
     }
     if !token_uri.trim().is_empty() {
         // Mark as in-flight BEFORE spawning, so the next 1.2s round doesn't
         // spawn a duplicate fetch while this one is still resolving.
         if let Ok(mut cache) = fl_meta_cache().lock() {
-            cache.insert(token, engine::Meta::default());
+            cache.insert(token, engine::TokenSocials::default());
         }
         let uri = token_uri.to_string();
         tokio::spawn(async move {
             let meta = engine::fetch_flaunch_meta(&uri).await;
             if !meta.is_empty() {
                 let m2 = meta.clone();
-                crate::facts::merge(token, move |f| f.meta = m2);
+                crate::token_metadata_eth::merge(token, move |f| f.socials = m2);
             }
             if let Ok(mut cache) = fl_meta_cache().lock() {
                 cache.insert(token, meta);
             }
         });
     }
-    engine::Meta::default()
+    engine::TokenSocials::default()
 }
 
 /// One Flaunch row from what the round already paid for: metrics from the
 /// batched StateView reads, swap count from the shared tape, supply from the
-/// facts cache, symbol/meta from the launch event. No RPC of its own — the
+/// on-chain metadata cache, symbol/socials from the launch event. No RPC of its own — the
 /// same contract `build_row` has for Pons rows.
 /// A row for a pons v2 launch still on its bonding curve.
 ///
@@ -544,7 +544,7 @@ fn build_v2_row(
     my_bal: f64,
     head: u64,
 ) -> Row {
-    let f = crate::facts::get(c.token);
+    let f = crate::token_metadata_eth::get(c.token);
     let sym = f.as_ref().map(|f| f.sym.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| {
         format!("0x{}", &alloy::hex::encode(c.token.as_slice())[..6])
     });
@@ -558,7 +558,7 @@ fn build_v2_row(
             token: c.pair_token,
             // The QUOTE asset's decimals, not the launch token's. USDG is 6,
             // and reading a 6-dec reserve as 18 shows the price as 0.000000.
-            decimals: crate::facts::get(c.pair_token).and_then(|f| f.decimals).unwrap_or(18),
+            decimals: crate::token_metadata_eth::get(c.pair_token).and_then(|f| f.decimals).unwrap_or(18),
         }
     };
     let qd = quote.decimals() as i32;
@@ -576,7 +576,7 @@ fn build_v2_row(
         // means "not known yet", not "free".
         fee: 0,
         launch_block: c.block,
-        meta: engine::Meta::default(),
+        socials: engine::TokenSocials::default(),
     };
     Row {
         grad,
@@ -590,8 +590,8 @@ fn build_v2_row(
 }
 
 fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: usize, head: u64) -> Row {
-    let meta = fl_meta(c.token, &c.token_uri);
-    let supply = crate::facts::get(c.token).map(|f| f.supply).unwrap_or(0.0);
+    let socials = fl_meta(c.token, &c.token_uri);
+    let supply = crate::token_metadata_eth::get(c.token).map(|f| f.supply).unwrap_or(0.0);
     let grad = Grad {
         token: c.token,
         kind: engine::PoolKind::FlaunchV4 { pool_id: c.pool_id, coin_is_0: c.coin_is_0 },
@@ -600,7 +600,7 @@ fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: u
         // The hook's ~1% cut, for quote estimates — the pool's own lpFee is 0.
         fee: FLAUNCH_FEE_EST,
         launch_block: c.block,
-        meta,
+        socials,
     };
     // flETH ≈ ETH 1:1, so the flETH-side virtual reserve IS pooled ETH. flETH
     // is token0 unless the launch flipped the pair (`coin_is_0`).
@@ -847,7 +847,7 @@ async fn big_fish_rows<L: Provider>(
             sym,
             fee: 10_000,
             launch_block: *b,
-            meta: engine::Meta::default(),
+            socials: engine::TokenSocials::default(),
         };
         rows.push(Row { grad, pooled_eth: *eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: false });
     }
@@ -995,7 +995,7 @@ async fn v4_rows<L: Provider>(
             sym,
             fee: *fee,
             launch_block: *block,
-            meta: engine::Meta::default(),
+            socials: engine::TokenSocials::default(),
         };
         rows.push(Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: false });
     }
@@ -1062,7 +1062,7 @@ async fn verified_rows(
             sym: p.sym.clone(),
             fee: p.fee,
             launch_block: 0,
-            meta: engine::Meta::default(),
+            socials: engine::TokenSocials::default(),
         };
         rows.push(Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: true });
     }
@@ -1237,7 +1237,7 @@ fn save_flaunch_recents(rows: &[FlCand]) {
 /// take turns, so the whole remembered list stays current within ~10s without
 /// costing a full sweep every round.
 const SWEEP_CHUNK: usize = 24;
-/// New tokens whose immutable facts are fetched per round. Facts are 6 calls
+/// New tokens whose on-chain metadata is fetched per round — 6 calls
 /// each, once ever — the bound only smooths the burst when a fresh install
 /// meets 150 remembered tokens at once.
 const FACTS_PER_ROUND: usize = 4;
@@ -1257,7 +1257,7 @@ const FACTS_PER_ROUND: usize = 4;
 ///   4. one batched `eth_call` for slot0/liquidity/balance of the rows that
 ///      are due a refresh,
 ///   5. immutable facts for tokens seen for the FIRST time (bounded, cached
-///      to disk by src/facts.rs, never asked again). Flaunch tokens carry
+///      to disk by src/token_metadata_eth.rs, never asked again). Flaunch tokens carry
 ///      symbol and metadata in the launch event itself, so only their total
 ///      supply ever needs a call.
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
@@ -1339,7 +1339,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         if from <= head && wide_ok {
             let (pons, fl, v2) = scan_launchpads(&provider, from, head).await;
             for c in pons {
-                crate::facts::record_launch(c.0, c.2);
+                crate::token_metadata_eth::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
                     known.push(c);
                 }
@@ -1446,9 +1446,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
                 break;
             }
-            let have = crate::facts::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0);
+            let have = crate::token_metadata_eth::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0);
             if !have {
-                crate::facts::ensure(&provider, *t, Some(*p)).await;
+                crate::token_metadata_eth::ensure(&provider, *t, Some(*p)).await;
                 fetched += 1;
             }
         }
@@ -1456,11 +1456,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
                 break;
             }
-            let have = crate::facts::get(c.token).is_some_and(|f| f.supply > 0.0);
+            let have = crate::token_metadata_eth::get(c.token).is_some_and(|f| f.supply > 0.0);
             if !have {
-                crate::facts::ensure_supply(&provider, c.token).await;
+                crate::token_metadata_eth::ensure_supply(&provider, c.token).await;
                 let (sym, block) = (c.sym.clone(), c.block);
-                crate::facts::merge(c.token, move |f| {
+                crate::token_metadata_eth::merge(c.token, move |f| {
                     if f.sym.is_empty() {
                         f.sym = sym;
                     }
@@ -1513,9 +1513,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // symbols come from the event; only the supply gates them.)
         due.retain(|d| match d {
             Due::Pons(t, _, _) => {
-                crate::facts::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
+                crate::token_metadata_eth::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
             }
-            Due::Fl(c) => crate::facts::get(c.token).is_some_and(|f| f.supply > 0.0),
+            Due::Fl(c) => crate::token_metadata_eth::get(c.token).is_some_and(|f| f.supply > 0.0),
             // A curve holds the whole supply, so its reserves ARE the numbers
             // worth showing — nothing to wait on.
             Due::V2(_) => true,
@@ -1604,7 +1604,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
             let row = match d {
                 Due::Pons(t, p, b) => {
-                    let Some(f) = crate::facts::get(*t) else { continue };
+                    let Some(f) = crate::token_metadata_eth::get(*t) else { continue };
                     let n = swap_count.get(&p.into_word()).copied().unwrap_or(0);
                     build_row(*t, *p, *b, &f, sqrt, liq, my_bal, n, head)
                 }
@@ -1915,7 +1915,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
                     let q = if v.quote.is_eth() {
                         "ETH".to_string()
                     } else {
-                        crate::facts::get(v.quote.addr())
+                        crate::token_metadata_eth::get(v.quote.addr())
                             .map(|f| f.sym)
                             .filter(|s| !s.is_empty())
                             .unwrap_or_else(|| "quote".to_string())
@@ -1979,7 +1979,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
                             sym: v.sym.clone(),
                             fee: v.fee,
                             launch_block: 0,
-                            meta: engine::Meta::default(),
+                            socials: engine::TokenSocials::default(),
                         }));
                     }
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
@@ -2219,7 +2219,7 @@ async fn resolve_v3_grad<P: Provider>(
                         sym: sym.to_string(),
                         fee,
                         launch_block: 0,
-                        meta: engine::Meta::default(),
+                        socials: engine::TokenSocials::default(),
                     }));
                 }
                 crate::trace(&format!("resolve {sym} fee {fee}: pool {addr:#x} has no liquidity"));
@@ -2350,7 +2350,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "source", "symbol", "pooled ETH", "mkt cap", "metadata", "tx/sec", "age", "mine", "pool",
+        "", "source", "symbol", "pooled ETH", "mkt cap", "socials", "tx/sec", "age", "mine", "pool",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -2366,7 +2366,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
             let mine = if r.my_bal > 0.0 { "●" } else { "" };
             let active = r.tx_per_sec >= HOT_TX_PER_SEC;
             let fire = is_fire(r); // 🔥 only if active AND cap ≥ 4 ETH
-            let meta_full = r.grad.meta.score() >= 4;
+            let meta_full = r.grad.socials.score() >= 4;
             ratatui::widgets::Row::new(vec![
                 Cell::from(if fire { "🔥" } else { "" }),
                 Cell::from(venue_tag(&r.grad))
@@ -2374,7 +2374,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                 Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(format!("{:.4}", r.pooled_eth)),
                 Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
-                Cell::from(format!("{}/{}", r.grad.meta.score(), META_FIELDS))
+                Cell::from(format!("{}/{}", r.grad.socials.score(), SOCIAL_FIELDS))
                     .style(Style::default().fg(if meta_full { crate::ui::widgets::tone_color(crate::view::Tone::Good) } else { crate::ui::widgets::tone_color(crate::view::Tone::Normal) })),
                 Cell::from(format!("{:.2}", r.tx_per_sec))
                     .style(Style::default().fg(if active { crate::ui::widgets::tone_color(crate::view::Tone::Good) } else { crate::ui::widgets::tone_color(crate::view::Tone::Normal) })),
@@ -2411,7 +2411,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     // Details box for the selected pool — the actual X / telegram / website.
     let detail: Vec<Line> = match rows.get(sel) {
         Some(r) => {
-            let m = &r.grad.meta;
+            let m = &r.grad.socials;
             let fld = |label: &str, v: &str| {
                 if v.trim().is_empty() {
                     // Only the ABSENCE marker is dimmed — it carries no info.

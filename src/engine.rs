@@ -405,7 +405,7 @@ pub struct Bot {
     // sells settle the coin through Permit2, which needs both grants).
     pub ur_permit2_done: bool,
     pub routes: Vec<Route>, // candidate ETH-quoted venues for best-execution routing
-    pub meta: Meta,     // current token's on-chain socials/metadata (for the market view)
+    pub socials: TokenSocials,     // current token's on-chain socials/metadata (for the market view)
     /// Pons graduation block, for the pool-age display and the venue logo.
     ///
     /// `Some(0)` means "no Pons launch" — verified and leaderboard pools carry
@@ -452,7 +452,7 @@ pub struct Basis {
 /// On-chain socials/metadata for a Pons launch token (all empty for non-Pons).
 /// Serde because the facts cache (src/facts.rs) mirrors it to disk.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct Meta {
+pub struct TokenSocials {
     pub logo: String,
     pub description: String,
     pub twitter: String,
@@ -462,7 +462,7 @@ pub struct Meta {
     pub farcaster: String,
 }
 
-impl Meta {
+impl TokenSocials {
     /// Count of filled fields (0..=7) — a quick completeness signal.
     pub fn score(&self) -> u8 {
         [&self.logo, &self.description, &self.twitter, &self.telegram, &self.website, &self.discord, &self.farcaster]
@@ -477,7 +477,7 @@ impl Meta {
 
 /// Read a Pons token's socials/metadata. Returns default (all empty) for tokens
 /// that aren't Pons launches (the calls revert → mapped to empty).
-pub async fn fetch_token_meta<P: Provider>(provider: &P, token: Address) -> Meta {
+pub async fn fetch_token_meta<P: Provider>(provider: &P, token: Address) -> TokenSocials {
     let t = crate::contracts::IPonsToken::new(token, provider);
     let logo = t.logo().call().await.map(|s| s._0).unwrap_or_default();
     let description = t.description().call().await.map(|s| s._0).unwrap_or_default();
@@ -487,31 +487,31 @@ pub async fn fetch_token_meta<P: Provider>(provider: &P, token: Address) -> Meta
         .await
         .map(|s| (s.twitter, s.telegram, s.discord, s.website, s.farcaster))
         .unwrap_or_default();
-    Meta { logo, description, twitter, telegram, website, discord, farcaster }
+    TokenSocials { logo, description, twitter, telegram, website, discord, farcaster }
 }
 
 /// Fetch a Flaunch coin's metadata JSON from its launch tokenUri (ipfs://…).
 /// Unlike Pons, the socials live off-chain: the JSON carries image, description
 /// and the social URLs. Any failure (gateway down, bad JSON) returns an empty
-/// Meta — metadata is never worth stalling the app for. `farcaster` stays
+/// TokenSocials — metadata is never worth stalling the app for. `farcaster` stays
 /// empty: Flaunch metadata has no such field.
-pub async fn fetch_flaunch_meta(token_uri: &str) -> Meta {
+pub async fn fetch_flaunch_meta(token_uri: &str) -> TokenSocials {
     if token_uri.trim().is_empty() {
-        return Meta::default();
+        return TokenSocials::default();
     }
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build() {
         Ok(c) => c,
-        Err(_) => return Meta::default(),
+        Err(_) => return TokenSocials::default(),
     };
     // The URI is attacker-written on-chain data — the guard decides whether
     // it is fetchable at all, and refuses anything aimed at this machine.
-    let Some(url) = crate::net::metadata_url(token_uri) else { return Meta::default() };
+    let Some(url) = crate::net::metadata_url(token_uri) else { return TokenSocials::default() };
     let json: serde_json::Value = match client.get(url).send().await {
         Ok(r) => match r.json().await {
             Ok(j) => j,
-            Err(_) => return Meta::default(),
+            Err(_) => return TokenSocials::default(),
         },
-        Err(_) => return Meta::default(),
+        Err(_) => return TokenSocials::default(),
     };
     let s = |keys: &[&str]| -> String {
         keys.iter()
@@ -520,7 +520,7 @@ pub async fn fetch_flaunch_meta(token_uri: &str) -> Meta {
             .unwrap_or_default()
             .to_string()
     };
-    Meta {
+    TokenSocials {
         // The image is itself usually ipfs:// — store the gateway form so the
         // detail panes hold a URL a person can actually open.
         logo: {
@@ -780,7 +780,7 @@ impl Bot {
                     "TRADE {} tok={:#x} pnl={:+.6} ret={:+.1}% cost={:.6} proceeds={:.6} entry_mc={:.3}ETH entry_liq={:.4} exit_mc={:.3}ETH exit_liq={:.4} meta={}/7 buy_tx={} sell_tx={:#x}",
                     self.pool.sym, self.pool.token, realized, ret, cost, eth,
                     self.entry_mc, self.entry_pooled_eth, exit_mc, self.r0,
-                    self.meta.score(), buy_tx, hash
+                    self.socials.score(), buy_tx, hash
                 ));
                 // The permanent record. `realized_pnl` above is this session's
                 // running total and dies with the process; the calendar needs
