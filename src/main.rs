@@ -267,6 +267,7 @@ fn nudge_buy_step(bot: &mut engine::Bot, coarser: bool) {
     // must not leave the size off its own grid.
     let step = BUY_STEPS[next];
     bot.buy_frac = ((bot.buy_frac / step).round() * step).clamp(step, 1.0);
+    save_sizing(bot);
     let msg = buy_size_status(bot);
     setting(bot, "Buy step", pct_compact(step), msg);
 }
@@ -383,6 +384,52 @@ fn load_evm_tape(token: &alloy::primitives::Address) -> std::collections::VecDeq
         out.pop_front();
     }
     out
+}
+
+/// The sizing settings, remembered between sessions.
+///
+/// Buy size is a decision somebody makes once and then trades on. Resetting it
+/// to 5% on every launch means either re-setting it every time or, worse, not
+/// noticing and trading a size that was chosen by a default.
+///
+/// In the cache beside `theme.txt` and `currency.txt`, not in the config: these
+/// are set from keys during a session, and the app writing into a file it asks
+/// people to hand-edit is what the config/cache split exists to avoid.
+///
+/// Absent or unreadable means the defaults, which is what a first run gets.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Sizing {
+    #[serde(default)]
+    buy_frac: Option<f64>,
+    #[serde(default)]
+    buy_step: Option<f64>,
+}
+
+fn sizing_path() -> String {
+    format!("{}/sizing.json", state_dir())
+}
+
+fn load_sizing() -> Sizing {
+    std::fs::read_to_string(sizing_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Written whenever the size changes, so a crash cannot lose the setting the
+/// way holding it until exit would.
+fn save_sizing(bot: &engine::Bot) {
+    let _ = std::fs::create_dir_all(state_dir());
+    // A size outside (0, 1] is not a size; refuse to persist one rather than
+    // reload it next launch and act on it.
+    let buy_frac = (bot.buy_frac > 0.0 && bot.buy_frac <= 1.0).then_some(bot.buy_frac);
+    let s = Sizing { buy_frac, buy_step: bot.buy_step_override };
+    if let Ok(t) = serde_json::to_string(&s) {
+        let tmp = format!("{}.tmp", sizing_path());
+        if std::fs::write(&tmp, t).is_ok() {
+            let _ = std::fs::rename(&tmp, sizing_path());
+        }
+    }
 }
 
 fn save_last_wallet(name: &str) {
@@ -2026,7 +2073,8 @@ async fn app(
         orders: engine::Bot::load_orders(trader),
         log,
         logs: VecDeque::new(),
-        buy_frac: 0.05,       // buy 5% of ETH balance (fine steps)
+        // Whatever was last chosen, else 5%. See `Sizing`.
+        buy_frac: load_sizing().buy_frac.unwrap_or(0.05),
         sell_frac: 1.00,      // sell 100% of token balance by default (10% steps)
         slippage_pct: 3.0,    // matches the previous hardcoded floor
         max_price_move: 0.0,  // impact cap OFF by default — full-size swaps / instant exits ('}' to cap, '{' lower)
@@ -2047,7 +2095,7 @@ async fn app(
         drain_watch: Vec::new(),
         bought_gas: 0.0,
         gas_burned: 0.0,
-        buy_step_override: None,
+        buy_step_override: load_sizing().buy_step,
         acting_key: String::new(),
         ur_permit2_done: false,
         routes: routes_for(&pools, pool.token),
@@ -3079,6 +3127,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             // coarse step does not leave every later press
                             // landing on 1.35%, 1.45%, 1.55%.
                             bot.buy_frac = (((bot.buy_frac / step).round() + 1.0) * step).min(1.0);
+                            save_sizing(bot);
                             let msg = buy_size_status(bot);
                             setting(bot, "Buy size", pct_compact(bot.buy_frac), msg);
                         }
@@ -3136,6 +3185,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('[') => {
                             let step = buy_step(bot);
                             bot.buy_frac = (((bot.buy_frac / step).round() - 1.0) * step).max(step);
+                            save_sizing(bot);
                             let msg = buy_size_status(bot);
                             setting(bot, "Buy size", pct_compact(bot.buy_frac), msg);
                         }
