@@ -837,6 +837,7 @@ mod tests {
             held_secs: Some(7),
             gas: 0.0,
             proof: String::new(),
+            pv: 0,
             verified: true,
         }
     }
@@ -964,6 +965,7 @@ mod tests {
         assert_eq!(row_of_last_day(Some(31)), unselected, "cursor on the last week moved the grid");
     }
 
+    /// Draw a euro figure into a real ratatui buffer and read the cells back.
     #[test]
     fn money_stays_inside_a_calendar_cell() {
         // The figure sits in 9 columns; one that overflows would shove the

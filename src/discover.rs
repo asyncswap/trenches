@@ -2006,14 +2006,20 @@ struct LeaderRow {
     pooled_unit: &'static str, // "ETH" / "USDG" / "" (none found)
 }
 
-/// Compact USD in millions/thousands: $4.20M, $840k, $120.
+/// Compact money in millions/thousands: $4.20M, $840k, $120.
+///
+/// Takes USD, renders in the reader's currency — the same rule as everywhere
+/// else. This screen was the last one still writing a dollar sign of its own,
+/// so a leaderboard read in euros had every market cap labelled in dollars.
 fn usd_m(x: f64) -> String {
+    let sym = crate::base_currency::symbol();
+    let x = crate::base_currency::from_usd(x);
     if x >= 1e6 {
-        format!("${:.2}M", x / 1e6)
+        format!("{sym}{:.2}M", x / 1e6)
     } else if x >= 1e3 {
-        format!("${:.0}k", x / 1e3)
+        format!("{sym}{:.0}k", x / 1e3)
     } else {
-        format!("${:.0}", x)
+        format!("{sym}{:.0}", x)
     }
 }
 

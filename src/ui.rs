@@ -61,6 +61,83 @@ pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Op
     }
 }
 
+/// A short, centred picker that sits over the screen rather than replacing it.
+///
+/// `select` sizes its box to hold every item, which is right for a handful of
+/// accounts and wrong for a hundred and sixty currencies: the box grows past
+/// the screen, the borders leave, and a menu becomes a wall of text. This one
+/// is a fixed panel that scrolls, so the list length stops being the layout.
+///
+/// `jump` lets a letter seek — pressing `e` walks to EUR, then to EGP. With a
+/// list this long, arrow keys are not navigation, they are a chore.
+pub fn select_overlay(
+    term: &mut Term,
+    title: &str,
+    items: &[String],
+    start: usize,
+) -> eyre::Result<Option<usize>> {
+    image::clear();
+    let mut state = ListState::default();
+    state.select(Some(start.min(items.len().saturating_sub(1))));
+    // What a typed letter seeks on: the first ASCII letter of each row, past
+    // any flag or marker in front of it.
+    let keys: Vec<char> = items
+        .iter()
+        .map(|s| s.chars().find(|c| c.is_ascii_alphabetic()).unwrap_or(' ').to_ascii_lowercase())
+        .collect();
+    loop {
+        term.draw(|f| {
+            widgets::paint_bg(f);
+            // Tall enough to be worth scrolling, short enough to read as a
+            // panel rather than a page.
+            let h = (f.area().height * 3 / 5).clamp(7, 22);
+            let area = centered(f.area(), 34, h);
+            f.render_widget(ratatui::widgets::Clear, area);
+            let sel = state.selected().unwrap_or(0) + 1;
+            let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
+                .block(
+                    widgets::themed_block(format!(" {title} "))
+                        .title_bottom(format!(" {sel}/{}  ↑/↓ · a–z jump · enter · esc ", items.len())),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(widgets::bg_base())
+                        .bg(widgets::tone_color(crate::view::Tone::Info)),
+                )
+                .highlight_symbol("▶ ");
+            f.render_stateful_widget(list, area, &mut state);
+        })?;
+        crate::ui_alive();
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let Event::Key(k) = event::read()? else { continue };
+        let i = state.selected().unwrap_or(0);
+        match k.code {
+            KeyCode::Up => state.select(Some(if i == 0 { items.len() - 1 } else { i - 1 })),
+            KeyCode::Down => state.select(Some((i + 1) % items.len())),
+            KeyCode::PageUp => state.select(Some(i.saturating_sub(10))),
+            KeyCode::PageDown => state.select(Some((i + 10).min(items.len() - 1))),
+            KeyCode::Home => state.select(Some(0)),
+            KeyCode::End => state.select(Some(items.len() - 1)),
+            KeyCode::Enter => return Ok(state.selected()),
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                // Seek to the next row starting with that letter, wrapping —
+                // so holding it cycles the matches rather than sticking.
+                let c = c.to_ascii_lowercase();
+                let next = (1..=items.len())
+                    .map(|d| (i + d) % items.len())
+                    .find(|&j| keys[j] == c);
+                if let Some(j) = next {
+                    state.select(Some(j));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// One row of a `select_table`.
 pub struct PickRow {
     pub cells: Vec<String>,

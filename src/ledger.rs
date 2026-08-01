@@ -74,6 +74,21 @@ pub struct Fill {
     /// Empty on fills written before proofs existed: unverified, not forged.
     #[serde(default)]
     pub proof: String,
+    /// Which field set `proof` covers.
+    ///
+    /// A chained log that is only ever appended cannot be re-proved when the
+    /// fields change — and they did: adding `gas` to the covered set
+    /// invalidated every proof already on disk, so six honest fills came back
+    /// flagged as tampered by a change I made. That is the warning crying
+    /// wolf, which is the one failure a warning cannot survive.
+    ///
+    /// So each fill records the scheme it was written under. A row from an
+    /// older scheme is UNVERIFIED — it predates the guarantee — rather than
+    /// broken, and rows from the current one still chain to each other.
+    ///
+    /// 0 = written before proofs were versioned.
+    #[serde(default)]
+    pub pv: u32,
     /// Whether this fill's proof matched when the file was read. Not persisted
     /// — it is a fact about the last read, not about the record.
     #[serde(skip)]
@@ -186,6 +201,10 @@ pub fn path(account: &str) -> String {
 /// and `quote_usd` because re-stamping the rate silently re-prices the day.
 /// Adding a field here invalidates every existing proof, which is correct — an
 /// old proof did not attest to the new field.
+/// The current proof scheme. Bump when `fill_fields` changes; never edit a
+/// past version's field list, or the rows written under it stop verifying.
+pub const PROOF_VERSION: u32 = 1;
+
 pub fn fill_fields(f: &Fill) -> Vec<String> {
     vec![
         f.ts.to_string(),
@@ -207,9 +226,13 @@ pub fn fill_fields(f: &Fill) -> Vec<String> {
 /// chains onto. Empty when the file is new, or ends in a pre-proof line.
 fn last_proof(account: &str) -> String {
     let Ok(text) = std::fs::read_to_string(path(account)) else { return String::new() };
+    // The last proof FROM THIS SCHEME. Chaining onto an older one would make
+    // the new row unverifiable the moment the old row is skipped, which is
+    // exactly what skipping it is meant to avoid.
     text.lines()
         .rev()
-        .find_map(|l| serde_json::from_str::<Fill>(l).ok())
+        .filter_map(|l| serde_json::from_str::<Fill>(l).ok())
+        .find(|f| f.pv == PROOF_VERSION && !f.proof.is_empty())
         .map(|f| f.proof)
         .unwrap_or_default()
 }
@@ -224,6 +247,7 @@ pub fn append(account: &str, f: &Fill) {
     // instance may have appended since, and reading the tail is how this stays
     // correct without a lock.
     let mut f = f.clone();
+    f.pv = PROOF_VERSION;
     let fields = fill_fields(&f);
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
     f.proof = crate::verification::proof(&last_proof(account), &refs);
@@ -242,11 +266,24 @@ pub fn append(account: &str, f: &Fill) {
 /// break onward is marked too — a chain that breaks at row `i` says nothing
 /// about row `i+1`.
 fn verify_chain(fills: &mut [Fill]) -> Option<usize> {
-    let records: Vec<(String, Vec<String>)> =
-        fills.iter().map(|f| (f.proof.clone(), fill_fields(f))).collect();
+    // A row from an older scheme presents an EMPTY proof to the checker, which
+    // treats it as pre-proof and carries the chain past it untouched. It is
+    // unverified, not broken: nobody edited it, the rules changed underneath
+    // it, and saying "tampered" about that is how a warning stops being read.
+    let records: Vec<(String, Vec<String>)> = fills
+        .iter()
+        .map(|f| {
+            if f.pv == PROOF_VERSION {
+                (f.proof.clone(), fill_fields(f))
+            } else {
+                (String::new(), Vec::new())
+            }
+        })
+        .collect();
     let broken = crate::verification::first_broken(&records);
     for (i, f) in fills.iter_mut().enumerate() {
-        f.verified = broken.is_none_or(|b| i < b);
+        f.verified =
+            f.pv == PROOF_VERSION && !f.proof.is_empty() && broken.is_none_or(|b| i < b);
     }
     broken
 }
@@ -504,6 +541,7 @@ mod tests {
             held_secs: Some(42),
             gas: 0.0,
             proof: String::new(),
+            pv: 0,
             verified: true,
         };
         assert!((f.usd() - 200.0).abs() < 1e-9);
@@ -526,6 +564,7 @@ mod tests {
             held_secs: None,
             gas: 0.0,
             proof: String::new(),
+            pv: 0,
             verified: true,
         };
         assert_eq!(f.ret_pct(), 0.0);
@@ -554,7 +593,7 @@ mod ret_col_tests {
             ts: 0, chain: "t".into(), sym: "A".into(), token: "0x1".into(),
             pnl, cost, proceeds: cost + pnl, quote_sym: "ETH".into(),
             quote_usd: 1.0, tx: "0x0".into(), held_secs: None,
-            gas: 0.0, proof: String::new(), verified: true,
+            gas: 0.0, proof: String::new(), pv: 0, verified: true,
         }
     }
 
@@ -592,6 +631,60 @@ mod ret_col_tests {
         assert_ne!(f(&base), f(&edited), "how long it was held is covered");
     }
 
+    /// The regression that prompted versioning: adding `gas` to the covered
+    /// fields turned six honest fills into "⚠ unverified" on the calendar. A
+    /// row written under an older scheme predates the guarantee; it is not
+    /// evidence of tampering, and saying so is how a warning stops being read.
+    #[test]
+    fn a_fill_from_an_older_scheme_is_unverified_not_broken() {
+        let mut chain: Vec<Fill> = Vec::new();
+        // Two rows written before proofs were versioned, carrying proofs from
+        // a field set that no longer exists.
+        for pnl in [0.1, 0.2] {
+            let mut f = fill(pnl, 1.0);
+            f.pv = 0;
+            f.proof = "deadbeef".into();
+            chain.push(f);
+        }
+        // Then two written under the current scheme, chained to each other.
+        let mut prev = String::new();
+        for pnl in [0.3, 0.4] {
+            let mut f = fill(pnl, 1.0);
+            f.pv = PROOF_VERSION;
+            let v = fill_fields(&f);
+            let r: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            f.proof = crate::verification::proof(&prev, &r);
+            prev = f.proof.clone();
+            chain.push(f);
+        }
+        assert_eq!(verify_chain(&mut chain), None, "the old rows do not break it");
+        assert!(!chain[0].verified && !chain[1].verified, "old rows are unverified");
+        assert!(chain[2].verified && chain[3].verified, "new rows still verify");
+    }
+
+    /// And tampering with a CURRENT row is still caught, past the old ones.
+    #[test]
+    fn versioning_does_not_blunt_the_check() {
+        let mut chain: Vec<Fill> = Vec::new();
+        let mut old = fill(0.1, 1.0);
+        old.pv = 0;
+        old.proof = "stale".into();
+        chain.push(old);
+        let mut prev = String::new();
+        for pnl in [0.3, 0.4] {
+            let mut f = fill(pnl, 1.0);
+            f.pv = PROOF_VERSION;
+            let v = fill_fields(&f);
+            let r: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            f.proof = crate::verification::proof(&prev, &r);
+            prev = f.proof.clone();
+            chain.push(f);
+        }
+        chain[1].pnl = 99.0; // somebody edits the profit
+        assert_eq!(verify_chain(&mut chain), Some(1));
+        assert!(!chain[2].verified, "and everything after it");
+    }
+
     /// Editing one fill must flag it AND everything after — a chain that breaks
     /// at row `i` says nothing about row `i+1`.
     #[test]
@@ -600,6 +693,7 @@ mod ret_col_tests {
         let mut prev = String::new();
         for pnl in [0.1, 0.2, 0.3] {
             let mut f = fill(pnl, 1.0);
+            f.pv = PROOF_VERSION; // written under the current scheme
             let v = fill_fields(&f);
             let r: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
             f.proof = crate::verification::proof(&prev, &r);

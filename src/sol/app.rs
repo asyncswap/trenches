@@ -1446,6 +1446,7 @@ impl SolBot {
                         // 5000 lamports would say "counted" and be wrong.
                         gas: 0.0,
                         proof: String::new(), // filled by append, which reads the chain
+                        pv: 0,                // likewise
                         verified: true,       // just made; nothing to distrust yet
                     },
                 );

@@ -844,6 +844,7 @@ impl Bot {
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
                         gas,
                         proof: String::new(), // filled by append, which reads the chain
+                        pv: 0,                // likewise
                         verified: true,       // just made; nothing to distrust yet
                     },
                 );

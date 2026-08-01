@@ -62,18 +62,33 @@ impl BaseCurrency {
         if !usd.is_finite() { usd } else { usd * self.per_usd }
     }
 
-    /// The prefix a bare figure wears.
+    /// The prefix a bare figure wears. ASCII, always.
     ///
-    /// A glyph only when it belongs to this currency alone; the ISO code
-    /// otherwise. Every number on this screen renders as `$4.20M` with the
-    /// code nowhere near it, so a shared glyph is not shorthand, it is a
-    /// wrong label — `$` is ten currencies and `kr` is four. The picker,
-    /// where the code sits right beside it, uses `glyph` instead.
+    /// Not a style choice — a correctness one. `€` is U+20AC, whose East Asian
+    /// Width is AMBIGUOUS, and a terminal is free to draw it one column wide or
+    /// two. Ours renders it as two: the app writes `€0.152` into six cells, the
+    /// terminal paints it across seven, every cell after it shifts, and the
+    /// column boundary eats a digit. `€0.152` arrives as `€.152`, and `€2.99`
+    /// as `€.99` — a price that has silently lost its leading digit while
+    /// looking like a perfectly ordinary number.
+    ///
+    /// Verified rather than guessed: rendering into a ratatui TestBackend
+    /// returns `€0.152` intact, so the app is right and the terminal is
+    /// reading the same bytes differently. Nothing in this process can fix
+    /// that, and no amount of padding survives a character whose width is
+    /// decided by someone else's font.
+    ///
+    /// So a figure carries `$` — ASCII, one column, everywhere — or the ISO
+    /// code, which is also ASCII. `₹`, `₩`, `£`, `¥` and the rest are ambiguous
+    /// or Latin-1 and are kept for the picker (see `glyph`), where a
+    /// one-column shift moves a label instead of corrupting a number.
     pub fn symbol(&self) -> String {
         let g = glyph(&self.code);
         let owned = UNIQUE_GLYPH.contains(&self.code.as_str())
             || KEEPS_SHARED_GLYPH.contains(&self.code.as_str());
-        if !g.is_empty() && owned {
+        // `is_ascii` is the whole test: anything outside it has a width this
+        // process does not control.
+        if owned && g.is_ascii() && !g.is_empty() {
             g.to_string()
         } else {
             format!("{} ", self.code)
@@ -511,7 +526,17 @@ mod tests {
     fn a_selected_currency_scales_every_figure() {
         let d = at("EUR", 0.92);
         assert!((d.from_usd(100.0) - 92.0).abs() < 1e-9);
-        assert_eq!(d.symbol(), "€");
+        assert_eq!(d.symbol(), "EUR ");
+    }
+
+    /// The bug this rule exists for: an ambiguous-width glyph beside a digit.
+    /// Whatever a figure wears, the terminal must agree on how wide it is.
+    #[test]
+    fn nothing_that_rides_a_figure_is_wider_than_we_think() {
+        for code in ["USD", "EUR", "GBP", "JPY", "INR", "KRW", "NGN", "CHF", "SEK", "ZZZ"] {
+            let sym = at(code, 1.0).symbol();
+            assert!(sym.is_ascii(), "{code} renders {sym:?}, whose width is the terminal's to decide");
+        }
     }
 
     /// `$` belongs to more than one currency, and a Canadian reading it as USD
@@ -522,18 +547,17 @@ mod tests {
         // States keeps it, because an unqualified `$` means dollars to almost
         // everyone; the other nine wear their code.
         assert_eq!(at("USD", 1.0).symbol(), "$");
-        assert_eq!(at("GBP", 0.79).symbol(), "£", "and £ is Britain's");
-        assert_eq!(at("JPY", 150.0).symbol(), "¥", "and ¥ is Japan's");
         assert_eq!(at("CNY", 7.2).symbol(), "CNY ", "but not China's");
         assert_eq!(at("MXN", 17.0).symbol(), "MXN ", "not a bare $");
         assert_eq!(at("CLP", 950.0).symbol(), "CLP ");
         // `kr` is four Nordic currencies; none of them may claim it alone.
         assert_eq!(at("SEK", 10.5).symbol(), "SEK ");
         assert_eq!(at("NOK", 10.5).symbol(), "NOK ");
-        // But an unshared glyph is kept, because it reads instantly.
-        assert_eq!(at("EUR", 0.92).symbol(), "€");
-        assert_eq!(at("GBP", 0.79).symbol(), "£");
-        assert_eq!(at("INR", 83.0).symbol(), "₹");
+        // Non-ASCII glyphs never ride a figure, however unambiguous they are
+        // as symbols: their width belongs to the terminal, not to us.
+        assert_eq!(at("EUR", 0.92).symbol(), "EUR ");
+        assert_eq!(at("GBP", 0.79).symbol(), "GBP ");
+        assert_eq!(at("INR", 83.0).symbol(), "INR ");
     }
 
     /// An unknown code gets its ISO code rather than a borrowed glyph.

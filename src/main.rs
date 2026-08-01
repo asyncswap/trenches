@@ -1584,14 +1584,6 @@ fn wallet_screen(
 }
 
 /// First 6 and last 4 of an address — enough to match against an explorer
-/// without eating the row.
-fn short_addr(a: alloy::primitives::Address) -> String {
-    let s = format!("{a:#x}");
-    if s.len() <= 12 {
-        return s;
-    }
-    format!("{}…{}", &s[..6], &s[s.len() - 4..])
-}
 
 /// `~`-shortened path, so a wallet list reads as a location rather than a wall
 /// of home directory.
@@ -2992,11 +2984,19 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 .iter()
                                 .find(|q| q.token == bot.pool.token && !bot.pool.kind.is_empty())
                                 .cloned();
-                            // No "from" when there is nothing loaded — the zero
-                            // address is a placeholder, not a wallet.
-                            let from =
-                                if bot.trader.is_zero() { String::new() } else { format!("{:#x}", bot.trader) };
-                            events::action("Opened the account picker", &[("current", from)]);
+                            // DELIBERATELY NOT LOGGED.
+                            //
+                            // The account picker is the doorway to a keystore
+                            // password. A timestamped line saying it just
+                            // opened is a signal to anything watching the log
+                            // that a password is about to be typed — it turns
+                            // an opportunistic keylogger into a targeted one
+                            // that only has to record for the next few seconds.
+                            //
+                            // The log is a trading record, and nothing about
+                            // opening a menu is a trade. What it cost to say so
+                            // was one line nobody reads; what it bought was a
+                            // cue for whoever else is reading.
                             return Ok(Exit::ChangeAccount);
                         }
                         // Back to the chain picker without restarting.
@@ -3110,7 +3110,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                         if *c == here { format!("{row}   ✓") } else { row }
                                     })
                                     .collect();
-                                if let Some(i) = ui::select(terminal, "Display currency", &labels)? {
+                                // Opens ON the current currency, not at the top:
+                                // the list is 160 long and the row you care
+                                // about most is the one you are already using.
+                                let at = codes.iter().position(|c| *c == here).unwrap_or(0);
+                                if let Some(i) =
+                                    ui::select_overlay(terminal, "Display currency", &labels, at)?
+                                {
                                     let pick = codes[i].clone();
                                     if crate::base_currency::select(&pick) {
                                         crate::base_currency::save(&pick);
@@ -3890,9 +3896,31 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         ]),
     );
     // One piece of information per row — priced in the pool's quote currency.
-    mkt.push(Line::from(vec![mlbl("Price"), Span::raw(format!("{:.4} {}/{}", bot.price(), bot.pool.sym, bot.pool.quote_sym))]));
+    // The price of ONE token, in money, with the pool's own ratio behind it.
+    //
+    // `242599210.5249 SALPHA/ETH` is the pool's number in the pool's unit: true,
+    // and not comparable to the market cap under it, to a chart, or to anything
+    // a person quotes a price in. What you want to know is what one costs.
+    mkt.push(Line::from(vec![
+        mlbl("Price"),
+        Span::raw(if bot.price() > 0.0 && bot.pool.quote_usd > 0.0 {
+            format!(
+                "{} / {}   ({:.4} {}/{})",
+                view::usd_price(bot.pool.quote_usd / bot.price()),
+                bot.pool.sym,
+                bot.price(),
+                bot.pool.sym,
+                bot.pool.quote_sym
+            )
+        } else {
+            format!("{:.4} {}/{}", bot.price(), bot.pool.sym, bot.pool.quote_sym)
+        }),
+    ]));
     mkt.push(Line::from(vec![mlbl("Tick"), Span::raw(format!("{}", bot.tick))]));
-    mkt.push(Line::from(vec![mlbl("Mkt Cap"), Span::raw(format!("${:.2}M", bot.market_cap_usd() / 1e6))]));
+    mkt.push(Line::from(vec![
+        mlbl("Mkt Cap"),
+        Span::raw(view::usd_compact(bot.market_cap_usd())),
+    ]));
     if let Some(lb) = bot.pons_launch() {
         let s = block.saturating_sub(lb) / 10; // ~10 blocks/sec since graduation
         let a = view::age_compact(s as f64);
@@ -3987,10 +4015,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
             }
             let pbp = bot.price_b();
-            mb.push(Line::from(format!("{:<9}{:.4} {}/{}", "Price", pbp, pb.sym, pb.quote_sym)));
+            mb.push(Line::from(if pbp > 0.0 && pb.quote_usd > 0.0 {
+                format!("{:<9}{} / {}", "Price", view::usd_price(pb.quote_usd / pbp), pb.sym)
+            } else {
+                format!("{:<9}{:.4} {}/{}", "Price", pbp, pb.sym, pb.quote_sym)
+            }));
             mb.push(Line::from(format!("{:<9}{}", "Tick", bot.mkt_b.tick)));
             let mcap_b = if pbp > 0.0 { bot.mkt_b.supply / pbp * pb.quote_usd } else { 0.0 };
-            mb.push(Line::from(format!("{:<9}${:.2}M", "Mkt Cap", mcap_b / 1e6)));
+            mb.push(Line::from(format!("{:<9}{}", "Mkt Cap", view::usd_compact(mcap_b))));
             mb.push(Line::from(format!("{:<9}{} {}", "Pooled", view::eth(bot.mkt_b.r0), pb.quote_sym)));
             mb.push(Line::from(format!("{:<9}{:.0} {}", "Pooled", bot.mkt_b.r1, pb.sym)));
             let gap = bot.arb_gap_pct();
@@ -4323,7 +4355,13 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Col::fixed("price", 19),
                     view::Col::fixed(format!("pooled {}", bot.pool.quote_sym), 12),
                     view::Col::fixed("mkt cap", 12),
-                    view::Col::fixed("trader", 14),
+                    // FULL, never shortened. `0x8f63…fc8` is enough to
+                    // recognise someone you already know and not enough to
+                    // identify someone you do not — and the middle is exactly
+                    // what an address-generator grinds to make two addresses
+                    // look alike. It is also the one field here you would ever
+                    // want to copy, and half an address pastes as nothing.
+                    view::Col::fixed("trader", 44),
                     view::Col::min("tx", 12),
                 ],
             );
@@ -4416,7 +4454,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                             },
                             atone,
                         ),
-                        view::Cell::toned(short_addr(s.trader), view::Tone::Normal),
+                        view::Cell::toned(format!("{:#x}", s.trader), view::Tone::Normal),
                         view::Cell::toned(format!("{}", s.tx), view::Tone::Normal),
                     ],
                     mine,
