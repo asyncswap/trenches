@@ -62,34 +62,21 @@ impl BaseCurrency {
         if !usd.is_finite() { usd } else { usd * self.per_usd }
     }
 
-    /// The prefix a figure wears. A symbol where one is unambiguous in a
-    /// terminal, and the ISO code otherwise.
+    /// The prefix a bare figure wears.
     ///
-    /// `$` for USD, `€` for EUR — those read as money instantly. But `$` is
-    /// also CAD, AUD, NZD, HKD and a dozen more, and a Canadian reading `$` on
-    /// a screen that means USD is being actively misled. So anything that
-    /// shares a glyph gets its code instead: `CA$`, `A$`. Being unmistakable
-    /// matters more here than being pretty.
+    /// A glyph only when it belongs to this currency alone; the ISO code
+    /// otherwise. Every number on this screen renders as `$4.20M` with the
+    /// code nowhere near it, so a shared glyph is not shorthand, it is a
+    /// wrong label — `$` is ten currencies and `kr` is four. The picker,
+    /// where the code sits right beside it, uses `glyph` instead.
     pub fn symbol(&self) -> String {
-        match self.code.as_str() {
-            "USD" => "$".into(),
-            "EUR" => "€".into(),
-            "GBP" => "£".into(),
-            "JPY" => "¥".into(),
-            "CNY" => "CN¥".into(),
-            "INR" => "₹".into(),
-            "KRW" => "₩".into(),
-            "NGN" => "₦".into(),
-            "RUB" => "₽".into(),
-            "TRY" => "₺".into(),
-            "BRL" => "R$".into(),
-            "CAD" => "C$".into(),
-            "AUD" => "A$".into(),
-            "NZD" => "NZ$".into(),
-            "MXN" => "MX$".into(),
-            "CHF" => "Fr".into(),
-            "SEK" | "NOK" | "DKK" => format!("{} ", self.code),
-                _ => format!("{} ", self.code),
+        let g = glyph(&self.code);
+        let owned = UNIQUE_GLYPH.contains(&self.code.as_str())
+            || KEEPS_SHARED_GLYPH.contains(&self.code.as_str());
+        if !g.is_empty() && owned {
+            g.to_string()
+        } else {
+            format!("{} ", self.code)
         }
     }
 }
@@ -172,6 +159,180 @@ pub fn is_fiat(code: &str) -> bool {
     FIAT.contains(&code)
 }
 
+/// The conventional glyph for a currency — AsyncSwap's `currencySymbol.ts`,
+/// carried over whole.
+///
+/// Used where the CODE is on screen beside it, which is the only place a
+/// shared glyph is safe. See `symbol` for the other case.
+pub fn glyph(code: &str) -> &'static str {
+    match code {
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "JPY" => "¥",
+        "AUD" => "A$",
+        "CAD" => "C$",
+        "CHF" => "Fr",
+        "CNY" => "¥",
+        "HKD" => "HK$",
+        "NZD" => "NZ$",
+        "SEK" => "kr",
+        "KRW" => "₩",
+        "SGD" => "S$",
+        "NOK" => "kr",
+        "MXN" => "$",
+        "INR" => "₹",
+        "RUB" => "₽",
+        "ZAR" => "R",
+        "TRY" => "₺",
+        "BRL" => "R$",
+        "TWD" => "NT$",
+        "DKK" => "kr",
+        "PLN" => "zł",
+        "THB" => "฿",
+        "IDR" => "Rp",
+        "HUF" => "Ft",
+        "CZK" => "Kč",
+        "ILS" => "₪",
+        "CLP" => "$",
+        "PHP" => "₱",
+        "AED" => "د.إ",
+        "COP" => "$",
+        "SAR" => "﷼",
+        "MYR" => "RM",
+        "RON" => "lei",
+        "ARS" => "$",
+        "UAH" => "₴",
+        "HRK" => "kn",
+        "AZN" => "₼",
+        "BDT" => "৳",
+        "BGN" => "лв",
+        "BHD" => ".د.ب",
+        "BIF" => "FBu",
+        "BMD" => "$",
+        "BND" => "B$",
+        "BOB" => "Bs.",
+        "BSD" => "B$",
+        "BTN" => "Nu.",
+        "BWP" => "P",
+        "BYN" => "Br",
+        "BZD" => "BZ$",
+        "CRC" => "₡",
+        "CUP" => "₱",
+        "CVE" => "Esc",
+        "DJF" => "Fdj",
+        "DOP" => "RD$",
+        "DZD" => "دج",
+        "EGP" => "E£",
+        "ETB" => "Br",
+        "FJD" => "FJ$",
+        "FKP" => "£",
+        "GEL" => "₾",
+        "GHS" => "GH₵",
+        "GIP" => "£",
+        "GMD" => "D",
+        "GNF" => "FG",
+        "GTQ" => "Q",
+        "GYD" => "G$",
+        "HNL" => "L",
+        "HTG" => "G",
+        "IQD" => "ع.د",
+        "IRR" => "﷼",
+        "ISK" => "kr",
+        "JMD" => "J$",
+        "JOD" => "JD",
+        "KES" => "KSh",
+        "KGS" => "лв",
+        "KHR" => "៛",
+        "KMF" => "CF",
+        "KWD" => "د.ك",
+        "KYD" => "$",
+        "KZT" => "₸",
+        "LAK" => "₭",
+        "LBP" => "ل.ل",
+        "LKR" => "₨",
+        "LRD" => "$",
+        "LSL" => "L",
+        "LYD" => "ل.د",
+        "MAD" => "د.م.",
+        "MDL" => "L",
+        "MGA" => "Ar",
+        "MKD" => "ден",
+        "MMK" => "K",
+        "MNT" => "₮",
+        "MOP" => "MOP$",
+        "MRU" => "UM",
+        "MUR" => "₨",
+        "MVR" => "Rf",
+        "MWK" => "MK",
+        "MZN" => "MT",
+        "NAD" => "$",
+        "NGN" => "₦",
+        "NIO" => "C$",
+        "NPR" => "₨",
+        "OMR" => "ر.ع.",
+        "PAB" => "B/.",
+        "PEN" => "S/.",
+        "PGK" => "K",
+        "PKR" => "₨",
+        "PYG" => "₲",
+        "QAR" => "ر.ق",
+        "RSD" => "дин.",
+        "RWF" => "RF",
+        "SBD" => "SI$",
+        "SCR" => "SR",
+        "SDG" => "ج.س.",
+        "SHP" => "£",
+        "SLL" => "Le",
+        "SOS" => "S",
+        "SRD" => "$",
+        "SSP" => "£",
+        "STN" => "Db",
+        "SYP" => "£S",
+        "SZL" => "E",
+        "TJS" => "ЅМ",
+        "TMT" => "m",
+        "TND" => "د.ت",
+        "TOP" => "T$",
+        "TTD" => "TT$",
+        "TZS" => "TSh",
+        "UGX" => "USh",
+        "UYU" => "$U",
+        "UZS" => "лв",
+        "VES" => "Bs",
+        "VND" => "₫",
+        "VUV" => "VT",
+        "WST" => "WS$",
+        "XAF" => "FCFA",
+        "XCD" => "EC$",
+        "XOF" => "CFA",
+        "XPF" => "₣",
+        "YER" => "﷼",
+        "ZMW" => "ZK",
+        _ => "",
+    }
+}
+
+/// Codes whose glyph belongs to them alone.
+///
+/// Thirteen glyphs in that table are shared: `$` by ten currencies, `kr` by
+/// four, `₨` by four, `¥` by two. In a dropdown reading `MXN ($)` that is
+/// fine — the code is right there. On a figure that renders as `$4.20M` and
+/// nothing else, it is a Mexican peso wearing a dollar sign.
+const UNIQUE_GLYPH: [&str; 99] = ["AED", "AUD", "AZN", "BDT", "BHD", "BIF", "BOB", "BRL", "BTN", "BWP", "BZD", "CHF", "CRC", "CVE", "CZK", "DJF", "DOP", "DZD", "EGP", "EUR", "FJD", "GEL", "GHS", "GMD", "GNF", "GTQ", "GYD", "HKD", "HRK", "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "JMD", "JOD", "KES", "KHR", "KMF", "KRW", "KWD", "KZT", "LAK", "LBP", "LYD", "MAD", "MGA", "MKD", "MNT", "MOP", "MRU", "MVR", "MWK", "MYR", "MZN", "NGN", "NZD", "OMR", "PAB", "PEN", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SBD", "SCR", "SDG", "SGD", "SLL", "SOS", "STN", "SYP", "SZL", "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "UYU", "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "ZAR", "ZMW"];
+
+/// The currencies that keep a glyph they share.
+///
+/// `$` belongs to ten currencies in that table and to the United States in
+/// practice: an unqualified `$` on a screen means dollars to almost everyone,
+/// and writing `USD ` instead would make the default case — the one nearly
+/// every reader is in — uglier to serve a rare one. Same for `£` and `¥`.
+///
+/// The list stops there on purpose. `kr` without qualification means nothing:
+/// Sweden, Norway, Denmark and Iceland have equal claim, so none of them gets
+/// it. A glyph is kept only where there is no real contest.
+const KEEPS_SHARED_GLYPH: [&str; 3] = ["USD", "GBP", "JPY"];
+
 /// The flag for a currency, derived rather than tabulated.
 ///
 /// A currency code is its country's ISO 3166 code plus a letter for the
@@ -200,8 +361,12 @@ pub fn flag(code: &str) -> String {
 /// about to start reading, where a bare `CAD` leaves you to find out after the
 /// whole screen has changed.
 pub fn label(code: &str) -> String {
-    let d = BaseCurrency { code: code.to_string(), per_usd: 1.0 };
-    format!("{}  {}  ({})", flag(code), code, d.symbol().trim())
+    let g = glyph(code);
+    if g.is_empty() {
+        format!("{}  {}", flag(code), code)
+    } else {
+        format!("{}  {}  ({})", flag(code), code, g)
+    }
 }
 
 /// Every currency we have a rate for, sorted, with the majors first.
@@ -353,15 +518,37 @@ mod tests {
     /// is being misled by the thing that was supposed to help.
     #[test]
     fn currencies_that_share_a_glyph_are_disambiguated() {
-        assert_eq!(at("CAD", 1.37).symbol(), "C$");
-        assert_eq!(at("AUD", 1.5).symbol(), "A$");
-        assert_ne!(at("CAD", 1.37).symbol(), at("USD", 1.0).symbol());
+        // `$` belongs to ten currencies in the reference table. The United
+        // States keeps it, because an unqualified `$` means dollars to almost
+        // everyone; the other nine wear their code.
+        assert_eq!(at("USD", 1.0).symbol(), "$");
+        assert_eq!(at("GBP", 0.79).symbol(), "£", "and £ is Britain's");
+        assert_eq!(at("JPY", 150.0).symbol(), "¥", "and ¥ is Japan's");
+        assert_eq!(at("CNY", 7.2).symbol(), "CNY ", "but not China's");
+        assert_eq!(at("MXN", 17.0).symbol(), "MXN ", "not a bare $");
+        assert_eq!(at("CLP", 950.0).symbol(), "CLP ");
+        // `kr` is four Nordic currencies; none of them may claim it alone.
+        assert_eq!(at("SEK", 10.5).symbol(), "SEK ");
+        assert_eq!(at("NOK", 10.5).symbol(), "NOK ");
+        // But an unshared glyph is kept, because it reads instantly.
+        assert_eq!(at("EUR", 0.92).symbol(), "€");
+        assert_eq!(at("GBP", 0.79).symbol(), "£");
+        assert_eq!(at("INR", 83.0).symbol(), "₹");
     }
 
     /// An unknown code gets its ISO code rather than a borrowed glyph.
     #[test]
     fn an_unlisted_currency_still_says_what_it_is() {
-        assert_eq!(at("ZMW", 26.0).symbol(), "ZMW ");
+        assert_eq!(at("ZZZ", 26.0).symbol(), "ZZZ ");
+    }
+
+    /// The picker shows the code, so a shared glyph is unambiguous there and
+    /// worth showing: `MXN ($)` tells you what you are about to read.
+    #[test]
+    fn the_picker_may_show_a_glyph_the_figures_cannot() {
+        assert_eq!(glyph("MXN"), "$");
+        assert!(label("MXN").ends_with("($)"));
+        assert_eq!(at("MXN", 17.0).symbol(), "MXN ", "but a bare figure may not");
     }
 
     /// A rate that never arrived must not quietly render as dollars.
@@ -428,5 +615,6 @@ mod picker_tests {
         assert_eq!(label("USD"), "🇺🇸  USD  ($)");
         assert_eq!(label("CAD"), "🇨🇦  CAD  (C$)");
         assert_eq!(label("CHF"), "🇨🇭  CHF  (Fr)");
+        assert_eq!(label("JPY"), "🇯🇵  JPY  (¥)");
     }
 }
