@@ -1866,13 +1866,16 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // status light exists to break.
     let (live, n) = crate::launch_stream::status();
     let feed = if live {
+        // "live (5)" read as five live tokens, which is the one thing it does
+        // not mean — the list below is the tokens. This is the websocket: that
+        // it is connected, and how many launches it has pushed. Say both.
         Span::styled(
-            format!("· live ({n}) "),
+            format!("· websocket connected · {n} pushed "),
             Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Good)),
         )
     } else {
         Span::styled(
-            "· polling only ",
+            "· no websocket · polling only ",
             Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Warn)),
         )
     };
