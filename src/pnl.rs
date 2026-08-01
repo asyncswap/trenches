@@ -80,7 +80,8 @@ fn summarise(fills: &[&Fill]) -> Day {
     Day {
         pnl_usd: fills.iter().map(|f| f.usd()).sum(),
         trades: fills.len(),
-        wins: fills.iter().filter(|f| f.pnl > 0.0).count(),
+        // `counted_pnl`, so a sell whose cost is unknown is not a win.
+        wins: fills.iter().filter(|f| f.counted_pnl() > 0.0).count(),
     }
 }
 
@@ -158,18 +159,67 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     // of trades points at nothing you asked for.
     let mut scroll: usize = 0;
 
+    // Highlight-to-copy, the same as the dashboard.
+    //
+    // Mouse capture is on for the whole app, which means the terminal's own
+    // selection is off — so a screen that ignores mouse events is a screen you
+    // cannot copy a number out of at all. This is the screen people most want
+    // to copy numbers out of.
+    let mut msel = crate::ui::mouse::Selection::default();
+    let mut copy_armed = false;
+    let mut copied: Option<usize> = None;
+
     loop {
-        term.draw(|f| draw(f, &fills, year, month, sel, range, today, scroll))?;
+        // Read off the rendered buffer, so what lands on the clipboard is what
+        // is on the screen — no second formatting pass to disagree with it.
+        let mut grabbed: Option<String> = None;
+        term.draw(|f| {
+            draw(f, &fills, year, month, sel, range, today, scroll, copied);
+            crate::ui::mouse::paint(f, &msel);
+            if copy_armed {
+                if let Some((a, b)) = msel.region() {
+                    grabbed = Some(crate::ui::mouse::selected_text(f.buffer_mut(), a, b));
+                }
+            }
+        })?;
+        if let Some(t) = grabbed {
+            copy_armed = false;
+            msel.clear();
+            if !t.is_empty() {
+                crate::ui::mouse::copy(&t);
+                copied = Some(t.chars().count());
+            }
+        }
 
         crate::ui_alive();
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
+        let k = match event::read()? {
+            Event::Mouse(m) => {
+                use crossterm::event::MouseEventKind as MK;
+                match m.kind {
+                    // The wheel scrolls the breakdown, three rows a notch —
+                    // the arrows' one-at-a-time is for precision.
+                    MK::ScrollUp => scroll = scroll.saturating_add(3),
+                    MK::ScrollDown => scroll = scroll.saturating_sub(3),
+                    _ => {
+                        if msel.on_mouse(m) {
+                            copy_armed = true; // extracted on the next frame
+                        }
+                    }
+                }
+                continue;
+            }
+            Event::Key(k) => k,
+            _ => continue,
+        };
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        // Any keypress retires the "copied" note — it belongs to the moment.
+        copied = None;
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => return Ok(()),
             // The breakdown lists. Arrows are free here — months are on
@@ -274,6 +324,7 @@ fn draw(
     range: Range,
     today: Date,
     scroll: usize,
+    copied: Option<usize>,
 ) {
     widgets::paint_bg(f);
 
@@ -301,7 +352,7 @@ fn draw(
     header(f, rows[0], fills, &by_day, year, month, range, sel, today);
     grid(f, rows[1], &by_day, year, month, sel, today);
     breakdown(f, rows[2], &by_day, year, month, sel, scroll);
-    keys(f, rows[3]);
+    keys(f, rows[3], copied);
 }
 
 /// Range total, month total, and how the days split.
@@ -588,6 +639,7 @@ fn breakdown(
     };
 
     let row = |fl: &Fill| {
+        let known = fl.basis_known();
         Line::from(vec![
             // One glyph for "this row no longer matches its proof". Silent
             // when it does — a badge on every row teaches you to stop reading
@@ -599,27 +651,36 @@ fn breakdown(
                 Style::default().fg(tone_color(Tone::Bad)).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:<12}", truncate(&fl.sym, 12)),
+                format!("{:<11}", truncate(&fl.sym, 11)),
                 Style::default().fg(tone_color(Tone::Normal)).add_modifier(Modifier::BOLD),
             ),
+            // The profit — or `?`, when there is no recorded buy to subtract.
+            // Printing the proceeds here would call the whole sale profit,
+            // which is how a bag that cost $30 reports a $10 win.
             Span::styled(
-                format!("{:>10}  ", money(fl.usd())),
-                Style::default().fg(tone_color(pnl_tone(fl.pnl))).add_modifier(Modifier::BOLD),
+                if known { format!("{:>10}", money(fl.usd())) } else { format!("{:>10}", "?") },
+                Style::default()
+                    .fg(tone_color(if known { pnl_tone(fl.pnl) } else { Tone::Warn }))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:>8}  ", fl.ret_col()),
-                Style::default().fg(tone_color(pnl_tone(fl.pnl))),
+                format!("{:>7}  ", fl.ret_col()),
+                Style::default().fg(tone_color(if known { pnl_tone(fl.pnl) } else { Tone::Dim })),
+            ),
+            // IN and OUT, the two numbers the profit is the difference of.
+            // Without them a total is something to believe rather than check,
+            // and "I do not know how much I put in" has no answer on screen.
+            Span::styled(
+                format!("{:>9}", fl.cost_usd().map(money).unwrap_or_else(|| "?".into())),
+                Style::default().fg(tone_color(if known { Tone::Dim } else { Tone::Warn })),
             ),
             Span::styled(
-                format!("{:>7}  ", fl.held()),
-                Style::default().fg(tone_color(Tone::Info)),
-            ),
-            Span::styled(
-                // Scaled, like everywhere else: at four decimals a winning
-                // trade and a losing one both read "0.0000", which is the one
-                // thing this column exists to tell apart.
-                format!("{} {}", crate::view::eth(fl.pnl), fl.quote_sym),
+                format!(" {:>9}  ", money(fl.proceeds_usd())),
                 Style::default().fg(tone_color(Tone::Dim)),
+            ),
+            Span::styled(
+                format!("{:>7}", fl.held()),
+                Style::default().fg(tone_color(Tone::Info)),
             ),
         ])
     };
@@ -631,12 +692,23 @@ fn breakdown(
         ))]
     };
 
+    // Sells with no recorded buy are neither. They sit under the winners —
+    // money did come in — but below every real one, marked, and adding
+    // nothing to the day. Dropping them would be worse: the sale happened,
+    // and a row that vanishes is how you stop trusting the whole screen.
     let wins: Vec<Line> = {
-        let v: Vec<Line> = trades.iter().filter(|f| f.pnl > 0.0).map(|f| row(f)).collect();
-        if v.is_empty() { empty("winners") } else { v }
+        let mut v: Vec<Line> =
+            trades.iter().filter(|f| f.basis_known() && f.pnl > 0.0).map(|f| row(f)).collect();
+        let unpriced: Vec<Line> = trades.iter().filter(|f| !f.basis_known()).map(|f| row(f)).collect();
+        if v.is_empty() && unpriced.is_empty() {
+            empty("winners")
+        } else {
+            v.extend(unpriced);
+            v
+        }
     };
     let losses: Vec<Line> = {
-        let mut v: Vec<&&Fill> = trades.iter().filter(|f| f.pnl < 0.0).collect();
+        let mut v: Vec<&&Fill> = trades.iter().filter(|f| f.basis_known() && f.pnl < 0.0).collect();
         v.reverse(); // worst first
         let v: Vec<Line> = v.into_iter().map(|f| row(f)).collect();
         if v.is_empty() { empty("losers") } else { v }
@@ -663,7 +735,16 @@ fn breakdown(
     // Say it in the title too, once. A badge deep in a scrolled list is easy
     // to never reach; the count is what tells you to go looking.
     let bad = trades.iter().filter(|f| !f.verified && !f.proof.is_empty()).count();
-    let flag = if bad > 0 { format!("· ⚠ {bad} unverified ") } else { String::new() };
+    let unpriced = trades.iter().filter(|f| !f.basis_known()).count();
+    let mut flag = String::new();
+    if bad > 0 {
+        flag.push_str(&format!("· ⚠ {bad} unverified "));
+    }
+    // Say the count in the title. A sale with no recorded buy is not counted
+    // in the day, and a total that quietly excludes something must say so.
+    if unpriced > 0 {
+        flag.push_str(&format!("· {unpriced} unpriced (no recorded buy) "));
+    }
 
     f.render_widget(
         Paragraph::new(wins.clone())
@@ -679,9 +760,20 @@ fn breakdown(
     );
 }
 
-fn keys(f: &mut Frame, area: Rect) {
+fn keys(f: &mut Frame, area: Rect, copied: Option<usize>) {
     let dim = Style::default().fg(tone_color(Tone::Dim));
     let key = Style::default().fg(tone_color(Tone::Info)).add_modifier(Modifier::BOLD);
+    // A copy with no acknowledgement feels like a copy that did not happen.
+    if let Some(n) = copied {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  copied {n} characters"),
+                Style::default().fg(tone_color(Tone::Good)).add_modifier(Modifier::BOLD),
+            ))),
+            area,
+        );
+        return;
+    }
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("  h j k l", key),
@@ -696,6 +788,8 @@ fn keys(f: &mut Frame, area: Rect) {
             Span::styled(" whole month   ", dim),
             Span::styled("t", key),
             Span::styled(" today   ", dim),
+            Span::styled("drag", key),
+            Span::styled(" copy   ", dim),
             Span::styled("esc", key),
             Span::styled(" back", dim),
         ])),

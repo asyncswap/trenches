@@ -70,9 +70,46 @@ pub struct Fill {
 }
 
 impl Fill {
+    /// Whether this sell had a cost to subtract.
+    ///
+    /// A sell of tokens the app never saw bought has no basis: the buy happened
+    /// in a session before this one, on another machine, or before the basis
+    /// was kept on disk at all. `pnl` for such a fill is `proceeds - 0`, which
+    /// is the whole sale reported as profit — a $10.63 "win" on a bag that may
+    /// have cost $30.
+    ///
+    /// Derived rather than stored, so it applies to every fill already written
+    /// and does not disturb a single proof. An airdropped bag looks the same
+    /// from here, and is treated the same on purpose: what this says is "this
+    /// app has no record of paying for these", and calling that profit is the
+    /// error either way.
+    pub fn basis_known(&self) -> bool {
+        self.cost > 1e-12 || self.proceeds <= 1e-12
+    }
+
+    /// The profit this fill may be added to a total with — zero when the basis
+    /// is unknown, because an unknown number is not a large one.
+    ///
+    /// Not dropped from the ledger and not hidden in the UI: the sale happened
+    /// and the proceeds are real. It is only barred from arithmetic that would
+    /// present a guess as a measurement.
+    pub fn counted_pnl(&self) -> f64 {
+        if self.basis_known() { self.pnl } else { 0.0 }
+    }
+
     /// Profit in dollars, at the rate that applied when it was made.
     pub fn usd(&self) -> f64 {
-        self.pnl * self.quote_usd
+        self.counted_pnl() * self.quote_usd
+    }
+
+    /// What came out of the sale, in dollars — known even when the cost is not.
+    pub fn proceeds_usd(&self) -> f64 {
+        self.proceeds * self.quote_usd
+    }
+
+    /// What went in, in dollars. `None` when the app has no record of a buy.
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.basis_known().then_some(self.cost * self.quote_usd)
     }
 
     /// How long it was held, short enough for a column. A trade measured in
@@ -248,7 +285,9 @@ pub fn load_checked(account: &str) -> (Vec<Fill>, Option<usize>) {
 }
 
 fn total(account: &str, keep: impl Fn(&Fill) -> bool) -> f64 {
-    load(account).iter().filter(|f| keep(f)).map(|f| f.pnl).sum()
+    // `counted_pnl`, not `pnl`: a sell with no recorded buy would otherwise
+    // add its entire proceeds to the day as profit.
+    load(account).iter().filter(|f| keep(f)).map(|f| f.counted_pnl()).sum()
 }
 
 pub fn load_all() -> Vec<Fill> {
@@ -459,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn a_free_bag_does_not_report_an_infinite_return() {
+    fn a_bag_with_no_recorded_cost_reports_neither_an_infinite_return_nor_a_profit() {
         let f = Fill {
             ts: 0,
             chain: "solana".into(),
@@ -476,7 +515,12 @@ mod tests {
             verified: true,
         };
         assert_eq!(f.ret_pct(), 0.0);
-        assert!((f.usd() - 150.0).abs() < 1e-9);
+        // This assertion used to read `usd() == 150.0` — the whole sale
+        // counted as profit. That was the bug: a bag with no recorded cost is
+        // one the app never saw bought, and its profit is unknown, not equal
+        // to its proceeds. The money that came out is still reported.
+        assert_eq!(f.usd(), 0.0);
+        assert!((f.proceeds_usd() - 150.0).abs() < 1e-9);
     }
 
     #[test]
@@ -556,6 +600,41 @@ mod ret_col_tests {
         assert_eq!(verify_chain(&mut chain), Some(1), "the edited row is named");
         assert!(chain[0].verified, "the rows before it are still good");
         assert!(!chain[1].verified && !chain[2].verified, "it and everything after are suspect");
+    }
+
+    /// The bug this was written for: TOK was bought in an earlier session, so
+    /// its basis was not on disk, so the sell subtracted zero and reported the
+    /// entire 0.005679 ETH of proceeds as a $10.63 profit.
+    #[test]
+    fn a_sell_with_no_recorded_buy_is_not_counted_as_profit() {
+        let mut f = fill(0.005_679, 0.0); // pnl == proceeds, cost unknown
+        f.proceeds = 0.005_679;
+        f.quote_usd = 1_871.0;
+        assert!(!f.basis_known(), "no cost against real proceeds means no basis");
+        assert_eq!(f.counted_pnl(), 0.0, "an unknown profit is not a large one");
+        assert_eq!(f.usd(), 0.0, "and it does not reach the day total");
+        assert_eq!(f.cost_usd(), None, "what went in is unknown, not zero");
+        assert!(f.proceeds_usd() > 10.0, "what came out is still known");
+    }
+
+    /// The number stays a number when the basis IS known — the guard must not
+    /// swallow ordinary trades.
+    #[test]
+    fn an_ordinary_sell_still_counts() {
+        let f = fill(0.5, 1.0);
+        assert!(f.basis_known());
+        assert_eq!(f.counted_pnl(), 0.5);
+        assert_eq!(f.cost_usd(), Some(1.0));
+    }
+
+    /// A sell that brought in nothing — a failed or dust exit — has no
+    /// proceeds to mistake for profit, so it is not "unpriced".
+    #[test]
+    fn a_sale_of_nothing_is_not_treated_as_an_unknown_basis() {
+        let mut f = fill(0.0, 0.0);
+        f.proceeds = 0.0;
+        assert!(f.basis_known());
+        assert_eq!(f.counted_pnl(), 0.0);
     }
 
     #[test]
