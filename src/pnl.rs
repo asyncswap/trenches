@@ -153,9 +153,13 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
     // which is what you want the moment it opens.
     let mut sel: Option<u32> = None;
     let mut range = Range::Week;
+    // How far down the winners/losers lists are scrolled. Reset whenever the
+    // lists change under it — a scroll position carried onto a different set
+    // of trades points at nothing you asked for.
+    let mut scroll: usize = 0;
 
     loop {
-        term.draw(|f| draw(f, &fills, year, month, sel, range, today))?;
+        term.draw(|f| draw(f, &fills, year, month, sel, range, today, scroll))?;
 
         crate::ui_alive();
 
@@ -168,6 +172,13 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
         }
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => return Ok(()),
+            // The breakdown lists. Arrows are free here — months are on
+            // left/right and days on hjkl — and up/down is what a list wants.
+            KeyCode::Up => scroll = scroll.saturating_sub(1),
+            KeyCode::Down => scroll = scroll.saturating_add(1),
+            KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+            KeyCode::PageDown => scroll = scroll.saturating_add(10),
+            KeyCode::Home => scroll = 0,
             // Months on the arrows. The selected day is dropped rather than
             // carried across: "the 31st" does not exist in every month, and a
             // selection that silently moved to a different date would be worse
@@ -177,12 +188,14 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
                 year = y;
                 month = m;
                 sel = None;
+                scroll = 0;
             }
             KeyCode::Right => {
                 let (y, m) = ledger::shift_month(year, month, 1);
                 year = y;
                 month = m;
                 sel = None;
+                scroll = 0;
             }
             // hjkl walks the grid itself — h/l a day, j/k a week, because a
             // week is what the grid's rows literally are. One set of keys for
@@ -194,26 +207,30 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
             KeyCode::Char('h') => {
                 sel = step_day(sel, -1, year, month, today);
                 range = Range::Day;
+                scroll = 0;
             }
             KeyCode::Char('l') => {
                 sel = step_day(sel, 1, year, month, today);
                 range = Range::Day;
+                scroll = 0;
             }
             KeyCode::Char('k') => {
                 sel = step_day(sel, -7, year, month, today);
                 range = Range::Day;
+                scroll = 0;
             }
             KeyCode::Char('j') => {
                 sel = step_day(sel, 7, year, month, today);
                 range = Range::Day;
+                scroll = 0;
             }
-            KeyCode::Char('1') => range = Range::Day,
-            KeyCode::Char('2') => range = Range::Week,
-            KeyCode::Char('3') => range = Range::Month,
-            KeyCode::Char('4') => range = Range::Year,
-            KeyCode::Char('5') => range = Range::All,
+            KeyCode::Char('1') => { range = Range::Day; scroll = 0; }
+            KeyCode::Char('2') => { range = Range::Week; scroll = 0; }
+            KeyCode::Char('3') => { range = Range::Month; scroll = 0; }
+            KeyCode::Char('4') => { range = Range::Year; scroll = 0; }
+            KeyCode::Char('5') => { range = Range::All; scroll = 0; }
             // Back to the whole month, and back to this month.
-            KeyCode::Backspace => sel = None,
+            KeyCode::Backspace => { sel = None; scroll = 0; }
             KeyCode::Char('t') => {
                 year = today.y;
                 month = today.m;
@@ -256,6 +273,7 @@ fn draw(
     sel: Option<u32>,
     range: Range,
     today: Date,
+    scroll: usize,
 ) {
     widgets::paint_bg(f);
 
@@ -282,7 +300,7 @@ fn draw(
 
     header(f, rows[0], fills, &by_day, year, month, range, sel, today);
     grid(f, rows[1], &by_day, year, month, sel, today);
-    breakdown(f, rows[2], &by_day, year, month, sel);
+    breakdown(f, rows[2], &by_day, year, month, sel, scroll);
     keys(f, rows[3]);
 }
 
@@ -545,7 +563,15 @@ fn grid(
 }
 
 /// Winners and losers for the selected day, or for the whole month.
-fn breakdown(f: &mut Frame, area: Rect, by_day: &[Vec<&Fill>], year: i32, month: u32, sel: Option<u32>) {
+fn breakdown(
+    f: &mut Frame,
+    area: Rect,
+    by_day: &[Vec<&Fill>],
+    year: i32,
+    month: u32,
+    sel: Option<u32>,
+    scroll: usize,
+) {
     let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
 
     let mut trades: Vec<&Fill> = match sel {
@@ -607,12 +633,34 @@ fn breakdown(f: &mut Frame, area: Rect, by_day: &[Vec<&Fill>], year: i32, month:
         if v.is_empty() { empty("losers") } else { v }
     };
 
+    // A month of trading runs to more rows than fit, and the ones that scrolled
+    // off were unreachable — the list was rendered whole and clipped. Both
+    // panes scroll together on ↑/↓: they are two halves of one answer, and
+    // scrolling them apart would mean tracking which side has focus.
+    let inner_h = area.height.saturating_sub(2) as usize; // borders
+    let longest = wins.len().max(losses.len());
+    let max_scroll = longest.saturating_sub(inner_h);
+    let off = scroll.min(max_scroll);
+    // Say so when there is more below, and where you are — a list that scrolls
+    // silently looks like a list that ends.
+    let more = |n: usize| {
+        if longest > inner_h {
+            format!(" ({}–{} of {n}) ", (off + 1).min(n), (off + inner_h).min(n))
+        } else {
+            String::new()
+        }
+    };
+
     f.render_widget(
-        Paragraph::new(wins).block(themed_block(format!(" Winners — {scope} "))),
+        Paragraph::new(wins.clone())
+            .scroll((off as u16, 0))
+            .block(themed_block(format!(" Winners — {scope}{} ", more(wins.len())))),
         cols[0],
     );
     f.render_widget(
-        Paragraph::new(losses).block(themed_block(format!(" Losers — {scope} "))),
+        Paragraph::new(losses.clone())
+            .scroll((off as u16, 0))
+            .block(themed_block(format!(" Losers — {scope}{} ", more(losses.len())))),
         cols[1],
     );
 }
@@ -628,6 +676,8 @@ fn keys(f: &mut Frame, area: Rect) {
             Span::styled(" month   ", dim),
             Span::styled("1 2 3 4 5", key),
             Span::styled(" 1D 7D 30D 1Y ALL   ", dim),
+            Span::styled("↑ ↓", key),
+            Span::styled(" scroll   ", dim),
             Span::styled("bksp", key),
             Span::styled(" whole month   ", dim),
             Span::styled("t", key),
