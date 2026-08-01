@@ -29,24 +29,24 @@ use crate::lock;
 
 /// The selected currency and what one USD is worth in it.
 #[derive(Clone, Debug)]
-pub struct Display {
+pub struct BaseCurrency {
     /// ISO code — "USD", "EUR", "JPY", "NGN".
     pub code: String,
     /// Units of `code` per USD. Exactly 1.0 for USD itself.
     pub per_usd: f64,
 }
 
-impl Default for Display {
+impl Default for BaseCurrency {
     fn default() -> Self {
         // Dollars until told otherwise, and dollars if a fetch never lands.
         // A rate of 1.0 against USD is not an approximation.
-        Display { code: "USD".into(), per_usd: 1.0 }
+        BaseCurrency { code: "USD".into(), per_usd: 1.0 }
     }
 }
 
-fn current() -> &'static Mutex<Display> {
-    static CUR: OnceLock<Mutex<Display>> = OnceLock::new();
-    CUR.get_or_init(|| Mutex::new(Display::default()))
+fn current() -> &'static Mutex<BaseCurrency> {
+    static CUR: OnceLock<Mutex<BaseCurrency>> = OnceLock::new();
+    CUR.get_or_init(|| Mutex::new(BaseCurrency::default()))
 }
 
 /// The whole rate table from the last successful fetch, so switching currency
@@ -56,7 +56,7 @@ fn table() -> &'static Mutex<HashMap<String, f64>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-impl Display {
+impl BaseCurrency {
     /// A USD amount, in this currency.
     pub fn from_usd(&self, usd: f64) -> f64 {
         if !usd.is_finite() { usd } else { usd * self.per_usd }
@@ -83,17 +83,13 @@ impl Display {
             "RUB" => "₽".into(),
             "TRY" => "₺".into(),
             "BRL" => "R$".into(),
-            "CAD" => "CA$".into(),
+            "CAD" => "C$".into(),
             "AUD" => "A$".into(),
             "NZD" => "NZ$".into(),
             "MXN" => "MX$".into(),
-            "CHF" => "CHF ".into(),
+            "CHF" => "Fr".into(),
             "SEK" | "NOK" | "DKK" => format!("{} ", self.code),
-            // Crypto as a display currency is legitimate — "how many sats is
-            // this" is a real question — and no glyph for it is universal.
-            "BTC" => "₿".into(),
-            "ETH" => "Ξ".into(),
-            _ => format!("{} ", self.code),
+                _ => format!("{} ", self.code),
         }
     }
 }
@@ -127,17 +123,85 @@ pub fn symbol() -> String {
 pub fn select(code: &str) -> bool {
     let code = code.trim().to_uppercase();
     if code == "USD" {
-        *lock(current()) = Display::default();
+        *lock(current()) = BaseCurrency::default();
         return true;
+    }
+    if !is_fiat(&code) {
+        return false; // an asset Coinbase prices is not a currency to read in
     }
     let rate = lock(table()).get(&code).copied();
     match rate {
         Some(r) if r.is_finite() && r > 0.0 => {
-            *lock(current()) = Display { code, per_usd: r };
+            *lock(current()) = BaseCurrency { code, per_usd: r };
             true
         }
         _ => false,
     }
+}
+
+/// ISO 4217 — the currencies a country issues.
+///
+/// Coinbase's rate table is not a currency list. It carries every asset they
+/// price, so the picker offered ETH, BTC and a few hundred tokens alongside the
+/// dollar. Two things wrong with that: a list nobody can find EUR in is not a
+/// picker, and ETH is already the QUOTE asset of most pools here — "PnL in ETH"
+/// converted from USD by an exchange rate, sitting beside a pooled-ETH figure
+/// that was never converted at all, is a screen with two different ETHs on it.
+///
+/// So: money issued by a state. Filtering by an explicit list rather than by
+/// excluding known crypto, because the exclusion list grows every week and the
+/// inclusion list has not changed materially in years.
+const FIAT: [&str; 162] = [
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
+    "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD",
+    "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD",
+    "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GGP", "GHS", "GIP", "GMD", "GNF",
+    "GTQ", "GYD", "HKD", "HNL", "HRK", "HTG", "HUF", "IDR", "ILS", "IMP", "INR", "IQD", "IRR",
+    "ISK", "JEP", "JMD", "JOD", "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD",
+    "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "LYD", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT",
+    "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK", "NPR",
+    "NZD", "OMR", "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB",
+    "RWF", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SLL", "SOS", "SRD", "SSP",
+    "STN", "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS",
+    "UAH", "UGX", "USD", "UYU", "UZS", "VES", "VND", "VUV", "WST", "XAF", "XCD", "XCG", "XDR",
+    "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
+];
+
+/// Whether a code is a currency rather than an asset Coinbase happens to price.
+pub fn is_fiat(code: &str) -> bool {
+    FIAT.contains(&code)
+}
+
+/// The flag for a currency, derived rather than tabulated.
+///
+/// A currency code is its country's ISO 3166 code plus a letter for the
+/// currency — USD is US, GBP is GB, JPY is JP — and a flag emoji is just those
+/// two letters as regional indicators. So 160 flags come from three lines
+/// instead of a table that would go stale the next time a country redenominates.
+///
+/// The `X` codes are the exceptions by design: XAF, XOF, XPF and XDR belong to
+/// unions and institutions rather than countries, and there is no flag to
+/// derive. They get a neutral mark instead of a wrong one.
+pub fn flag(code: &str) -> String {
+    let b = code.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_uppercase() || !b[1].is_ascii_uppercase() {
+        return "\u{1f4b1}".into();
+    }
+    if b[0] == b'X' {
+        return "\u{1f4b1}".into(); // supranational: no country, no flag
+    }
+    let ri = |c: u8| char::from_u32(0x1F1E6 + (c - b'A') as u32).unwrap_or('?');
+    format!("{}{}", ri(b[0]), ri(b[1]))
+}
+
+/// One picker row: flag, code, and the glyph figures will actually wear.
+///
+/// The symbol in parentheses is the point — `CAD (C$)` tells you what you are
+/// about to start reading, where a bare `CAD` leaves you to find out after the
+/// whole screen has changed.
+pub fn label(code: &str) -> String {
+    let d = BaseCurrency { code: code.to_string(), per_usd: 1.0 };
+    format!("{}  {}  ({})", flag(code), code, d.symbol().trim())
 }
 
 /// Every currency we have a rate for, sorted, with the majors first.
@@ -146,10 +210,13 @@ pub fn select(code: &str) -> bool {
 /// to reach EUR is a picker that has ranked completeness over use.
 pub fn available() -> Vec<String> {
     const MAJORS: [&str; 10] =
-        ["USD", "EUR", "GBP", "JPY", "CNY", "CAD", "AUD", "CHF", "INR", "BTC"];
+        ["USD", "EUR", "GBP", "JPY", "CNY", "CAD", "AUD", "CHF", "INR", "SGD"];
     let t = lock(table());
-    let mut rest: Vec<String> =
-        t.keys().filter(|k| !MAJORS.contains(&k.as_str())).cloned().collect();
+    let mut rest: Vec<String> = t
+        .keys()
+        .filter(|k| is_fiat(k) && !MAJORS.contains(&k.as_str()))
+        .cloned()
+        .collect();
     rest.sort();
     let mut out: Vec<String> = MAJORS
         .iter()
@@ -256,20 +323,20 @@ pub async fn restore() -> Option<String> {
 mod tests {
     use super::*;
 
-    // These exercise `Display` directly rather than the process-global.
+    // These exercise `BaseCurrency` directly rather than the process-global.
     //
     // The globals are shared by every test in the binary, including the
     // formatter tests in `view` that assert on a `$` — so a test that switched
     // the global to EUR could fail an unrelated test running beside it, which
     // it did. Behaviour worth testing does not need to be tested through a
     // singleton.
-    fn at(code: &str, per_usd: f64) -> Display {
-        Display { code: code.into(), per_usd }
+    fn at(code: &str, per_usd: f64) -> BaseCurrency {
+        BaseCurrency { code: code.into(), per_usd }
     }
 
     #[test]
     fn dollars_are_not_converted_at_all() {
-        let d = Display::default();
+        let d = BaseCurrency::default();
         assert_eq!(d.code, "USD");
         assert_eq!(d.from_usd(12.34), 12.34);
         assert_eq!(d.symbol(), "$");
@@ -286,7 +353,7 @@ mod tests {
     /// is being misled by the thing that was supposed to help.
     #[test]
     fn currencies_that_share_a_glyph_are_disambiguated() {
-        assert_eq!(at("CAD", 1.37).symbol(), "CA$");
+        assert_eq!(at("CAD", 1.37).symbol(), "C$");
         assert_eq!(at("AUD", 1.5).symbol(), "A$");
         assert_ne!(at("CAD", 1.37).symbol(), at("USD", 1.0).symbol());
     }
@@ -308,5 +375,58 @@ mod tests {
     #[test]
     fn a_non_finite_amount_passes_through_untouched() {
         assert!(at("EUR", 0.92).from_usd(f64::NAN).is_nan());
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    /// The bug the picker shipped with: Coinbase's rate table is every asset
+    /// they price, so the list ran USD, EUR, GBP … then 1INCH, AAVE, ADA and a
+    /// few hundred more.
+    #[test]
+    fn tokens_are_not_currencies() {
+        for asset in ["ETH", "BTC", "1INCH", "AAVE", "ADA", "AERO", "APE", "ARB", "AVAX"] {
+            assert!(!is_fiat(asset), "{asset} is an asset, not a currency");
+        }
+    }
+
+    #[test]
+    fn real_currencies_survive_the_filter() {
+        for money in ["USD", "EUR", "GBP", "JPY", "NGN", "ZAR", "INR", "BRL", "SGD"] {
+            assert!(is_fiat(money), "{money} is a currency");
+        }
+    }
+
+    /// A ticker that collides with a currency code must not be selectable just
+    /// because Coinbase has a rate for it.
+    #[test]
+    fn selecting_an_asset_is_refused() {
+        assert!(!select("ETH"));
+        assert!(!select("BTC"));
+    }
+
+    #[test]
+    fn a_flag_comes_from_the_country_in_the_code() {
+        assert_eq!(flag("USD"), "🇺🇸");
+        assert_eq!(flag("GBP"), "🇬🇧");
+        assert_eq!(flag("JPY"), "🇯🇵");
+        assert_eq!(flag("EUR"), "🇪🇺");
+    }
+
+    /// Union currencies have no country to take a flag from, and a wrong flag
+    /// is worse than none.
+    #[test]
+    fn supranational_currencies_get_a_neutral_mark() {
+        assert_eq!(flag("XOF"), "💱");
+        assert_eq!(flag("XDR"), "💱");
+    }
+
+    #[test]
+    fn a_row_says_what_you_will_be_reading() {
+        assert_eq!(label("USD"), "🇺🇸  USD  ($)");
+        assert_eq!(label("CAD"), "🇨🇦  CAD  (C$)");
+        assert_eq!(label("CHF"), "🇨🇭  CHF  (Fr)");
     }
 }

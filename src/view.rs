@@ -539,8 +539,8 @@ pub fn log_scale(v: f64, min: f64) -> f64 {
 /// that every one of these call sites follows without knowing about it, and so
 /// that nothing on the way to disk is ever converted.
 pub fn usd_compact(x: f64) -> String {
-    let sym = crate::currency::symbol();
-    let x = crate::currency::from_usd(x);
+    let sym = crate::base_currency::symbol();
+    let x = crate::base_currency::from_usd(x);
     if x >= 1e6 {
         format!("{sym}{:.2}M", x / 1e6)
     } else if x >= 1e3 {
@@ -588,8 +588,8 @@ fn usd_price_sig(x: f64, sig: u32) -> String {
     if !x.is_finite() || x <= 0.0 {
         return "—".to_string();
     }
-    let sym = crate::currency::symbol();
-    let x = crate::currency::from_usd(x);
+    let sym = crate::base_currency::symbol();
+    let x = crate::base_currency::from_usd(x);
     if x >= 1.0 {
         return format!("{sym}{x:.*}", sig as usize + 1);
     }

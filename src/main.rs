@@ -7,7 +7,7 @@
 mod agent;
 mod verification;
 mod config;
-mod currency;
+mod base_currency;
 mod net;
 mod contracts;
 mod discover;
@@ -2074,7 +2074,7 @@ async fn app(
     bot.recover_basis(0);
     // Restore the display currency before the first frame, or every figure
     // flashes dollars and then changes under the reader.
-    if let Some(c) = currency::restore().await {
+    if let Some(c) = base_currency::restore().await {
         trace(&format!("display currency: {c}"));
     }
     bot.load_daily(); // restore today's PnL baseline across restarts
@@ -2777,8 +2777,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // The display currency's rate rides the same interval.
                         // A session left open overnight would otherwise still
                         // be converting at yesterday's number.
-                        if !crate::currency::is_usd() {
-                            crate::currency::refresh().await;
+                        if !crate::base_currency::is_usd() {
+                            crate::base_currency::refresh().await;
                         }
                     });
                 }
@@ -3092,25 +3092,28 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // changes what you read it in.
                         KeyCode::Char('$') => {
                             bot.status = "loading currencies…".into();
-                            if crate::currency::available().len() < 2 {
-                                crate::currency::refresh().await;
+                            if crate::base_currency::available().len() < 2 {
+                                crate::base_currency::refresh().await;
                             }
-                            let codes = crate::currency::available();
+                            let codes = crate::base_currency::available();
                             if codes.len() < 2 {
                                 bot.note(
                                     "Could not reach Coinbase for exchange rates, so the currency list is empty. Figures stay in USD."
                                         .into(),
                                 );
                             } else {
-                                let here = crate::currency::code();
+                                let here = crate::base_currency::code();
                                 let labels: Vec<String> = codes
                                     .iter()
-                                    .map(|c| if *c == here { format!("{c}  ·  current") } else { c.clone() })
+                                    .map(|c| {
+                                        let row = base_currency::label(c);
+                                        if *c == here { format!("{row}   ✓") } else { row }
+                                    })
                                     .collect();
                                 if let Some(i) = ui::select(terminal, "Display currency", &labels)? {
                                     let pick = codes[i].clone();
-                                    if crate::currency::select(&pick) {
-                                        crate::currency::save(&pick);
+                                    if crate::base_currency::select(&pick) {
+                                        crate::base_currency::save(&pick);
                                         bot.note(format!(
                                             "Reading in {pick}. Prices are still recorded in USD — only the display changed."
                                         ));

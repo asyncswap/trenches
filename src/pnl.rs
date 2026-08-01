@@ -93,8 +93,8 @@ fn summarise(fills: &[&Fill]) -> Day {
 fn money(v: f64) -> String {
     // USD in, the reader's currency out — see `crate::currency`. The ledger
     // keeps dollars; only the cell is converted.
-    let sym = crate::currency::symbol();
-    let v = crate::currency::from_usd(v);
+    let sym = crate::base_currency::symbol();
+    let v = crate::base_currency::from_usd(v);
     let sign = if v < 0.0 { "-" } else { "" };
     let a = v.abs();
     if a >= 1_000_000.0 {
