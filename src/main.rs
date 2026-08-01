@@ -4664,12 +4664,18 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 "—".to_string()
             };
             t.push(vec![
-                if o.verified || o.proof.is_empty() && o.at == 0 {
-                    // Verified, or too old to have a proof at all. Either way
-                    // there is nothing to shout about.
-                    view::Cell::new("")
+                if o.suspect() {
+                    // `!`, not `⚠`. U+26A0 is emoji-capable, so a terminal
+                    // may draw it two columns wide — the same ambiguous-width
+                    // trap that ate a digit out of every euro price. A badge
+                    // that shifts the row it is warning about is worse than no
+                    // badge. ASCII is one column everywhere.
+                    view::Cell::bold("!", view::Tone::Bad)
                 } else {
-                    view::Cell::bold("⚠", view::Tone::Bad)
+                    // Verified, or not checkable at all. Only a proof that
+                    // exists, covers today's fields, and does not match is
+                    // worth a glyph.
+                    view::Cell::new("")
                 },
                 view::Cell::bold(st, stone),
                 view::Cell::toned(ago, view::Tone::Normal),

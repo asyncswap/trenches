@@ -651,7 +651,9 @@ fn breakdown(
             // fill still counts toward the totals: refusing to show a number
             // is not safer than showing one you are told to check.
             Span::styled(
-                if fl.suspect() { "⚠ " } else { "  " },
+                // ASCII: see the note on the orders badge. An emoji-width
+                // glyph in a fixed cell shifts every column after it.
+                if fl.suspect() { "! " } else { "  " },
                 Style::default().fg(tone_color(Tone::Bad)).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -751,7 +753,7 @@ fn breakdown(
     // title spent a third of the header on a footnote.
     let mut flag = String::new();
     if bad > 0 {
-        flag.push_str(&format!("· ⚠ {bad} unverified "));
+        flag.push_str(&format!("· {bad} unverified "));
     }
 
     // Seven columns of bare numbers explain nothing. The header carries the

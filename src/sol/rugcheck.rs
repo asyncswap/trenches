@@ -60,7 +60,7 @@ impl Report {
         if self.risks.is_empty() {
             format!("{}", self.score)
         } else if self.has_danger() {
-            format!("{} ⚠", self.score)
+            format!("{} !", self.score)
         } else {
             format!("{} !", self.score)
         }
@@ -254,7 +254,8 @@ mod tests {
     #[test]
     fn badges_signal_flags() {
         assert_eq!(report(3, &[]).badge(), "3");
-        assert!(report(50, &["danger"]).badge().contains('⚠'));
+        // ASCII: an emoji-width glyph in a fixed-width cell shifts the row.
+        assert!(report(50, &["danger"]).badge().contains('!'));
         assert!(report(20, &["warn"]).badge().contains('!'));
     }
 

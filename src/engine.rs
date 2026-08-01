@@ -118,6 +118,12 @@ pub struct Order {
     /// the file can answer. Empty on orders written before this existed.
     #[serde(default)]
     pub key: String,
+    /// Which field set `proof` covers. See `ledger::Fill::pv` — same problem,
+    /// same shape. Adding `sym` to the covered fields invalidated every proof
+    /// already written, so untouched orders came back flagged as tampered by a
+    /// change made here. 0 = written before proofs were versioned.
+    #[serde(default)]
+    pub pv: u32,
     /// Chained proof over this order's own fields and the proof before it.
     /// See `verification`. Empty means unverified, not forged.
     #[serde(default)]
@@ -128,6 +134,22 @@ pub struct Order {
     #[serde(skip)]
     pub verified: bool,
 }
+
+/// The current order-proof scheme. Bump when `order_fields` changes.
+pub const ORDER_PROOF_VERSION: u32 = 1;
+
+impl Order {
+    /// Whether this order's proof can be checked at all, and failed.
+    ///
+    /// Not the same as "unverified". Most rows are unverifiable for reasons
+    /// that say nothing about anyone: written before proofs existed, or under
+    /// an older field set. Badging those is a warning about a schema change,
+    /// and a warning that fires for that stops being read for anything.
+    pub fn suspect(&self) -> bool {
+        self.pv == ORDER_PROOF_VERSION && !self.proof.is_empty() && !self.verified
+    }
+}
+
 
 /// Protocol-specific pool identity. A v4 pool is identified by its pool id +
 /// tickSpacing; a v3 pool by its contract address + token orientation. Encoding
@@ -1133,6 +1155,7 @@ impl Bot {
             gas: 0.0,  // likewise: only the receipt knows
             at: crate::ledger::now(),
             key: self.acting_key.clone(),
+            pv: ORDER_PROOF_VERSION,
             proof: String::new(), // filled by save_orders, which knows the chain
             verified: true,       // we just made it; nothing to distrust yet
         });
@@ -1147,6 +1170,7 @@ impl Bot {
     fn orders_path(trader: Address) -> String {
         format!("{}/orders-evm-{trader}.jsonl", crate::state_dir())
     }
+
 
 /// The fields a proof covers, in a fixed order.
 ///
@@ -1351,11 +1375,13 @@ fn order_fields(o: &Order) -> Vec<String> {
             // across the row, which is the honest label: this predates the
             // record, so the record does not vouch for it.
             if o.at > 0 {
+                o.pv = ORDER_PROOF_VERSION;
                 let f = Self::order_fields(&o);
                 let refs: Vec<&str> = f.iter().map(|s| s.as_str()).collect();
                 o.proof = crate::verification::proof(&prev, &refs);
                 prev = o.proof.clone();
             } else {
+                o.pv = 0;
                 o.proof.clear();
             }
             if let Ok(j) = serde_json::to_string(&o) {
@@ -1391,8 +1417,19 @@ fn order_fields(o: &Order) -> Vec<String> {
         // Verify the chain as loaded. A row that fails is NOT dropped — the
         // whole point is to show it and say it cannot be trusted, because a
         // record that quietly disappears is worse than one flagged.
-        let chain: Vec<(String, Vec<String>)> =
-            out.iter().map(|o| (o.proof.clone(), Self::order_fields(o))).collect();
+        // A row from an older scheme presents an EMPTY proof to the checker,
+        // which carries the chain past it untouched. Unverifiable is not
+        // tampered: the rules changed underneath it.
+        let chain: Vec<(String, Vec<String>)> = out
+            .iter()
+            .map(|o| {
+                if o.pv == ORDER_PROOF_VERSION {
+                    (o.proof.clone(), Self::order_fields(o))
+                } else {
+                    (String::new(), Vec::new())
+                }
+            })
+            .collect();
         if let Some(i) = crate::verification::first_broken(&chain) {
             crate::events::error(
                 "An order on disk does not match its proof — the file has been changed",
@@ -1412,7 +1449,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             }
         } else {
             for o in out.iter_mut() {
-                o.verified = !o.proof.is_empty();
+                o.verified = o.pv == ORDER_PROOF_VERSION && !o.proof.is_empty();
             }
         }
         while out.len() > 200 {
