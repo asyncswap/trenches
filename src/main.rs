@@ -68,8 +68,23 @@ struct SelPool {
     quote_sym: String,     // display symbol for the quote side
 }
 
-/// Symbol for a known stablecoin quote token (fallback "USD").
+/// Symbol for a non-ETH quote token.
+///
+/// Read from the facts cache first, because the quote side is not a short list
+/// any more: a pons launch names its own pair asset, and those are already
+/// arriving as tokenized equities rather than dollars. Calling an NVDA-quoted
+/// pool "USD" prices every number on the screen in the wrong thing.
+///
+/// USDG stays hardcoded as a floor — it is the chain's default quote and must
+/// resolve before any RPC has run. "USD" is now only what an unknown token
+/// falls back to once the cache has nothing, and it is deliberately vague
+/// rather than confidently wrong.
 fn stable_symbol(addr: alloy::primitives::Address) -> String {
+    if let Some(f) = crate::facts::get(addr) {
+        if !f.sym.is_empty() {
+            return f.sym;
+        }
+    }
     match format!("{addr:#x}").as_str() {
         "0x5fc5360d0400a0fd4f2af552add042d716f1d168" => "USDG".to_string(),
         _ => "USD".to_string(),
@@ -146,6 +161,56 @@ fn load_last_wallet() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// How much one press of `[` or `]` moves the buy size.
+///
+/// A fixed 0.5% was right on the wallet this was written for and useless on a
+/// larger one: the step is a fraction of the balance, so the bigger the
+/// balance the bigger the smallest adjustment you can make. Past a few
+/// thousand dollars the finest available change is larger than the whole
+/// position a smaller account would take, which is the opposite of what
+/// precision should do.
+///
+/// So the step gets finer as the wallet grows. Two tiers, not a formula: a
+/// step that slides continuously with the balance means the same key does a
+/// different thing every session, and a size control has to be predictable
+/// before it is clever.
+fn buy_step(bot: &engine::Bot) -> f64 {
+    let wallet_usd = bot.eth * bot.eth_usd;
+    // With no USD feed there is nothing to judge "large" against; keep the
+    // step that has always been there rather than guessing from raw ETH.
+    if wallet_usd >= 1_000.0 { 0.001 } else { 0.005 }
+}
+
+/// A percentage with as few decimals as it needs: `5%`, `0.5%`, `0.1%`.
+///
+/// One decimal cannot show a 0.1% step landing on 1.25%, and two decimals
+/// print `5.00%` for every ordinary size. Trim what is not carrying meaning.
+fn pct_compact(frac: f64) -> String {
+    let p = frac * 100.0;
+    if (p * 10.0).fract().abs() > 1e-6 {
+        format!("{p:.2}%")
+    } else if p.fract().abs() > 1e-6 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.0}%")
+    }
+}
+
+
+#[cfg(test)]
+mod buy_size_tests {
+    use super::pct_compact;
+
+    #[test]
+    fn a_percentage_shows_only_the_decimals_it_needs() {
+        assert_eq!(pct_compact(0.05), "5%");
+        assert_eq!(pct_compact(0.005), "0.5%");
+        // The case one decimal could not show: a 0.1% step off a 1.2% size.
+        assert_eq!(pct_compact(0.0125), "1.25%");
+        assert_eq!(pct_compact(0.001), "0.1%");
+    }
+}
+
 /// The buy-size status, quoting the stake in the units that matter: the
 /// percent you set, the ETH it works out to, and the dollars that is.
 fn buy_size_status(bot: &engine::Bot) -> String {
@@ -153,15 +218,15 @@ fn buy_size_status(bot: &engine::Bot) -> String {
     let usd = stake * bot.eth_usd;
     if bot.eth > 0.0 && bot.eth_usd > 0.0 {
         format!(
-            "Buy size {:.1}% \u{2248} {} ETH ({})",
-            bot.buy_frac * 100.0,
+            "Buy size {} \u{2248} {} ETH ({})",
+            pct_compact(bot.buy_frac),
             view::eth(stake),
             view::usd_compact(usd)
         )
     } else if bot.eth > 0.0 {
-        format!("Buy size {:.1}% \u{2248} {} ETH", bot.buy_frac * 100.0, view::eth(stake))
+        format!("Buy size {} \u{2248} {} ETH", pct_compact(bot.buy_frac), view::eth(stake))
     } else {
-        format!("Buy size is now {:.1} percent of your ETH balance", bot.buy_frac * 100.0)
+        format!("Buy size is now {} of your ETH balance", pct_compact(bot.buy_frac))
     }
 }
 
@@ -219,6 +284,10 @@ fn load_evm_tape(token: &alloy::primitives::Address) -> std::collections::VecDeq
     // record a moment later, at the block the trade actually landed in, so
     // dropping them here loses nothing and repairs every tape already saved.
     out.retain(|s| s.eth_wei != 0);
+    // A row with no block cannot be placed in time at all: age is measured as
+    // distance from the head, so block 0 reads as the age of the chain. Two
+    // such rows in the USDG tape dated a 22-hour-old swap at 28 days.
+    out.retain(|s| s.block > 0);
     while out.len() > 400 {
         out.pop_front();
     }
@@ -2533,7 +2602,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // Whatever the logs said, a confirmed order of the current
                 // pool that the tape lacks is injected from what the order
                 // already knows.
-                {
+                //
+                // Not until the head block is known, though. Age on the tape is
+                // block distance, so a row injected at block 0 is not merely
+                // undated — it is dated 28 days ago and sorts to the top, which
+                // is how a swap made 22 hours ago read as a month old. There is
+                // nothing to lose by waiting: the next poll injects it.
+                if block.load(Ordering::Relaxed) > 0 {
                     let mut t = tape.lock().unwrap();
                     let have: std::collections::HashSet<_> = t.iter().map(|s| s.tx).collect();
                     for o in bot.orders.iter() {
@@ -2890,18 +2965,23 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             bot.status = "refreshed — full read + tape re-anchor queued".into();
                         }
                         // Live knobs, shown as percentages:
-                        //   [ ]  BUY size (% of ETH balance)    — 0.5% steps
+                        //   [ ]  BUY size (% of ETH balance)    — see `buy_step`
                         //   ( )  SELL size (% of token balance) — 10% steps
                         //   { }  impact cap (% price move);  0 = off
                         KeyCode::Char(']') => {
-                            bot.buy_frac = (bot.buy_frac + 0.005).min(1.0);
+                            let step = buy_step(bot);
+                            // Snap to the step's grid, so a size set under a
+                            // coarse step does not leave every later press
+                            // landing on 1.35%, 1.45%, 1.55%.
+                            bot.buy_frac = (((bot.buy_frac / step).round() + 1.0) * step).min(1.0);
                             let msg = buy_size_status(bot);
-                            setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), msg);
+                            setting(bot, "Buy size", pct_compact(bot.buy_frac), msg);
                         }
                         KeyCode::Char('[') => {
-                            bot.buy_frac = (bot.buy_frac - 0.005).max(0.005);
+                            let step = buy_step(bot);
+                            bot.buy_frac = (((bot.buy_frac / step).round() - 1.0) * step).max(step);
                             let msg = buy_size_status(bot);
-                            setting(bot, "Buy size", format!("{:.1}%", bot.buy_frac * 100.0), msg);
+                            setting(bot, "Buy size", pct_compact(bot.buy_frac), msg);
                         }
                         // Bracket family, paired with the header labels:
                         // [] buy · () sell · {} slippage · <> impact cap.
@@ -3543,7 +3623,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             Line::from(vec![
                 hint("[ ] "),
                 sbold(format!("{:<10}", "buy")),
-                val(format!("{:<10}", format!("{:.1}%", bot.buy_frac * 100.0))),
+                val(format!("{:<10}", pct_compact(bot.buy_frac))),
                 hint("    "),
                 sbold(format!("{:<10}", "mode")),
                 val("manual".to_string()),
@@ -4043,8 +4123,13 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let h = mid_area.height.saturating_sub(3).max(1) as usize;
             // ~10 blocks/sec on Robinhood Chain — estimate age from block delta.
             let age = |blk: u64| -> String {
-                let d = block.saturating_sub(blk);
-                let secs = d / 10;
+                // No block, or a block ahead of the head we have read: say so.
+                // Subtracting from zero produces a confident, enormous, wrong
+                // number, and "—" is the honest shape of "not known yet".
+                if blk == 0 || blk > block {
+                    return "—".to_string();
+                }
+                let secs = block.saturating_sub(blk) / 10;
                 view::age_compact(secs as f64)
             };
             // Single-market mode shows only the active venue's swaps; arb mode

@@ -1908,7 +1908,18 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
             let trows: Vec<ratatui::widgets::Row> = verified
                 .iter()
                 .map(|v| {
-                    let q = if v.quote.is_eth() { "ETH" } else { "USDG" };
+                    // The quote side is whatever the pool was launched
+                    // against — increasingly a tokenized equity, not a
+                    // stablecoin. Naming it "USDG" regardless labels an
+                    // NVDA-quoted pool with the wrong asset.
+                    let q = if v.quote.is_eth() {
+                        "ETH".to_string()
+                    } else {
+                        crate::facts::get(v.quote.addr())
+                            .map(|f| f.sym)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "quote".to_string())
+                    };
                     let pct = v.fee as f64 / 10_000.0;
                     // These fees are real — a v4 pool id is a hash of its own
                     // parameters, so an id that resolves to a live pool proves
