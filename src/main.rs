@@ -836,6 +836,9 @@ const HEALTHY: &str = "Healthy — pool is live.";
 fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
     let (key, val) = match p.kind {
         engine::PoolKind::V3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
+        // Name it for what it is: there is no pool yet, and calling a curve
+        // "pool" in a bug report sends whoever reads it to the wrong contract.
+        engine::PoolKind::PonsCurve { curve, .. } => ("curve", format!("{curve:#x}")),
         engine::PoolKind::V4 { pool_id, .. }
         | engine::PoolKind::FlaunchV4 { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
     };
@@ -1900,6 +1903,15 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
         engine::PoolKind::V3 { pool_addr, .. } => (
             "v3", String::new(), pool_addr.to_string(), 0,
             contracts::WETH.to_string(), String::new(),
+        ),
+        // The curve address goes in the `address` slot, and the quote asset in
+        // `currency0`, so a reload can rebuild the variant from what it reads.
+        // A curve is a transient state — it graduates into a pool and this
+        // entry stops being true — so it is worth re-reading the launch's phase
+        // rather than trusting a saved one indefinitely.
+        engine::PoolKind::PonsCurve { curve, quote } => (
+            "pons_curve", String::new(), curve.to_string(), 0,
+            quote.to_string(), String::new(),
         ),
     };
     let pool_obj = json!({
@@ -3495,6 +3507,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     match bot.pool.kind {
         engine::PoolKind::V3 { pool_addr, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
+        engine::PoolKind::PonsCurve { curve, .. } =>
+            mkt.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
         engine::PoolKind::V4 { pool_id, .. } | engine::PoolKind::FlaunchV4 { pool_id, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
     }
@@ -3600,6 +3614,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             match pb.kind {
                 engine::PoolKind::V3 { pool_addr, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
+                engine::PoolKind::PonsCurve { curve, .. } =>
+                    mb.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
                 engine::PoolKind::V4 { pool_id, .. } | engine::PoolKind::FlaunchV4 { pool_id, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
             }

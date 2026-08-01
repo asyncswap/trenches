@@ -11,6 +11,7 @@ use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, TxHash, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
+use alloy::sol_types::SolCall;
 
 use crate::contracts::*;
 use crate::v3;
@@ -72,6 +73,15 @@ pub enum PoolKind {
     // launch (flETH's low address makes it currency0 in practice, but the
     // protocol allows either order).
     FlaunchV4 { pool_id: B256, coin_is_0: bool },
+    // A pons v2 launch still on its bonding CURVE. Not a pool at all: the curve
+    // holds the whole supply and both prices and settles every trade itself,
+    // so there is no pool id, no tick, and no router in the path — you call
+    // buy/sell on the curve. It becomes a v4 pool at graduation, at which point
+    // the launch is re-read as `V4` and this variant is gone for that token.
+    //
+    // `quote` is what the launch is priced in: zero for native ETH, otherwise
+    // an approved ERC-20 that is the currency of the entire launch.
+    PonsCurve { curve: Address, quote: Address },
 }
 
 impl PoolKind {
@@ -80,6 +90,7 @@ impl PoolKind {
             PoolKind::V4 { .. } => "v4",
             PoolKind::V3 { .. } => "v3",
             PoolKind::FlaunchV4 { .. } => "flaunch",
+            PoolKind::PonsCurve { .. } => "curve",
         }
     }
 
@@ -91,6 +102,7 @@ impl PoolKind {
             PoolKind::V4 { .. } => "Uniswap V4",
             PoolKind::V3 { .. } => "Uniswap V3",
             PoolKind::FlaunchV4 { .. } => "Flaunch",
+            PoolKind::PonsCurve { .. } => "pons curve",
         }
     }
     pub fn is_v3(&self) -> bool {
@@ -103,7 +115,15 @@ impl PoolKind {
                 *pool_id == B256::ZERO
             }
             PoolKind::V3 { pool_addr, .. } => *pool_addr == Address::ZERO,
+            PoolKind::PonsCurve { curve, .. } => *curve == Address::ZERO,
         }
+    }
+
+    /// True while the launch trades on a bonding curve rather than in a pool.
+    /// Everything pool-shaped — tick, sqrt price, pool id, routing through a
+    /// router — is meaningless until this is false.
+    pub fn is_curve(&self) -> bool {
+        matches!(self, PoolKind::PonsCurve { .. })
     }
 }
 
@@ -1954,9 +1974,12 @@ impl Bot {
     pub async fn add_liquidity<P: Provider>(&mut self, provider: &P, eth_wei: u128) -> eyre::Result<()> {
         let spacing = match self.pool.kind {
             PoolKind::V4 { tick_spacing, .. } => tick_spacing,
-            PoolKind::V3 { .. } => {
+            PoolKind::V3 { .. } | PoolKind::PonsCurve { .. } => {
                 self.skips += 1;
                 self.push_order("ADD LP".into(), OrderStatus::Skipped, None);
+                // A curve holds the whole supply and IS the liquidity; there is
+                // no position to open, and the pool it graduates into is seeded
+                // by the protocol, not by us.
                 self.note("Adding liquidity needs a Uniswap V4 pool. This one is trade only".into());
                 return Ok(());
             }
@@ -2575,7 +2598,49 @@ async fn read_market_inner<P: Provider>(
     let erc = IERC20::new(pref.token, provider);
 
     // sqrtPrice + raw liquidity L, from the protocol's state source.
+    // A bonding curve has no sqrt price, no tick and no concentrated liquidity.
+    // It reports its reserves directly, and the price is simply their ratio —
+    // so the pool-shaped read below is skipped entirely and the market is built
+    // from `getReserves`.
+    //
+    // The quote reserve it returns includes a PHANTOM balance, a virtual amount
+    // that sets the opening price so the first buyer does not get the supply
+    // for nothing. That is correct for pricing and wrong for "how much has this
+    // raised", which is `realQuoteReserve` — pooled depth uses the real one.
+    if let PoolKind::PonsCurve { curve, .. } = pref.kind {
+        let c = IPonsCurve::new(curve, provider);
+        let cb_res = c.getReserves();
+        let cb_real = c.realQuoteReserve();
+        let cb_bal = erc.balanceOf(trader);
+        let (res, real, bal) = tokio::join!(cb_res.call(), cb_real.call(), cb_bal.call());
+        let res = res?;
+        let q = units_to_f64(res.quoteReserve, pref.quote.decimals());
+        let t = units_to_f64(res.tokenReserve, pref.token_decimals);
+        let raised = real.map(|r| units_to_f64(r._0, pref.quote.decimals())).unwrap_or(0.0);
+        let eth = if full {
+            crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)).await.ok()
+        } else {
+            None
+        };
+        return Ok(Market {
+            // Price is quote per token, the same orientation every other venue
+            // reports, so the rest of the app needs no special case.
+            sqrt_price: if t > 0.0 { (q / t).sqrt() } else { 0.0 },
+            tick: 0,
+            r0: raised, // what is actually in it, not the phantom-inflated figure
+            r1: t,
+            eth: eth.map(wei_to_f64),
+            token_bal: bal.ok().map(|b| units_to_f64(b._0, pref.token_decimals)),
+            ready: q > 0.0 && t > 0.0,
+            read_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            gas_price: provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0),
+            supply: 0.0,
+            full,
+        });
+    }
     let (sqrt_p, tick, l) = match pref.kind {
+        // Curves returned above; this arm exists only so the match is total.
+        PoolKind::PonsCurve { .. } => (0.0, 0, 0.0),
         PoolKind::V4 { pool_id, .. } | PoolKind::FlaunchV4 { pool_id, .. } => {
             let sv = IStateView::new(STATE_VIEW, provider);
             let cb0 = sv.getSlot0(pool_id);
@@ -2630,6 +2695,8 @@ async fn read_market_inner<P: Provider>(
     let qd = pref.quote.decimals() as i32;
     let tdi = pref.token_decimals as i32; // tracked-token decimals — read on-chain, NOT assumed
     let (r0, r1) = match pref.kind {
+        // Curves returned above; this arm exists only so the match is total.
+        PoolKind::PonsCurve { .. } => (0.0, 0.0),
         // token0 = min(token, quote). If the tracked token sorts below the quote
         // it's token0 (a); the quote is token1 (b) → quote-side r0 = b.
         PoolKind::V4 { .. } => {
@@ -2848,6 +2915,16 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
     // One filter per protocol (no topic0 filter — decode by topic0 below). v4:
     // scope to our pool via topic1 = pool id. v3: scope by pool address.
     let (weth0, v4, filter) = match pref.kind {
+        // A curve emits its OWN trade events, on its own address — not Uniswap
+        // Swaps on the PoolManager. Decoding those is separate work, so rather
+        // than filter for logs this decoder cannot read, say so once and return
+        // nothing. An empty tape that explains itself beats one that does not.
+        PoolKind::PonsCurve { curve, .. } => {
+            crate::trace(&format!(
+                "tape: {curve:#x} is a pons curve — CurveBuy/CurveSell are not decoded yet"
+            ));
+            return Ok(Vec::new());
+        }
         PoolKind::V4 { pool_id, .. } => (
             true, true,
             Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
@@ -3163,6 +3240,33 @@ fn build_swap(
             v4::swap_calldata(token, fee, tick_spacing, buying, wi, wm),
             value,
         ),
+        // A curve is not routed. It prices and settles the trade itself, so the
+        // call goes straight to it — buy spends the quote asset, sell spends
+        // the launch token, and for a native-quote launch `quoteIn` must equal
+        // the value sent or it reverts with NativeValueMismatch.
+        PoolKind::PonsCurve { curve, quote } => {
+            let data: Bytes = if buying {
+                IPonsCurve::buyCall {
+                    quoteIn: U256::from(wi),
+                    minTokensOut: U256::from(wm),
+                    recipient: trader,
+                }
+                .abi_encode()
+                .into()
+            } else {
+                IPonsCurve::sellCall {
+                    tokensIn: U256::from(wi),
+                    minQuoteOut: U256::from(wm),
+                    recipient: trader,
+                }
+                .abi_encode()
+                .into()
+            };
+            // Native quote only: an ERC-20 quote is pulled by the curve after
+            // an approval, and sending value alongside reverts.
+            let v = if buying && quote == Address::ZERO { U256::from(wi) } else { U256::ZERO };
+            (curve, data, v)
+        }
         // `fee` is deliberately unused: the Flaunch pool key's fee is 0 (the
         // hook charges its cut), and the builder hardcodes the key layout.
         PoolKind::FlaunchV4 { .. } => (
@@ -3508,5 +3612,74 @@ mod drain_tests {
             let pct = (lost * U256::from(100) / had).to::<u128>();
             assert!(pct < 10, "{pct}% should not warn");
         }
+    }
+}
+
+#[cfg(test)]
+mod pons_curve_tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    const CURVE: Address = address!("bc39b6502e1a6ab36e4a5c5026a35f08342a0a9c");
+    const TOKEN: Address = address!("a1186a1bcde151634440e5f51ae998c61e465f5d");
+    const TRADER: Address = address!("bf93d16a2a0bd298bb274ba8e824097bd1122671");
+    const USDG: Address = address!("5fc5360d0400a0fd4f2af552add042d716f1d168");
+
+    /// A curve is not routed. The call goes to the CURVE, not to a router —
+    /// sending a bonding-curve trade to the UniversalRouter would revert, and
+    /// sending it to SwapRouter02 would be worse.
+    #[test]
+    fn a_curve_trade_goes_to_the_curve() {
+        let (to, data, _) = build_swap(
+            PoolKind::PonsCurve { curve: CURVE, quote: Address::ZERO },
+            TOKEN, 0, true, Wei::exact(U256::from(1_000u64)), Wei::ZERO, TRADER,
+        );
+        assert_eq!(to, CURVE, "must call the curve itself");
+        assert_eq!(&data[..4], &IPonsCurve::buyCall::SELECTOR, "buy(), not a router call");
+    }
+
+    /// Native quote: `quoteIn` must EQUAL the value sent, or the curve reverts
+    /// with NativeValueMismatch. An ERC-20 quote is pulled after an approval,
+    /// and any value sent alongside reverts with UnexpectedNativeValue.
+    #[test]
+    fn value_is_sent_only_for_a_native_quote() {
+        let amount = Wei::exact(U256::from(500_000_000_000_000u64));
+        let (_, _, native_value) = build_swap(
+            PoolKind::PonsCurve { curve: CURVE, quote: Address::ZERO },
+            TOKEN, 0, true, amount, Wei::ZERO, TRADER,
+        );
+        assert_eq!(native_value, U256::from(500_000_000_000_000u64), "native buy sends its quote");
+
+        let (_, _, erc20_value) = build_swap(
+            PoolKind::PonsCurve { curve: CURVE, quote: USDG },
+            TOKEN, 0, true, amount, Wei::ZERO, TRADER,
+        );
+        assert_eq!(erc20_value, U256::ZERO, "an ERC-20 quote must send no value");
+    }
+
+    /// Selling spends the launch TOKEN, so no value rides along in either case.
+    #[test]
+    fn selling_never_sends_value() {
+        for quote in [Address::ZERO, USDG] {
+            let (to, data, value) = build_swap(
+                PoolKind::PonsCurve { curve: CURVE, quote },
+                TOKEN, 0, false, Wei::exact(U256::from(42u64)), Wei::ZERO, TRADER,
+            );
+            assert_eq!(to, CURVE);
+            assert_eq!(&data[..4], &IPonsCurve::sellCall::SELECTOR);
+            assert_eq!(value, U256::ZERO, "a sell spends tokens, not ETH");
+        }
+    }
+
+    /// The pool-shaped questions have to answer sensibly for a curve, because
+    /// every screen asks them.
+    #[test]
+    fn a_curve_knows_it_is_not_a_pool() {
+        let k = PoolKind::PonsCurve { curve: CURVE, quote: Address::ZERO };
+        assert!(k.is_curve());
+        assert!(!k.is_v3());
+        assert!(!k.is_empty());
+        assert!(PoolKind::PonsCurve { curve: Address::ZERO, quote: Address::ZERO }.is_empty());
+        assert_eq!(k.proto(), "curve");
     }
 }

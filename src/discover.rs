@@ -85,6 +85,9 @@ impl Grad {
     pub fn pool_key(&self) -> B256 {
         match self.kind {
             engine::PoolKind::V3 { pool_addr, .. } => pool_addr.into_word(),
+            // A curve has no pool; its own address is the stable identity, and
+            // it is unique per launch.
+            engine::PoolKind::PonsCurve { curve, .. } => curve.into_word(),
             engine::PoolKind::V4 { pool_id, .. }
             | engine::PoolKind::FlaunchV4 { pool_id, .. } => pool_id,
         }
@@ -94,6 +97,7 @@ impl Grad {
     pub fn pool_display(&self) -> String {
         match self.kind {
             engine::PoolKind::V3 { pool_addr, .. } => format!("{pool_addr:#x}"),
+            engine::PoolKind::PonsCurve { curve, .. } => format!("{curve:#x}"),
             engine::PoolKind::V4 { pool_id, .. }
             | engine::PoolKind::FlaunchV4 { pool_id, .. } => format!("{pool_id:#x}"),
         }
@@ -2170,6 +2174,9 @@ fn venue_tag(g: &Grad) -> &'static str {
     match g.kind {
         engine::PoolKind::V3 { .. } => "pons",
         engine::PoolKind::FlaunchV4 { .. } => "flnch",
+        // Still on its curve — a different thing to trade than a pool, and the
+        // column is the place that says so.
+        engine::PoolKind::PonsCurve { .. } => "pons2",
         engine::PoolKind::V4 { .. } => "v4",
     }
 }
