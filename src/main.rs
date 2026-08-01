@@ -4068,12 +4068,28 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // Live, slippage-aware unrealized P&L of selling the whole holding NOW —
     // updates every refresh, independent of the profit filter being on/off.
     let live = bot.live_edge();
-    let edge_span = Span::styled(
-        format!("{:+.7}", live),
-        Style::default()
-            .fg(if live > 0.0 { ui::widgets::tone_color(view::Tone::Good) } else if live < 0.0 { ui::widgets::tone_color(view::Tone::Bad) } else { ui::widgets::tone_color(view::Tone::Dim) })
-            .add_modifier(Modifier::BOLD),
-    );
+    // Seven decimals of ETH is a number nobody holds an intuition for, and this
+    // is the one figure on the panel that answers "should I get out now" — the
+    // question is what it is WORTH. Muted at zero, like every other P&L line:
+    // `+0.0000000` is not an edge, it is the absence of one.
+    let edge_spans = {
+        let tone = pnl_tone(live, 7);
+        let mut v = vec![Span::styled(
+            format!("{live:+.7} {}", bot.pool.quote_sym),
+            Style::default().fg(ui::widgets::tone_color(tone)).add_modifier(Modifier::BOLD),
+        )];
+        // Same rate the P&L rows use: the pool's quote when it has one, ETH
+        // otherwise. Defined once, here, because the Edge line is built before
+        // the wallet block that used to own it.
+        let rate = if bot.pool.quote_usd > 0.0 { bot.pool.quote_usd } else { bot.eth_usd };
+        if let Some(tag) = view::usd_tag(live, rate) {
+            v.push(Span::styled(
+                format!("  {tag}"),
+                Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
+            ));
+        }
+        v
+    };
     // Wallet — same vertical format in both modes, always on the left (col 0).
     // Row labels are bold so the eye lands on them first; values carry the
     // colour. `lbl` keeps the column alignment in one place.
@@ -4193,7 +4209,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         pnl_row("PnL/Sesh", pnl, pnl_color),
         // Profit above Activity: the guard and edge belong with the PnL lines
         // above them, and Activity reads as the running tally at the bottom.
-        Line::from(vec![lbl("Edge"), edge_span]),
+        Line::from([vec![lbl("Edge")], edge_spans].concat()),
         Line::from(vec![
             lbl("Activity"),
             Span::raw(format!(
