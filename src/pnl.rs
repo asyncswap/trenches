@@ -746,29 +746,40 @@ fn breakdown(
     // Say it in the title too, once. A badge deep in a scrolled list is easy
     // to never reach; the count is what tells you to go looking.
     let bad = trades.iter().filter(|f| f.suspect()).count();
-    let unpriced = trades.iter().filter(|f| !f.basis_known()).count();
+    // A sale with no recorded buy shows `?` in both the profit and the `in`
+    // column, which says it on the row where it applies. Repeating it in the
+    // title spent a third of the header on a footnote.
     let mut flag = String::new();
     if bad > 0 {
         flag.push_str(&format!("· ⚠ {bad} unverified "));
     }
-    // Say the count in the title. A sale with no recorded buy is not counted
-    // in the day, and a total that quietly excludes something must say so.
-    if unpriced > 0 {
-        flag.push_str(&format!("· {unpriced} unpriced (no recorded buy) "));
-    }
 
-    f.render_widget(
-        Paragraph::new(wins.clone())
-            .scroll((off as u16, 0))
-            .block(themed_block(format!(" Winners — {scope}{} {flag}", more(wins.len())))),
-        cols[0],
-    );
-    f.render_widget(
-        Paragraph::new(losses.clone())
-            .scroll((off as u16, 0))
-            .block(themed_block(format!(" Losers — {scope}{} ", more(losses.len())))),
-        cols[1],
-    );
+    // Seven columns of bare numbers explain nothing. The header carries the
+    // same widths as `row` so the words sit over what they name, and it is
+    // drawn OUTSIDE the scrolling paragraph — a legend that scrolls away is a
+    // legend you need exactly when it is gone.
+    let header = Line::from(Span::styled(
+        format!(
+            "  {:<11}{:>10}{:>7}  {:>9} {:>9}  {:>7}  {:>7}",
+            "coin", "profit", "return", "in", "out", "held", "gas"
+        ),
+        Style::default().fg(tone_color(Tone::Info)).add_modifier(Modifier::BOLD),
+    ));
+
+    let mut pane = |area: Rect, title: String, body: Vec<Line<'static>>| {
+        let block = themed_block(title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        f.render_widget(Paragraph::new(header.clone()), rows[0]);
+        f.render_widget(Paragraph::new(body).scroll((off as u16, 0)), rows[1]);
+    };
+
+    pane(cols[0], format!(" Winners — {scope}{} {flag}", more(wins.len())), wins.clone());
+    pane(cols[1], format!(" Losers — {scope}{} ", more(losses.len())), losses.clone());
 }
 
 fn keys(f: &mut Frame, area: Rect, copied: Option<usize>) {
