@@ -531,16 +531,24 @@ pub fn log_scale(v: f64, min: f64) -> f64 {
     }
 }
 
-/// Compact USD: `$4.20M`, `$840k`, `$120`. Shared by every chain's tables.
+/// A compact money figure: `$4.20M`, `$840k`, `$120`. Shared by every chain's
+/// tables.
+///
+/// Takes USD, because USD is what the feeds quote and what the ledger records.
+/// Renders in whatever currency the reader chose — the conversion lives here so
+/// that every one of these call sites follows without knowing about it, and so
+/// that nothing on the way to disk is ever converted.
 pub fn usd_compact(x: f64) -> String {
+    let sym = crate::currency::symbol();
+    let x = crate::currency::from_usd(x);
     if x >= 1e6 {
-        format!("${:.2}M", x / 1e6)
+        format!("{sym}{:.2}M", x / 1e6)
     } else if x >= 1e3 {
         // Two decimals: "$9k" hides the difference between $9,001 and $9,999,
         // which is exactly the movement a tape is being read for.
-        format!("${:.2}k", x / 1e3)
+        format!("{sym}{:.2}k", x / 1e3)
     } else {
-        format!("${x:.2}")
+        format!("{sym}{x:.2}")
     }
 }
 
@@ -580,26 +588,28 @@ fn usd_price_sig(x: f64, sig: u32) -> String {
     if !x.is_finite() || x <= 0.0 {
         return "—".to_string();
     }
+    let sym = crate::currency::symbol();
+    let x = crate::currency::from_usd(x);
     if x >= 1.0 {
-        return format!("${x:.*}", sig as usize + 1);
+        return format!("{sym}{x:.*}", sig as usize + 1);
     }
     if x >= 0.001 {
         // Enough places to show `sig` real digits after however many zeros.
         let zeros = (-x.log10().ceil()).max(0.0) as usize;
-        return format!("${x:.*}", zeros + sig as usize);
+        return format!("{sym}{x:.*}", zeros + sig as usize);
     }
     // How many zeros sit between the point and the first real digit.
     let zeros = (-x.log10().floor() - 1.0) as usize;
     // Beyond eighteen there is nothing left to say — that is past the
     // resolution of the units themselves.
     if zeros > 18 {
-        return "~$0".to_string();
+        return format!("~{sym}0");
     }
     let digits = (x * 10f64.powi(zeros as i32 + sig as i32)).round() as u64;
     const SUB: [char; 10] = ['\u{2080}', '\u{2081}', '\u{2082}', '\u{2083}', '\u{2084}',
                              '\u{2085}', '\u{2086}', '\u{2087}', '\u{2088}', '\u{2089}'];
     let sub: String = zeros.to_string().chars().filter_map(|c| c.to_digit(10)).map(|d| SUB[d as usize]).collect();
-    format!("$0.0{sub}{digits}")
+    format!("{sym}0.0{sub}{digits}")
 }
 
 /// The dollar tag that rides beside a figure in the native currency:

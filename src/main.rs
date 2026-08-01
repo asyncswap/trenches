@@ -7,6 +7,7 @@
 mod agent;
 mod verification;
 mod config;
+mod currency;
 mod net;
 mod contracts;
 mod discover;
@@ -2071,6 +2072,11 @@ async fn app(
     // Nothing recorded for this coin? Your own trades on the saved tape can
     // still say what it cost. See `recover_basis`.
     bot.recover_basis(0);
+    // Restore the display currency before the first frame, or every figure
+    // flashes dollars and then changes under the reader.
+    if let Some(c) = currency::restore().await {
+        trace(&format!("display currency: {c}"));
+    }
     bot.load_daily(); // restore today's PnL baseline across restarts
     // Today's figure comes from the ledger, so it has to be read before the
     // first render — otherwise the wallet shows zero for a day that already
@@ -2768,6 +2774,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         if !f.is_empty() {
                             *cell.lock().unwrap() = Some(f);
                         }
+                        // The display currency's rate rides the same interval.
+                        // A session left open overnight would otherwise still
+                        // be converting at yesterday's number.
+                        if !crate::currency::is_usd() {
+                            crate::currency::refresh().await;
+                        }
                     });
                 }
                 if let Some(f) = feed_cell.lock().unwrap().take() {
@@ -3075,6 +3087,41 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // The wallet-size default is a starting point, not a
                         // rule: past a few thousand dollars 0.5% is a big jump,
                         // but 0.1% is a lot of presses to cross a whole percent.
+                        // `$` for the currency the screen is read in. Every
+                        // figure here is priced in USD underneath; this only
+                        // changes what you read it in.
+                        KeyCode::Char('$') => {
+                            bot.status = "loading currencies…".into();
+                            if crate::currency::available().len() < 2 {
+                                crate::currency::refresh().await;
+                            }
+                            let codes = crate::currency::available();
+                            if codes.len() < 2 {
+                                bot.note(
+                                    "Could not reach Coinbase for exchange rates, so the currency list is empty. Figures stay in USD."
+                                        .into(),
+                                );
+                            } else {
+                                let here = crate::currency::code();
+                                let labels: Vec<String> = codes
+                                    .iter()
+                                    .map(|c| if *c == here { format!("{c}  ·  current") } else { c.clone() })
+                                    .collect();
+                                if let Some(i) = ui::select(terminal, "Display currency", &labels)? {
+                                    let pick = codes[i].clone();
+                                    if crate::currency::select(&pick) {
+                                        crate::currency::save(&pick);
+                                        bot.note(format!(
+                                            "Reading in {pick}. Prices are still recorded in USD — only the display changed."
+                                        ));
+                                    } else {
+                                        bot.note(format!("No rate for {pick} yet, so the display stays in {here}."));
+                                    }
+                                } else {
+                                    bot.status = "ready".into();
+                                }
+                            }
+                        }
                         KeyCode::Char(';') => nudge_buy_step(bot, false),
                         KeyCode::Char('\'') => nudge_buy_step(bot, true),
                         KeyCode::Char('[') => {
@@ -4604,7 +4651,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 35] = [
+        let items: [(&str, &str); 36] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
@@ -4636,6 +4683,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             ("", "{  }  0|slippage −/+"),
             ("MODE", ""),
             ("", "T|theme picker"),
+            ("", "$|display currency"),
             ("", "g|toggle profit guard"),
             ("", "n|toggle buy dedup"),
             ("", "q|quit"),

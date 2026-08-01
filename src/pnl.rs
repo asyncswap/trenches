@@ -91,20 +91,24 @@ fn summarise(fills: &[&Fill]) -> Day {
 /// decimals are not affordable — and on a day that made four figures they are
 /// not information either.
 fn money(v: f64) -> String {
+    // USD in, the reader's currency out — see `crate::currency`. The ledger
+    // keeps dollars; only the cell is converted.
+    let sym = crate::currency::symbol();
+    let v = crate::currency::from_usd(v);
     let sign = if v < 0.0 { "-" } else { "" };
     let a = v.abs();
     if a >= 1_000_000.0 {
-        format!("{sign}${:.1}M", a / 1e6)
+        format!("{sign}{sym}{:.1}M", a / 1e6)
     } else if a >= 1_000.0 {
-        format!("{sign}${:.1}K", a / 1e3)
+        format!("{sign}{sym}{:.1}K", a / 1e3)
     } else if a >= 1.0 {
-        format!("{sign}${a:.2}")
+        format!("{sign}{sym}{a:.2}")
     } else if a > 0.0 {
         // Sub-dollar days are still days you traded; rounding them to $0 would
         // make a cell look empty when it is not.
-        format!("{sign}${a:.3}")
+        format!("{sign}{sym}{a:.3}")
     } else {
-        "$0".into()
+        format!("{sym}0")
     }
 }
 
