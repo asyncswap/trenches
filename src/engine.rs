@@ -1124,6 +1124,56 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// Load the saved basis for the CURRENT pool's token, or zero it when that
     /// token has no open position. Replaces the bare `bought_qty = 0.0` resets:
     /// basis is per-token, and now it survives the process.
+    /// Rebuild a cost basis from your own trades on the saved tape.
+    ///
+    /// The basis file only knows what THIS app was told, and it was told
+    /// nothing about a coin bought before the file existed. TOK sold for
+    /// 0.005679 ETH against a basis of zero and was reported as a $10.63
+    /// profit; the tape had held the four buys that made it — 0.000440,
+    /// 0.000418, 0.000397 and 0.000377 ETH — the whole time. That is a real
+    /// 3.5x, and calling it a $10.63 win overstated it by a third while
+    /// calling nothing about it uncertain.
+    ///
+    /// The tape is local, already on disk, and marks which swaps are yours, so
+    /// this costs no RPC. It replays your buys and sells in block order at
+    /// average cost, exactly as a live session would have, and returns what is
+    /// left open.
+    ///
+    /// Quantities come from each row's price rather than from a token amount
+    /// the tape does not carry, so this is a RECONSTRUCTION, not a record —
+    /// which is why it is only ever consulted when nothing was recorded.
+    pub fn basis_from_tape(rows: &[Swap], trader: Address) -> (f64, f64, Option<u64>) {
+        let mut mine: Vec<&Swap> = rows
+            .iter()
+            .filter(|s| s.trader == trader && s.price > 0.0 && s.eth > 0.0)
+            .collect();
+        mine.sort_by_key(|s| s.block);
+        let (mut qty, mut cost) = (0.0f64, 0.0f64);
+        let mut opened: Option<u64> = None;
+        for s in mine {
+            let tok = s.eth * s.price;
+            match s.action {
+                TapeAction::Buy => {
+                    if qty <= 1e-12 {
+                        opened = Some(s.block); // a fresh position starts its own clock
+                    }
+                    qty += tok;
+                    cost += s.eth;
+                }
+                TapeAction::Sell => {
+                    let (sold, spent) = realized_cost(tok, qty, cost);
+                    qty = (qty - sold).max(0.0);
+                    cost = (cost - spent).max(0.0);
+                    if qty <= 1e-12 {
+                        opened = None;
+                    }
+                }
+                _ => {} // liquidity events move no basis
+            }
+        }
+        (qty, cost, opened)
+    }
+
     pub fn restore_basis(&mut self) {
         let b = Self::load_basis_map(self.trader)
             .remove(&format!("{:#x}", self.pool.token))
@@ -1134,6 +1184,45 @@ fn order_fields(o: &Order) -> Vec<String> {
         self.entry_mc = b.entry_mc;
         self.entry_pooled_eth = b.entry_pooled_eth;
         self.entry_tx = b.entry_tx.and_then(|s| s.parse().ok());
+    }
+
+    /// Fill a missing basis from the tape, and say so.
+    ///
+    /// Only when nothing was recorded — a reconstruction must never overwrite
+    /// a real record, however plausible it looks. Called after `restore_basis`
+    /// with the tape already in memory.
+    pub fn recover_basis(&mut self, head: u64) {
+        if self.trader.is_zero()
+            || self.pool.token.is_zero()
+            || self.bought_qty > 1e-12
+            || self.bought_cost > 1e-12
+        {
+            return; // recorded, or nothing to recover for
+        }
+        // Straight off disk: the tape in memory may not have been loaded for
+        // this token yet, and the file is the same rows.
+        let Ok(text) = std::fs::read_to_string(crate::evm_tape_path(&self.pool.token)) else {
+            return;
+        };
+        let rows: Vec<Swap> =
+            text.lines().filter_map(|l| serde_json::from_str::<Swap>(l).ok()).collect();
+        let (qty, cost, opened) = Self::basis_from_tape(&rows, self.trader);
+        if qty <= 1e-12 || cost <= 1e-12 {
+            return;
+        }
+        self.bought_qty = qty;
+        self.bought_cost = cost;
+        // A block number, converted at this chain's ~10 blocks/sec. Better than
+        // no hold time; not presented as more than it is.
+        if let Some(b) = opened {
+            let behind = head.saturating_sub(b) / 10;
+            self.entry_at = Some(crate::ledger::now().saturating_sub(behind));
+        }
+        self.note(format!(
+            "Rebuilt a cost basis for {} from your own trades on the tape: {:.6} ETH across the buys still open.              Nothing had been recorded, so a sell would have booked its whole proceeds as profit.",
+            self.pool.sym, cost
+        ));
+        self.save_basis(); // recorded from here on, so this runs once
     }
 
     /// Persist the queue, capped alongside the in-memory ring. A restart
@@ -3443,6 +3532,92 @@ pub fn burn_amounts(liquidity: f64, sqrt_p: f64, tick_lower: i32, tick_upper: i3
 ///   entire proceeds, while the money sat stranded in the basis forever.
 ///
 /// Returns `(inventory_consumed, cost)`.
+
+#[cfg(test)]
+mod basis_recovery_tests {
+    use super::*;
+
+    fn swap(action: TapeAction, eth: f64, price: f64, block: u64, trader: Address) -> Swap {
+        Swap {
+            action,
+            eth,
+            eth_wei: (eth * 1e18) as u128,
+            price,
+            trader,
+            liq_eth: 1.0,
+            block,
+            tx: TxHash::ZERO,
+            tick_lo: 0,
+            tick_hi: 0,
+            is_v4: false,
+        }
+    }
+
+    /// The TOK case, from the real tape: four buys the basis file never knew
+    /// about, then the sell that got booked as pure profit.
+    #[test]
+    fn open_buys_on_the_tape_rebuild_the_basis_that_was_never_recorded() {
+        let me = Address::repeat_byte(0xbf);
+        let px = 1e9; // tokens per ETH; only the ratio matters here
+        let rows = vec![
+            swap(TapeAction::Buy, 0.000_440, px, 23_445_181, me),
+            swap(TapeAction::Buy, 0.000_418, px, 23_445_431, me),
+            swap(TapeAction::Buy, 0.000_397, px, 23_445_563, me),
+            swap(TapeAction::Buy, 0.000_377, px, 23_445_668, me),
+        ];
+        let (qty, cost, opened) = Bot::basis_from_tape(&rows, me);
+        assert!((cost - 0.001_632).abs() < 1e-9, "every open buy counted: {cost}");
+        assert!((qty - 0.001_632 * px).abs() < 1.0);
+        assert_eq!(opened, Some(23_445_181), "the clock starts at the FIRST buy");
+    }
+
+    /// Strangers' trades sit on the same tape. Counting them would invent a
+    /// basis out of other people's money.
+    #[test]
+    fn only_your_own_trades_count() {
+        let me = Address::repeat_byte(0xbf);
+        let them = Address::repeat_byte(0x11);
+        let rows = vec![
+            swap(TapeAction::Buy, 0.001, 1e9, 100, them),
+            swap(TapeAction::Buy, 0.002, 1e9, 101, me),
+        ];
+        let (_, cost, _) = Bot::basis_from_tape(&rows, me);
+        assert!((cost - 0.002).abs() < 1e-12);
+    }
+
+    /// A position already closed on the tape must rebuild as nothing — else
+    /// the next buy inherits a basis it did not pay for.
+    #[test]
+    fn a_closed_position_rebuilds_as_flat() {
+        let me = Address::repeat_byte(0xbf);
+        let px = 1e9;
+        let rows = vec![
+            swap(TapeAction::Buy, 0.001, px, 100, me),
+            swap(TapeAction::Sell, 0.003, px, 200, me), // sold the whole bag
+        ];
+        let (qty, cost, opened) = Bot::basis_from_tape(&rows, me);
+        assert!(qty <= 1e-9 && cost <= 1e-9, "nothing left open: qty={qty} cost={cost}");
+        assert_eq!(opened, None);
+    }
+
+    /// Rows arrive out of order when two windows overlap; the replay has to
+    /// put them back in block order or a sell can consume a buy that had not
+    /// happened yet.
+    #[test]
+    fn the_replay_is_in_block_order_whatever_the_file_order() {
+        let me = Address::repeat_byte(0xbf);
+        let px = 1e9;
+        let jumbled = vec![
+            swap(TapeAction::Sell, 0.003, px, 200, me),
+            swap(TapeAction::Buy, 0.001, px, 100, me),
+            swap(TapeAction::Buy, 0.002, px, 300, me),
+        ];
+        let (_, cost, opened) = Bot::basis_from_tape(&jumbled, me);
+        assert!((cost - 0.002).abs() < 1e-9, "only the post-sell buy is open: {cost}");
+        assert_eq!(opened, Some(300));
+    }
+}
+
 pub fn realized_cost(tok: f64, bought_qty: f64, bought_cost: f64) -> (f64, f64) {
     let from_basis = if tok > 0.0 { tok.min(bought_qty) } else { bought_qty };
     let avg = if bought_qty > 1e-12 { bought_cost / bought_qty } else { 0.0 };

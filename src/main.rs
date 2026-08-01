@@ -167,7 +167,7 @@ fn buy_size_status(bot: &engine::Bot) -> String {
 
 /// Where a token's tape history sleeps between sessions. Keyed by TOKEN, so
 /// the history follows the coin across venue upgrades and pool migrations.
-fn evm_tape_path(token: &alloy::primitives::Address) -> String {
+pub(crate) fn evm_tape_path(token: &alloy::primitives::Address) -> String {
     format!("{}/tape-evm-{token}.jsonl", state_dir())
 }
 
@@ -1906,6 +1906,9 @@ async fn app(
     // cost basis has to come back with it — a zero basis books the next sell's
     // entire proceeds as profit, permanently, into the ledger.
     bot.restore_basis();
+    // Nothing recorded for this coin? Your own trades on the saved tape can
+    // still say what it cost. See `recover_basis`.
+    bot.recover_basis(0);
     bot.load_daily(); // restore today's PnL baseline across restarts
     // Today's figure comes from the ledger, so it has to be read before the
     // first render — otherwise the wallet shows zero for a day that already
@@ -2934,6 +2937,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             bot.pool = to_poolcfg(&blank);
                             bot.routes.clear();
                             bot.restore_basis();
+                            bot.recover_basis(block.load(Ordering::Relaxed));
                             bot.lp_permit2_done = false;
                             bot.v3_covered = false;
                             bot.ur_permit2_done = false;
@@ -3068,6 +3072,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
                                     bot.restore_basis();
+                                    bot.recover_basis(block.load(Ordering::Relaxed));
+                            bot.recover_basis(block.load(Ordering::Relaxed));
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
                                     bot.ur_permit2_done = false;
@@ -3166,6 +3172,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                         discover::remember(g.token, pool_addr, g.launch_block);
                                     }
                                     bot.restore_basis(); // basis is per-token, and survives restarts
+                                    bot.recover_basis(block.load(Ordering::Relaxed));
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
                                     bot.ur_permit2_done = false;
@@ -3340,6 +3347,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
                                     bot.restore_basis(); // basis is per-token, and survives restarts
+                                    bot.recover_basis(block.load(Ordering::Relaxed));
                                     bot.lp_permit2_done = false;
                                     bot.v3_covered = false;
                                     bot.ur_permit2_done = false;
