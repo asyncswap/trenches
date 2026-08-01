@@ -88,6 +88,29 @@ fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
     }
 }
 
+/// The venue name for a tape or order row.
+///
+/// A row records only whether it was v4, so the name comes from whichever
+/// loaded pool matches that — the active one first, then the arb counterpart.
+/// With neither matching, the protocol version is all that is actually known,
+/// and saying that is better than naming the wrong project.
+fn venue_of(bot: &Bot, is_v4: bool) -> &'static str {
+    let matches = |k: &engine::PoolKind| {
+        !k.is_empty()
+            && matches!(k, engine::PoolKind::V4 { .. } | engine::PoolKind::FlaunchV4 { .. })
+                == is_v4
+    };
+    if matches(&bot.pool.kind) {
+        return bot.pool.kind.venue_short();
+    }
+    if let Some(b) = bot.pool_b.as_ref() {
+        if matches(&b.kind) {
+            return b.kind.venue_short();
+        }
+    }
+    if is_v4 { "v4" } else { "v3" }
+}
+
 /// A v3 tick, as a price per token in dollars.
 ///
 /// LP rows carried `tick [-887200, 204200]`, which is the pool's own
@@ -4370,7 +4393,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     // Age leads, as on the Solana tape: a tape is read
                     // newest-first, so "how long ago" is the first thing wanted.
                     view::Col::fixed("age", 6),
-                    view::Col::fixed("pool", 4),
+                    view::Col::fixed("venue", 8),
                     view::Col::fixed("action", 7),
                     // Named for the pool's quote asset, not for ETH. A USDG
                     // pool's depth under a header saying ETH is a unit error
@@ -4446,7 +4469,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 } else {
                     "—".into()
                 };
-                let (venue, vtone) = if s.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
+                let (venue, vtone) = (
+                    venue_of(bot, s.is_v4),
+                    if s.is_v4 { view::Tone::Info } else { view::Tone::Accent },
+                );
                 // The whole row carries the trade's colour, so a buy reads as
                 // one green unit and a sell as one red one. Age stays neutral:
                 // it says when, not what.
@@ -4559,7 +4585,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // trade you are looking at now is how long ago, not what the
                 // clock read. The exact second is still on the record.
                 view::Col::fixed("ago", 5),
-                view::Col::fixed("pool", 4),
+                view::Col::fixed("venue", 8),
                 // WHICH key caused it, immediately before what it did — the
                 // two halves of one sentence, read together.
                 view::Col::fixed("key", 4),
@@ -4598,7 +4624,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 s if s.starts_with("REMOVE") || s.starts_with("CLOSE") => view::Tone::Accent,
                 _ => view::Tone::Normal,
             };
-            let (venue, vtone) = if o.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
+            let (venue, vtone) = (
+                venue_of(bot, o.is_v4),
+                if o.is_v4 { view::Tone::Info } else { view::Tone::Accent },
+            );
             // How long ago, which is the form the question is asked in.
             let ago = if o.at > 0 {
                 view::age_compact(crate::ledger::now().saturating_sub(o.at) as f64)

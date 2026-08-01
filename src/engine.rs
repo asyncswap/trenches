@@ -199,8 +199,25 @@ impl PoolKind {
             PoolKind::V4 { .. } => "Uniswap V4",
             PoolKind::V3 { .. } => "Uniswap V3",
             PoolKind::FlaunchV4 { .. } => "Flaunch",
-            PoolKind::PonsCurve { .. } => "pons curve",
-            PoolKind::PonsV2Pool { .. } => "pons v2",
+            PoolKind::PonsCurve { .. } => "Pons v2 curve",
+            PoolKind::PonsV2Pool { .. } => "Pons v2",
+        }
+    }
+
+    /// The venue's name, short enough for a table cell.
+    ///
+    /// `v3` and `v4` describe a protocol version, which is not what anyone is
+    /// asking when they glance at that column — they want to know whose venue
+    /// this is. These projects have names and there is no reason not to use
+    /// them: Flaunch launches are Flaunch's, and every v3 pool on this chain
+    /// arrived through Pons.
+    pub fn venue_short(&self) -> &'static str {
+        match self {
+            PoolKind::V4 { .. } => "Uniswap",
+            PoolKind::V3 { .. } => "Uniswap",
+            PoolKind::FlaunchV4 { .. } => "Flaunch",
+            PoolKind::PonsCurve { .. } => "Pons v2",
+            PoolKind::PonsV2Pool { .. } => "Pons v2",
         }
     }
     pub fn is_v3(&self) -> bool {
