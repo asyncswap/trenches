@@ -113,6 +113,55 @@ pub fn flaunch_swap_calldata(token: Address, buy: bool, amount_in: u128, min_out
     .into()
 }
 
+/// One v4 hop between a coin and its quote, through a named hook.
+///
+/// For a pons v2 pool: the hook is part of the pool key, so it cannot be
+/// defaulted — a swap built with hooks = 0 addresses a pool that does not
+/// exist. The pool's own fee is ZERO because the hook charges instead, which
+/// is why fee is not a parameter and why reading the pool's fee tells you
+/// nothing about what a trade costs.
+pub fn hop_calldata(
+    token: Address,
+    quote: Address,
+    hook: Address,
+    tick_spacing: i32,
+    buy: bool,
+    amount_in: u128,
+    min_out: u128,
+) -> Bytes {
+    let (input_cur, output_cur, hop_cur) =
+        if buy { (quote, token, token) } else { (token, quote, quote) };
+    let path = vec![PathKey {
+        intermediateCurrency: hop_cur,
+        fee: alloy::primitives::aliases::U24::ZERO,
+        tickSpacing: tick_spacing.try_into().unwrap_or_default(),
+        hooks: hook,
+        hookData: Bytes::new(),
+    }];
+    let params0 = ExactInputParams {
+        currencyIn: input_cur,
+        path,
+        minHopPriceX36: vec![],
+        amountIn: amount_in,
+        amountOutMinimum: min_out,
+    }
+    .abi_encode();
+    let params1 = (input_cur, U256::from(amount_in)).abi_encode_params();
+    let params2 = (output_cur, U256::from(min_out)).abi_encode_params();
+
+    let actions = Bytes::from(vec![SWAP_EXACT_IN, SETTLE_ALL, TAKE_ALL]);
+    let params: Vec<Bytes> = vec![params0.into(), params1.into(), params2.into()];
+    let v4_input = (actions, params).abi_encode_params();
+
+    IUniversalRouter::executeCall {
+        commands: Bytes::from(vec![V4_SWAP]),
+        inputs: vec![v4_input.into()],
+        deadline: U256::from(FAR_DEADLINE),
+    }
+    .abi_encode()
+    .into()
+}
+
 /// Build PositionManager.modifyLiquidities() calldata to open a position.
 #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 pub fn add_liquidity_calldata(

@@ -89,7 +89,8 @@ impl Grad {
             // it is unique per launch.
             engine::PoolKind::PonsCurve { curve, .. } => curve.into_word(),
             engine::PoolKind::V4 { pool_id, .. }
-            | engine::PoolKind::FlaunchV4 { pool_id, .. } => pool_id,
+            | engine::PoolKind::FlaunchV4 { pool_id, .. }
+            | engine::PoolKind::PonsV2Pool { pool_id, .. } => pool_id,
         }
     }
     /// Human display of the venue id — the 20-byte pool ADDRESS for v3, the
@@ -99,7 +100,8 @@ impl Grad {
             engine::PoolKind::V3 { pool_addr, .. } => format!("{pool_addr:#x}"),
             engine::PoolKind::PonsCurve { curve, .. } => format!("{curve:#x}"),
             engine::PoolKind::V4 { pool_id, .. }
-            | engine::PoolKind::FlaunchV4 { pool_id, .. } => format!("{pool_id:#x}"),
+            | engine::PoolKind::FlaunchV4 { pool_id, .. }
+            | engine::PoolKind::PonsV2Pool { pool_id, .. } => format!("{pool_id:#x}"),
         }
     }
     /// True when WETH/quote is token0 (only meaningful for ETH-quoted v3 pools).
@@ -2177,6 +2179,8 @@ fn venue_tag(g: &Grad) -> &'static str {
         // Still on its curve — a different thing to trade than a pool, and the
         // column is the place that says so.
         engine::PoolKind::PonsCurve { .. } => "pons2",
+        // Graduated: same launchpad, now a pool.
+        engine::PoolKind::PonsV2Pool { .. } => "pons2",
         engine::PoolKind::V4 { .. } => "v4",
     }
 }

@@ -840,7 +840,8 @@ fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
         // "pool" in a bug report sends whoever reads it to the wrong contract.
         engine::PoolKind::PonsCurve { curve, .. } => ("curve", format!("{curve:#x}")),
         engine::PoolKind::V4 { pool_id, .. }
-        | engine::PoolKind::FlaunchV4 { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
+        | engine::PoolKind::FlaunchV4 { pool_id, .. }
+        | engine::PoolKind::PonsV2Pool { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
     };
     vec![
         ("sym", p.sym.clone()),
@@ -1913,6 +1914,10 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
             "pons_curve", String::new(), curve.to_string(), 0,
             quote.to_string(), String::new(),
         ),
+        engine::PoolKind::PonsV2Pool { pool_id, quote, tick_spacing, .. } => (
+            "pons_v2", pool_id.to_string(), String::new(), tick_spacing,
+            quote.to_string(), contracts::STATE_VIEW.to_string(),
+        ),
     };
     let pool_obj = json!({
         "label": format!("ETH/{} {}", p.sym, fee_label(p.fee)),
@@ -2451,6 +2456,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // when a buy is due a re-check, so it costs nothing otherwise.
                 phase!("checking a recent buy for a drain");
                 let _ = tokio::time::timeout(Duration::from_secs(2), bot.check_drains(provider)).await;
+                // A pons v2 launch can graduate mid-session, at which point the
+                // curve stops accepting trades entirely. Costs one call, and
+                // only while a curve is open.
+                phase!("checking whether a curve has graduated");
+                let _ = tokio::time::timeout(Duration::from_secs(2), bot.check_graduation(provider)).await;
                 // YOUR confirmed trades are guaranteed a tape row. The tape is
                 // built from getLogs, and this chain's public endpoint can
                 // answer a window thinly while rate limited — when that window
@@ -3509,7 +3519,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
         engine::PoolKind::PonsCurve { curve, .. } =>
             mkt.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
-        engine::PoolKind::V4 { pool_id, .. } | engine::PoolKind::FlaunchV4 { pool_id, .. } =>
+        engine::PoolKind::V4 { pool_id, .. }
+        | engine::PoolKind::FlaunchV4 { pool_id, .. }
+        | engine::PoolKind::PonsV2Pool { pool_id, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
     }
     // Which venue and pair, first — it moved off the header to make room for
@@ -3616,7 +3628,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
                 engine::PoolKind::PonsCurve { curve, .. } =>
                     mb.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
-                engine::PoolKind::V4 { pool_id, .. } | engine::PoolKind::FlaunchV4 { pool_id, .. } =>
+                engine::PoolKind::V4 { pool_id, .. }
+                | engine::PoolKind::FlaunchV4 { pool_id, .. }
+                | engine::PoolKind::PonsV2Pool { pool_id, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_id}"))])),
             }
             let pbp = bot.price_b();

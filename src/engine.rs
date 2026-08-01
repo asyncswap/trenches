@@ -82,6 +82,31 @@ pub enum PoolKind {
     // `quote` is what the launch is priced in: zero for native ETH, otherwise
     // an approved ERC-20 that is the currency of the entire launch.
     PonsCurve { curve: Address, quote: Address },
+    // What a pons v2 launch becomes once its curve sells out: a Uniswap v4 pool
+    // carrying the pons hook, paired against whatever the launch was priced in.
+    //
+    // Not `V4`, which bakes in currency0 = native ETH and hooks = 0. This pool's
+    // fee field is ZERO and the hook charges instead, so reading the pool's own
+    // fee tells you nothing about what a trade costs — the same trap that
+    // mispriced Flaunch.
+    // `quote` and `tick_spacing` ride along because ROUTING needs them: the
+    // hook and both currencies form the pool key, and unlike Flaunch the quote
+    // is not a fixed asset — each launch chooses its own.
+    PonsV2Pool { pool_id: B256, coin_is_0: bool, quote: Address, tick_spacing: i32 },
+}
+
+/// The v4 pool id a pons v2 launch graduates into.
+///
+/// Uniswap sorts the two currencies by address, and native ETH is the zero
+/// address so it always takes currency0 when present. The pool's own fee is
+/// zero — the hook charges — and the hook is part of the key, so a pool id
+/// computed with hooks = 0 would point at a pool that does not exist.
+pub fn pons_v2_pool_id(token: Address, quote: Address, tick_spacing: i32, hook: Address) -> B256 {
+    use alloy::sol_types::SolValue;
+    let (c0, c1) = if quote < token { (quote, token) } else { (token, quote) };
+    let spacing: alloy::primitives::aliases::I24 = tick_spacing.try_into().unwrap_or_default();
+    let fee: alloy::primitives::aliases::U24 = alloy::primitives::aliases::U24::ZERO;
+    alloy::primitives::keccak256((c0, c1, fee, spacing, hook).abi_encode_params())
 }
 
 impl PoolKind {
@@ -91,6 +116,7 @@ impl PoolKind {
             PoolKind::V3 { .. } => "v3",
             PoolKind::FlaunchV4 { .. } => "flaunch",
             PoolKind::PonsCurve { .. } => "curve",
+            PoolKind::PonsV2Pool { .. } => "pons2",
         }
     }
 
@@ -103,6 +129,7 @@ impl PoolKind {
             PoolKind::V3 { .. } => "Uniswap V3",
             PoolKind::FlaunchV4 { .. } => "Flaunch",
             PoolKind::PonsCurve { .. } => "pons curve",
+            PoolKind::PonsV2Pool { .. } => "pons v2",
         }
     }
     pub fn is_v3(&self) -> bool {
@@ -111,9 +138,9 @@ impl PoolKind {
     /// True when no real pool is selected (placeholder / empty network).
     pub fn is_empty(&self) -> bool {
         match self {
-            PoolKind::V4 { pool_id, .. } | PoolKind::FlaunchV4 { pool_id, .. } => {
-                *pool_id == B256::ZERO
-            }
+            PoolKind::V4 { pool_id, .. }
+            | PoolKind::FlaunchV4 { pool_id, .. }
+            | PoolKind::PonsV2Pool { pool_id, .. } => *pool_id == B256::ZERO,
             PoolKind::V3 { pool_addr, .. } => *pool_addr == Address::ZERO,
             PoolKind::PonsCurve { curve, .. } => *curve == Address::ZERO,
         }
@@ -1126,6 +1153,76 @@ impl Bot {
         }
     }
 
+    /// Follow a pons v2 launch across graduation.
+    ///
+    /// A launch trades on its curve and then, without warning and inside
+    /// whoever's buy happens to finish it, becomes a Uniswap v4 pool. The curve
+    /// stops accepting trades at that moment and reverts with CurveGraduated,
+    /// so a bot still pointed at it would sit there failing every order while
+    /// the token traded normally somewhere else.
+    ///
+    /// `phase` on the factory is the authoritative signal — 0 curve, 1 swept
+    /// (closed, pool not built yet), 2 pool, 3 rescued. Their docs are explicit
+    /// that it must not be inferred from balances or events, so it is read.
+    ///
+    /// Cheap: one call, and only while a curve is actually open.
+    pub async fn check_graduation<P: Provider>(&mut self, provider: &P) {
+        let PoolKind::PonsCurve { .. } = self.pool.kind else { return };
+        let f = IPonsV2Factory::new(PONS_V2_FACTORY, provider);
+        let Ok(rec) = f.getLaunchedToken(self.pool.token).call().await else { return };
+        let rec = rec._0;
+        if !rec.exists {
+            return;
+        }
+        match rec.phase {
+            // Still on the curve, or closed but not yet seeded. Phase 1 is
+            // transient and nothing trades in it, so say so rather than
+            // leaving the screen looking live.
+            0 => {}
+            1 => self.note(format!(
+                "{} sold out its curve and is waiting for its pool. Trading resumes when it lands",
+                self.pool.sym
+            )),
+            2 => {
+                let pool_id = pons_v2_pool_id(
+                    self.pool.token,
+                    rec.pairToken,
+                    rec.tickSpacing.as_i32(),
+                    PONS_V2_HOOK,
+                );
+                self.pool.kind = PoolKind::PonsV2Pool {
+                    pool_id,
+                    // Uniswap sorts by address, and native ETH is address zero,
+                    // so a native-quote launch always has the coin as
+                    // currency1.
+                    coin_is_0: self.pool.token < rec.pairToken,
+                    quote: rec.pairToken,
+                    tick_spacing: rec.tickSpacing.as_i32(),
+                };
+                // The tape was reading the curve, which no longer emits.
+                self.note(format!(
+                    "{} graduated — now trading in its Uniswap pool",
+                    self.pool.sym
+                ));
+                crate::events::info(
+                    "A pons v2 launch graduated to its pool",
+                    &[
+                        ("coin", self.pool.sym.clone()),
+                        ("pool_id", format!("{pool_id:#x}")),
+                        ("quote", format!("{:#x}", rec.pairToken)),
+                    ],
+                );
+            }
+            // The recovery path. Off the normal route entirely, and worth
+            // saying out loud rather than quietly showing a dead market.
+            3 => self.note(format!(
+                "{} was rescued rather than graduated. It has no pool — do not trade it",
+                self.pool.sym
+            )),
+            _ => {}
+        }
+    }
+
     /// Gas for a send: ask the node, then add real headroom — never below the
     /// venue's floor.
     ///
@@ -1974,7 +2071,7 @@ impl Bot {
     pub async fn add_liquidity<P: Provider>(&mut self, provider: &P, eth_wei: u128) -> eyre::Result<()> {
         let spacing = match self.pool.kind {
             PoolKind::V4 { tick_spacing, .. } => tick_spacing,
-            PoolKind::V3 { .. } | PoolKind::PonsCurve { .. } => {
+            PoolKind::V3 { .. } | PoolKind::PonsCurve { .. } | PoolKind::PonsV2Pool { .. } => {
                 self.skips += 1;
                 self.push_order("ADD LP".into(), OrderStatus::Skipped, None);
                 // A curve holds the whole supply and IS the liquidity; there is
@@ -2641,7 +2738,9 @@ async fn read_market_inner<P: Provider>(
     let (sqrt_p, tick, l) = match pref.kind {
         // Curves returned above; this arm exists only so the match is total.
         PoolKind::PonsCurve { .. } => (0.0, 0, 0.0),
-        PoolKind::V4 { pool_id, .. } | PoolKind::FlaunchV4 { pool_id, .. } => {
+        PoolKind::V4 { pool_id, .. }
+        | PoolKind::FlaunchV4 { pool_id, .. }
+        | PoolKind::PonsV2Pool { pool_id, .. } => {
             let sv = IStateView::new(STATE_VIEW, provider);
             let cb0 = sv.getSlot0(pool_id);
             let cbl = sv.getLiquidity(pool_id);
@@ -2724,6 +2823,16 @@ async fn read_market_inner<P: Provider>(
                 (b_raw / 1e18, a_raw / 10f64.powi(tdi))
             } else {
                 (a_raw / 1e18, b_raw / 10f64.powi(tdi))
+            }
+        }
+        // pons v2: same orientation question as Flaunch, but the quote is
+        // whatever the launch was priced in — NOT necessarily an 18-decimal
+        // asset, so the quote side is scaled by its own decimals.
+        PoolKind::PonsV2Pool { coin_is_0, .. } => {
+            if coin_is_0 {
+                (b_raw / 10f64.powi(qd), a_raw / 10f64.powi(tdi))
+            } else {
+                (a_raw / 10f64.powi(qd), b_raw / 10f64.powi(tdi))
             }
         }
     };
@@ -2931,6 +3040,11 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         ),
         // Same PoolManager events as V4, but the quote side is flETH, whose
         // position follows the launch's _currencyFlipped rather than always 0.
+        // pons v2: same PoolManager events, orientation from the launch record.
+        PoolKind::PonsV2Pool { pool_id, coin_is_0, .. } => (
+            !coin_is_0, true,
+            Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
+        ),
         PoolKind::FlaunchV4 { pool_id, coin_is_0 } => (
             !coin_is_0, true,
             Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
@@ -3239,6 +3353,16 @@ fn build_swap(
             UNIVERSAL_ROUTER,
             v4::swap_calldata(token, fee, tick_spacing, buying, wi, wm),
             value,
+        ),
+        // A graduated pons v2 pool: ONE v4 hop through the pons hook, paired
+        // against whatever the launch was priced in. The hook is part of the
+        // key, so it cannot be omitted, and the pool's own fee is zero.
+        PoolKind::PonsV2Pool { quote, tick_spacing, .. } => (
+            UNIVERSAL_ROUTER,
+            v4::hop_calldata(token, quote, PONS_V2_HOOK, tick_spacing, buying, wi, wm),
+            // Native-quote launches pay in ETH; an ERC-20 quote is pulled
+            // through Permit2 and must send none.
+            if buying && quote == Address::ZERO { value } else { U256::ZERO },
         ),
         // A curve is not routed. It prices and settles the trade itself, so the
         // call goes straight to it — buy spends the quote asset, sell spends
@@ -3681,5 +3805,76 @@ mod pons_curve_tests {
         assert!(!k.is_empty());
         assert!(PoolKind::PonsCurve { curve: Address::ZERO, quote: Address::ZERO }.is_empty());
         assert_eq!(k.proto(), "curve");
+    }
+}
+
+#[cfg(test)]
+mod pons_v2_pool_tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    const TOKEN: Address = address!("a1186a1bcde151634440e5f51ae998c61e465f5d");
+    const USDG: Address = address!("5fc5360d0400a0fd4f2af552add042d716f1d168");
+
+    /// The hook is part of the pool key. A pool id computed with hooks = 0
+    /// addresses a pool that does not exist, so every swap built from it would
+    /// revert — and the id is derived, never read back, so nothing else would
+    /// catch it.
+    #[test]
+    fn the_hook_is_part_of_the_pool_id() {
+        let with = pons_v2_pool_id(TOKEN, Address::ZERO, 60, PONS_V2_HOOK);
+        let without = pons_v2_pool_id(TOKEN, Address::ZERO, 60, Address::ZERO);
+        assert_ne!(with, without, "the hook must change the pool id");
+    }
+
+    /// Uniswap sorts currencies by address, and native ETH is address zero, so
+    /// a native-quote launch always has ETH as currency0. Getting the order
+    /// wrong yields a different id — again, a pool that does not exist.
+    #[test]
+    fn currency_order_does_not_depend_on_argument_order() {
+        let a = pons_v2_pool_id(TOKEN, USDG, 60, PONS_V2_HOOK);
+        let b = pons_v2_pool_id(USDG, TOKEN, 60, PONS_V2_HOOK);
+        assert_eq!(a, b, "the key sorts its currencies, so the id is stable");
+        assert_ne!(
+            pons_v2_pool_id(TOKEN, Address::ZERO, 60, PONS_V2_HOOK),
+            a,
+            "a different quote asset is a different pool"
+        );
+    }
+
+    /// Tick spacing is in the key too.
+    #[test]
+    fn tick_spacing_changes_the_pool() {
+        assert_ne!(
+            pons_v2_pool_id(TOKEN, Address::ZERO, 60, PONS_V2_HOOK),
+            pons_v2_pool_id(TOKEN, Address::ZERO, 200, PONS_V2_HOOK),
+        );
+    }
+
+    /// A graduated pool routes through the Universal Router, not the curve.
+    #[test]
+    fn a_graduated_launch_routes_through_the_router() {
+        let kind = PoolKind::PonsV2Pool {
+            pool_id: B256::ZERO,
+            coin_is_0: false,
+            quote: Address::ZERO,
+            tick_spacing: 60,
+        };
+        let (to, _, value) = build_swap(
+            kind, TOKEN, 0, true, Wei::exact(U256::from(1_000u64)), Wei::ZERO, TOKEN,
+        );
+        assert_eq!(to, UNIVERSAL_ROUTER);
+        assert_eq!(value, U256::from(1_000u64), "a native-quote buy sends ETH");
+
+        let erc20 = PoolKind::PonsV2Pool {
+            pool_id: B256::ZERO,
+            coin_is_0: false,
+            quote: USDG,
+            tick_spacing: 60,
+        };
+        let (_, _, v) = build_swap(
+            erc20, TOKEN, 0, true, Wei::exact(U256::from(1_000u64)), Wei::ZERO, TOKEN,
+        );
+        assert_eq!(v, U256::ZERO, "an ERC-20 quote is pulled, not sent");
     }
 }
