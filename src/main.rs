@@ -4183,7 +4183,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // 12-hour with AM/PM. A bare 04:13 is ambiguous by exactly the
                 // twelve hours that matter — "was I asleep?" is the whole
                 // question this column exists to answer.
-                view::Col::fixed("time", 11),
+                view::Col::fixed("time", 9),
                 view::Col::fixed("ago", 5),
                 view::Col::fixed("pool", 4),
                 // Orders carry full labels — "SELL ALL", "REMOVE LP #505",
@@ -4231,13 +4231,17 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let when = if o.at > 0 {
                 let secs = (o.at % 86_400) as i64;
                 let local = (secs + tz_offset_secs()).rem_euclid(86_400);
-                let (h24, m, sec) = (local / 3600, (local % 3600) / 60, local % 60);
+                let (h24, m) = (local / 3600, (local % 3600) / 60);
                 let ampm = if h24 < 12 { "AM" } else { "PM" };
                 let h12 = match h24 % 12 {
                     0 => 12, // midnight and noon are 12, not 0
                     h => h,
                 };
-                format!("{h12}:{m:02}:{sec:02} {ampm}")
+                // No seconds. The question here is which minute of which half
+                // of the day, and a ticking third field only makes the column
+                // harder to scan. The exact second is still on the record —
+                // `at` keeps unix seconds — it is just not what you read.
+                format!("{h12}:{m:02} {ampm}")
             } else {
                 // Written before orders carried a time. Say so rather than
                 // showing a plausible-looking zero.
@@ -4348,11 +4352,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 33] = [
+        let items: [(&str, &str); 34] = [
             ("TRADE", ""),
             ("", "b|buy"),
             ("", "s|sell"),
             ("", "x|sell all"),
+            ("", "h|token holdings"),
             ("LIQUIDITY", ""),
             ("", "a|add liquidity"),
             ("", "r|remove last liquidity"),
