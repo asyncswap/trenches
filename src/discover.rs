@@ -248,6 +248,39 @@ fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64
     (pair == WETH).then_some((token, pool, lg.block_number.unwrap_or(0)))
 }
 
+/// Turn raw factory logs into launch candidates, whichever launchpad emitted
+/// them.
+///
+/// Split out so the polled scan and the live subscription decode identically.
+/// Two decoders for one event shape is two places for a launch to be missed,
+/// and they would drift the first time an ABI changed.
+pub fn sort_launch_logs(
+    logs: &[alloy::rpc::types::Log],
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>) {
+    let mut seen = std::collections::HashSet::new();
+    let (mut pons, mut fl, mut v2) = (Vec::new(), Vec::new(), Vec::new());
+    for lg in logs {
+        if lg.address() == PONS_V2_FACTORY {
+            if let Some(c) = decode_pons_v2_log(lg) {
+                if seen.insert(c.token.into_word()) {
+                    v2.push(c);
+                }
+            }
+        } else if lg.address() == PONS_FACTORY {
+            if let Some(c) = decode_pons_log(lg) {
+                if seen.insert(c.1.into_word()) {
+                    pons.push(c);
+                }
+            }
+        } else if let Some(c) = decode_flaunch_log(lg) {
+            if seen.insert(c.pool_id) {
+                fl.push(c);
+            }
+        }
+    }
+    (pons, fl, v2)
+}
+
 /// One chunked getLogs covers EVERY launchpad: both factory addresses, both
 /// event topics, dispatched by the emitting address. Scanning them separately
 /// doubled the widest, most rate-limited request the app makes, every round.
@@ -300,29 +333,7 @@ async fn scan_launchpads<P: Provider>(
         }
         start = end + 1;
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut pons = Vec::new();
-    let mut fl = Vec::new();
-    let mut v2 = Vec::new();
-    for lg in &logs {
-        if lg.address() == PONS_V2_FACTORY {
-            if let Some(c) = decode_pons_v2_log(lg) {
-                if seen.insert(c.token.into_word()) {
-                    v2.push(c);
-                }
-            }
-        } else if lg.address() == PONS_FACTORY {
-            if let Some(c) = decode_pons_log(lg) {
-                if seen.insert(c.1.into_word()) {
-                    pons.push(c);
-                }
-            }
-        } else if let Some(c) = decode_flaunch_log(lg) {
-            if seen.insert(c.pool_id) {
-                fl.push(c);
-            }
-        }
-    }
+    let (mut pons, mut fl, v2) = sort_launch_logs(&logs);
     if !v2.is_empty() {
         crate::trace(&format!("launch scan: {} pons v2 launch(es)", v2.len()));
     }
@@ -1263,6 +1274,19 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let mut sweep_at: usize = 0;
     // When the head-block warning last reached the event log.
     let mut last_head_warn: Option<std::time::Instant> = None;
+    // The live feed. Runs beside the scan below, not instead of it — see
+    // `launch_stream`. Empty ws config makes this a no-op and the scan carries
+    // on exactly as before.
+    let stream = crate::launch_stream::spawn(
+        crate::ws_pool(),
+        vec![PONS_FACTORY, FLAUNCH_PM, PONS_V2_FACTORY],
+        vec![
+            IPonsFactory::TokenLaunched::SIGNATURE_HASH,
+            IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
+            IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
+        ],
+        stop.clone(),
+    );
 
     while !stop.load(Ordering::Relaxed) {
         // A head read that did not answer is not block zero. It used to fall
@@ -1306,6 +1330,44 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // limits. While it rests, SKIP the scan and leave the cursor alone —
         // asking anyway is what kept it benched forever, and the unmoved
         // cursor means the skipped blocks are scanned the moment it is back.
+        // Whatever the socket pushed since the last round, FIRST — before the
+        // scan, and regardless of whether the scan runs at all.
+        //
+        // This is the half that makes the guarantee: the scan below is skipped
+        // when the wide-logs endpoint is resting, and narrowed when it is rate
+        // limited, and neither of those touches the stream. A launch that
+        // arrives during a deferred scan is on screen anyway.
+        {
+            let live = stream.drain();
+            if !live.is_empty() {
+                let (pons, fl, v2) = sort_launch_logs(&live);
+                let (mut n_pons, mut n_fl, mut n_v2) = (0usize, 0usize, 0usize);
+                for c in pons {
+                    crate::token_metadata_chain_id::record_launch(c.0, c.2);
+                    if !known.iter().any(|(t, _, _)| *t == c.0) {
+                        known.push(c);
+                        n_pons += 1;
+                    }
+                }
+                for c in fl {
+                    if !known_fl.iter().any(|k| k.token == c.token) {
+                        known_fl.push(c);
+                        n_fl += 1;
+                    }
+                }
+                for c in v2 {
+                    if !known_v2.iter().any(|k| k.token == c.token) {
+                        known_v2.push(c);
+                        n_v2 += 1;
+                    }
+                }
+                if n_pons + n_fl + n_v2 > 0 {
+                    crate::trace(&format!(
+                        "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2, live"
+                    ));
+                }
+            }
+        }
         let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
         if from <= head && wide_ok {
             let (pons, fl, v2) = scan_launchpads(&provider, from, head).await;

@@ -8,6 +8,7 @@ mod agent;
 mod verification;
 mod config;
 mod base_currency;
+mod launch_stream;
 mod net;
 mod contracts;
 mod discover;
@@ -596,6 +597,21 @@ static SESSION_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new
 /// against the config — so a cache is never keyed by a chain the app only
 /// believed it was on.
 static CHAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The chain's websocket endpoints, resolved once at startup.
+///
+/// A global for the same reason `chain_id` is one: the discovery task is
+/// spawned deep in the app and threading the whole config down to it, through
+/// layers that have no other use for it, would be plumbing for one string.
+static WS_POOL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub fn set_ws_pool(urls: Vec<String>) {
+    let _ = WS_POOL.set(urls);
+}
+
+pub fn ws_pool() -> Vec<String> {
+    WS_POOL.get().cloned().unwrap_or_default()
+}
 
 pub fn set_chain_id(id: u64) {
     CHAIN_ID.store(id, std::sync::atomic::Ordering::Relaxed);
@@ -1991,7 +2007,11 @@ async fn app(
                 net.chain_id
             );
         }
-        Ok(live) => set_chain_id(live),
+        Ok(live) => {
+            set_chain_id(live);
+            // Derived from the RPC when not written down — see `ws_pool`.
+            set_ws_pool(net.ws_pool());
+        }
         // Unreachable is the RPC layer's problem to report and retry; it is
         // not evidence of a wrong chain, so it must not block the session.
         // The configured id is what everything else in this session is already
@@ -1999,6 +2019,7 @@ async fn app(
         Err(e) => {
             trace(&format!("chain id check skipped: {e}"));
             set_chain_id(net.chain_id);
+            set_ws_pool(net.ws_pool());
         }
     }
 

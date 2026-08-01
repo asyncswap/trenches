@@ -32,7 +32,6 @@ solana = [
     "dep:borsh",
     "dep:bincode",
     "dep:eth-keystore",
-    "dep:tokio-tungstenite",
 ]
 
 [dependencies]
@@ -101,7 +100,9 @@ eth-keystore = { version = "0.5", optional = true }
 rand = "0.8"
 # WebSocket, for pump.fun logsSubscribe (launches are far too rare in the
 # signature stream to discover by polling). Already present via alloy-transport-ws.
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+# Both chains need it now: Solana's log stream and, since discovery moved
+# off polling, the EVM launch subscription. No longer optional.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1.9.0"
 minisign-verify = "0.2"
 
