@@ -1081,6 +1081,10 @@ fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
 const ROW_TTL_BLOCKS: u64 = 72_000;
 /// Ceiling on the list, so a busy day cannot grow it without bound.
 const ROW_MAX: usize = 400;
+/// How long a launch has to attract a buy before it stops earning a row.
+/// ~10 blocks/sec, so about ten minutes — long enough that a slow start is
+/// not mistaken for a dead one.
+const DEAD_GRACE_BLOCKS: u64 = 6_000;
 
 /// Tokens discovery has seen before, newest first.
 ///
@@ -1629,6 +1633,18 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             let before = cur.len();
             if head > 0 {
                 cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
+                // A launch nobody ever bought is not a launch worth a row.
+                //
+                // The list is capped, so every dead entry costs a live one.
+                // A Flaunch coin holds its liquidity single-sided until the
+                // first buy, so zero pooled is CORRECT and expected for the
+                // first few minutes — which is exactly why this is age-gated
+                // rather than applied on sight. Past the grace period, no
+                // depth and no trades means nobody came.
+                cur.retain(|r| {
+                    let age = head.saturating_sub(r.grad.launch_block);
+                    age <= DEAD_GRACE_BLOCKS || r.pooled_eth > 0.0 || r.tx_per_sec > 0.0
+                });
             }
             sort_rows(&mut cur);
             // Newest first, so the truncation drops the oldest.

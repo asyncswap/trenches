@@ -3973,14 +3973,34 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         ),
     ]));
     // Token metadata (Pons socials) — confirm the details of what you're trading.
+    // The LINKS, not a score. A count belongs in the discovery grid, where it
+    // ranks a hundred launches at a glance; here there is one coin and the
+    // question is what it actually points at.
+    //
+    // "1/7 filled" with nothing under it was the common case, because the one
+    // filled field was a logo or a description and neither was rendered — a
+    // row spent saying that something existed somewhere off screen.
     if !bot.socials.is_empty() {
-        mkt.push(Line::from(vec![mlbl("Socials"), Span::raw(format!("{}/7 filled", bot.socials.score()))])
-            .style(Style::default().fg(ui::widgets::tone_color(view::Tone::Normal))));
         let m = &bot.socials;
-        if !m.website.trim().is_empty() { mkt.push(Line::from(vec![mlbl("Web"), Span::raw(m.website.clone())])); }
-        if !m.twitter.trim().is_empty() { mkt.push(Line::from(vec![mlbl("X"), Span::raw(m.twitter.clone())])); }
-        if !m.telegram.trim().is_empty() { mkt.push(Line::from(vec![mlbl("Telegram"), Span::raw(m.telegram.clone())])); }
-        if !m.discord.trim().is_empty() { mkt.push(Line::from(vec![mlbl("Discord"), Span::raw(m.discord.clone())])); }
+        let mut any = false;
+        for (label, v) in [
+            ("Web", &m.website),
+            ("X", &m.twitter),
+            ("Telegram", &m.telegram),
+            ("Discord", &m.discord),
+            ("Farcaster", &m.farcaster),
+        ] {
+            if !v.trim().is_empty() {
+                mkt.push(Line::from(vec![mlbl(label), Span::raw(v.trim().to_string())]));
+                any = true;
+            }
+        }
+        // A coin with no links at all but something written about it: say the
+        // something rather than a score of it.
+        if !any && !m.description.trim().is_empty() {
+            let d: String = m.description.trim().chars().take(48).collect();
+            mkt.push(Line::from(vec![mlbl("About"), Span::raw(d)]));
+        }
     }
     // Nothing selected: none of the above is a fact. A zero address, a 0% fee
     // and a venue we are not on read as data, and the whole point of the empty
@@ -4604,7 +4624,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // The ticker it wore WHEN YOU TRADED IT, stored on the order
                 // rather than looked up — a scam can rename itself afterwards.
                 view::Col::fixed("symbol", 12),
-                view::Col::fixed(format!("amount {}", bot.pool.quote_sym), 13),
+                // In money. `o.eth` is already an ETH-numeraire figure, so it
+                // converts at the ETH rate whatever pool the order was on —
+                // and six decimals of ether is not a size anyone weighs a
+                // trade by.
+                view::Col::fixed("amount", 11),
                 // What the press cost to send. Asked of a single transaction,
                 // so answered on the transaction — a buy has no closed trade to
                 // hang it on until the sell, which may be days away or never.
@@ -4663,7 +4687,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Tone::Accent,
                 ),
                 // Amount always in ETH numeraire (cost in ether).
-                view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
+                view::Cell::new(if o.eth > 0.0 && bot.eth_usd > 0.0 {
+                    view::usd_compact(o.eth * bot.eth_usd)
+                } else if o.eth > 0.0 {
+                    // No rate yet — ether is still true, and true beats blank.
+                    format!("{:.6}", o.eth)
+                } else {
+                    String::new()
+                }),
                 view::Cell::toned(
                     if o.gas > 0.0 && bot.eth_usd > 0.0 {
                         // The symbol rides the VALUE, not the header: a column
