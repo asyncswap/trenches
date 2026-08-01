@@ -68,6 +68,25 @@ struct SelPool {
     quote_sym: String,     // display symbol for the quote side
 }
 
+/// The colour a P&L figure earns, given how many decimals it is printed to.
+///
+/// Green for up, red for down, MUTED for anything that rounds to nothing at
+/// the precision on screen. `-0.000000 ETH` painted red claims a direction the
+/// number does not show, and `+0.000000` painted green claims a win that is
+/// not there — both from a figure whose whole visible content is zero. A
+/// signed zero is an artefact of the formatter, not a result.
+fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
+    // Half of the last printed place: below this the display reads all zeros.
+    let visible = 0.5 * 10f64.powi(-decimals);
+    if !v.is_finite() || v.abs() < visible {
+        view::Tone::Dim
+    } else if v > 0.0 {
+        view::Tone::Good
+    } else {
+        view::Tone::Bad
+    }
+}
+
 /// A v3 tick, as a price per token in dollars.
 ///
 /// LP rows carried `tick [-887200, 204200]`, which is the pool's own
@@ -3771,7 +3790,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     );
 
     let pnl = bot.pnl();
-    let pnl_color = if pnl >= 0.0 { ui::widgets::tone_color(view::Tone::Good) } else { ui::widgets::tone_color(view::Tone::Bad) };
+    let pnl_color = ui::widgets::tone_color(pnl_tone(pnl, 6));
 
     // Columns: [wallet | market] normally, [wallet | market A | market B] in arb.
     // Wallet is always column 0 (left).
@@ -3948,8 +3967,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         }
     }
 
-    let day_color = if bot.daily_pnl() >= 0.0 { ui::widgets::tone_color(view::Tone::Good) } else { ui::widgets::tone_color(view::Tone::Bad) };
-    let real_color = if bot.realized_pnl >= 0.0 { ui::widgets::tone_color(view::Tone::Good) } else { ui::widgets::tone_color(view::Tone::Bad) };
+    // Six decimals is what `pnl_row` prints, so six is what decides whether
+    // there is a direction worth colouring.
+    let day_color = ui::widgets::tone_color(pnl_tone(bot.daily_pnl(), 6));
+    let real_color = ui::widgets::tone_color(pnl_tone(bot.realized_pnl, 6));
     // Live, slippage-aware unrealized P&L of selling the whole holding NOW —
     // updates every refresh, independent of the profit filter being on/off.
     let live = bot.live_edge();
@@ -4063,15 +4084,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         ]),
         pnl_row("Realized", bot.realized_pnl, real_color),
         match bot.last_fill_pnl {
-            Some(v) => pnl_row(
-                "Last Fill",
-                v,
-                if v >= 0.0 {
-                    ui::widgets::tone_color(view::Tone::Good)
-                } else {
-                    ui::widgets::tone_color(view::Tone::Bad)
-                },
-            ),
+            Some(v) => pnl_row("Last Fill", v, ui::widgets::tone_color(pnl_tone(v, 6))),
             None => Line::from(vec![
                 lbl("Last Fill"),
                 Span::styled(
@@ -4249,14 +4262,17 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Col::fixed("age", 6),
                     view::Col::fixed("pool", 4),
                     view::Col::fixed("action", 7),
-                    view::Col::fixed("amount", 14),
+                    // Named for the pool's quote asset, not for ETH. A USDG
+                    // pool's depth under a header saying ETH is a unit error
+                    // on screen, and the difference is a factor of ~1850.
+                    view::Col::fixed(format!("amount {}", bot.pool.quote_sym), 14),
                     // Dollars per token, like every other price on screen.
                     // The pool's own tokens-per-ETH is the right number in the
                     // wrong unit: nothing else on the row is quoted that way,
                     // so it could not be compared with anything.
-                    view::Col::fixed("price", 16),
-                    view::Col::fixed("pooled", 12),
-                    view::Col::fixed("mkt cap $", 12),
+                    view::Col::fixed("price", 19),
+                    view::Col::fixed(format!("pooled {}", bot.pool.quote_sym), 12),
+                    view::Col::fixed("mkt cap", 12),
                     view::Col::fixed("trader", 14),
                     view::Col::min("tx", 12),
                 ],
@@ -4292,7 +4308,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     match (tick_usd(bot, s.tick_lo), tick_usd(bot, s.tick_hi)) {
                         (Some(a), Some(b)) => {
                             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                            format!("{}–{}", view::usd_price(lo), view::usd_price(hi))
+                            // Bracketed, both sides carrying their own dollar
+                            // sign: a bare second number reads as a quantity,
+                            // and a range is two prices or it is nothing.
+                            format!(
+                                "[{}, {}]",
+                                view::usd_price_brief(lo),
+                                view::usd_price_brief(hi)
+                            )
                         }
                         // Orientation unknown for this venue: the raw ticks are
                         // still true, and true beats a converted guess.
@@ -4431,12 +4454,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // The ticker it wore WHEN YOU TRADED IT, stored on the order
                 // rather than looked up — a scam can rename itself afterwards.
                 view::Col::fixed("symbol", 12),
-                view::Col::fixed("amount ETH", 13),
+                view::Col::fixed(format!("amount {}", bot.pool.quote_sym), 13),
                 // What the press cost to send. Asked of a single transaction,
                 // so answered on the transaction — a buy has no closed trade to
                 // hang it on until the sell, which may be days away or never.
                 view::Col::fixed("gas $", 8),
-                view::Col::fixed("pooled ETH", 11),
+                view::Col::fixed(format!("pooled {}", bot.pool.quote_sym), 11),
                 view::Col::fixed("mkt cap", 11),
                 view::Col::min("tx", 66),
             ],
@@ -4739,3 +4762,32 @@ fn fee_label(fee: u32) -> String {
 
 // ---------------- interactive selection (arrow-key menus via inquire) -------
 
+
+#[cfg(test)]
+mod pnl_tone_tests {
+    use super::pnl_tone;
+    use crate::view::Tone;
+
+    /// The case from the dashboard: a figure whose every printed digit is zero
+    /// must not be coloured as a win or a loss.
+    #[test]
+    fn a_figure_that_rounds_to_zero_is_muted() {
+        // Prints as "-0.000000" at six places.
+        assert_eq!(pnl_tone(-0.000_000_4, 6), Tone::Dim);
+        assert_eq!(pnl_tone(0.000_000_4, 6), Tone::Dim);
+        assert_eq!(pnl_tone(0.0, 6), Tone::Dim);
+    }
+
+    #[test]
+    fn a_figure_with_a_visible_digit_keeps_its_direction() {
+        assert_eq!(pnl_tone(0.000_002, 6), Tone::Good);
+        assert_eq!(pnl_tone(-0.000_002, 6), Tone::Bad);
+    }
+
+    /// The threshold follows the precision, not a constant.
+    #[test]
+    fn fewer_decimals_mute_more() {
+        assert_eq!(pnl_tone(0.000_2, 2), Tone::Dim, "prints as 0.00");
+        assert_eq!(pnl_tone(0.000_2, 6), Tone::Good, "prints as 0.000200");
+    }
+}

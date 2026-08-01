@@ -599,7 +599,7 @@ pub fn table(f: &mut Frame, area: Rect, t: &TableView, state: Option<&mut TableS
         return;
     }
 
-    let header = Row::new(t.cols.iter().map(|c| c.title))
+    let header = Row::new(t.cols.iter().map(|c| c.title.clone()))
         .style(Style::default().fg(tone_color(Tone::Info)).add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = {
         t.rows

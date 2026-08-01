@@ -62,16 +62,19 @@ pub enum Width {
 /// A table column: heading + width.
 #[derive(Clone, Debug)]
 pub struct Col {
-    pub title: &'static str,
+    /// Owned, not `&'static str`: a header often has to name the pool's quote
+    /// asset, and which asset that is only becomes known at runtime. "pooled
+    /// ETH" printed over a USDG pool's depth is a unit error on screen.
+    pub title: String,
     pub width: Width,
 }
 
 impl Col {
-    pub fn fixed(title: &'static str, w: u16) -> Col {
-        Col { title, width: Width::Fixed(w) }
+    pub fn fixed(title: impl Into<String>, w: u16) -> Col {
+        Col { title: title.into(), width: Width::Fixed(w) }
     }
-    pub fn min(title: &'static str, w: u16) -> Col {
-        Col { title, width: Width::Min(w) }
+    pub fn min(title: impl Into<String>, w: u16) -> Col {
+        Col { title: title.into(), width: Width::Min(w) }
     }
 }
 
@@ -553,14 +556,37 @@ pub fn usd_compact(x: f64) -> String {
 /// of counting. Above a thousandth this is just a normal price with enough
 /// decimals to be one.
 pub fn usd_price(x: f64) -> String {
+    usd_price_sig(x, 3)
+}
+
+/// The same price with two significant digits and no trailing zeros, for
+/// somewhere two of them have to fit side by side.
+///
+/// An LP range is a pair of boundaries, not a price anyone trades at, and six
+/// decimals on each turns `[$0.02, $0.08]` into something that runs off the
+/// end of its column and gets truncated mid-number — which is how the second
+/// bound lost its dollar sign.
+pub fn usd_price_brief(x: f64) -> String {
+    let s = usd_price_sig(x, 2);
+    // `$0.020` says nothing `$0.02` does not.
+    if s.contains('.') && !s.contains('\u{2080}') && s.ends_with('0') {
+        return s.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    s
+}
+
+/// `sig` counts the digits kept after the leading zeros.
+fn usd_price_sig(x: f64, sig: u32) -> String {
     if !x.is_finite() || x <= 0.0 {
         return "—".to_string();
     }
     if x >= 1.0 {
-        return format!("${x:.4}");
+        return format!("${x:.*}", sig as usize + 1);
     }
     if x >= 0.001 {
-        return format!("${x:.6}");
+        // Enough places to show `sig` real digits after however many zeros.
+        let zeros = (-x.log10().ceil()).max(0.0) as usize;
+        return format!("${x:.*}", zeros + sig as usize);
     }
     // How many zeros sit between the point and the first real digit.
     let zeros = (-x.log10().floor() - 1.0) as usize;
@@ -569,7 +595,7 @@ pub fn usd_price(x: f64) -> String {
     if zeros > 18 {
         return "~$0".to_string();
     }
-    let digits = (x * 10f64.powi(zeros as i32 + 3)).round() as u64;
+    let digits = (x * 10f64.powi(zeros as i32 + sig as i32)).round() as u64;
     const SUB: [char; 10] = ['\u{2080}', '\u{2081}', '\u{2082}', '\u{2083}', '\u{2084}',
                              '\u{2085}', '\u{2086}', '\u{2087}', '\u{2088}', '\u{2089}'];
     let sub: String = zeros.to_string().chars().filter_map(|c| c.to_digit(10)).map(|d| SUB[d as usize]).collect();
@@ -846,7 +872,19 @@ mod usd_price_tests {
     #[test]
     fn ordinary_prices_are_written_as_ordinary_prices() {
         assert_eq!(usd_price(1.5), "$1.5000");
-        assert_eq!(usd_price(0.0125), "$0.012500");
+        // Three significant digits, not six decimals: `$0.012500` padded two
+        // places that carry nothing.
+        assert_eq!(usd_price(0.0125), "$0.0125");
+    }
+
+    /// The form an LP range needs: two of these have to sit inside one column.
+    #[test]
+    fn the_brief_form_drops_what_it_does_not_need() {
+        use super::usd_price_brief;
+        assert_eq!(usd_price_brief(0.020_137), "$0.02");
+        assert_eq!(usd_price_brief(0.08), "$0.08");
+        // Still says something below a cent, where rounding to $0.00 would not.
+        assert_eq!(usd_price_brief(0.000_002_56), "$0.0₅26");
     }
 
     #[test]
