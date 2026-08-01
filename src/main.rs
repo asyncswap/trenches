@@ -88,29 +88,6 @@ fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
     }
 }
 
-/// The venue name for a tape or order row.
-///
-/// A row records only whether it was v4, so the name comes from whichever
-/// loaded pool matches that — the active one first, then the arb counterpart.
-/// With neither matching, the protocol version is all that is actually known,
-/// and saying that is better than naming the wrong project.
-fn venue_of(bot: &Bot, is_v4: bool) -> &'static str {
-    let matches = |k: &engine::PoolKind| {
-        !k.is_empty()
-            && matches!(k, engine::PoolKind::V4 { .. } | engine::PoolKind::FlaunchV4 { .. })
-                == is_v4
-    };
-    if matches(&bot.pool.kind) {
-        return bot.pool.kind.venue_short();
-    }
-    if let Some(b) = bot.pool_b.as_ref() {
-        if matches(&b.kind) {
-            return b.kind.venue_short();
-        }
-    }
-    if is_v4 { "v4" } else { "v3" }
-}
-
 /// A v3 tick, as a price per token in dollars.
 ///
 /// LP rows carried `tick [-887200, 204200]`, which is the pool's own
@@ -3699,23 +3676,22 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     let (logo_box, indent_cols) = ui::image::header_box(ui::widgets::themed_block("").inner(c[0]));
     let venue = header_venue(bot);
     let avail = c[0].width.saturating_sub(indent_cols + 32);
-    // Trading says TRENCHES.SH; an empty screen says the chain.
+    // The banner names the VENUE being traded: PONS V1, PONS V2, FLAUNCH,
+    // UNISWAP V4.
     //
-    // The venue's mark stays beside it — the logo is how you tell a Pons launch
-    // from a Uniswap pool at a glance, and that is worth keeping. Its name in
-    // large type is not: this is our screen, it ends up in screenshots, and
-    // setting someone else's brand across it in the biggest type on the page
-    // advertises them rather than us.
+    // This used to say TRENCHES.SH on the reasoning that a screen which ends
+    // up in screenshots should not set someone else's brand in the biggest
+    // type on the page. Reversed deliberately: the venue is the single most
+    // load-bearing fact on the screen — it decides the router, the fee, the
+    // gas limit and how an exit is built — and the largest type is where the
+    // thing you must not be wrong about belongs. The logo beside it says the
+    // same thing in a glance; this says it in a word.
     //
-    // The exception is the empty state, which names the chain. There is no
-    // trade to label there, and the chain is the one thing still true.
+    // The empty state still names the chain. There is no venue to label, and
+    // the chain is the one thing still true.
     let name = match venue {
         ui::image::Venue::Chain => venue.display_name(&bot.net),
-        // Only when it fits: on a narrow terminal the full name drops out of
-        // large type and renders as small text, which is a worse trade than a
-        // short form set properly.
-        _ if ui::bigtext::width("TRENCHES.SH") <= avail => "TRENCHES.SH".to_string(),
-        _ => "TRENCHES".to_string(),
+        _ => bot.pool.kind.banner_name().to_string(),
     };
 
     // Large type only if it fits; on a narrow terminal the plain name is
@@ -4393,7 +4369,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     // Age leads, as on the Solana tape: a tape is read
                     // newest-first, so "how long ago" is the first thing wanted.
                     view::Col::fixed("age", 6),
-                    view::Col::fixed("venue", 8),
+                    view::Col::fixed("pool", 4),
                     view::Col::fixed("action", 7),
                     // Named for the pool's quote asset, not for ETH. A USDG
                     // pool's depth under a header saying ETH is a unit error
@@ -4473,10 +4449,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 } else {
                     "—".into()
                 };
-                let (venue, vtone) = (
-                    venue_of(bot, s.is_v4),
-                    if s.is_v4 { view::Tone::Info } else { view::Tone::Accent },
-                );
+                let (venue, vtone) = if s.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
                 // The whole row carries the trade's colour, so a buy reads as
                 // one green unit and a sell as one red one. Age stays neutral:
                 // it says when, not what.
@@ -4589,7 +4562,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // trade you are looking at now is how long ago, not what the
                 // clock read. The exact second is still on the record.
                 view::Col::fixed("ago", 5),
-                view::Col::fixed("venue", 8),
+                view::Col::fixed("pool", 4),
                 // WHICH key caused it, immediately before what it did — the
                 // two halves of one sentence, read together.
                 view::Col::fixed("key", 4),
@@ -4628,10 +4601,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 s if s.starts_with("REMOVE") || s.starts_with("CLOSE") => view::Tone::Accent,
                 _ => view::Tone::Normal,
             };
-            let (venue, vtone) = (
-                venue_of(bot, o.is_v4),
-                if o.is_v4 { view::Tone::Info } else { view::Tone::Accent },
-            );
+            let (venue, vtone) = if o.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
             // How long ago, which is the form the question is asked in.
             let ago = if o.at > 0 {
                 view::age_compact(crate::ledger::now().saturating_sub(o.at) as f64)

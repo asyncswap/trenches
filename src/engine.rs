@@ -204,6 +204,22 @@ impl PoolKind {
         }
     }
 
+    /// The venue's name for the banner, in the pixel font's alphabet.
+    ///
+    /// Every v3 pool reachable here arrived through a Pons v1 graduation, so
+    /// that is what a v3 pool is — "UNISWAP V3" would name the AMM it settled
+    /// into rather than the launchpad it came from, and the launchpad is what
+    /// decides how it behaves.
+    pub fn banner_name(&self) -> &'static str {
+        match self {
+            PoolKind::V3 { .. } => "PONS V1",
+            PoolKind::PonsCurve { .. } => "PONS V2",
+            PoolKind::PonsV2Pool { .. } => "PONS V2",
+            PoolKind::FlaunchV4 { .. } => "FLAUNCH",
+            PoolKind::V4 { .. } => "UNISWAP V4",
+        }
+    }
+
     /// The venue's name, short enough for a table cell.
     ///
     /// `v3` and `v4` describe a protocol version, which is not what anyone is
