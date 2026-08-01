@@ -3137,7 +3137,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 discover::screen_verified(terminal, verified.clone()).await?
                             } else if k.code == KeyCode::Char('k') {
                                 bot.status = "loading top tokens…".into();
-                                discover::screen_top_tokens(terminal, provider, discovery_rpc.clone()).await?
+                                discover::screen_top_tokens(terminal, provider, discovery_rpc.clone(), bot.eth_usd).await?
                             } else {
                                 bot.status = "discovering token launches…".into();
                                 discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?

@@ -1149,10 +1149,23 @@ fn order_fields(o: &Order) -> Vec<String> {
         let mut prev = String::new();
         for o in self.orders.iter() {
             let mut o = o.clone();
-            let f = Self::order_fields(&o);
-            let refs: Vec<&str> = f.iter().map(|s| s.as_str()).collect();
-            o.proof = crate::verification::proof(&prev, &refs);
-            prev = o.proof.clone();
+            // Orders from before this app recorded a time are left OUT of the
+            // chain — no proof written, none expected.
+            //
+            // Proving them would be proving nothing: they have no timestamp, no
+            // key, no symbol, so the fields a proof would cover are mostly
+            // absent, and a chain anchored on rows that thin cascades a break
+            // through every real order behind it. They already read as `—`
+            // across the row, which is the honest label: this predates the
+            // record, so the record does not vouch for it.
+            if o.at > 0 {
+                let f = Self::order_fields(&o);
+                let refs: Vec<&str> = f.iter().map(|s| s.as_str()).collect();
+                o.proof = crate::verification::proof(&prev, &refs);
+                prev = o.proof.clone();
+            } else {
+                o.proof.clear();
+            }
             if let Ok(j) = serde_json::to_string(&o) {
                 out.push_str(&j);
                 out.push('\n');

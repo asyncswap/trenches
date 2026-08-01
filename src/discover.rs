@@ -2082,37 +2082,88 @@ async fn blockscout_top(client: &reqwest::Client) -> Vec<LeaderRow> {
 /// resolving its v3 WETH pool and reading WETH.balanceOf — all batched (getPool
 /// for every token×fee, then balanceOf on the survivors). USDG/v4-only tokens are
 /// left blank for now (the v4 depth path is dormant).
-async fn enrich_pooled(client: &reqwest::Client, url: &str, rows: &mut [LeaderRow]) {
+/// The assets a listed token might be paired against, and the rate needed to
+/// compare one pool's depth against another's.
+///
+/// The leaderboard used to probe WETH alone, so anything quoted in something
+/// else read as "0.00 ETH" — USDE at $3.9B market cap and $30M of daily volume
+/// showed no liquidity at all, which is not a small error on a screen whose one
+/// job is ranking what is worth trading.
+///
+/// `usd` is what one unit is worth, for choosing between a WETH pool and a USDG
+/// one. ETH's is passed in; a dollar stablecoin is a dollar.
+struct QuoteAsset {
+    token: Address,
+    sym: &'static str,
+    decimals: i32,
+}
+
+const QUOTES: [QuoteAsset; 2] = [
+    QuoteAsset { token: WETH, sym: "ETH", decimals: 18 },
+    // 6-dec, not 18. Reading a USDG reserve as 18 shows $2.6M of depth as 0.
+    QuoteAsset { token: USDG, sym: "USDG", decimals: 6 },
+];
+
+async fn enrich_pooled(
+    client: &reqwest::Client,
+    url: &str,
+    rows: &mut [LeaderRow],
+    eth_usd: f64,
+) {
     let fees = [10000u32, 3000, 500, 100];
-    let mut pool_calls = Vec::with_capacity(rows.len() * fees.len());
+    // One batch for every (row, quote, fee) triple. Three times the lookups of
+    // the WETH-only version, on a screen that is opened deliberately and reads
+    // once — cheap next to listing a $3.9B token as having no pool.
+    let mut pool_calls = Vec::with_capacity(rows.len() * QUOTES.len() * fees.len());
     for r in rows.iter() {
-        for &fee in &fees {
-            let data = IV3Factory::getPoolCall { tokenA: r.token, tokenB: WETH, fee: fee.try_into().unwrap() }.abi_encode();
-            pool_calls.push((V3_FACTORY, data));
-        }
-    }
-    let pool_res = batch_call(client, url, &pool_calls).await;
-    // (row idx, pool addr) for every non-zero pool found.
-    let mut pools: Vec<(usize, Address)> = Vec::new();
-    for ri in 0..rows.len() {
-        for fi in 0..fees.len() {
-            if let Some(d) = pool_res.get(ri * fees.len() + fi).and_then(|o| o.as_ref()) {
-                if d.len() >= 32 {
-                    let pool = Address::from_word(B256::from_slice(&d[d.len() - 32..]));
-                    if pool != Address::ZERO {
-                        pools.push((ri, pool));
-                    }
+        for q in QUOTES.iter() {
+            for &fee in &fees {
+                let data = IV3Factory::getPoolCall {
+                    tokenA: r.token,
+                    tokenB: q.token,
+                    fee: fee.try_into().unwrap(),
                 }
+                .abi_encode();
+                pool_calls.push((V3_FACTORY, data));
             }
         }
     }
-    let bal_calls: Vec<(Address, Vec<u8>)> = pools.iter().map(|(_, p)| (WETH, balanceof_data(*p))).collect();
+    let pool_res = batch_call(client, url, &pool_calls).await;
+    // (row idx, quote idx, pool addr) for every non-zero pool found.
+    let mut pools: Vec<(usize, usize, Address)> = Vec::new();
+    for (i, res) in pool_res.iter().enumerate() {
+        let Some(d) = res.as_ref() else { continue };
+        if d.len() < 32 {
+            continue;
+        }
+        let pool = Address::from_word(B256::from_slice(&d[d.len() - 32..]));
+        if pool == Address::ZERO {
+            continue;
+        }
+        let ri = i / (QUOTES.len() * fees.len());
+        let qi = (i / fees.len()) % QUOTES.len();
+        pools.push((ri, qi, pool));
+    }
+    // Each pool's balance of ITS OWN quote asset — not of WETH, which is what
+    // made a USDG pool read as empty.
+    let bal_calls: Vec<(Address, Vec<u8>)> =
+        pools.iter().map(|(_, qi, p)| (QUOTES[*qi].token, balanceof_data(*p))).collect();
     let bals = batch_call(client, url, &bal_calls).await;
-    for ((ri, _), b) in pools.iter().zip(bals.iter()) {
-        let eth = b.as_ref().map(|d| uf(u256_of(d)) / 1e18).unwrap_or(0.0);
-        if eth > rows[*ri].pooled {
-            rows[*ri].pooled = eth;
-            rows[*ri].pooled_unit = "ETH";
+    // Keep the DEEPEST pool per row, compared in dollars so a 2.6M USDG pool
+    // beats a dust WETH one instead of losing to it on the raw number.
+    let mut best_usd = vec![0.0f64; rows.len()];
+    for ((ri, qi, _), b) in pools.iter().zip(bals.iter()) {
+        let q = &QUOTES[*qi];
+        let amt = b.as_ref().map(|d| uf(u256_of(d)) / 10f64.powi(q.decimals)).unwrap_or(0.0);
+        let rate = if q.token == WETH { eth_usd } else { 1.0 };
+        let usd = amt * rate;
+        // With no ETH price yet, dollars cannot rank anything — fall back to
+        // the raw amount rather than silently preferring whichever came last.
+        let score = if rate > 0.0 { usd } else { amt };
+        if score > best_usd[*ri] {
+            best_usd[*ri] = score;
+            rows[*ri].pooled = amt;
+            rows[*ri].pooled_unit = q.sym;
         }
     }
 }
@@ -2174,7 +2225,7 @@ async fn resolve_v3_grad<P: Provider>(
 
 /// The top-tokens screen ('t'): tabbed leaderboard + big-fish. Returns the chosen
 /// token as a Grad (leaderboard picks are resolved to their v3 pool on Enter).
-pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_url: Option<String>) -> eyre::Result<Option<Grad>> {
+pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_url: Option<String>, eth_usd: f64) -> eyre::Result<Option<Grad>> {
     // This screen owns the terminal now: take down any image the last one left.
     // Clearing also marks every placement stale, so the dashboard redraws its
     // logo when we return — no screen has to know about any other.
@@ -2190,7 +2241,9 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
         .or_else(|| disc_url.filter(|u| !u.trim().is_empty() && !u.contains("YOUR_")))
         .unwrap_or_else(|| PUBLIC_RPC.to_string());
     let mut leader = blockscout_top(&client).await;
-    enrich_pooled(&client, &url, &mut leader).await; // fill pooled ETH depth
+    // Depth in whatever the token is actually paired against, not in WETH
+    // regardless. See `enrich_pooled`.
+    enrich_pooled(&client, &url, &mut leader, eth_usd).await;
 
     // Only keep what can actually be traded.
     //
@@ -2203,7 +2256,7 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
     let listed = leader.len();
     leader.retain(|r| r.pooled > 0.0);
     crate::trace(&format!(
-        "top tokens: {} of {listed} have a funded WETH pool; the rest are not tradable here",
+        "top tokens: {} of {listed} have a funded quote pool; the rest are not tradable here",
         leader.len()
     ));
 
