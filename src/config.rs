@@ -494,7 +494,11 @@ pub fn starter_json() -> String {
                 // Websocket, one URL or a list — the launch feed rotates on a
                 // drop. Providers usually serve WS on a different host than
                 // HTTP, which is why it is a separate field rather than derived.
-                "ws": [],
+                // Prefilled with the hosted endpoint so the only edit needed
+                // is the key. Left as a placeholder it reads as unset — see
+                // `clean_urls` — so the app polls and says so rather than
+                // hammering a URL that cannot resolve.
+                "ws": "wss://rpc.trenches.sh/<your-key>/robinhood-ws",
                 "ws_flux_example": "wss://ws.us.fluxrpc.com?key=YOUR_FLUX_KEY",
                 "tokens": [],
                 "public_pools": []
@@ -680,7 +684,12 @@ impl Registry {
 fn clean_urls(mut v: Vec<String>, scheme: &str) -> Vec<String> {
     v.retain(|u| {
         let u = u.trim();
-        !u.is_empty() && !u.contains("YOUR_") && u.starts_with(scheme)
+        // An unreplaced placeholder is not an endpoint. Both spellings the
+        // shipped config uses — `YOUR_KEY` and `<your-key>` — read as unset, so
+        // a prefilled line waiting to be edited behaves like an empty field
+        // rather than like an endpoint that refuses every connection.
+        let placeholder = u.contains("YOUR_") || u.contains('<') || u.contains('>');
+        !u.is_empty() && !placeholder && u.starts_with(scheme)
     });
     let mut seen = std::collections::HashSet::new();
     v.retain(|u| seen.insert(u.clone()));
