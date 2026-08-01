@@ -68,6 +68,39 @@ struct SelPool {
     quote_sym: String,     // display symbol for the quote side
 }
 
+/// A v3 tick, as a price per token in dollars.
+///
+/// LP rows carried `tick [-887200, 204200]`, which is the pool's own
+/// coordinate system: correct, and unreadable next to a column of dollars.
+/// The bounds of a liquidity range are prices, and prices are the thing being
+/// compared — so they are shown as prices.
+///
+/// A tick is a ratio of the pool's two RAW balances, `1.0001^tick`, so getting
+/// back to a human price needs both which side is WETH and how many decimals
+/// the token has. Neither is on the tape row; both are on the pool it belongs
+/// to. Returns `None` for a venue whose orientation is not known here, rather
+/// than printing a number derived from a guess.
+fn tick_usd(bot: &Bot, tick: i32) -> Option<f64> {
+    let engine::PoolKind::V3 { weth_is_token0, .. } = bot.pool.kind else {
+        return None;
+    };
+    let quote_usd = bot.pool.quote_usd;
+    if quote_usd <= 0.0 {
+        return None;
+    }
+    // token1_raw per token0_raw.
+    let ratio = 1.0001f64.powf(tick as f64);
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    // Put the memecoin on top, then undo the decimal scaling of both sides.
+    let raw_tokens_per_quote = if weth_is_token0 { ratio } else { 1.0 / ratio };
+    let scale = 1e18 / 10f64.powi(bot.pool.token_decimals as i32);
+    let tokens_per_quote = raw_tokens_per_quote * scale;
+    (tokens_per_quote > 0.0 && tokens_per_quote.is_finite())
+        .then(|| quote_usd / tokens_per_quote)
+}
+
 /// Symbol for a non-ETH quote token.
 ///
 /// Read from the facts cache first, because the quote side is not a short list
@@ -4217,7 +4250,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Col::fixed("pool", 4),
                     view::Col::fixed("action", 7),
                     view::Col::fixed("amount", 14),
-                    view::Col::fixed("price / tick", 24),
+                    // Dollars per token, like every other price on screen.
+                    // The pool's own tokens-per-ETH is the right number in the
+                    // wrong unit: nothing else on the row is quoted that way,
+                    // so it could not be compared with anything.
+                    view::Col::fixed("price", 16),
                     view::Col::fixed("pooled", 12),
                     view::Col::fixed("mkt cap $", 12),
                     view::Col::fixed("trader", 14),
@@ -4250,9 +4287,23 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // For LP add/remove, show the tick range in the price column.
                 let is_lp = matches!(s.action, engine::TapeAction::Add | engine::TapeAction::Remove);
                 let mid = if is_lp {
-                    format!("tick [{}, {}]", s.tick_lo, s.tick_hi)
+                    // A range is two prices. Ticks are how the pool stores
+                    // them, not how anyone reads them.
+                    match (tick_usd(bot, s.tick_lo), tick_usd(bot, s.tick_hi)) {
+                        (Some(a), Some(b)) => {
+                            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                            format!("{}–{}", view::usd_price(lo), view::usd_price(hi))
+                        }
+                        // Orientation unknown for this venue: the raw ticks are
+                        // still true, and true beats a converted guess.
+                        _ => format!("tick [{}, {}]", s.tick_lo, s.tick_hi),
+                    }
+                } else if s.price > 0.0 && bot.pool.quote_usd > 0.0 {
+                    // `price` is tokens per unit of quote, so the price OF a
+                    // token is the quote's dollar value divided by it.
+                    view::usd_price(bot.pool.quote_usd / s.price)
                 } else if s.price > 0.0 {
-                    format!("{:.6}", s.price)
+                    format!("{:.6}", s.price) // no USD rate yet; the raw ratio is all there is
                 } else {
                     "—".into()
                 };

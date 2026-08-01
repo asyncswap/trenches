@@ -541,6 +541,41 @@ pub fn usd_compact(x: f64) -> String {
     }
 }
 
+/// A per-token price in dollars, however small.
+///
+/// A memecoin trades at $0.00000256, and every general-purpose formatter
+/// renders that as `$0.00`. Two decimals is right for a balance and useless
+/// for a price whose whole story is in the seventh place.
+///
+/// So leading zeros are counted rather than printed, the way every chart site
+/// writes them: `$0.0₅256` is `$0.00000256`. The subscript is the number of
+/// zeros after the point, so the eye reads the magnitude in one glyph instead
+/// of counting. Above a thousandth this is just a normal price with enough
+/// decimals to be one.
+pub fn usd_price(x: f64) -> String {
+    if !x.is_finite() || x <= 0.0 {
+        return "—".to_string();
+    }
+    if x >= 1.0 {
+        return format!("${x:.4}");
+    }
+    if x >= 0.001 {
+        return format!("${x:.6}");
+    }
+    // How many zeros sit between the point and the first real digit.
+    let zeros = (-x.log10().floor() - 1.0) as usize;
+    // Beyond eighteen there is nothing left to say — that is past the
+    // resolution of the units themselves.
+    if zeros > 18 {
+        return "~$0".to_string();
+    }
+    let digits = (x * 10f64.powi(zeros as i32 + 3)).round() as u64;
+    const SUB: [char; 10] = ['\u{2080}', '\u{2081}', '\u{2082}', '\u{2083}', '\u{2084}',
+                             '\u{2085}', '\u{2086}', '\u{2087}', '\u{2088}', '\u{2089}'];
+    let sub: String = zeros.to_string().chars().filter_map(|c| c.to_digit(10)).map(|d| SUB[d as usize]).collect();
+    format!("$0.0{sub}{digits}")
+}
+
 /// The dollar tag that rides beside a figure in the native currency:
 /// `($12.34)`, or `(-$12.34)` for a loss.
 ///
@@ -794,5 +829,29 @@ mod age_tests {
         assert_eq!(age_compact(3_599.0), "59m");
         assert_eq!(age_compact(3_600.0), "1h");
         assert_eq!(age_compact(86_399.0), "23h");
+    }
+}
+
+#[cfg(test)]
+mod usd_price_tests {
+    use super::usd_price;
+
+    #[test]
+    fn a_memecoin_price_keeps_its_significant_digits() {
+        // The value behind "$2.56k market cap" on a 731163386 tokens/ETH pool.
+        assert_eq!(usd_price(0.000_002_56), "$0.0₅256");
+        assert_eq!(usd_price(0.000_000_001_23), "$0.0₈123");
+    }
+
+    #[test]
+    fn ordinary_prices_are_written_as_ordinary_prices() {
+        assert_eq!(usd_price(1.5), "$1.5000");
+        assert_eq!(usd_price(0.0125), "$0.012500");
+    }
+
+    #[test]
+    fn nothing_is_not_priced() {
+        assert_eq!(usd_price(0.0), "—");
+        assert_eq!(usd_price(f64::NAN), "—");
     }
 }
