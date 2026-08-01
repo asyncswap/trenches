@@ -4194,13 +4194,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // The address is gone from here: this panel opens filtered to
                 // one token, whose address is already on screen above it, so
                 // 44 characters of it per row squeezed every other column.
-                view::Col::fixed("sym", 12),
-                // WHICH key caused it. Nothing here trades without one.
-                view::Col::fixed("key", 4),
+                view::Col::fixed("symbol", 12),
                 view::Col::fixed("amount ETH", 13),
-                view::Col::fixed("price / tick", 18),
                 view::Col::fixed("pooled ETH", 11),
-                view::Col::fixed("mkt cap $", 11),
+                view::Col::fixed("mkt cap", 11),
                 view::Col::min("tx", 66),
             ],
         );
@@ -4214,7 +4211,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 engine::OrderStatus::Failed => ("failed", view::Tone::Bad),
                 engine::OrderStatus::Skipped => ("skipped", view::Tone::Dim),
             };
-            let (action, _amount, price) = parse_order(&o.label);
+            let (action, _amount, _price) = parse_order(&o.label);
             let atone = match action.to_ascii_uppercase().as_str() {
                 s if s.starts_with("BUY") => view::Tone::Good,
                 s if s.starts_with("SELL") => view::Tone::Bad,
@@ -4272,13 +4269,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     if o.sym.is_empty() { "—".to_string() } else { format!("${}", o.sym) },
                     view::Tone::Accent,
                 ),
-                view::Cell::toned(
-                    if o.key.is_empty() { "—".to_string() } else { o.key.clone() },
-                    view::Tone::Info,
-                ),
                 // Amount always in ETH numeraire (cost in ether).
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
-                view::Cell::new(price),
                 view::Cell::new(if o.pooled > 0.0 { view::eth(o.pooled) } else { String::new() }),
                 view::Cell::new(if o.mc > 0.0 {
                     if bot.eth_usd > 0.0 {
