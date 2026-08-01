@@ -4546,7 +4546,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // What the press cost to send. Asked of a single transaction,
                 // so answered on the transaction — a buy has no closed trade to
                 // hang it on until the sell, which may be days away or never.
-                view::Col::fixed("gas $", 8),
+                view::Col::fixed("gas", 8),
                 view::Col::fixed(format!("pooled {}", bot.pool.quote_sym), 11),
                 view::Col::fixed("mkt cap", 11),
                 view::Col::min("tx", 66),
@@ -4604,7 +4604,19 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
                 view::Cell::toned(
                     if o.gas > 0.0 && bot.eth_usd > 0.0 {
-                        format!("{:.3}", o.gas * bot.eth_usd)
+                        // The symbol rides the VALUE, not the header: a column
+                        // headed `gas $` still has to be read as money once you
+                        // reach the number, and it stops being true the moment
+                        // the screen is in euros.
+                        //
+                        // Three decimals, because a leg of gas here is about
+                        // half a cent — `$0.01` would round two very different
+                        // trades to the same figure.
+                        format!(
+                            "{}{:.3}",
+                            base_currency::symbol(),
+                            base_currency::from_usd(o.gas * bot.eth_usd)
+                        )
                     } else if o.gas > 0.0 {
                         view::eth(o.gas)
                     } else {

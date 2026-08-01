@@ -651,7 +651,7 @@ fn breakdown(
             // fill still counts toward the totals: refusing to show a number
             // is not safer than showing one you are told to check.
             Span::styled(
-                if fl.verified || fl.proof.is_empty() { "  " } else { "⚠ " },
+                if fl.suspect() { "⚠ " } else { "  " },
                 Style::default().fg(tone_color(Tone::Bad)).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -745,7 +745,7 @@ fn breakdown(
 
     // Say it in the title too, once. A badge deep in a scrolled list is easy
     // to never reach; the count is what tells you to go looking.
-    let bad = trades.iter().filter(|f| !f.verified && !f.proof.is_empty()).count();
+    let bad = trades.iter().filter(|f| f.suspect()).count();
     let unpriced = trades.iter().filter(|f| !f.basis_known()).count();
     let mut flag = String::new();
     if bad > 0 {

@@ -123,6 +123,30 @@ impl Fill {
         if self.basis_known() { self.pnl } else { 0.0 }
     }
 
+    /// Whether this fill's proof can be checked AT ALL.
+    ///
+    /// False for a row with no proof, and for one written under an older
+    /// scheme — the fields a proof covered then are not the fields it covers
+    /// now, so there is nothing to compare against. Not a verdict; the absence
+    /// of one.
+    pub fn checkable(&self) -> bool {
+        self.pv == PROOF_VERSION && !self.proof.is_empty()
+    }
+
+    /// Whether this fill is worth SHOUTING about: checkable, and it failed.
+    ///
+    /// The distinction the badge kept getting wrong. "Could not be checked"
+    /// and "did not match" are different facts, and drawing both with the same
+    /// ⚠ made every schema change look like a break-in — KARMA was flagged for
+    /// having been written between two versions of the proof, which is
+    /// something I did, not something anyone did to the file.
+    ///
+    /// A row that cannot be checked says nothing, and nothing is the honest
+    /// thing to display for it.
+    pub fn suspect(&self) -> bool {
+        self.checkable() && !self.verified
+    }
+
     /// Profit in dollars, at the rate that applied when it was made.
     pub fn usd(&self) -> f64 {
         self.counted_pnl() * self.quote_usd
@@ -660,6 +684,25 @@ mod ret_col_tests {
         assert_eq!(verify_chain(&mut chain), None, "the old rows do not break it");
         assert!(!chain[0].verified && !chain[1].verified, "old rows are unverified");
         assert!(chain[2].verified && chain[3].verified, "new rows still verify");
+    }
+
+    /// A row written between two schemes has a proof that cannot be checked.
+    /// That is not the same as a proof that failed, and only one of them is
+    /// worth a warning — KARMA was flagged for having been written on the
+    /// wrong side of a change I made.
+    #[test]
+    fn a_row_that_cannot_be_checked_is_not_accused() {
+        let mut old = fill(0.1, 1.0);
+        old.pv = 0;
+        old.proof = "written under a scheme that no longer exists".into();
+        assert!(!old.checkable(), "there is nothing to compare it against");
+        assert!(!old.suspect(), "so it is not evidence of anything");
+
+        let mut broken = fill(0.1, 1.0);
+        broken.pv = PROOF_VERSION;
+        broken.proof = "does not match".into();
+        broken.verified = false;
+        assert!(broken.suspect(), "but a CURRENT proof that fails still is");
     }
 
     /// And tampering with a CURRENT row is still caught, past the old ones.
