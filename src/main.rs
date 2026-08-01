@@ -3778,7 +3778,19 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             Line::from(vec![
                 hint("[ ] "),
                 sbold(format!("{:<10}", "buy")),
-                val(format!("{:<10}", pct_compact(bot.buy_frac))),
+                // The percentage AND what it commits. A percentage of a
+                // balance is a number you have to do arithmetic on before you
+                // know what you are risking, and this is the setting most
+                // likely to be adjusted in a hurry. The sell side needs no
+                // equivalent: it is a percentage of a holding whose value is
+                // already on the wallet panel.
+                val(format!(
+                    "{:<10}",
+                    match view::usd_tag(bot.eth * bot.buy_frac, bot.eth_usd) {
+                        Some(tag) => format!("{} {}", pct_compact(bot.buy_frac), tag),
+                        None => pct_compact(bot.buy_frac),
+                    }
+                )),
                 hint("    "),
                 sbold(format!("{:<10}", "mode")),
                 val("manual".to_string()),
