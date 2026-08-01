@@ -51,6 +51,17 @@ pub struct Fill {
     /// exactly where it is most interesting.
     #[serde(default)]
     pub held_secs: Option<u64>,
+    /// What the SELL cost to send, in the quote currency.
+    ///
+    /// Reported separately rather than hidden inside `proceeds`, because the
+    /// two answer different questions: `proceeds` is what the pool paid, this
+    /// is what the chain took. `pnl` is already net of both — the buy's gas
+    /// went into `cost` when the buy confirmed.
+    ///
+    /// Zero on fills written before gas was measured, which is a real zero for
+    /// this chain more often than not, and in any case not a number to invent.
+    #[serde(default)]
+    pub gas: f64,
     /// Chained proof over this fill's fields and the proof of the one before
     /// it in this account's file. See `verification`.
     ///
@@ -188,6 +199,7 @@ pub fn fill_fields(f: &Fill) -> Vec<String> {
         format!("{:.8}", f.quote_usd),
         f.tx.clone(),
         f.held_secs.map(|s| s.to_string()).unwrap_or_default(),
+        format!("{:.18}", f.gas),
     ]
 }
 
@@ -490,6 +502,7 @@ mod tests {
             quote_usd: 2000.0,
             tx: "0xabc".into(),
             held_secs: Some(42),
+            gas: 0.0,
             proof: String::new(),
             verified: true,
         };
@@ -511,6 +524,7 @@ mod tests {
             quote_usd: 150.0,
             tx: "sig".into(),
             held_secs: None,
+            gas: 0.0,
             proof: String::new(),
             verified: true,
         };
@@ -540,7 +554,7 @@ mod ret_col_tests {
             ts: 0, chain: "t".into(), sym: "A".into(), token: "0x1".into(),
             pnl, cost, proceeds: cost + pnl, quote_sym: "ETH".into(),
             quote_usd: 1.0, tx: "0x0".into(), held_secs: None,
-            proof: String::new(), verified: true,
+            gas: 0.0, proof: String::new(), verified: true,
         }
     }
 
@@ -600,6 +614,47 @@ mod ret_col_tests {
         assert_eq!(verify_chain(&mut chain), Some(1), "the edited row is named");
         assert!(chain[0].verified, "the rows before it are still good");
         assert!(!chain[1].verified && !chain[2].verified, "it and everything after are suspect");
+    }
+
+    /// Gas is inside the profit, from both ends of the trade.
+    ///
+    /// The AI round trip: 0.000408 ETH in, 0.000418 out. Nineteen thousandths
+    /// of a dollar of profit on stakes this size is entirely capable of being
+    /// less than what the two transactions cost to send, and a screen that
+    /// leaves gas out cannot tell a small win from a small loss.
+    #[test]
+    fn profit_is_net_of_what_both_transactions_cost_to_send() {
+        let cost_in = 0.000_408;
+        let out = 0.000_418;
+        let buy_gas = 0.000_004;
+        let sell_gas = 0.000_004;
+        // What the engine books: gas in on the basis, gas out of the proceeds.
+        let basis = cost_in + buy_gas;
+        let proceeds = out - sell_gas;
+        let mut f = fill(proceeds - basis, basis);
+        f.proceeds = proceeds;
+        f.gas = buy_gas + sell_gas;
+        f.quote_usd = 1_871.0;
+
+        assert!(f.basis_known());
+        // 0.000414 out against 0.000412 in — still a win, but a third of what
+        // the gross difference of 0.000010 would have claimed.
+        assert!((f.pnl - 0.000_002).abs() < 1e-9, "pnl was {}", f.pnl);
+        assert!(f.pnl < out - cost_in, "gas can only make a trade worse");
+        assert!(f.gas > 0.0, "and the amount is reported, not just subtracted");
+    }
+
+    /// The case that matters most: a trade that looks green gross and is red
+    /// once the chain is paid.
+    #[test]
+    fn a_gross_win_smaller_than_its_gas_is_reported_as_a_loss() {
+        let basis = 0.001_000 + 0.000_020; // buy plus its gas
+        let proceeds = 0.001_010 - 0.000_020; // sell less its gas
+        let mut f = fill(proceeds - basis, basis);
+        f.proceeds = proceeds;
+        f.gas = 0.000_040;
+        assert!(f.pnl < 0.0, "gross +0.00001, net {}", f.pnl);
+        assert!(f.counted_pnl() < 0.0, "and it reaches the day total as a loss");
     }
 
     /// The bug this was written for: TOK was bought in an earlier session, so

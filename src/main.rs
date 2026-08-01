@@ -2000,6 +2000,8 @@ async fn app(
         v3_covered: false,
         own_txs: engine::Bot::load_own_txs(trader),
         drain_watch: Vec::new(),
+        bought_gas: 0.0,
+        gas_burned: 0.0,
         buy_step_override: None,
         acting_key: String::new(),
         ur_permit2_done: false,
@@ -4379,6 +4381,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // rather than looked up — a scam can rename itself afterwards.
                 view::Col::fixed("symbol", 12),
                 view::Col::fixed("amount ETH", 13),
+                // What the press cost to send. Asked of a single transaction,
+                // so answered on the transaction — a buy has no closed trade to
+                // hang it on until the sell, which may be days away or never.
+                view::Col::fixed("gas $", 8),
                 view::Col::fixed("pooled ETH", 11),
                 view::Col::fixed("mkt cap", 11),
                 view::Col::min("tx", 66),
@@ -4434,6 +4440,19 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 ),
                 // Amount always in ETH numeraire (cost in ether).
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
+                view::Cell::toned(
+                    if o.gas > 0.0 && bot.eth_usd > 0.0 {
+                        format!("{:.3}", o.gas * bot.eth_usd)
+                    } else if o.gas > 0.0 {
+                        view::eth(o.gas)
+                    } else {
+                        // Zero is the answer on a chain whose gas rounds to
+                        // nothing, and also what an order written before gas
+                        // was measured knows. Blank rather than a bold "0.000".
+                        String::new()
+                    },
+                    view::Tone::Dim,
+                ),
                 view::Cell::new(if o.pooled > 0.0 { view::eth(o.pooled) } else { String::new() }),
                 view::Cell::new(if o.mc > 0.0 {
                     if bot.eth_usd > 0.0 {

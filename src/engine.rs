@@ -92,6 +92,14 @@ pub struct Order {
     /// to attest to something already attested.
     #[serde(default)]
     pub block: u64,
+    /// What this transaction cost to send, in ETH, off its receipt.
+    ///
+    /// Per order rather than only per closed trade, because the question "what
+    /// did that press cost me" is asked of a single transaction — and a buy has
+    /// no fill to hang it on until the sell that closes it, which may be days
+    /// away or never.
+    #[serde(default)]
+    pub gas: f64,
     /// Unix seconds when THIS bot sent it.
     ///
     /// The audit trail. Every order in this list was signed and broadcast by
@@ -398,6 +406,12 @@ pub struct Bot {
     /// is chosen for you is a convenience, a default that keeps overriding you
     /// is a fault.
     pub buy_step_override: Option<f64>,
+    /// ETH spent on transactions that reverted — bought nothing, cost real
+    /// money. Kept apart from any position's basis because it belongs to none.
+    /// Gas spent acquiring the position currently open, so a sell can report
+    /// what the whole round trip cost rather than only its own half.
+    pub bought_gas: f64,
+    pub gas_burned: f64,
     pub acting_key: String,
     /// Buys waiting to be re-checked for a drain. See [`Bot::watch_for_drain`].
     pub drain_watch: Vec<DrainWatch>,
@@ -437,6 +451,11 @@ pub struct DrainWatch {
 /// address in `basis-evm-<trader>.json`; absent means no open position.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Basis {
+    /// Gas already spent acquiring this position. Persisted with the rest of
+    /// the basis: a restart that forgot it would report the next sell's round
+    /// trip as costing only the exit.
+    #[serde(default)]
+    pub gas: f64,
     pub qty: f64,
     pub cost: f64,
     #[serde(default)]
@@ -749,11 +768,21 @@ impl Bot {
     /// purchased inventory at their price; sells consume it first (realizing
     /// profit vs basis), and anything beyond it comes from the free bag at zero
     /// cost → pure profit.
-    fn apply_fill(&mut self, side: Side, eth: f64, tok: f64, hash: TxHash) {
+    /// `gas` is what THIS transaction actually cost to send, in ETH, read from
+    /// its receipt. It is part of the trade, not an overhead beside it: a buy's
+    /// gas is money spent acquiring the position, and a sell's gas comes
+    /// straight out of the proceeds. Leaving it out reports every trade as
+    /// better than it was, and on stakes this size it is not a rounding error
+    /// — a 0.0018 ETH buy whose gas is 0.00002 ETH has given up 1% before the
+    /// price has moved at all.
+    fn apply_fill(&mut self, side: Side, eth: f64, tok: f64, hash: TxHash, gas: f64) {
         match side {
             Side::Buy => {
                 self.bought_qty += tok;
-                self.bought_cost += eth;
+                // What the position cost is what left the wallet: the ETH into
+                // the pool AND the gas that put it there.
+                self.bought_cost += eth + gas;
+                self.bought_gas += gas;
                 // Stamp the ENTRY so the trade log is self-contained (survives
                 // restarts / lost tape): mkt cap + pooled ETH + buy hash at entry.
                 self.entry_mc = if self.price() > 0.0 { self.token_supply / self.price() } else { 0.0 };
@@ -766,8 +795,22 @@ impl Bot {
                 }
             }
             Side::Sell => {
+                // Proceeds are what you KEEP: the ETH out of the pool less the
+                // gas it cost to get it out.
+                let eth = eth - gas;
                 let (from_basis, cost) = realized_cost(tok, self.bought_qty, self.bought_cost);
                 let realized = eth - cost; // free-bag portion has zero cost
+                // The ROUND TRIP's gas: this sell's, plus the share of the
+                // buys' that belongs to the portion being closed. The buy half
+                // is already inside `cost`; this reports it so the number can
+                // be looked at rather than only felt.
+                let buy_share = if self.bought_qty > 1e-12 {
+                    self.bought_gas * (from_basis / self.bought_qty).min(1.0)
+                } else {
+                    self.bought_gas
+                };
+                let gas = gas + buy_share;
+                self.bought_gas = (self.bought_gas - buy_share).max(0.0);
 
                 self.last_fill_pnl = Some(realized); // this sell's return, on its own
                 // Per-trade order record (greppable: "TRADE ") — a complete,
@@ -799,6 +842,7 @@ impl Bot {
                         quote_usd: self.pool.quote_usd,
                         tx: format!("{hash:#x}"),
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
+                        gas,
                         proof: String::new(), // filled by append, which reads the chain
                         verified: true,       // just made; nothing to distrust yet
                     },
@@ -1038,6 +1082,7 @@ impl Bot {
             token: self.pool.token,
             sym: self.pool.sym.clone(),
             block: 0, // unknown until the receipt lands; see `settle_order`
+            gas: 0.0,  // likewise: only the receipt knows
             at: crate::ledger::now(),
             key: self.acting_key.clone(),
             proof: String::new(), // filled by save_orders, which knows the chain
@@ -1110,6 +1155,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             all.insert(
                 key,
                 Basis {
+                    gas: self.bought_gas,
                     qty: self.bought_qty,
                     cost: self.bought_cost,
                     entry_at: self.entry_at,
@@ -1188,6 +1234,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             .unwrap_or_default();
         self.bought_qty = b.qty;
         self.bought_cost = b.cost;
+        self.bought_gas = b.gas;
         self.entry_at = b.entry_at;
         self.entry_mc = b.entry_mc;
         self.entry_pooled_eth = b.entry_pooled_eth;
@@ -1345,9 +1392,10 @@ fn order_fields(o: &Order) -> Vec<String> {
     }
 
     /// Move any pending order matching `hash` to a terminal status.
-    fn settle_order(&mut self, hash: TxHash, status: OrderStatus, block: u64) {
+    fn settle_order(&mut self, hash: TxHash, status: OrderStatus, block: u64, gas: f64) {
         if let Some(o) = self.orders.iter_mut().find(|o| o.hash == Some(hash)) {
             o.status = status;
+            o.gas = gas;
             // Where in time this trade actually sits. Everything that places it
             // on the tape reads this rather than "now", so a fill re-shown
             // later is shown at its own moment.
@@ -2221,9 +2269,14 @@ fn order_fields(o: &Order) -> Vec<String> {
                     // one await left (pre_approve_exit) is an optimisation the
                     // sell path can redo — so removing now strands nothing.
                     let p = self.pending.remove(idx);
+                    // What this transaction actually cost to send, straight
+                    // off the receipt — not the pre-trade estimate, which is
+                    // a guess made before the gas price was known.
+                    let gas_eth =
+                        rc.gas_used as f64 * rc.effective_gas_price as f64 / 1e18;
                     if rc.status() {
                         self.trades += 1;
-                        self.settle_order(p.hash, OrderStatus::Confirmed, rc.block_number.unwrap_or(0));
+                        self.settle_order(p.hash, OrderStatus::Confirmed, rc.block_number.unwrap_or(0), gas_eth);
                         let mut recv_eth: Option<f64> = None; // actual ETH received on a sell
                         if let Some(side) = p.side {
                             // Realized PnL must use what the swap ACTUALLY moved, not the
@@ -2269,7 +2322,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                             if side == Side::Sell {
                                 recv_eth = Some(fill_eth); // key number: ETH actually received
                             }
-                            self.apply_fill(side, fill_eth, fill_tok, p.hash);
+                            self.apply_fill(side, fill_eth, fill_tok, p.hash, gas_eth);
                             match side {
                                 // Look again in a moment: did the coin let us
                                 // keep what it just handed over?
@@ -2337,7 +2390,12 @@ fn order_fields(o: &Order) -> Vec<String> {
                         }
                     } else {
                         self.fails += 1;
-                        self.settle_order(p.hash, OrderStatus::Reverted, rc.block_number.unwrap_or(0));
+                        // A revert still burns the gas. Nothing was bought, so
+                        // there is no basis to add it to — it is spent money
+                        // with no position behind it, and saying so is the only
+                        // honest place to put it.
+                        self.gas_burned += gas_eth;
+                        self.settle_order(p.hash, OrderStatus::Reverted, rc.block_number.unwrap_or(0), gas_eth);
                         // A burn that reverted didn't actually close — put the
                         // position back in the cache so it can be retried.
                         if let Some(id) = p.position_id {

@@ -1439,6 +1439,12 @@ impl SolBot {
                         quote_usd: self.sol_usd,
                         tx: sig.clone(),
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
+                        // NOT measured on this side yet. The EVM path reads gas
+                        // off the receipt; the Solana fee is available the same
+                        // way and is simply not wired up. Zero is the honest
+                        // placeholder — it says "not counted", where a guessed
+                        // 5000 lamports would say "counted" and be wrong.
+                        gas: 0.0,
                         proof: String::new(), // filled by append, which reads the chain
                         verified: true,       // just made; nothing to distrust yet
                     },

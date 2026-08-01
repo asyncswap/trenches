@@ -682,6 +682,13 @@ fn breakdown(
                 format!("{:>7}", fl.held()),
                 Style::default().fg(tone_color(Tone::Info)),
             ),
+            // What the round trip cost to send, both halves. Already inside
+            // the profit to its left; shown so the profit can be checked
+            // rather than believed.
+            Span::styled(
+                if fl.gas > 0.0 { format!("  {:>7}", money(fl.gas * fl.quote_usd)) } else { String::new() },
+                Style::default().fg(tone_color(Tone::Dim)),
+            ),
         ])
     };
 
@@ -824,6 +831,7 @@ mod tests {
             quote_usd: usd,
             tx: "0x0".into(),
             held_secs: Some(7),
+            gas: 0.0,
             proof: String::new(),
             verified: true,
         }
