@@ -210,9 +210,15 @@ fn load_evm_tape(token: &alloy::primitives::Address) -> std::collections::VecDeq
     // window thinly — but the merge used to key on eth_wei, so the real log
     // never matched it and ONE swap persisted as two rows at different prices.
     // Saved tapes still carry those pairs; drop the placeholder side on load.
-    let real: std::collections::HashSet<_> =
-        out.iter().filter(|s| s.eth_wei != 0).map(|s| s.tx).collect();
-    out.retain(|s| s.eth_wei != 0 || !real.contains(&s.tx));
+    //
+    // ALL of them, not just the ones a real log has caught up with. A
+    // placeholder is a within-session patch over a thin `getLogs` window, and
+    // the ones already on disk were stamped with whatever block was current
+    // when they were written — so reloading a token put its old fills at the
+    // top of the tape dated seconds ago. They are re-injected from the order
+    // record a moment later, at the block the trade actually landed in, so
+    // dropping them here loses nothing and repairs every tape already saved.
+    out.retain(|s| s.eth_wei != 0);
     while out.len() > 400 {
         out.pop_front();
     }
@@ -2548,7 +2554,24 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             eth_wei: 0,
                             price,
                             liq_eth: o.pooled,
-                            block: block.load(Ordering::Relaxed),
+                            // The block the trade LANDED in, not the one we
+                            // happen to be on. Stamping "now" is what made an
+                            // hour-old fill reappear at the top of the tape
+                            // dated seconds ago every time you came back to the
+                            // token. For orders recorded before the receipt's
+                            // block was kept, walk back from the wall clock at
+                            // this chain's ~10 blocks/sec — an estimate, but one
+                            // that puts the row within a minute of the truth
+                            // instead of an hour out.
+                            block: if o.block > 0 {
+                                o.block
+                            } else if o.at > 0 {
+                                let now = block.load(Ordering::Relaxed);
+                                let ago = crate::ledger::now().saturating_sub(o.at);
+                                now.saturating_sub(ago.saturating_mul(10))
+                            } else {
+                                block.load(Ordering::Relaxed)
+                            },
                             tx: h,
                             trader: bot.trader,
                             tick_lo: 0,
@@ -2635,6 +2658,26 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         bot.status = "no pool selected — press [f] to find pools".into();
                         continue;
                     }
+                    // The key that caused whatever follows, stamped HERE — once,
+                    // for every key — rather than inside the arms that trade.
+                    //
+                    // It used to be set in four arms and cleared in none, which
+                    // does not mean the others recorded nothing: they recorded
+                    // the last key that DID remember. Every sell in the file
+                    // came out labelled `b`, because a buy had set it and
+                    // nothing ever unset it. A wrong answer in this column is
+                    // worse than no answer, because the column exists to be
+                    // believed.
+                    //
+                    // So: every key sets it, and every key that cannot trade
+                    // clears it. An arm added later that forgets now records
+                    // "—", which is true, instead of inheriting a lie.
+                    bot.acting_key = match k.code {
+                        KeyCode::Char(c @ ('b' | 's' | 'x' | 'a' | 'r' | 'S' | 'e' | 'h')) => {
+                            c.to_string()
+                        }
+                        _ => String::new(),
+                    };
                     match k.code {
                         // `q` is one keystroke away from every other action, so
                         // it asks first. `Q` is the deliberate escape hatch.
@@ -2903,8 +2946,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             prices.clear();
                             bot.status = "pool deselected — press [f] to find pools".into();
                         }
-                        KeyCode::Char('b') => { bot.acting_key = "b".into(); bot.status = "buying…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Buy)).await; }
-                        KeyCode::Char('s') => { bot.acting_key = "s".into(); bot.status = "selling…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Sell)).await; }
+                        KeyCode::Char('b') => { bot.status = "buying…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Buy)).await; }
+                        KeyCode::Char('s') => { bot.status = "selling…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Sell)).await; }
                         KeyCode::Char('a') => { bot.status = "adding LP…".into(); let wei = (bot.eth * bot.lp_frac * 1e18).max(0.0) as u128; let _ = tokio::time::timeout(Duration::from_secs(8), bot.add_liquidity(provider, wei)).await; }
                         KeyCode::Char('r') => { bot.status = "removing one LP…".into(); let _ = tokio::time::timeout(Duration::from_secs(8), bot.remove_liquidity(provider)).await; }
                         KeyCode::Char('x') => { bot.status = "closing ALL LP…".into(); let _ = tokio::time::timeout(Duration::from_secs(12), bot.close_all(provider)).await; }
@@ -2935,7 +2978,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.routes = routes_for(&pools, p.token);
                                 bot.v3_covered = false;
                                 bot.ur_permit2_done = false;
-                                bot.acting_key = "x".into();
                                 let _ = tokio::time::timeout(Duration::from_secs(10), bot.sell_all(provider)).await;
                                 swept += 1;
                             }
@@ -3080,7 +3122,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // Execute the two-leg arb: buy cheap pool, sell dear pool.
                         KeyCode::Char('e') => {
                             bot.status = "arb: executing…".into();
-                            bot.acting_key = "a".into();
                             let _ = tokio::time::timeout(Duration::from_secs(14), bot.arb(provider)).await;
                         }
                         KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('k') => {
@@ -4141,7 +4182,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // Say WHICH orders these are. A filtered list that looks unfiltered is
         // how you conclude you never traded a coin you traded twice.
         let scope = if filtered {
-            format!(" · {} only · [o] all", bot.pool.sym)
+            // Not "DGMA only": the symbol is in every row and in the header
+            // above. What the title has to carry is the way OUT of the filter.
+            " [o] all".to_string()
         } else if bot.orders.len() > total {
             " · all tokens".to_string()
         } else {
@@ -4180,20 +4223,21 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // Status first, then WHEN. That is the order the questions
                 // come in: did it go through, and was that me just now.
                 view::Col::fixed("status", 9),
-                // 12-hour with AM/PM. A bare 04:13 is ambiguous by exactly the
-                // twelve hours that matter — "was I asleep?" is the whole
-                // question this column exists to answer.
-                view::Col::fixed("time", 9),
+                // "How long ago" only. A wall clock beside it was two columns
+                // answering one question — and the one you actually ask of a
+                // trade you are looking at now is how long ago, not what the
+                // clock read. The exact second is still on the record.
                 view::Col::fixed("ago", 5),
                 view::Col::fixed("pool", 4),
-                // Orders carry full labels — "SELL ALL", "REMOVE LP #505",
-                // "CLOSE ALL" — not the tape's 4-character BUY/SELL.
-                view::Col::fixed("action", 13),
+                // WHICH key caused it, immediately before what it did — the
+                // two halves of one sentence, read together.
+                view::Col::fixed("key", 4),
+                // Order labels run to "SELL ALL" and "CLOSE ALL"; the longer
+                // "REMOVE LP #505" gives up its tail rather than making every
+                // BUY row carry four columns of empty space for it.
+                view::Col::fixed("action", 10),
                 // The ticker it wore WHEN YOU TRADED IT, stored on the order
                 // rather than looked up — a scam can rename itself afterwards.
-                // The address is gone from here: this panel opens filtered to
-                // one token, whose address is already on screen above it, so
-                // 44 characters of it per row squeezed every other column.
                 view::Col::fixed("symbol", 12),
                 view::Col::fixed("amount ETH", 13),
                 view::Col::fixed("pooled ETH", 11),
@@ -4220,33 +4264,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 _ => view::Tone::Normal,
             };
             let (venue, vtone) = if o.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
-            // Local wall clock, because the question this answers is "was I at
-            // the keyboard then?" — and that is asked in the time on the wall,
-            // not in UTC or in blocks.
-            //
-            // Twelve-hour with AM/PM. `04:13` is ambiguous by exactly the
-            // twelve hours that decide whether you were awake for it, and this
-            // column exists for the morning you find a trade you do not
-            // remember making.
-            let when = if o.at > 0 {
-                let secs = (o.at % 86_400) as i64;
-                let local = (secs + tz_offset_secs()).rem_euclid(86_400);
-                let (h24, m) = (local / 3600, (local % 3600) / 60);
-                let ampm = if h24 < 12 { "AM" } else { "PM" };
-                let h12 = match h24 % 12 {
-                    0 => 12, // midnight and noon are 12, not 0
-                    h => h,
-                };
-                // No seconds. The question here is which minute of which half
-                // of the day, and a ticking third field only makes the column
-                // harder to scan. The exact second is still on the record —
-                // `at` keeps unix seconds — it is just not what you read.
-                format!("{h12}:{m:02} {ampm}")
-            } else {
-                // Written before orders carried a time. Say so rather than
-                // showing a plausible-looking zero.
-                "—".to_string()
-            };
             // How long ago, which is the form the question is asked in.
             let ago = if o.at > 0 {
                 view::age_compact(crate::ledger::now().saturating_sub(o.at) as f64)
@@ -4262,9 +4279,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     view::Cell::bold("⚠", view::Tone::Bad)
                 },
                 view::Cell::bold(st, stone),
-                view::Cell::toned(when, view::Tone::Dim),
                 view::Cell::toned(ago, view::Tone::Normal),
                 view::Cell::bold(venue, vtone),
+                view::Cell::toned(
+                    if o.key.is_empty() { "—".to_string() } else { o.key.clone() },
+                    view::Tone::Info,
+                ),
                 view::Cell::bold(action, atone),
                 // `$` prefixed, the way a ticker is written everywhere else —
                 // and the way it is spoken, which is what you compare against

@@ -79,6 +79,19 @@ pub struct Order {
     /// Empty on orders written before this field existed.
     #[serde(default)]
     pub sym: String,
+    /// The block the transaction landed in, once the receipt is in hand.
+    ///
+    /// Not the block it was SENT at: a confirmed order is injected into the
+    /// tape when a thin `getLogs` window misses it, and a placeholder stamped
+    /// with the current block reads as a trade that just happened. Coming back
+    /// to a token re-injected yesterday's fills at the top of the tape, dated
+    /// seconds old.
+    ///
+    /// Deliberately NOT part of the proof: it is a property of `tx`, which the
+    /// proof already covers, so adding it would invalidate every existing proof
+    /// to attest to something already attested.
+    #[serde(default)]
+    pub block: u64,
     /// Unix seconds when THIS bot sent it.
     ///
     /// The audit trail. Every order in this list was signed and broadcast by
@@ -1016,6 +1029,7 @@ impl Bot {
             is_v4,
             token: self.pool.token,
             sym: self.pool.sym.clone(),
+            block: 0, // unknown until the receipt lands; see `settle_order`
             at: crate::ledger::now(),
             key: self.acting_key.clone(),
             proof: String::new(), // filled by save_orders, which knows the chain
@@ -1221,9 +1235,15 @@ fn order_fields(o: &Order) -> Vec<String> {
     }
 
     /// Move any pending order matching `hash` to a terminal status.
-    fn settle_order(&mut self, hash: TxHash, status: OrderStatus) {
+    fn settle_order(&mut self, hash: TxHash, status: OrderStatus, block: u64) {
         if let Some(o) = self.orders.iter_mut().find(|o| o.hash == Some(hash)) {
             o.status = status;
+            // Where in time this trade actually sits. Everything that places it
+            // on the tape reads this rather than "now", so a fill re-shown
+            // later is shown at its own moment.
+            if block > 0 {
+                o.block = block;
+            }
         }
     }
 
@@ -2093,7 +2113,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                     let p = self.pending.remove(idx);
                     if rc.status() {
                         self.trades += 1;
-                        self.settle_order(p.hash, OrderStatus::Confirmed);
+                        self.settle_order(p.hash, OrderStatus::Confirmed, rc.block_number.unwrap_or(0));
                         let mut recv_eth: Option<f64> = None; // actual ETH received on a sell
                         if let Some(side) = p.side {
                             // Realized PnL must use what the swap ACTUALLY moved, not the
@@ -2207,7 +2227,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                         }
                     } else {
                         self.fails += 1;
-                        self.settle_order(p.hash, OrderStatus::Reverted);
+                        self.settle_order(p.hash, OrderStatus::Reverted, rc.block_number.unwrap_or(0));
                         // A burn that reverted didn't actually close — put the
                         // position back in the cache so it can be retried.
                         if let Some(id) = p.position_id {
