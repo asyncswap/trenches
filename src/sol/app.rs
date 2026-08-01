@@ -1439,6 +1439,8 @@ impl SolBot {
                         quote_usd: self.sol_usd,
                         tx: sig.clone(),
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
+                        proof: String::new(), // filled by append, which reads the chain
+                        verified: true,       // just made; nothing to distrust yet
                     },
                 );
                 self.bought_cost = (self.bought_cost - cost).max(0.0);

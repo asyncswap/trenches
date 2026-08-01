@@ -71,6 +71,14 @@ pub struct Order {
     /// The token this order traded — so a confirmed order can be matched to
     /// (or injected into) the CURRENT pool's tape, and never someone else's.
     pub token: Address,
+    /// Its ticker at the time of the order.
+    ///
+    /// Stored, not looked up: tickers are not unique and a scam can rename
+    /// itself, so what matters is the name it wore when you traded it. The
+    /// address beside it is the identity; this is only how to say it out loud.
+    /// Empty on orders written before this field existed.
+    #[serde(default)]
+    pub sym: String,
     /// Unix seconds when THIS bot sent it.
     ///
     /// The audit trail. Every order in this list was signed and broadcast by
@@ -770,6 +778,8 @@ impl Bot {
                         quote_usd: self.pool.quote_usd,
                         tx: format!("{hash:#x}"),
                         held_secs: self.entry_at.map(|t| crate::ledger::now().saturating_sub(t)),
+                        proof: String::new(), // filled by append, which reads the chain
+                        verified: true,       // just made; nothing to distrust yet
                     },
                 );
                 // The day figure comes from the ledger, so it is recounted
@@ -1005,6 +1015,7 @@ impl Bot {
             eth,
             is_v4,
             token: self.pool.token,
+            sym: self.pool.sym.clone(),
             at: crate::ledger::now(),
             key: self.acting_key.clone(),
             proof: String::new(), // filled by save_orders, which knows the chain
@@ -1035,6 +1046,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         format!("{}", o.status.label()),
         o.hash.map(|h| format!("{h:#x}")).unwrap_or_default(),
         format!("{:#x}", o.token),
+        o.sym.clone(),
         format!("{:.18}", o.eth),
         format!("{:.18}", o.mc),
         o.at.to_string(),
@@ -1172,9 +1184,11 @@ fn order_fields(o: &Order) -> Vec<String> {
                 ],
             );
             // Everything from the first break onward is suspect: a chain that
-            // breaks at i tells you nothing about i+1.
+            // breaks at i tells you nothing about i+1. The proof is KEPT, not
+            // cleared — an empty proof is how a pre-proof row says "written
+            // before this existed", and a broken row must not be able to
+            // disguise itself as an old one.
             for o in out.iter_mut().skip(i) {
-                o.proof.clear();
                 o.verified = false;
             }
         } else {

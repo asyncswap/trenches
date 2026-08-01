@@ -1806,6 +1806,27 @@ async fn app(
     let log = std::fs::File::create(&log_path)?;
     set_session_log(&log_path);
 
+    // Check the profit ledger's chain once, on the way in.
+    //
+    // The calendar badges the individual rows, but that screen is behind a
+    // keypress and a month of scrolling — and a ledger that has been edited is
+    // exactly the thing you would not think to go looking for. Say it here,
+    // named, where every session start will see it.
+    {
+        let (fills, broken) = ledger::load_checked(&account);
+        if let Some(i) = broken {
+            crate::events::error(
+                "A recorded trade does not match its proof — the profit ledger has been changed",
+                &[
+                    ("row", i.to_string()),
+                    ("trade", fills.get(i).map(|f| f.sym.clone()).unwrap_or_default()),
+                    ("tx", fills.get(i).map(|f| f.tx.clone()).unwrap_or_default()),
+                    ("file", ledger::path(&account)),
+                ],
+            );
+        }
+    }
+
     let mut bot = Bot {
         trader,
         net: view::pretty_network(&net.name),
@@ -2325,6 +2346,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     let mut view = Panel::Tape; // default to the live tape
     let mut show_help = false;
     let mut orders_scroll: usize = 0;
+    // Whether the orders panel shows every order or only the open token's.
+    //
+    // Defaults to the open token: when you are looking at a coin, "have I
+    // traded this before, and at what?" is the question in front of you, and
+    // the answer was previously buried among every other coin's orders. Press
+    // `o` again for all of them.
+    let mut orders_all = false;
     let mut reader = crossterm::event::EventStream::new();
     // Highlight-to-copy (see ui::mouse): drag paints, release copies. The
     // text is read off the NEXT rendered frame, where the full buffer is in
@@ -2408,7 +2436,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // window, a busy tab — not because of anything in the app.
                 phase!("drawing (a stalled draw usually means the terminal itself was busy)");
                 terminal.draw(|f| {
-                    logo_box = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, &tape_snap, show_help);
+                    logo_box = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, orders_all, &tape_snap, show_help);
                     ui::mouse::paint(f, &msel);
                     if copy_armed {
                         if let Some((a, b)) = msel.region() {
@@ -2563,7 +2591,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // rows per notch — the arrows' one-at-a-time is for
                         // precision, not for covering a 143-row tape.
                         MK::ScrollUp => {
-                            let n = match view { Panel::Tape => tape.lock().unwrap().len(), Panel::Logs => bot.logs.len(), _ => bot.orders.len() };
+                            let n = match view { Panel::Tape => tape.lock().unwrap().len(), Panel::Logs => bot.logs.len(),
+                                // Orders may be filtered to the open token; scrolling
+                                // past the end of what is drawn does nothing but feel broken.
+                                _ => if !orders_all && !bot.pool.token.is_zero() {
+                                    bot.orders.iter().filter(|o| o.token == bot.pool.token).count()
+                                } else { bot.orders.len() } };
                             orders_scroll = (orders_scroll + 3).min(n.saturating_sub(1));
                         }
                         MK::ScrollDown => orders_scroll = orders_scroll.saturating_sub(3),
@@ -2761,7 +2794,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // stop on a carousel: t trades, o orders, l logs,
                         // v chart. The arrows still cycle for the habit.
                         KeyCode::Char('t') => { view = Panel::Tape; orders_scroll = 0; }
-                        KeyCode::Char('o') => { view = Panel::Orders; orders_scroll = 0; }
+                        // First `o` opens the panel; pressing it again widens
+                        // from this token's orders to every order.
+                        KeyCode::Char('o') => {
+                            if view == Panel::Orders { orders_all = !orders_all; }
+                            view = Panel::Orders;
+                            orders_scroll = 0;
+                        }
                         KeyCode::Char('l') => { view = Panel::Logs; orders_scroll = 0; }
                         // Capital O spins the carousel for one-handed browsing;
                         // the lowercase keys stay the fast direct jumps.
@@ -2773,7 +2812,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('.') => { bot.chart_iv = view::iv_step(bot.chart_iv, true); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
                         // Scroll the active panel (↑ older, ↓ newer) — orders or tape.
                         KeyCode::Up => {
-                            let n = match view { Panel::Tape => tape.lock().unwrap().len(), Panel::Logs => bot.logs.len(), _ => bot.orders.len() };
+                            let n = match view { Panel::Tape => tape.lock().unwrap().len(), Panel::Logs => bot.logs.len(),
+                                // Orders may be filtered to the open token; scrolling
+                                // past the end of what is drawn does nothing but feel broken.
+                                _ => if !orders_all && !bot.pool.token.is_zero() {
+                                    bot.orders.iter().filter(|o| o.token == bot.pool.token).count()
+                                } else { bot.orders.len() } };
                             orders_scroll = (orders_scroll + 1).min(n.saturating_sub(1));
                         }
                         KeyCode::Down => { orders_scroll = orders_scroll.saturating_sub(1); }
@@ -3310,7 +3354,7 @@ enum Panel {
 /// Draws the dashboard and returns where the header logo goes, so the caller
 /// can place a real terminal image there after the frame.
 #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
-fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders_scroll: usize, tape: &[engine::Swap], show_help: bool) -> Option<Rect> {
+fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders_scroll: usize, orders_all: bool, tape: &[engine::Swap], show_help: bool) -> Option<Rect> {
     // Paint the theme background FIRST. Without this a light theme renders dark
     // text on the terminal's own dark background — unreadable.
     ui::widgets::paint_bg(f);
@@ -4077,17 +4121,42 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Panel::Orders => {
         // Orders queue as an aligned table: STATUS | ACTION | SIDE | AMOUNT | PRICE | TX.
         let h = mid_area.height.saturating_sub(3).max(1) as usize; // minus borders + header
-        let total = bot.orders.len();
+        // Every order this bot ever sent for the open token, not just this
+        // session's — the file holds them all, and "have I traded this coin
+        // before?" is exactly the question you ask when a coin is in front of
+        // you. Falls back to everything when no token is loaded, or on `o`.
+        let filtered = !orders_all && !bot.pool.token.is_zero();
+        let rows: Vec<&engine::Order> = bot
+            .orders
+            .iter()
+            .filter(|o| !filtered || o.token == bot.pool.token)
+            .collect();
+        let total = rows.len();
         let scroll = orders_scroll.min(total.saturating_sub(1));
         // Built as a chain-agnostic TableView and drawn by the shared widget —
         // same code path as the Solana orders panel.
         // "My Orders", not "Orders": this panel is YOUR sends, while the tape
         // beside it is everyone's. One word saves reading two panels to work
         // out which is which.
-        let title = if total > h {
-            format!(" My Orders {}–{} of {} ↑/↓ scroll ", scroll + 1, (scroll + h).min(total), total)
+        // Say WHICH orders these are. A filtered list that looks unfiltered is
+        // how you conclude you never traded a coin you traded twice.
+        let scope = if filtered {
+            format!(" · {} only · [o] all", bot.pool.sym)
+        } else if bot.orders.len() > total {
+            " · all tokens".to_string()
         } else {
-            format!(" My Orders ({total}) ")
+            String::new()
+        };
+        let title = if total > h {
+            format!(
+                " My Orders {}–{} of {}{} ↑/↓ scroll ",
+                scroll + 1,
+                (scroll + h).min(total),
+                total,
+                scope
+            )
+        } else {
+            format!(" My Orders ({total}){scope} ")
         };
         let mut t = view::TableView::new(
             title,
@@ -4095,6 +4164,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // WHEN, first. This list is the record of what this bot sent,
                 // and the first question anyone asks of it is "was that me,
                 // just now?" — which is a time question.
+                //
+                // Asked as "how long ago", so answered that way. A clock time
+                // has to be subtracted from now before it means anything, and
+                // the moment you actually need this column is the moment you
+                // are least willing to do arithmetic. The wall clock is one
+                // column over, for when the question is "was I at the keyboard
+                // at 03:42".
+                view::Col::fixed("ago", 6),
                 view::Col::fixed("time", 9),
                 // One glyph for "this row still matches its proof". Silent
                 // when fine — a badge on every row teaches you to stop
@@ -4111,6 +4188,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 view::Col::fixed("price / tick", 24),
                 view::Col::fixed("pooled ETH", 12),
                 view::Col::fixed("mkt cap $", 12),
+                // The ticker it wore WHEN YOU TRADED IT, stored on the order
+                // rather than looked up — a scam can rename itself afterwards.
+                view::Col::fixed("sym", 10),
                 // FULL, never truncated: the address is the only identifier a
                 // scammer cannot copy, so a shortened one is worse than none.
                 view::Col::fixed("token", 44),
@@ -4119,7 +4199,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         );
         t.empty_note = "no orders yet\npress b to buy  ·  s to sell  ·  a add LP  ·  x sell all".into();
         t.active_key = Some('o');
-        for o in bot.orders.iter().rev().skip(scroll).take(h) {
+        for o in rows.iter().rev().skip(scroll).take(h) {
             let (st, stone) = match o.status {
                 engine::OrderStatus::Confirmed => ("confirmed", view::Tone::Good),
                 engine::OrderStatus::Pending => ("pending", view::Tone::Warn),
@@ -4148,7 +4228,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // showing a plausible-looking zero.
                 "—".to_string()
             };
+            // How long ago, which is the form the question is asked in.
+            let ago = if o.at > 0 {
+                view::age_compact(crate::ledger::now().saturating_sub(o.at) as f64)
+            } else {
+                "—".to_string()
+            };
             t.push(vec![
+                view::Cell::toned(ago, view::Tone::Normal),
                 view::Cell::toned(when, view::Tone::Dim),
                 if o.verified || o.proof.is_empty() && o.at == 0 {
                     // Verified, or too old to have a proof at all. Either way
@@ -4168,7 +4255,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
                 view::Cell::new(price),
                 view::Cell::new(if o.pooled > 0.0 { view::eth(o.pooled) } else { String::new() }),
-                view::Cell::toned(format!("{:#x}", o.token), view::Tone::Dim),
                 view::Cell::new(if o.mc > 0.0 {
                     if bot.eth_usd > 0.0 {
                         view::usd_compact(o.mc * bot.eth_usd)
@@ -4178,6 +4264,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 } else {
                     String::new()
                 }),
+                view::Cell::bold(
+                    if o.sym.is_empty() { "—".to_string() } else { o.sym.clone() },
+                    view::Tone::Accent,
+                ),
+                view::Cell::toned(format!("{:#x}", o.token), view::Tone::Dim),
                 view::Cell::toned(
                     o.hash.map(|h| format!("{h:#x}")).unwrap_or_default(),
                     view::Tone::Normal,

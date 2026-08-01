@@ -51,6 +51,22 @@ pub struct Fill {
     /// exactly where it is most interesting.
     #[serde(default)]
     pub held_secs: Option<u64>,
+    /// Chained proof over this fill's fields and the proof of the one before
+    /// it in this account's file. See `verification`.
+    ///
+    /// The orders file is rewritten whole on every save, so its chain is
+    /// recomputed each time. This one never is: fills are append-only, so each
+    /// proof was computed once, at the moment the sell confirmed, and links to
+    /// a proof that was already on disk. Rewriting one line means rewriting
+    /// every line after it — with the secret.
+    ///
+    /// Empty on fills written before proofs existed: unverified, not forged.
+    #[serde(default)]
+    pub proof: String,
+    /// Whether this fill's proof matched when the file was read. Not persisted
+    /// — it is a fact about the last read, not about the record.
+    #[serde(skip)]
+    pub verified: bool,
 }
 
 impl Fill {
@@ -115,15 +131,75 @@ pub fn path(account: &str) -> String {
     format!("{}/fills-{}.jsonl", crate::state_dir(), safe_account(account))
 }
 
-/// Append one fill. Failures are swallowed on purpose: a full disk must not
-/// turn a completed sell into an error the trader has to think about.
+/// The fields a fill's proof covers, in a fixed order.
+///
+/// Everything that would change what the trade earned or which trade it was.
+/// `held_secs` is in because a forged hold time rewrites how the trade was won,
+/// and `quote_usd` because re-stamping the rate silently re-prices the day.
+/// Adding a field here invalidates every existing proof, which is correct — an
+/// old proof did not attest to the new field.
+pub fn fill_fields(f: &Fill) -> Vec<String> {
+    vec![
+        f.ts.to_string(),
+        f.chain.clone(),
+        f.sym.clone(),
+        f.token.clone(),
+        format!("{:.18}", f.pnl),
+        format!("{:.18}", f.cost),
+        format!("{:.18}", f.proceeds),
+        f.quote_sym.clone(),
+        format!("{:.8}", f.quote_usd),
+        f.tx.clone(),
+        f.held_secs.map(|s| s.to_string()).unwrap_or_default(),
+    ]
+}
+
+/// The proof on the last line of an account's file — the link a new fill
+/// chains onto. Empty when the file is new, or ends in a pre-proof line.
+fn last_proof(account: &str) -> String {
+    let Ok(text) = std::fs::read_to_string(path(account)) else { return String::new() };
+    text.lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<Fill>(l).ok())
+        .map(|f| f.proof)
+        .unwrap_or_default()
+}
+
+/// Append one fill, chained onto the proof already on disk.
+///
+/// Failures are swallowed on purpose: a full disk must not turn a completed
+/// sell into an error the trader has to think about.
 pub fn append(account: &str, f: &Fill) {
     use std::io::Write;
-    let Ok(line) = serde_json::to_string(f) else { return };
+    // Chain onto what is on disk, NOT onto anything held in memory — another
+    // instance may have appended since, and reading the tail is how this stays
+    // correct without a lock.
+    let mut f = f.clone();
+    let fields = fill_fields(&f);
+    let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+    f.proof = crate::verification::proof(&last_proof(account), &refs);
+    let Ok(line) = serde_json::to_string(&f) else { return };
     let _ = std::fs::create_dir_all(crate::state_dir());
     if let Ok(mut h) = std::fs::OpenOptions::new().create(true).append(true).open(path(account)) {
         let _ = writeln!(h, "{line}");
     }
+}
+
+/// Verify a file's chain in place, marking each fill and returning the index of
+/// the first break.
+///
+/// A broken fill is FLAGGED, never dropped: a profit record that quietly
+/// disappears is worse than one you are told to distrust. Everything from the
+/// break onward is marked too — a chain that breaks at row `i` says nothing
+/// about row `i+1`.
+fn verify_chain(fills: &mut [Fill]) -> Option<usize> {
+    let records: Vec<(String, Vec<String>)> =
+        fills.iter().map(|f| (f.proof.clone(), fill_fields(f))).collect();
+    let broken = crate::verification::first_broken(&records);
+    for (i, f) in fills.iter_mut().enumerate() {
+        f.verified = broken.is_none_or(|b| i < b);
+    }
+    broken
 }
 
 /// Every account's fills, merged, oldest first.
@@ -150,10 +226,25 @@ pub fn total_since(account: &str, since: u64) -> f64 {
     total(account, |f| f.ts >= since)
 }
 
-/// One account's fills, as they are on disk.
+/// One account's fills, as they are on disk, each marked verified or not.
 pub fn load(account: &str) -> Vec<Fill> {
     let Ok(text) = std::fs::read_to_string(path(account)) else { return Vec::new() };
-    text.lines().filter_map(|l| serde_json::from_str::<Fill>(l).ok()).collect()
+    let mut v: Vec<Fill> = text.lines().filter_map(|l| serde_json::from_str::<Fill>(l).ok()).collect();
+    verify_chain(&mut v);
+    v
+}
+
+/// One account's fills, plus the first row whose proof did not match.
+///
+/// Separate from `load` because the totals do not care and the UI does: the
+/// arithmetic still has to run over every fill — refusing to show a number is
+/// not safer than showing one marked untrustworthy — but somebody has to say
+/// so out loud, once, naming the file and the row.
+pub fn load_checked(account: &str) -> (Vec<Fill>, Option<usize>) {
+    let Ok(text) = std::fs::read_to_string(path(account)) else { return (Vec::new(), None) };
+    let mut v: Vec<Fill> = text.lines().filter_map(|l| serde_json::from_str::<Fill>(l).ok()).collect();
+    let broken = verify_chain(&mut v);
+    (v, broken)
 }
 
 fn total(account: &str, keep: impl Fn(&Fill) -> bool) -> f64 {
@@ -171,9 +262,13 @@ pub fn load_all() -> Vec<Fill> {
         })
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .flat_map(|t| {
-            t.lines()
-                .filter_map(|l| serde_json::from_str::<Fill>(l).ok())
-                .collect::<Vec<_>>()
+            // Verify PER FILE, before merging. Each account's file is its own
+            // chain; interleaving two accounts by timestamp and then checking
+            // would break every proof in both.
+            let mut v: Vec<Fill> =
+                t.lines().filter_map(|l| serde_json::from_str::<Fill>(l).ok()).collect();
+            verify_chain(&mut v);
+            v
         })
         .collect();
     v.sort_by_key(|f| f.ts);
@@ -356,6 +451,8 @@ mod tests {
             quote_usd: 2000.0,
             tx: "0xabc".into(),
             held_secs: Some(42),
+            proof: String::new(),
+            verified: true,
         };
         assert!((f.usd() - 200.0).abs() < 1e-9);
         assert!((f.ret_pct() - 20.0).abs() < 1e-9);
@@ -375,6 +472,8 @@ mod tests {
             quote_usd: 150.0,
             tx: "sig".into(),
             held_secs: None,
+            proof: String::new(),
+            verified: true,
         };
         assert_eq!(f.ret_pct(), 0.0);
         assert!((f.usd() - 150.0).abs() < 1e-9);
@@ -397,6 +496,7 @@ mod ret_col_tests {
             ts: 0, chain: "t".into(), sym: "A".into(), token: "0x1".into(),
             pnl, cost, proceeds: cost + pnl, quote_sym: "ETH".into(),
             quote_usd: 1.0, tx: "0x0".into(), held_secs: None,
+            proof: String::new(), verified: true,
         }
     }
 
@@ -405,6 +505,57 @@ mod ret_col_tests {
         // Sold for a profit with nothing recorded as paid: the return is
         // undefined, and saying "+0%" would call it break-even.
         assert_eq!(fill(0.000_931, 0.0).ret_col(), "—");
+    }
+
+    /// A fill's proof has to cover the profit, or it proves nothing worth
+    /// proving: the number someone would want to change is the number itself.
+    #[test]
+    fn a_fills_proof_covers_the_money() {
+        let base = fill(0.5, 1.0);
+        let f = |x: &Fill| {
+            let v = fill_fields(x);
+            let r: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            crate::verification::proof("", &r)
+        };
+        let mut edited = base.clone();
+        edited.pnl = 5.0;
+        assert_ne!(f(&base), f(&edited), "the profit is covered");
+
+        let mut edited = base.clone();
+        edited.quote_usd = 9_999.0;
+        assert_ne!(f(&base), f(&edited), "the day's rate is covered");
+
+        let mut edited = base.clone();
+        edited.tx = "0xdead".into();
+        assert_ne!(f(&base), f(&edited), "which trade it was is covered");
+
+        let mut edited = base.clone();
+        edited.held_secs = Some(1);
+        assert_ne!(f(&base), f(&edited), "how long it was held is covered");
+    }
+
+    /// Editing one fill must flag it AND everything after — a chain that breaks
+    /// at row `i` says nothing about row `i+1`.
+    #[test]
+    fn an_edited_fill_and_everything_after_it_stops_verifying() {
+        let mut chain: Vec<Fill> = Vec::new();
+        let mut prev = String::new();
+        for pnl in [0.1, 0.2, 0.3] {
+            let mut f = fill(pnl, 1.0);
+            let v = fill_fields(&f);
+            let r: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+            f.proof = crate::verification::proof(&prev, &r);
+            prev = f.proof.clone();
+            chain.push(f);
+        }
+        assert_eq!(verify_chain(&mut chain), None, "an untouched ledger verifies");
+        assert!(chain.iter().all(|f| f.verified));
+
+        // Someone doubles the middle trade's profit and leaves its proof alone.
+        chain[1].pnl = 0.4;
+        assert_eq!(verify_chain(&mut chain), Some(1), "the edited row is named");
+        assert!(chain[0].verified, "the rows before it are still good");
+        assert!(!chain[1].verified && !chain[2].verified, "it and everything after are suspect");
     }
 
     #[test]

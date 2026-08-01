@@ -589,6 +589,15 @@ fn breakdown(
 
     let row = |fl: &Fill| {
         Line::from(vec![
+            // One glyph for "this row no longer matches its proof". Silent
+            // when it does — a badge on every row teaches you to stop reading
+            // it, and the only one worth noticing is the broken one. A flagged
+            // fill still counts toward the totals: refusing to show a number
+            // is not safer than showing one you are told to check.
+            Span::styled(
+                if fl.verified || fl.proof.is_empty() { "  " } else { "⚠ " },
+                Style::default().fg(tone_color(Tone::Bad)).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{:<12}", truncate(&fl.sym, 12)),
                 Style::default().fg(tone_color(Tone::Normal)).add_modifier(Modifier::BOLD),
@@ -651,10 +660,15 @@ fn breakdown(
         }
     };
 
+    // Say it in the title too, once. A badge deep in a scrolled list is easy
+    // to never reach; the count is what tells you to go looking.
+    let bad = trades.iter().filter(|f| !f.verified && !f.proof.is_empty()).count();
+    let flag = if bad > 0 { format!("· ⚠ {bad} unverified ") } else { String::new() };
+
     f.render_widget(
         Paragraph::new(wins.clone())
             .scroll((off as u16, 0))
-            .block(themed_block(format!(" Winners — {scope}{} ", more(wins.len())))),
+            .block(themed_block(format!(" Winners — {scope}{} {flag}", more(wins.len())))),
         cols[0],
     );
     f.render_widget(
@@ -716,6 +730,8 @@ mod tests {
             quote_usd: usd,
             tx: "0x0".into(),
             held_secs: Some(7),
+            proof: String::new(),
+            verified: true,
         }
     }
 

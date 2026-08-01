@@ -94,7 +94,7 @@ pub fn proof(prev: &str, fields: &[&str]) -> String {
 /// existed carries an empty proof and is SKIPPED rather than failed — an old
 /// file is unverified, which is not the same as forged, and reporting it as
 /// tampering would teach people to ignore the warning.
-pub fn first_broken<'a>(records: &'a [(String, Vec<String>)]) -> Option<usize> {
+pub fn first_broken(records: &[(String, Vec<String>)]) -> Option<usize> {
     let mut prev = String::new();
     for (i, (got, fields)) in records.iter().enumerate() {
         if got.is_empty() {
