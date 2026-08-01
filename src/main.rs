@@ -4171,29 +4171,36 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // are least willing to do arithmetic. The wall clock is one
                 // column over, for when the question is "was I at the keyboard
                 // at 03:42".
-                view::Col::fixed("ago", 6),
-                view::Col::fixed("time", 9),
-                // One glyph for "this row still matches its proof". Silent
-                // when fine — a badge on every row teaches you to stop
-                // reading it; the only one worth noticing is the broken one.
+                // One glyph for "this row no longer matches its proof".
+                // Blank when it does — a badge on every row teaches you to
+                // stop reading it; the only one worth noticing is the broken
+                // one. A blank two-character gutter is not a column you read,
+                // so `status` is still the first thing your eye lands on.
                 view::Col::fixed("", 2),
-                // WHICH key caused it. Nothing here trades without one.
-                view::Col::fixed("key", 4),
+                // Status first, then WHEN. That is the order the questions
+                // come in: did it go through, and was that me just now.
                 view::Col::fixed("status", 9),
+                // 12-hour with AM/PM. A bare 04:13 is ambiguous by exactly the
+                // twelve hours that matter — "was I asleep?" is the whole
+                // question this column exists to answer.
+                view::Col::fixed("time", 11),
+                view::Col::fixed("ago", 5),
                 view::Col::fixed("pool", 4),
                 // Orders carry full labels — "SELL ALL", "REMOVE LP #505",
                 // "CLOSE ALL" — not the tape's 4-character BUY/SELL.
-                view::Col::fixed("action", 14),
-                view::Col::fixed("amount ETH", 14),
-                view::Col::fixed("price / tick", 24),
-                view::Col::fixed("pooled ETH", 12),
-                view::Col::fixed("mkt cap $", 12),
+                view::Col::fixed("action", 13),
                 // The ticker it wore WHEN YOU TRADED IT, stored on the order
                 // rather than looked up — a scam can rename itself afterwards.
-                view::Col::fixed("sym", 10),
-                // FULL, never truncated: the address is the only identifier a
-                // scammer cannot copy, so a shortened one is worse than none.
-                view::Col::fixed("token", 44),
+                // The address is gone from here: this panel opens filtered to
+                // one token, whose address is already on screen above it, so
+                // 44 characters of it per row squeezed every other column.
+                view::Col::fixed("sym", 12),
+                // WHICH key caused it. Nothing here trades without one.
+                view::Col::fixed("key", 4),
+                view::Col::fixed("amount ETH", 13),
+                view::Col::fixed("price / tick", 18),
+                view::Col::fixed("pooled ETH", 11),
+                view::Col::fixed("mkt cap $", 11),
                 view::Col::min("tx", 66),
             ],
         );
@@ -4219,10 +4226,21 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             // Local wall clock, because the question this answers is "was I at
             // the keyboard then?" — and that is asked in the time on the wall,
             // not in UTC or in blocks.
+            //
+            // Twelve-hour with AM/PM. `04:13` is ambiguous by exactly the
+            // twelve hours that decide whether you were awake for it, and this
+            // column exists for the morning you find a trade you do not
+            // remember making.
             let when = if o.at > 0 {
                 let secs = (o.at % 86_400) as i64;
                 let local = (secs + tz_offset_secs()).rem_euclid(86_400);
-                format!("{:02}:{:02}:{:02}", local / 3600, (local % 3600) / 60, local % 60)
+                let (h24, m, sec) = (local / 3600, (local % 3600) / 60, local % 60);
+                let ampm = if h24 < 12 { "AM" } else { "PM" };
+                let h12 = match h24 % 12 {
+                    0 => 12, // midnight and noon are 12, not 0
+                    h => h,
+                };
+                format!("{h12}:{m:02}:{sec:02} {ampm}")
             } else {
                 // Written before orders carried a time. Say so rather than
                 // showing a plausible-looking zero.
@@ -4235,8 +4253,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 "—".to_string()
             };
             t.push(vec![
-                view::Cell::toned(ago, view::Tone::Normal),
-                view::Cell::toned(when, view::Tone::Dim),
                 if o.verified || o.proof.is_empty() && o.at == 0 {
                     // Verified, or too old to have a proof at all. Either way
                     // there is nothing to shout about.
@@ -4244,13 +4260,22 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 } else {
                     view::Cell::bold("⚠", view::Tone::Bad)
                 },
+                view::Cell::bold(st, stone),
+                view::Cell::toned(when, view::Tone::Dim),
+                view::Cell::toned(ago, view::Tone::Normal),
+                view::Cell::bold(venue, vtone),
+                view::Cell::bold(action, atone),
+                // `$` prefixed, the way a ticker is written everywhere else —
+                // and the way it is spoken, which is what you compare against
+                // when you are checking a coin you half remember.
+                view::Cell::bold(
+                    if o.sym.is_empty() { "—".to_string() } else { format!("${}", o.sym) },
+                    view::Tone::Accent,
+                ),
                 view::Cell::toned(
                     if o.key.is_empty() { "—".to_string() } else { o.key.clone() },
                     view::Tone::Info,
                 ),
-                view::Cell::bold(st, stone),
-                view::Cell::bold(venue, vtone),
-                view::Cell::bold(action, atone),
                 // Amount always in ETH numeraire (cost in ether).
                 view::Cell::new(if o.eth > 0.0 { format!("{:.6}", o.eth) } else { String::new() }),
                 view::Cell::new(price),
@@ -4264,11 +4289,6 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 } else {
                     String::new()
                 }),
-                view::Cell::bold(
-                    if o.sym.is_empty() { "—".to_string() } else { o.sym.clone() },
-                    view::Tone::Accent,
-                ),
-                view::Cell::toned(format!("{:#x}", o.token), view::Tone::Dim),
                 view::Cell::toned(
                     o.hash.map(|h| format!("{h:#x}")).unwrap_or_default(),
                     view::Tone::Normal,

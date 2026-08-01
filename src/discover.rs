@@ -2269,7 +2269,10 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
 fn venue_tag(g: &Grad) -> &'static str {
     match g.kind {
         engine::PoolKind::V3 { .. } => "pons",
-        engine::PoolKind::FlaunchV4 { .. } => "flnch",
+        // Spelled out. "flnch" saves one column and costs the reader a
+        // guess at which launchpad they are looking at, which is the only
+        // thing this column is for.
+        engine::PoolKind::FlaunchV4 { .. } => "flaunch",
         // Still on its curve — a different thing to trade than a pool, and the
         // column is the place that says so.
         engine::PoolKind::PonsCurve { .. } => "pons2",
@@ -2320,7 +2323,8 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
 
     let widths = [
         Constraint::Length(2),
-        Constraint::Length(6),
+        // Wide enough for "flaunch" spelled out — see `venue_tag`.
+        Constraint::Length(7),
         Constraint::Length(12),
         Constraint::Length(11),
         Constraint::Length(11),
