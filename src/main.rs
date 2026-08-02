@@ -3435,11 +3435,60 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             if held.is_empty() {
                                 bot.status = "no leftover tokens in wallet".into();
                             } else {
+                                // What it is worth against what it cost.
+                                //
+                                // The scan already knew the live value; the
+                                // basis file already knew the cost. Neither was
+                                // ever put beside the other, so a bag you
+                                // forgot to sell showed a size and a value and
+                                // said nothing about whether holding it had
+                                // been a good idea.
+                                //
+                                // Cost is pro-rated to what is still held: sell
+                                // half and the remaining half carries half the
+                                // basis, which is the same arithmetic a real
+                                // sell does.
+                                let basis = engine::Bot::load_basis_map(bot.trader);
+                                let priced = |p: &SelPool, bal: f64| -> Option<f64> {
+                                    let b = basis.get(&format!("{:#x}", p.token))?;
+                                    (b.qty > 1e-12 && b.cost > 1e-12)
+                                        .then(|| b.cost * (bal / b.qty).min(1.0))
+                                };
+                                let mut unrealized = 0.0;
+                                let mut unpriced = 0usize;
+                                for (p, bal, val) in held.iter() {
+                                    match priced(p, *bal) {
+                                        Some(c) => unrealized += val - c,
+                                        None => unpriced += 1,
+                                    }
+                                }
                                 let labels: Vec<String> = held
                                     .iter()
-                                    .map(|(p, bal, val)| format!("{:<12} {:>14.2}  ~{:.6} ETH", p.sym, bal, val))
+                                    .map(|(p, bal, val)| {
+                                        let tail = match priced(p, *bal) {
+                                            Some(c) => {
+                                                let pnl = val - c;
+                                                let ret = if c > 1e-12 { pnl / c * 100.0 } else { 0.0 };
+                                                match view::usd_tag(pnl, bot.eth_usd) {
+                                                    Some(t) => format!("{t} {ret:+.0}%"),
+                                                    None => format!("{pnl:+.6} ETH {ret:+.0}%"),
+                                                }
+                                            }
+                                            // No recorded buy: the value is
+                                            // real, the gain is unknowable, and
+                                            // guessing zero would call a free
+                                            // bag break-even.
+                                            None => "no recorded buy".to_string(),
+                                        };
+                                        format!("{:<12} {:>14.2}  ~{:.6} ETH   {tail}", p.sym, bal, val)
+                                    })
                                     .collect();
-                                if let Some(i) = ui::select(terminal, "Wallet holdings — Enter to trade/sell", &labels)? {
+                                let title = match view::usd_tag(unrealized, bot.eth_usd) {
+                                    Some(t) if unpriced == 0 => format!("Wallet holdings — unrealized {t}"),
+                                    Some(t) => format!("Wallet holdings — unrealized {t} · {unpriced} unpriced"),
+                                    None => "Wallet holdings — Enter to trade/sell".to_string(),
+                                };
+                                if let Some(i) = ui::select(terminal, &title, &labels)? {
                                     let p = held[i].0.clone();
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
@@ -3636,17 +3685,19 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             ranked.sort_by_key(|(held, _)| !*held); // stable: held first
                             let visible: Vec<SelPool> =
                                 ranked.iter().map(|(_, p)| p.clone()).collect();
-                            labels.extend(
-                                ranked
-                                    .iter()
-                                    .map(|(held, p)| {
-                                        if *held {
-                                            format!("● {}", p.label)
-                                        } else {
-                                            format!("  {}", p.label)
-                                        }
-                                    }),
-                            );
+                            // The address, in full, as its own column. Three
+                            // tokens here are called TKN and four are called
+                            // yolo — the symbol is a name, the address is the
+                            // identity, and picking the wrong one of four is
+                            // a trade in a coin you did not mean to buy.
+                            labels.extend(ranked.iter().map(|(held, p)| {
+                                format!(
+                                    "{} {}  {:#x}",
+                                    if *held { "●" } else { " " },
+                                    p.label,
+                                    p.token
+                                )
+                            }));
                             if let Some(i) = ui::select(terminal, "Pools", &labels)? {
                                 // Optionally produce a new SelPool to switch to + append.
                                 let new_pool: Option<SelPool> = match i {

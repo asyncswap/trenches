@@ -28,22 +28,68 @@ pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Op
     image::clear();
     let mut state = ListState::default();
     state.select(Some(0));
+    // Highlight-to-copy, the same as the dashboard and the calendar.
+    //
+    // Mouse capture is on for the whole app, so the terminal's own selection is
+    // off — a screen that ignores mouse events cannot be copied from at all.
+    // This one lists contract addresses, which exist to be copied.
+    let mut msel = crate::ui::mouse::Selection::default();
+    let mut copy_armed = false;
+    let mut copied: Option<usize> = None;
     loop {
+        let mut grabbed: Option<String> = None;
         term.draw(|f| {
             widgets::paint_bg(f);
             let area = centered(f.area(), 80, items.len() as u16 + 4);
+            let foot = match copied {
+                Some(n) => format!(" copied {n} characters "),
+                None => " ↑/↓ move   enter select   drag copy   q quit ".to_string(),
+            };
             let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
-                .block(
-                    widgets::themed_block(format!(" {title} ")).title_bottom(" ↑/↓ move   enter select   q quit "),
-                )
+                .block(widgets::themed_block(format!(" {title} ")).title_bottom(foot))
                 .highlight_style(Style::default().fg(widgets::bg_base()).bg(widgets::tone_color(crate::view::Tone::Info)))
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut state);
+            crate::ui::mouse::paint(f, &msel);
+            if copy_armed {
+                if let Some((a, b)) = msel.region() {
+                    grabbed = Some(crate::ui::mouse::selected_text(f.buffer_mut(), a, b));
+                }
+            }
         })?;
+        if let Some(t) = grabbed {
+            copy_armed = false;
+            msel.clear();
+            if !t.is_empty() {
+                crate::ui::mouse::copy(&t);
+                copied = Some(t.chars().count());
+            }
+        }
         crate::ui_alive();
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                match k.code {
+            match event::read()? {
+                Event::Mouse(m) => {
+                    use crossterm::event::MouseEventKind as MK;
+                    match m.kind {
+                        MK::ScrollUp => {
+                            let i = state.selected().unwrap_or(0);
+                            state.select(Some(i.saturating_sub(3)));
+                        }
+                        MK::ScrollDown => {
+                            let i = state.selected().unwrap_or(0);
+                            state.select(Some((i + 3).min(items.len().saturating_sub(1))));
+                        }
+                        _ => {
+                            if msel.on_mouse(m) {
+                                copy_armed = true; // extracted on the next frame
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Event::Key(k) => {
+                    copied = None; // the note belongs to the moment
+                    match k.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         let i = state.selected().unwrap_or(0);
                         state.select(Some(if i == 0 { items.len() - 1 } else { i - 1 }));
@@ -54,8 +100,10 @@ pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Op
                     }
                     KeyCode::Enter => return Ok(state.selected()),
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                    _ => {}
+                        _ => {}
+                    }
                 }
+                _ => {}
             }
         }
     }

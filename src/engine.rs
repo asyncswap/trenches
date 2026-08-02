@@ -1242,7 +1242,11 @@ fn order_fields(o: &Order) -> Vec<String> {
         format!("{}/basis-evm-{trader}.json", crate::state_dir())
     }
 
-    fn load_basis_map(trader: Address) -> std::collections::BTreeMap<String, Basis> {
+    /// Every recorded cost basis for an account, by token address.
+    ///
+    /// Public so the holdings screen can price what is held against what it
+    /// cost — the same numbers a sell would realize, read without selling.
+    pub fn load_basis_map(trader: Address) -> std::collections::BTreeMap<String, Basis> {
         if trader.is_zero() {
             return Default::default();
         }
