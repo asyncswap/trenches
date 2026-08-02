@@ -3636,7 +3636,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('p') => {
                             let mut labels = vec![
                                 "＋ Add token by contract address".to_string(),
-                                "＋ Add pool (select assets)".to_string(),
+                                "＋ Add pool by address".to_string(),
                                 "＋ Create new v4 pool (select assets)".to_string(),
                             ];
                             // Prune sold-out tokens from the picker: keep pools we still
@@ -3761,16 +3761,75 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                         }
                                     }
                                     1 => {
-                                        // Add an existing pool for a wallet-selected pair.
-                                        match pick_pair(terminal, provider, &assets, bot.trader).await? {
-                                            Pick::Token(token, sym) => fee_tier_select(terminal)?.map(|(fee, spacing)| SelPool {
-                                                    label: pool_label(false, "v4", "ETH", &sym, fee, ""),
-                                                    kind: engine::PoolKind::V4 { pool_id: compute_pool_id(token, fee, spacing), tick_spacing: spacing },
-                                                    token, sym, fee, owned: false,
-                                                    quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
-                                                }),
-                                            Pick::NeedsEth => { bot.status = "select ETH + one token".into(); None }
-                                            Pick::Cancelled => None,
+                                        // Resolve a POOL address, rather than assembling one
+                                        // from a pair and a fee tier.
+                                        //
+                                        // A pool address is what an explorer, a chart site or
+                                        // anyone sharing a coin actually hands you. Picking
+                                        // assets meant knowing the token AND guessing which
+                                        // fee tier its pool used — and guessing wrong builds
+                                        // a pool id for a pool that does not exist.
+                                        //
+                                        // The pool itself knows all of it: both sides and the
+                                        // fee are on the contract.
+                                        match ui::input(terminal, "Add pool by address", "paste the POOL address (0x…, 20 bytes)")? {
+                                            Some(s) => match s.trim().parse::<alloy::primitives::Address>() {
+                                                Ok(addr) => {
+                                                    let pool = contracts::IV3Pool::new(addr, provider);
+                                                    // Bound separately: the call builders are
+                                                    // temporaries, and joining them inline
+                                                    // drops each before its future is polled.
+                                                    let (c0, c1, cf) =
+                                                        (pool.token0(), pool.token1(), pool.fee());
+                                                    let (t0, t1, fee) =
+                                                        tokio::join!(c0.call(), c1.call(), cf.call());
+                                                    match (t0, t1, fee) {
+                                                        (Ok(a), Ok(b), Ok(f)) => {
+                                                            let (t0, t1) = (a._0, b._0);
+                                                            let fee: u32 = f._0.to_string().parse().unwrap_or(10_000);
+                                                            // One side must be WETH — that is
+                                                            // the side the app prices and
+                                                            // trades against.
+                                                            let token = if t0 == contracts::WETH {
+                                                                Some(t1)
+                                                            } else if t1 == contracts::WETH {
+                                                                Some(t0)
+                                                            } else {
+                                                                None
+                                                            };
+                                                            match token {
+                                                                Some(token) => {
+                                                                    let sym = read_symbol(provider, token).await;
+                                                                    bot.status = format!("resolved {sym} from that pool");
+                                                                    Some(SelPool {
+                                                                        label: pool_label(false, "v3", "ETH", &sym, fee, ""),
+                                                                        kind: engine::PoolKind::V3 {
+                                                                            pool_addr: addr,
+                                                                            weth_is_token0: t0 == contracts::WETH,
+                                                                        },
+                                                                        token, sym, fee, owned: false,
+                                                                        quote: engine::Quote::Eth,
+                                                                        quote_sym: "ETH".to_string(),
+                                                                    })
+                                                                }
+                                                                None => {
+                                                                    bot.note("That pool has no ETH side, so this app cannot price it".into());
+                                                                    None
+                                                                }
+                                                            }
+                                                        }
+                                                        // Not a v3 pool, or not a contract at
+                                                        // all. Say which rather than failing
+                                                        // silently into an empty menu.
+                                                        _ => {
+                                                            bot.note(format!("{addr:#x} does not answer as a Uniswap v3 pool"));
+                                                            None
+                                                        }
+                                                    }
+                                                }
+                                                Err(_) => { bot.status = "not a valid address".into(); None }
+                                            },
+                                            None => None,
                                         }
                                     }
                                     2 => {

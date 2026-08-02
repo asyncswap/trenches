@@ -24,7 +24,7 @@
 //! Lives exactly as long as the app: the task stops when `stop` is set, the
 //! socket closes with it, and nothing runs in the background afterwards.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alloy::rpc::types::Log;
@@ -50,16 +50,6 @@ struct Live {
 
 static CURRENT: Mutex<Option<Live>> = Mutex::new(None);
 
-/// Whether the feed is connected, and how many launches it has delivered.
-/// `(false, 0)` when there is no stream at all — unconfigured reads the same
-/// as disconnected here, which is correct: neither is delivering.
-pub fn status() -> (bool, u64) {
-    lock(&CURRENT)
-        .as_ref()
-        .map(|l| (l.stream.is_live(), l.stream.delivered()))
-        .unwrap_or((false, 0))
-}
-
 /// What the discovery loop reads from.
 #[derive(Clone, Default)]
 pub struct LaunchStream {
@@ -67,22 +57,12 @@ pub struct LaunchStream {
     logs: Arc<Mutex<Vec<Log>>>,
     /// Whether a socket is currently up, for the status line.
     live: Arc<AtomicBool>,
-    /// How many launches the stream has delivered this session.
-    seen: Arc<AtomicU64>,
 }
 
 impl LaunchStream {
     /// Take everything delivered since the last call.
     pub fn drain(&self) -> Vec<Log> {
         std::mem::take(&mut *lock(&self.logs))
-    }
-
-    pub fn is_live(&self) -> bool {
-        self.live.load(Ordering::Relaxed)
-    }
-
-    pub fn delivered(&self) -> u64 {
-        self.seen.load(Ordering::Relaxed)
     }
 
     fn push(&self, lg: Log) {
@@ -92,7 +72,6 @@ impl LaunchStream {
         // has stopped — and then the poll is the one still covering us.
         if v.len() < 4_096 {
             v.push(lg);
-            self.seen.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
