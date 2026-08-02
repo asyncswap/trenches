@@ -1028,14 +1028,24 @@ fn pool_label(owned: bool, proto: &str, quote_sym: &str, sym: &str, fee: u32, no
     // USDG-quoted pool was labelled ETH/AAPL — and since the last-used pool is
     // restored BY LABEL, that label then matched a different, ETH-quoted entry
     // on the next start. Every price and reserve came out scaled by 10^12.
+    // The COIN first, because that is what the list is scanned for. It used to
+    // lead with "[public]" — a tag every row carried, so it sorted and read as
+    // noise — then the venue, then the pair, leaving the one distinguishing
+    // word last. `[ours]` survives because it is rare and means something: we
+    // hold liquidity in it.
     format!(
-        "{} [{}] {}/{} {}{}",
-        if owned { "[ours]  " } else { "[public]" },
-        proto,
-        quote_sym,
+        "{:<14} {}{} {}{}",
         sym,
+        if owned { "[ours] " } else { "" },
+        proto,
         fee_label(fee),
-        note,
+        // The quote only when it is NOT the obvious one. An ETH pair is the
+        // default and saying so on every row costs more than it tells.
+        if quote_sym.eq_ignore_ascii_case("ETH") {
+            note.to_string()
+        } else {
+            format!("  ({quote_sym}-quoted){note}")
+        },
     )
 }
 
@@ -1208,7 +1218,18 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                     _ => continue,
                 }
             };
-            let sym = symbol_for(net, &p.currency1);
+            // The token being iterated IS the one whose symbol this is. It
+            // used to ask `symbol_for`, which searches the CONFIG only — so
+            // every cached token fell through to the literal "TOK" and a list
+            // of a hundred different coins rendered as a hundred identical
+            // rows. The cache has the symbols; it was never being read.
+            let sym = if !t.symbol.trim().is_empty() {
+                t.symbol.clone()
+            } else if !t.name.trim().is_empty() {
+                t.name.clone()
+            } else {
+                symbol_for(net, &p.currency1)
+            };
             let note = p.label.find('(').map(|i| format!("  {}", &p.label[i..])).unwrap_or_default();
             let (quote, quote_sym) = quote_from(&p.currency0);
             v.push(SelPool {
@@ -3546,7 +3567,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                             bot.note(format!("Kept {} for this session only because saving failed. {e}", pool_sentence(&p.label)))
                                         }
                                     }
-                                    if !pools.iter().any(|q| q.label == p.label) {
+                                    // Identity, not label. Symbols are not
+                                    // unique — this cache holds five different
+                                    // tokens called AI — so matching on the
+                                    // display string would refuse to add a
+                                    // genuinely new coin because an unrelated
+                                    // one shares its name.
+                                    if !pools.iter().any(|q| q.token == p.token && q.kind == p.kind) {
                                         pools.push(p);
                                     }
                                     bot.routes = routes_for(&pools, bot.pool.token);
