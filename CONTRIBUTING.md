@@ -88,6 +88,18 @@ cargo test  --release --features solana
 
 The release profile is what ships and what you should test against.
 
+## Screens
+
+A title bar names what a panel IS. The status line says what just happened.
+
+Putting state in a title is what produced `price · … · [m] market cap`, which
+became `market cap · … · [m] price` on the next press: two words trading places
+in the part of the screen a reader uses to keep their bearings, saying something
+the axis underneath already said. Position is fine there — `1–20 of 54` is which
+slice you are looking at, not an event. Anything that reads as news belongs in
+the status line, where it appears at the moment it is true and then gets out of
+the way.
+
 ## Principles
 
 [docs/manifesto.md](docs/manifesto.md) states what this bot promises and names
