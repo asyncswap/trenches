@@ -546,18 +546,50 @@ impl Rpc {
         // 261 and 301 bytes on mainnet today, and a hard-coded size silently
         // hides every newer pool. The discriminator is what actually identifies
         // the account type, and it survives layout growth.
-        let res = self
-            .call(
-                "getProgramAccounts",
-                json!([program.to_string(), {
-                    "encoding": "base64",
-                    "filters": [
-                        {"memcmp": {"offset": 0, "bytes": bs58::encode(disc).into_string()}},
-                        {"memcmp": {"offset": offset, "bytes": key.to_string()}}
-                    ]
-                }]),
-            )
-            .await?;
+        // Retried, because this specific call is the one providers ration.
+        //
+        // `getProgramAccounts` scans a whole program's accounts, so it runs
+        // against a separate index that is throttled on its own — a node can be
+        // answering everything else in 500ms and still refuse this with
+        // "account index service overloaded, please try again". That message is
+        // an instruction, and surfacing it as "could not load" ignored it.
+        //
+        // Only for the overload case: a malformed filter or a bad program id
+        // fails the same way every time, and retrying those just spends the
+        // budget three times before saying so.
+        let params = json!([program.to_string(), {
+            "encoding": "base64",
+            "filters": [
+                {"memcmp": {"offset": 0, "bytes": bs58::encode(disc).into_string()}},
+                {"memcmp": {"offset": offset, "bytes": key.to_string()}}
+            ]
+        }]);
+        let mut res = None;
+        let mut last: Option<eyre::Report> = None;
+        for attempt in 0..3u32 {
+            match self.call("getProgramAccounts", params.clone()).await {
+                Ok(v) => {
+                    res = Some(v);
+                    break;
+                }
+                Err(e) => {
+                    let overloaded = {
+                        let m = e.to_string().to_lowercase();
+                        m.contains("overloaded") || m.contains("please try again")
+                    };
+                    last = Some(e);
+                    if !overloaded || attempt == 2 {
+                        break;
+                    }
+                    // Short, growing: the index is busy, not broken.
+                    tokio::time::sleep(std::time::Duration::from_millis(400 << attempt)).await;
+                }
+            }
+        }
+        let res = match res {
+            Some(v) => v,
+            None => return Err(last.unwrap_or_else(|| eyre::eyre!("getProgramAccounts failed"))),
+        };
         let mut out = Vec::new();
         for item in res.as_array().into_iter().flatten() {
             let Some(pk) = item.get("pubkey").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()) else {

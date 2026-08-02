@@ -215,12 +215,20 @@ pub async fn find_pool(rpc: &Rpc, mint: &Pubkey) -> eyre::Result<(Pubkey, Pool, 
     // Look for the coin on BOTH sides. A PumpSwap pool may be created either way
     // round, and searching only the base slot hid ~78% of SOL pools on mainnet —
     // every one of them reported as "not a pump.fun coin".
-    let (as_base, as_quote) = tokio::join!(
-        rpc.program_accounts_memcmp(&PUMP_AMM_PROGRAM, &DISC_POOL, POOL_BASE_MINT_OFFSET, mint),
-        rpc.program_accounts_memcmp(&PUMP_AMM_PROGRAM, &DISC_POOL, POOL_QUOTE_MINT_OFFSET, mint),
-    );
-    let mut accounts = as_base?;
-    accounts.extend(as_quote?);
+    // Base side first, quote side only if it missed.
+    //
+    // These used to run together, which meant two program scans for every
+    // lookup — on the one call providers throttle hardest. Most pools list the
+    // coin as base, so the second scan is usually wasted work, and the cost of
+    // getting it wrong is one extra round-trip rather than a refused request.
+    let mut accounts =
+        rpc.program_accounts_memcmp(&PUMP_AMM_PROGRAM, &DISC_POOL, POOL_BASE_MINT_OFFSET, mint)
+            .await?;
+    if accounts.is_empty() {
+        accounts = rpc
+            .program_accounts_memcmp(&PUMP_AMM_PROGRAM, &DISC_POOL, POOL_QUOTE_MINT_OFFSET, mint)
+            .await?;
+    }
     let total = accounts.len();
     let mut candidates: Vec<(Pubkey, Pool, i128)> = Vec::new();
     for (key, data) in accounts {
