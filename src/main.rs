@@ -8,6 +8,7 @@ mod agent;
 mod verification;
 mod config;
 mod base_currency;
+mod keys;
 mod launch_stream;
 mod net;
 mod contracts;
@@ -1391,6 +1392,12 @@ async fn main() -> eyre::Result<()> {
                     }
                 }
                 println!();
+                return Ok(());
+            }
+            // Regenerate docs/keys.md from keys.json. A test fails when the
+            // page has drifted; this is how it stops drifting.
+            "--dump-keys" => {
+                print!("{}", keys::markdown());
                 return Ok(());
             }
             "--help" | "-h" => {
@@ -5133,45 +5140,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        let items: [(&str, &str); 37] = [
-            ("TRADE", ""),
-            ("", "b|buy"),
-            ("", "s|sell"),
-            ("", "x|sell all"),
-            ("", "h|token holdings"),
-            ("LIQUIDITY", ""),
-            ("", "a|add liquidity"),
-            ("", "r|remove last liquidity"),
-            ("DISCOVER", ""),
-            ("", "f|find market"),
-            ("", "F|verified tokens"),
-            ("", "k|leaderboard"),
-            ("POOL / ARB", ""),
-            ("", "p|select pool"),
-            ("", "Del|deselect the pool"),
-            ("", "d|toggle multi-pool view"),
-            ("", "e|auto arbitrage"),
-            ("VIEW", ""),
-            ("", "t  o  l  c|trades · orders · logs · chart"),
-            ("", "O  → ←|cycle panels"),
-            ("", "↑ ↓|scroll"),
-            ("", "c  v|candlestick chart"),
-            ("", ",  .|candle interval −/+"),
-            ("", "m|chart: price / market cap"),
-            ("", "L|PnL calendar"),
-            ("SIZE", ""),
-            ("", "[  ]|buy size −/+"),
-            ("", ";  '|buy step finer/coarser"),
-            ("", "(  )|sell size −/+"),
-            ("", "{  }  0|slippage −/+"),
-            ("MODE", ""),
-            ("", "T|theme picker"),
-            ("", "$|display currency"),
-            ("", "g|toggle profit guard"),
-            ("", "n|toggle buy dedup"),
-            ("", "q|quit"),
-            ("", "?|help"),
-        ];
+        // From keys.json, the one place shortcuts are listed. See `keys`.
+        let rows = keys::help_rows(keys::Chain::Evm);
+        let items: Vec<(&str, &str)> =
+            rows.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         // Shared with the Solana dashboard — one renderer, one look.
         ui::widgets::help(f, &items, " Shortcuts  (any key to close) ");
     }

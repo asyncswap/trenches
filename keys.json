@@ -1,0 +1,68 @@
+{
+  "$comment": [
+    "THE keyboard shortcuts. One file, read by everything that shows them.",
+    "",
+    "There were three copies before this: an array in src/main.rs, another in",
+    "src/sol/app.rs, and prose in docs/keys.md. They disagreed — `M` existed only",
+    "on Solana, `m` only on EVM, and `s` was 'sell' in one list and 'sell a slice",
+    "of the balance' in the other. Nobody was careless; three lists cannot be kept",
+    "in step by remembering to.",
+    "",
+    "FIELDS",
+    "  key      what you press, exactly as it should be shown",
+    "  desc     what it does, in as few words as say it",
+    "  section  the group it belongs to, in the order sections first appear here",
+    "  chains   which dashboards have it: evm, sol, or both",
+    "",
+    "A key on both chains is written ONCE. If it does different things on each,",
+    "that is two entries and a sign the key is wrong.",
+    "",
+    "Adding a key here is what puts it in the in-app help, docs/keys.md and the",
+    "website. A test fails if the docs fall behind."
+  ],
+  "keys": [
+    { "key": "b", "desc": "buy", "section": "TRADE", "chains": ["evm", "sol"] },
+    { "key": "s", "desc": "sell", "section": "TRADE", "chains": ["evm", "sol"] },
+    { "key": "x", "desc": "sell all", "section": "TRADE", "chains": ["evm", "sol"] },
+    { "key": "h", "desc": "token holdings", "section": "TRADE", "chains": ["evm"] },
+    { "key": "M", "desc": "move funds to an address", "section": "TRADE", "chains": ["sol"] },
+
+    { "key": "a", "desc": "add liquidity", "section": "LIQUIDITY", "chains": ["evm"] },
+    { "key": "r", "desc": "remove last liquidity", "section": "LIQUIDITY", "chains": ["evm"] },
+
+    { "key": "f", "desc": "find market", "section": "DISCOVER", "chains": ["evm", "sol"] },
+    { "key": "F", "desc": "verified tokens", "section": "DISCOVER", "chains": ["evm"] },
+    { "key": "k", "desc": "leaderboard", "section": "DISCOVER", "chains": ["evm"] },
+
+    { "key": "p", "desc": "select pool", "section": "POOL", "chains": ["evm"] },
+    { "key": "p", "desc": "add token by address", "section": "POOL", "chains": ["sol"] },
+    { "key": "Del", "desc": "deselect the pool", "section": "POOL", "chains": ["evm"] },
+    { "key": "d", "desc": "multi-pool view", "section": "POOL", "chains": ["evm"] },
+    { "key": "e", "desc": "auto arbitrage", "section": "POOL", "chains": ["evm"] },
+
+    { "key": "t  o  l  c", "desc": "trades · orders · logs · chart", "section": "VIEW", "chains": ["evm", "sol"] },
+    { "key": "O  → ←", "desc": "cycle panels", "section": "VIEW", "chains": ["evm", "sol"] },
+    { "key": "↑ ↓", "desc": "scroll", "section": "VIEW", "chains": ["evm", "sol"] },
+    { "key": ",  .", "desc": "candle interval −/+", "section": "VIEW", "chains": ["evm", "sol"] },
+    { "key": "m", "desc": "chart: price / market cap", "section": "VIEW", "chains": ["evm", "sol"] },
+    { "key": "L", "desc": "PnL calendar", "section": "VIEW", "chains": ["evm"] },
+
+    { "key": "[  ]", "desc": "buy size −/+", "section": "SIZE", "chains": ["evm", "sol"] },
+    { "key": ";  '", "desc": "buy step finer/coarser", "section": "SIZE", "chains": ["evm"] },
+    { "key": "(  )", "desc": "sell size −/+", "section": "SIZE", "chains": ["evm"] },
+    { "key": "(  )", "desc": "slippage −/+", "section": "SIZE", "chains": ["sol"] },
+    { "key": "{  }  0", "desc": "slippage −/+", "section": "SIZE", "chains": ["evm"] },
+    { "key": "{  }", "desc": "priority fee −/+", "section": "SIZE", "chains": ["sol"] },
+    { "key": "P", "desc": "auto priority on/off", "section": "SIZE", "chains": ["sol"] },
+
+    { "key": "T", "desc": "theme picker", "section": "MODE", "chains": ["evm", "sol"] },
+    { "key": "$", "desc": "display currency", "section": "MODE", "chains": ["evm"] },
+    { "key": "g", "desc": "profit guard on/off", "section": "MODE", "chains": ["evm"] },
+    { "key": "n", "desc": "buy dedup on/off", "section": "MODE", "chains": ["evm"] },
+    { "key": "C", "desc": "change chain", "section": "MODE", "chains": ["evm", "sol"] },
+    { "key": "W", "desc": "change wallet", "section": "MODE", "chains": ["evm", "sol"] },
+    { "key": "D", "desc": "docs", "section": "MODE", "chains": ["evm", "sol"] },
+    { "key": "q", "desc": "quit (Q skips the prompt)", "section": "MODE", "chains": ["evm", "sol"] },
+    { "key": "?", "desc": "help", "section": "MODE", "chains": ["evm", "sol"] }
+  ]
+}

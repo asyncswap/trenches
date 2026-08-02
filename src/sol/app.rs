@@ -1963,32 +1963,11 @@ fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
     p
 }
 
-const HELP: [(&str, &str); 24] = [
-    ("TRADE", ""),
-    ("", "b|buy"),
-    ("", "s|sell a slice of the balance"),
-    ("", "x|sell the whole balance"),
-    ("DISCOVER", ""),
-    ("", "f|find market (live launches)"),
-    ("", "p|add token by contract address"),
-    ("VIEW", ""),
-    ("", "t  o  l  c|trades · orders · logs · chart"),
-    ("", "O  → ←|cycle panels"),
-    ("", "↑ ↓|scroll"),
-    ("SIZE", ""),
-    ("", "[  ]|buy size −/+"),
-    ("", "(  )|slippage −/+"),
-    ("", "{  }|priority fee −/+"),
-    ("", "P|auto priority on/off"),
-    ("MODE", ""),
-    ("", "M|move SOL or a token to an address"),
-    ("", "T|theme picker"),
-    ("", "C|change chain"),
-    ("", "W|change wallet"),
-    ("", "D|docs"),
-    ("", "q|quit (Q skips the prompt)"),
-    ("", "?|help"),
-];
+/// The Solana dashboard's shortcuts, from keys.json — see `crate::keys`. The
+/// hand-written list that used to live here had drifted from the EVM one.
+fn help_rows() -> Vec<(String, String)> {
+    crate::keys::help_rows(crate::keys::Chain::Sol)
+}
 
 /// Draws the dashboard and returns where the header logo goes, so the caller
 /// can place a real terminal image there after the frame.
@@ -2226,7 +2205,10 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
     f.render_widget(footer, c[4]);
 
     if show_help {
-        ui::widgets::help(f, &HELP, " Shortcuts  (any key to close) ");
+        let rows = help_rows();
+        let items: Vec<(&str, &str)> =
+            rows.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        ui::widgets::help(f, &items, " Shortcuts  (any key to close) ");
     }
     Some(logo_box)
 }
