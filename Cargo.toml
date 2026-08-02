@@ -16,6 +16,20 @@ testnet = []
 # market context. EXPERIMENTAL — off in default and release builds while it
 # bakes; build with `--features agent` to play.
 agent = []
+# Providing liquidity: the `a` and `r` keys, and the position-closing half of
+# the sweep. OFF for the first release.
+#
+# Not because it does not work — because it is a different kind of risk from
+# buying and selling a token, and the first release is being scoped to what an
+# audit can cover properly. Minting a concentrated position commits funds to a
+# range and can be exited at a worse price than it entered; that deserves its
+# own review rather than riding in on the back of a swap audit.
+#
+# It comes back after 1.0, with launching, as one bundle. Until then this
+# feature keeps the code compiled and testable while keeping it out of the
+# binary people actually trade with — a reviewer should not have to work out
+# whether a path is reachable.
+liquidity = []
 # Solana/pump.fun support is OFF by default: the solana crate tree is heavy and
 # would slow the EVM-only `cargo build --release` cycle. Build with
 # `cargo build --release --features solana` when working on that side.

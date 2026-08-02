@@ -5,7 +5,7 @@ The screens, and the two numbers that decide whether a trade is a good idea.
 What each venue actually lets you do, since it is not the same everywhere:
 
 - **Uniswap V3** — trade only
-- **Uniswap V4** — trade, and add or remove liquidity
+- **Uniswap V4** — trade
 - **pons.family** — launch discovery, and graduations into Uniswap
 - **Flaunch** — launch discovery, and trading via Uniswap V4 (fees charged by
   the Flaunch hook)
@@ -47,7 +47,6 @@ Trading:
 b     buy
 s     sell the configured slice
 x     sell everything — the coin on screen
-S     sweep: close all liquidity, sell every token (EVM)
 M     move funds out to another address
 u     swap USDC and SOL (Solana)
 ```

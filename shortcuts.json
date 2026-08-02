@@ -62,14 +62,6 @@
       ]
     },
     {
-      "key": "S",
-      "desc": "sweep — close all liquidity, sell every token",
-      "section": "TRADE",
-      "chains": [
-        "evm"
-      ]
-    },
-    {
       "key": "h",
       "desc": "holdings",
       "section": "TRADE",
@@ -92,22 +84,6 @@
       "section": "TRADE",
       "chains": [
         "sol"
-      ]
-    },
-    {
-      "key": "a",
-      "desc": "add liquidity",
-      "section": "LIQUIDITY",
-      "chains": [
-        "evm"
-      ]
-    },
-    {
-      "key": "r",
-      "desc": "remove liquidity",
-      "section": "LIQUIDITY",
-      "chains": [
-        "evm"
       ]
     },
     {

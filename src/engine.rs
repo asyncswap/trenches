@@ -437,6 +437,7 @@ pub struct Bot {
     /// pair. Solana exposed this from the start; the EVM side did not.
     pub slippage_pct: f64,
     pub max_price_move: f64,  // per-swap price-impact cap              ({ })
+    #[cfg(feature = "liquidity")]
     pub lp_frac: f64,         // LP add size as fraction of ETH balance (fixed)
     pub nonce: Option<u64>,   // locally-tracked nonce (fast, race-free sends)
     pub profit_guard: bool,   // gate trades on positive EV (toggle with 'g')
@@ -2581,6 +2582,7 @@ fn order_fields(o: &Order) -> Vec<String> {
 
     /// Open a v4 liquidity position sized to `eth_wei` at the current range.
     /// v4-only: the bot doesn't manage v3 (NonfungiblePositionManager) positions.
+    #[cfg(feature = "liquidity")]
     pub async fn add_liquidity<P: Provider>(&mut self, provider: &P, eth_wei: u128) -> eyre::Result<()> {
         let spacing = match self.pool.kind {
             PoolKind::V4 { tick_spacing, .. } => tick_spacing,
@@ -2768,6 +2770,7 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// Scan for position NFTs owned by the trader (up to `limit`). Bounded so a
     /// sparse ID space can't freeze the UI; balanceOf short-circuits the empty
     /// case (no scan when nothing is held).
+    #[cfg(feature = "liquidity")]
     async fn find_positions<P: Provider>(&self, provider: &P, limit: usize) -> Vec<U256> {
         let posm = IPositionManager::new(POSITION_MANAGER, provider);
         let held = posm.balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
@@ -2799,6 +2802,7 @@ fn order_fields(o: &Order) -> Vec<String> {
     }
 
     /// Burn one position by tokenId, returning both tokens.
+    #[cfg(feature = "liquidity")]
     async fn burn_position<P: Provider>(&mut self, provider: &P, token_id: U256, label: String) -> eyre::Result<()> {
         let burn_id = Some(token_id);
         // Optimistically drop it from the owned cache so rapid removes step to
@@ -2874,6 +2878,7 @@ fn order_fields(o: &Order) -> Vec<String> {
 
     /// Position IDs that already have an in-flight burn (parsed from pending
     /// labels "…#<id>") — so we don't double-burn one while its burn is pending.
+    #[cfg(feature = "liquidity")]
     fn pending_burn_ids(&self) -> std::collections::HashSet<U256> {
         self.pending
             .iter()
@@ -2884,6 +2889,7 @@ fn order_fields(o: &Order) -> Vec<String> {
 
     /// Ensure the owned-position cache is populated (scan the chain only when
     /// it is empty — e.g. first use or after everything has been closed).
+    #[cfg(feature = "liquidity")]
     async fn ensure_positions<P: Provider>(&mut self, provider: &P) {
         if self.positions.is_empty() {
             self.positions = self.find_positions(provider, 50).await;
@@ -2892,6 +2898,7 @@ fn order_fields(o: &Order) -> Vec<String> {
 
     /// Remove ONE position ('r' key) — the most recent one, to iterate. Uses
     /// the local cache so rapid presses don't rescan or double-burn.
+    #[cfg(feature = "liquidity")]
     pub async fn remove_liquidity<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
         if self.pool.kind.is_v3() {
             self.note("Liquidity actions need a Uniswap V4 pool. This one is trade only".into());
@@ -2911,6 +2918,15 @@ fn order_fields(o: &Order) -> Vec<String> {
     }
 
     /// Close ALL positions ('x' key) — burn every one the trader owns.
+    /// Close every liquidity position at once.
+    ///
+    /// Nothing calls this today. It was reached by a wallet-wide sweep key that
+    /// has been removed: a screen showing one pool and one position should not
+    /// have a key that acts on everything else you hold. It is kept for the
+    /// liquidity bundle in V2, where closing positions is an action on a
+    /// positions screen rather than a surprise from a trading one.
+    #[allow(dead_code)]
+    #[cfg(feature = "liquidity")]
     pub async fn close_all<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
         // v4 with LP positions → burn them all. Otherwise (v3, or a v4 pool
         // where we hold no LP) → sell the entire token balance for ETH.
@@ -3736,6 +3752,7 @@ fn eth_of_label(label: &str) -> Option<f64> {
 /// and the range comes out garbage, which would make every burn either revert
 /// or accept any price. The tests below check this against positions read from
 /// the live PositionManager.
+#[cfg(any(feature = "liquidity", test))]
 pub fn position_ticks(info: U256) -> (i32, i32) {
     let field = |shift: u32| -> i32 {
         let raw = ((info >> shift) & U256::from(0xFF_FFFFu32)).to::<u32>();
@@ -3754,6 +3771,7 @@ pub fn position_ticks(info: U256) -> (i32, i32) {
 ///
 /// Standard concentrated-liquidity math, the inverse of what `add_liquidity`
 /// does to size a mint. Out of range the position is entirely one asset.
+#[cfg(any(feature = "liquidity", test))]
 pub fn burn_amounts(liquidity: f64, sqrt_p: f64, tick_lower: i32, tick_upper: i32) -> (f64, f64) {
     if liquidity <= 0.0 || sqrt_p <= 0.0 || tick_lower >= tick_upper {
         return (0.0, 0.0);

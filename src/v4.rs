@@ -163,6 +163,7 @@ pub fn hop_calldata(
 }
 
 /// Build PositionManager.modifyLiquidities() calldata to open a position.
+#[cfg(feature = "liquidity")]
 #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
 pub fn add_liquidity_calldata(
     token: Address,
@@ -217,6 +218,7 @@ pub fn add_liquidity_calldata(
 }
 
 /// Build calldata to close (burn) a position, returning both tokens.
+#[cfg(feature = "liquidity")]
 pub fn close_liquidity_calldata(
     token_id: U256,
     token: Address,

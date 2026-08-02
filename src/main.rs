@@ -1128,65 +1128,6 @@ fn to_poolcfg(p: &SelPool) -> engine::PoolCfg {
 /// Assuming 18 breaks any token that isn't (USDG is 6): reserves, balance and
 /// supply all come out 10^(18-d) too small, which shows up as price 0.000000 and
 /// a nonsense market cap. Called on every pool switch.
-/// The sweep: close every liquidity position, then sell every token held.
-///
-/// This is `S`. It used to be two keys that each did half — `x` closed
-/// positions and `S` sold holdings — so getting out completely meant pressing
-/// both and knowing that you had to. Whoever pressed only the one they
-/// remembered was left holding the other half.
-///
-/// `x` is now the ordinary exit, the coin on screen, the same on both chains.
-/// `S` is this: everything, everywhere. Shifted, because it is the bigger act.
-///
-/// Order matters. Positions come out first because liquidity still in a pool is
-/// not a balance yet — selling first would sweep whatever happened to be loose
-/// and quietly leave the rest behind.
-///
-/// The active pool is restored at the end: this is a sweep, not a navigation,
-/// and coming back to a different screen than you left is its own kind of wrong.
-async fn sweep<P: Provider>(
-    bot: &mut engine::Bot,
-    provider: &P,
-    pools: &[SelPool],
-) -> u32 {
-    bot.status = "closing ALL LP…".into();
-    let _ = bot.close_all(provider).await;
-
-    bot.status = "selling ALL holdings…".into();
-    let saved = bot.pool.clone();
-    let saved_routes = std::mem::take(&mut bot.routes);
-    let saved_covered = bot.v3_covered;
-    let saved_ur = bot.ur_permit2_done;
-    let mut swept = 0u32;
-    let mut seen: std::collections::HashSet<alloy::primitives::Address> = Default::default();
-    for p in pools {
-        if !p.kind.is_v3() || !seen.insert(p.token) {
-            continue;
-        }
-        let bal = contracts::IERC20::new(p.token, provider)
-            .balanceOf(bot.trader)
-            .call()
-            .await
-            .map(|b| b._0)
-            .unwrap_or_default();
-        if bal.is_zero() {
-            continue;
-        }
-        bot.pool = to_poolcfg(p);
-        trace_pool("switch", &bot.pool);
-        bot.routes = routes_for(pools, p.token);
-        bot.v3_covered = false;
-        bot.ur_permit2_done = false;
-        let _ = bot.sell_all(provider).await;
-        swept += 1;
-    }
-    bot.pool = saved;
-    bot.routes = saved_routes;
-    bot.v3_covered = saved_covered;
-    bot.ur_permit2_done = saved_ur;
-    swept
-}
-
 async fn refresh_token_decimals<P: Provider>(provider: &P, bot: &mut engine::Bot) {
     if bot.pool.token == alloy::primitives::Address::ZERO {
         return;
@@ -2345,6 +2286,7 @@ async fn app(
         sell_frac: 1.00,      // sell 100% of token balance by default (10% steps)
         slippage_pct: 3.0,    // matches the previous hardcoded floor
         max_price_move: 0.0,  // impact cap OFF by default — full-size swaps / instant exits ('}' to cap, '{' lower)
+        #[cfg(feature = "liquidity")]
         lp_frac: 0.05,        // add 5% of ETH balance as LP
         nonce: None,
         token_supply: 0.0,
@@ -3543,21 +3485,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // unsafe.
                         KeyCode::Char('b') => { bot.status = "buying…".into(); let _ = bot.place(provider, Side::Buy).await; }
                         KeyCode::Char('s') => { bot.status = "selling…".into(); let _ = bot.place(provider, Side::Sell).await; }
+                        #[cfg(feature = "liquidity")]
                         KeyCode::Char('a') => { bot.status = "adding LP…".into(); let wei = (bot.eth * bot.lp_frac * 1e18).max(0.0) as u128; let _ = bot.add_liquidity(provider, wei).await; }
+                        #[cfg(feature = "liquidity")]
                         KeyCode::Char('r') => { bot.status = "removing one LP…".into(); let _ = bot.remove_liquidity(provider).await; }
                         // Sell the whole balance of the coin you are on — the
                         // same act as `x` on Solana, so one key means one thing
                         // on both dashboards.
                         KeyCode::Char('x') => { bot.status = "selling it all…".into(); let _ = bot.sell_all(provider).await; }
-                        // Sweep: out of everything, everywhere. Positions closed
-                        // and every token sold, not just the one on screen.
-                        // Shifted because it is the bigger act.
-                        KeyCode::Char('S') => {
-                            let swept = sweep(bot, provider, &pools).await;
-                            refresh_token_decimals(provider, bot).await;
-                            *pool_cell.lock().unwrap() = bot.pool.as_ref();
-                            bot.status = format!("swept: {swept} holding(s) sold");
-                        }
                         // The PnL calendar. Reads the fill ledger and nothing
                         // else — no RPC, no wallet — so opening it cannot cost
                         // a trade and it works with the network down.

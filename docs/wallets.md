@@ -122,8 +122,8 @@ which is what makes them safe to copy somewhere.
 
 - It never sends your key anywhere. Signing happens on your machine.
 - It never trades on its own. Nothing signs without a keypress: `b` `s` `x`
-  to trade, `S` to sweep the wallet, `a` `r` for liquidity, `e` to arb, `M` to
-  send, `u` to swap. No timer and no background loop signs anything.
+  to trade, `e` to arb, `M` to send, `u` to swap. No timer and no background
+  loop signs anything, and no key touches a coin other than the one on screen.
 - Copy modes only pre-fill a size. They do not trade.
 - It never writes a password or a key to a log. Session logs record addresses and
   amounts; skim one before attaching it to a bug report anyway.

@@ -24,9 +24,11 @@ x     sell the lot — the coin you are on
 ```
 
 Those three are the ones you will reach for. They are not the only keys that
-sign: `S` sweeps the wallet — every position closed, every token sold — while
-`a` and `r` move liquidity, `e` runs an arb, `M` sends funds out, and `u` swaps
-USDC for SOL. Every one of them asks first or acts on a size you set.
+sign: `e` runs an arb, `M` sends funds out, and `u` swaps USDC for SOL. Every
+one of them asks first or acts on a size you set.
+
+No key trades a coin other than the one on screen. Selling something else means
+going to it first — `h` lists what you hold.
 
 What none of them do is act on their own. No timer, no strategy, no background
 loop opens a position while you are away from the keyboard. The bot is in

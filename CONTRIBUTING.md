@@ -88,6 +88,12 @@ cargo test  --release --features solana
 
 The release profile is what ships and what you should test against.
 
+## Principles
+
+[PRINCIPLES.md](PRINCIPLES.md) states the rules this codebase holds itself to
+and where each is enforced. Read it before adding a key that acts on anything,
+and add to it when you find a rule we have been following without saying so.
+
 ## Hooks
 
 Once per clone:
