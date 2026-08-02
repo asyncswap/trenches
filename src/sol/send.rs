@@ -15,7 +15,7 @@
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
-use super::{ata, SYSTEM_PROGRAM, TOKEN_PROGRAM};
+use super::{ata, SYSTEM_PROGRAM};
 
 /// What a send would do, resolved and checked, before anything is signed.
 pub struct Plan {
@@ -172,6 +172,7 @@ pub fn max_sol_lamports(balance: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::TOKEN_PROGRAM;
     use super::*;
 
     fn key(b: u8) -> Pubkey {

@@ -3322,11 +3322,30 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             prices.clear();
                             bot.status = "pool deselected — press [f] to find pools".into();
                         }
-                        KeyCode::Char('b') => { bot.status = "buying…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Buy)).await; }
-                        KeyCode::Char('s') => { bot.status = "selling…".into(); let _ = tokio::time::timeout(Duration::from_secs(5), bot.place(provider, Side::Sell)).await; }
-                        KeyCode::Char('a') => { bot.status = "adding LP…".into(); let wei = (bot.eth * bot.lp_frac * 1e18).max(0.0) as u128; let _ = tokio::time::timeout(Duration::from_secs(8), bot.add_liquidity(provider, wei)).await; }
-                        KeyCode::Char('r') => { bot.status = "removing one LP…".into(); let _ = tokio::time::timeout(Duration::from_secs(8), bot.remove_liquidity(provider)).await; }
-                        KeyCode::Char('x') => { bot.status = "closing ALL LP…".into(); let _ = tokio::time::timeout(Duration::from_secs(12), bot.close_all(provider)).await; }
+                        // NO timeout around anything that SENDS.
+                        //
+                        // `tokio::time::timeout` cancels by dropping the
+                        // future, and a dropped send is not an unsent one: the
+                        // request may already be at the node. The transaction
+                        // lands, the nonce is spent, and the code that would
+                        // have recorded it — the order row, the pending entry
+                        // that `reap` settles from — never runs. A trade you
+                        // made, with no row saying you made it, and a second
+                        // press because nothing on screen said the first
+                        // worked.
+                        //
+                        // The bound belongs one layer down, where it already
+                        // is: src/rpc.rs gives every request a 10s ceiling and
+                        // says in as many words that it sits above whatever
+                        // the caller wraps. The wrapper here was SHORTER than
+                        // that, so it could never fire except while a send was
+                        // genuinely in flight — the one moment cancelling is
+                        // unsafe.
+                        KeyCode::Char('b') => { bot.status = "buying…".into(); let _ = bot.place(provider, Side::Buy).await; }
+                        KeyCode::Char('s') => { bot.status = "selling…".into(); let _ = bot.place(provider, Side::Sell).await; }
+                        KeyCode::Char('a') => { bot.status = "adding LP…".into(); let wei = (bot.eth * bot.lp_frac * 1e18).max(0.0) as u128; let _ = bot.add_liquidity(provider, wei).await; }
+                        KeyCode::Char('r') => { bot.status = "removing one LP…".into(); let _ = bot.remove_liquidity(provider).await; }
+                        KeyCode::Char('x') => { bot.status = "closing ALL LP…".into(); let _ = bot.close_all(provider).await; }
                         // The PnL calendar. Reads the fill ledger and nothing
                         // else — no RPC, no wallet — so opening it cannot cost
                         // a trade and it works with the network down.
@@ -3354,7 +3373,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.routes = routes_for(&pools, p.token);
                                 bot.v3_covered = false;
                                 bot.ur_permit2_done = false;
-                                let _ = tokio::time::timeout(Duration::from_secs(10), bot.sell_all(provider)).await;
+                                let _ = bot.sell_all(provider).await;
                                 swept += 1;
                             }
                             bot.pool = saved;
@@ -3549,7 +3568,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // Execute the two-leg arb: buy cheap pool, sell dear pool.
                         KeyCode::Char('e') => {
                             bot.status = "arb: executing…".into();
-                            let _ = tokio::time::timeout(Duration::from_secs(14), bot.arb(provider)).await;
+                            // Two legs, both sends — and the second is the one
+                            // that gets you OUT of the coin the first bought.
+                            // Cancelling between them leaves a position nobody
+                            // asked to hold.
+                            let _ = bot.arb(provider).await;
                         }
                         KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('k') => {
                             // 'f' = live Pons v3 trenches; Shift-'F' = static Verified pools;
@@ -3841,7 +3864,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                         .and_then(|s| s.parse::<f64>().ok())
                                                         .unwrap_or(1.0);
                                                     let sp96 = price_to_sqrtx96(price);
-                                                    let _ = tokio::time::timeout(Duration::from_secs(10), bot.initialize_pool(provider, token, fee, spacing, sp96)).await;
+                                                    let _ = bot.initialize_pool(provider, token, fee, spacing, sp96).await;
                                                     Some(SelPool {
                                                         label: pool_label(true, "v4", "ETH", &sym, fee, ""),
                                                         kind: engine::PoolKind::V4 { pool_id: compute_pool_id(token, fee, spacing), tick_spacing: spacing },
