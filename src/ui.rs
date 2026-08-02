@@ -361,6 +361,9 @@ pub fn doc_pages() -> &'static [(&'static str, &'static str)] {
         vec![
             ("Welcome", include_str!("../docs/welcome.md")),
             ("Overview", include_str!("../docs/overview.md")),
+            // Early, and before the how-to pages. What a tool refuses to do is
+            // worth knowing before learning to drive it.
+            ("Manifesto", include_str!("../docs/manifesto.md")),
             // Setup first, then the shortcuts. The bindings only mean something
             // once you have an account and an endpoint to use them against.
             ("Accounts", include_str!("../docs/wallets.md")),

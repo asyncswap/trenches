@@ -25,6 +25,7 @@ Use `tab` to move between these documents, `↑` `↓` to scroll, `esc` to go ba
 
 - **Overview** — the screens, and the two numbers that decide whether a trade is
   a good idea.
+- **Manifesto** — what the bot promises, and the code that keeps each promise.
 - **Accounts** — how to make one, and what the bot will never do with it.
 - **Config** — where settings live, and how to set an API key.
 - **Shortcuts** — every binding, generated from the same file the app reads,

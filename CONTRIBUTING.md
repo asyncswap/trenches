@@ -90,9 +90,13 @@ The release profile is what ships and what you should test against.
 
 ## Principles
 
-[PRINCIPLES.md](PRINCIPLES.md) states the rules this codebase holds itself to
-and where each is enforced. Read it before adding a key that acts on anything,
-and add to it when you find a rule we have been following without saying so.
+[docs/manifesto.md](docs/manifesto.md) states what this bot promises and names
+the code that keeps each promise. It ships in the app, so it is read by users
+and reviewers alike. Read it before adding a key that acts on anything, and add
+to it when you find a rule we have been following without saying so.
+
+Two of them are easy to break by accident: nothing may act on a token other than
+the one on screen, and no approval may be unbounded.
 
 ## Hooks
 

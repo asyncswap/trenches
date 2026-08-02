@@ -1100,11 +1100,28 @@ impl Bot {
         let mut last = None;
         if !erc_ok {
             let nonce = self.take_nonce(provider).await?;
+            // The one approval in this codebase that is unbounded, and the
+            // only one allowed to be. See "No unlimited approvals" in
+            // docs/manifesto.md — this is the documented exception.
+            //
+            // PERMIT2 cannot move anything on its own. It moves tokens only
+            // where it holds a grant that names the spender, the amount and an
+            // expiry, and the grant below is exact and lasts an hour. That is
+            // where the bound lives.
+            //
+            // Bounding this leg too would cost an ERC-20 approval before every
+            // single trade, because an exact grant is consumed by the trade
+            // that uses it. An exit would be three transactions instead of two.
+            // In a market where the difference between getting out and not is
+            // measured in seconds, that is not a safety improvement — it trades
+            // a narrow risk for a broader one.
             let sent = erc.approve(PERMIT2, U256::MAX).gas(120_000).nonce(nonce).send().await;
             last = Some(*self.spent_nonce(sent)?.tx_hash());
         }
         if !p2_ok {
-            let expiration48 = U48::from(v4::FAR_DEADLINE);
+            // An hour, not the year 2100. A grant that outlives the session
+            // that needed it is a standing permission nobody remembers giving.
+            let expiration48 = now48.saturating_add(U48::from(3600u64));
             let nonce = self.take_nonce(provider).await?;
             let sent = p2
                 .approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
@@ -2667,9 +2684,11 @@ fn order_fields(o: &Order) -> Vec<String> {
             // EXACT amount, and an hour to use it — not U160::MAX until 2100.
             // An unlimited, effectively permanent grant to a contract that can
             // move the token is exactly what `ensure_ur_allowance` refuses to
-            // hand the router; the LP path had no reason to be different. The
-            // ERC-20 leg to PERMIT2 stays MAX because that IS the Permit2
-            // pattern — Permit2 is what bounds the spender, and it now does.
+            // hand the router; the LP path had no reason to be different.
+            //
+            // The ERC-20 leg to PERMIT2 stays MAX — the documented exception
+            // in docs/manifesto.md. Permit2 moves nothing without a grant, and
+            // the grant is right here: exact, and an hour long.
             let amount160 = need160;
             let expiration48 = U48::from(now_secs.saturating_add(3600));
             self.note("approving token for Permit2…".into());
