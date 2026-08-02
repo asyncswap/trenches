@@ -793,6 +793,23 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
     };
     bot.status = "sending…".into();
     let sig = super::tx::send(rpc, &bot.signer, ixs, 60_000, bot.cu_price_micro).await?;
+    // On the orders list like anything else that left this wallet.
+    //
+    // A transfer is not a trade, but it IS money leaving on a keypress, and the
+    // orders list is the record of exactly that. Leaving it out would mean the
+    // one irreversible action in the app was the one action with no row.
+    //
+    // SOL amounts go in the SOL column and token amounts in the token column,
+    // so a move reads in the same units as every row around it rather than
+    // putting a token count where a SOL figure belongs.
+    let (sol_moved, tokens_moved) = match plan.mint {
+        None => (plan.ui_amount(), 0.0),
+        Some(_) => (0.0, plan.ui_amount()),
+    };
+    // Pending, not confirmed: `send` submits, it does not confirm. The
+    // settlement poll turns it into one or the other from the chain, the same
+    // way every other order gets its answer.
+    bot.push_order("SENT", sol_moved, tokens_moved, OrderState::Pending, Some(sig.clone()));
     crate::events::action(
         "Sent",
         &[("what", plan.sentence()), ("sig", sig.clone())],
@@ -1447,6 +1464,16 @@ impl SolBot {
             if let Some(o) = self.orders.get_mut(i) {
                 o.state = if ok { OrderState::Confirmed } else { OrderState::Failed };
             }
+            // A transfer is not a trade. It settles like one — the signature
+            // either landed or it did not — but it buys and sells nothing, so
+            // everything below this line would be wrong for it: it would move
+            // cost basis, count as a trade, and write a fill to the ledger for
+            // a swap that never happened.
+            if action == "SENT" {
+                continue;
+            }
+            {
+            }
             // Your own fill must never depend on the socket having heard it:
             // the signature is RIGHT HERE. Fetch that one transaction and
             // inject its rows into the tape — same decoders, same channel,
@@ -1863,7 +1890,13 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
             OrderState::Confirmed => ("confirmed", Tone::Good),
             OrderState::Failed => ("failed", Tone::Bad),
         };
-        let atone = if o.action == "BUY" { Tone::Good } else { Tone::Bad };
+        let atone = match o.action {
+            "BUY" => Tone::Good,
+            // Money leaving on purpose is not a loss, and colouring it red
+            // beside a column of losses reads as one.
+            "SENT" => Tone::Accent,
+            _ => Tone::Bad,
+        };
         t.push(vec![
             Cell::new(crate::view::age_compact(o.at.elapsed().as_secs_f64())),
             Cell::bold(st, tone),
