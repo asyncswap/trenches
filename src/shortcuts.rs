@@ -6,6 +6,12 @@
 //! file is a build failure rather than an empty help screen someone discovers
 //! in production, and the binary carries no runtime dependency on a path.
 //!
+//! The file's shape is described by `shortcuts.schema.json`, published at
+//! <https://trenches.sh/shortcuts.schema.json> and named from the file itself,
+//! so an editor flags a bad entry while it is being typed rather than at the
+//! next build. The rules the schema cannot state — no key claimed twice on one
+//! chain, docs in step with the source — are the tests below.
+//!
 //! What this replaces: three hand-maintained lists that had drifted apart —
 //! one in the EVM dashboard, one in the Solana dashboard, and prose in the
 //! docs. `M` existed only on Solana, `m` only on EVM, and `s` was described
