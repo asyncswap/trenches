@@ -16,10 +16,21 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct Key {
-    pub key: String,
+    /// Always a list. A genuine pair — `[` and `]` for buy size — shares a
+    /// description and a row while staying two addressable keys, so the
+    /// collision test below can see both.
+    pub keys: Vec<String>,
     pub desc: String,
     pub section: String,
     pub chains: Vec<String>,
+}
+
+impl Key {
+    /// The keys as one label. Two spaces between them, so `[  ]` reads as two
+    /// keys rather than as a single odd one.
+    pub fn shown(&self) -> String {
+        self.keys.join("  ")
+    }
 }
 
 #[derive(Deserialize)]
@@ -68,7 +79,7 @@ pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
             section = &k.section;
             out.push((section.to_string(), String::new()));
         }
-        out.push((String::new(), format!("{}|{}", k.key, k.desc)));
+        out.push((String::new(), format!("{}|{}", k.shown(), k.desc)));
     }
     out
 }
@@ -87,7 +98,7 @@ pub fn markdown() -> String {
             (true, false) => "EVM",
             _ => "SOL",
         };
-        out.push_str(&format!("| `{}` | {} | {} |\n", k.key, k.desc, where_));
+        out.push_str(&format!("| `{}` | {} | {} |\n", k.shown(), k.desc, where_));
     }
     out
 }
@@ -104,9 +115,10 @@ mod tests {
     #[test]
     fn every_key_names_at_least_one_chain() {
         for k in all() {
-            assert!(!k.chains.is_empty(), "`{}` belongs to no dashboard", k.key);
+            assert!(!k.keys.is_empty(), "an entry with no keys: \"{}\"", k.desc);
+            assert!(!k.chains.is_empty(), "`{}` belongs to no dashboard", k.shown());
             for c in &k.chains {
-                assert!(c == "evm" || c == "sol", "`{}` has unknown chain {c}", k.key);
+                assert!(c == "evm" || c == "sol", "`{}` has unknown chain {c}", k.shown());
             }
         }
     }
@@ -117,10 +129,15 @@ mod tests {
     #[test]
     fn no_key_is_claimed_twice_on_the_same_chain() {
         for chain in ["evm", "sol"] {
+            // EVERY key, not every row — a pair shares a row and the two
+            // keys inside it must still be checked separately, which is the
+            // whole reason `keys` is a list.
             let mut seen: std::collections::HashMap<&str, &str> = Default::default();
             for k in all().iter().filter(|k| k.chains.iter().any(|c| c == chain)) {
-                if let Some(prev) = seen.insert(&k.key, &k.desc) {
-                    panic!("on {chain}, `{}` is both \"{prev}\" and \"{}\"", k.key, k.desc);
+                for key in &k.keys {
+                    if let Some(prev) = seen.insert(key, &k.desc) {
+                        panic!("on {chain}, `{key}` is both \"{prev}\" and \"{}\"", k.desc);
+                    }
                 }
             }
         }

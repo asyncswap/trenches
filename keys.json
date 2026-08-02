@@ -8,9 +8,17 @@
     "of the balance' in the other. Nobody was careless; three lists cannot be kept",
     "in step by remembering to.",
     "",
+    "`keys` IS ALWAYS A LIST, even for one key. A pair that is genuinely one",
+    "control — [ and ] for buy size — shares a description and a row, but each key",
+    "is still its own string. The first version of this file wrote those as \"[  ]\",",
+    "which reads fine and is useless as data: you cannot look up what `]` does, and",
+    "the collision test cannot see inside a string, so a future conflict on `]`",
+    "would ship. That grouping also hid a real error, with `0` filed under",
+    "\"slippage\" while the code has it clearing the price impact limit.",
+    "",
     "FIELDS",
-    "  key      what you press, exactly as it should be shown",
-    "  desc     what it does, in as few words as say it",
+    "  keys     what you press — a list, joined for display",
+    "  desc     what they do, in as few words as say it",
     "  section  the group it belongs to, in the order sections first appear here",
     "  chains   which dashboards have it: evm, sol, or both",
     "",
@@ -21,48 +29,486 @@
     "website. A test fails if the docs fall behind."
   ],
   "keys": [
-    { "key": "b", "desc": "buy", "section": "TRADE", "chains": ["evm", "sol"] },
-    { "key": "s", "desc": "sell", "section": "TRADE", "chains": ["evm", "sol"] },
-    { "key": "x", "desc": "sell all", "section": "TRADE", "chains": ["evm", "sol"] },
-    { "key": "h", "desc": "token holdings", "section": "TRADE", "chains": ["evm"] },
-    { "key": "M", "desc": "move funds to an address", "section": "TRADE", "chains": ["sol"] },
-
-    { "key": "a", "desc": "add liquidity", "section": "LIQUIDITY", "chains": ["evm"] },
-    { "key": "r", "desc": "remove last liquidity", "section": "LIQUIDITY", "chains": ["evm"] },
-
-    { "key": "f", "desc": "find market", "section": "DISCOVER", "chains": ["evm", "sol"] },
-    { "key": "F", "desc": "verified tokens", "section": "DISCOVER", "chains": ["evm"] },
-    { "key": "k", "desc": "leaderboard", "section": "DISCOVER", "chains": ["evm"] },
-
-    { "key": "p", "desc": "select pool", "section": "POOL", "chains": ["evm"] },
-    { "key": "p", "desc": "add token by address", "section": "POOL", "chains": ["sol"] },
-    { "key": "Del", "desc": "deselect the pool", "section": "POOL", "chains": ["evm"] },
-    { "key": "d", "desc": "multi-pool view", "section": "POOL", "chains": ["evm"] },
-    { "key": "e", "desc": "auto arbitrage", "section": "POOL", "chains": ["evm"] },
-
-    { "key": "t  o  l  c", "desc": "trades · orders · logs · chart", "section": "VIEW", "chains": ["evm", "sol"] },
-    { "key": "O  → ←", "desc": "cycle panels", "section": "VIEW", "chains": ["evm", "sol"] },
-    { "key": "↑ ↓", "desc": "scroll", "section": "VIEW", "chains": ["evm", "sol"] },
-    { "key": ",  .", "desc": "candle interval −/+", "section": "VIEW", "chains": ["evm", "sol"] },
-    { "key": "m", "desc": "chart: price / market cap", "section": "VIEW", "chains": ["evm", "sol"] },
-    { "key": "L", "desc": "PnL calendar", "section": "VIEW", "chains": ["evm"] },
-
-    { "key": "[  ]", "desc": "buy size −/+", "section": "SIZE", "chains": ["evm", "sol"] },
-    { "key": ";  '", "desc": "buy step finer/coarser", "section": "SIZE", "chains": ["evm"] },
-    { "key": "(  )", "desc": "sell size −/+", "section": "SIZE", "chains": ["evm"] },
-    { "key": "(  )", "desc": "slippage −/+", "section": "SIZE", "chains": ["sol"] },
-    { "key": "{  }  0", "desc": "slippage −/+", "section": "SIZE", "chains": ["evm"] },
-    { "key": "{  }", "desc": "priority fee −/+", "section": "SIZE", "chains": ["sol"] },
-    { "key": "P", "desc": "auto priority on/off", "section": "SIZE", "chains": ["sol"] },
-
-    { "key": "T", "desc": "theme picker", "section": "MODE", "chains": ["evm", "sol"] },
-    { "key": "$", "desc": "display currency", "section": "MODE", "chains": ["evm"] },
-    { "key": "g", "desc": "profit guard on/off", "section": "MODE", "chains": ["evm"] },
-    { "key": "n", "desc": "buy dedup on/off", "section": "MODE", "chains": ["evm"] },
-    { "key": "C", "desc": "change chain", "section": "MODE", "chains": ["evm", "sol"] },
-    { "key": "W", "desc": "change wallet", "section": "MODE", "chains": ["evm", "sol"] },
-    { "key": "D", "desc": "docs", "section": "MODE", "chains": ["evm", "sol"] },
-    { "key": "q", "desc": "quit (Q skips the prompt)", "section": "MODE", "chains": ["evm", "sol"] },
-    { "key": "?", "desc": "help", "section": "MODE", "chains": ["evm", "sol"] }
+    {
+      "keys": [
+        "b"
+      ],
+      "desc": "buy",
+      "section": "TRADE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "s"
+      ],
+      "desc": "sell",
+      "section": "TRADE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "x"
+      ],
+      "desc": "sell all",
+      "section": "TRADE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "h"
+      ],
+      "desc": "token holdings",
+      "section": "TRADE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "M"
+      ],
+      "desc": "move funds to an address",
+      "section": "TRADE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "a"
+      ],
+      "desc": "add liquidity",
+      "section": "LIQUIDITY",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "r"
+      ],
+      "desc": "remove last liquidity",
+      "section": "LIQUIDITY",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "f"
+      ],
+      "desc": "find market",
+      "section": "DISCOVER",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "F"
+      ],
+      "desc": "verified tokens",
+      "section": "DISCOVER",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "k"
+      ],
+      "desc": "leaderboard",
+      "section": "DISCOVER",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "p"
+      ],
+      "desc": "add pool",
+      "section": "POOL",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "p"
+      ],
+      "desc": "add token by address",
+      "section": "POOL",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "Del"
+      ],
+      "desc": "deselect the pool",
+      "section": "POOL",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "d"
+      ],
+      "desc": "multi-pool view",
+      "section": "POOL",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "e"
+      ],
+      "desc": "auto arbitrage",
+      "section": "POOL",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "t"
+      ],
+      "desc": "trades panel",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "o"
+      ],
+      "desc": "orders panel",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "l"
+      ],
+      "desc": "logs panel",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "c",
+        "v"
+      ],
+      "desc": "chart panel",
+      "section": "VIEW",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "c"
+      ],
+      "desc": "chart panel",
+      "section": "VIEW",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "O",
+        "→"
+      ],
+      "desc": "next panel",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "←"
+      ],
+      "desc": "previous panel",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "↑",
+        "↓"
+      ],
+      "desc": "scroll",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        ",",
+        "."
+      ],
+      "desc": "candle interval −/+",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "m"
+      ],
+      "desc": "chart: price / market cap",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "L"
+      ],
+      "desc": "PnL calendar",
+      "section": "VIEW",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "[",
+        "]"
+      ],
+      "desc": "buy size −/+",
+      "section": "SIZE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        ";",
+        "'"
+      ],
+      "desc": "buy step finer/coarser",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "(",
+        ")"
+      ],
+      "desc": "sell size −/+",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "(",
+        ")"
+      ],
+      "desc": "slippage −/+",
+      "section": "SIZE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "{",
+        "}"
+      ],
+      "desc": "slippage −/+",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "{",
+        "}"
+      ],
+      "desc": "priority fee −/+",
+      "section": "SIZE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "<",
+        ">"
+      ],
+      "desc": "price impact limit −/+",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "0"
+      ],
+      "desc": "price impact limit off",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "P"
+      ],
+      "desc": "auto priority on/off",
+      "section": "SIZE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "T"
+      ],
+      "desc": "theme picker",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "$"
+      ],
+      "desc": "display currency",
+      "section": "MODE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "g"
+      ],
+      "desc": "profit guard on/off",
+      "section": "MODE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "n"
+      ],
+      "desc": "buy dedup on/off",
+      "section": "MODE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "keys": [
+        "C"
+      ],
+      "desc": "change chain",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "W"
+      ],
+      "desc": "change wallet",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "D"
+      ],
+      "desc": "docs",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "q"
+      ],
+      "desc": "quit",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "Q"
+      ],
+      "desc": "quit without asking",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "keys": [
+        "?"
+      ],
+      "desc": "help",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    }
   ]
 }

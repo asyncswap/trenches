@@ -32,7 +32,7 @@ dashboard has it.
 
 | key | does | where |
 | --- | --- | --- |
-| `p` | select pool | EVM |
+| `p` | add pool | EVM |
 | `p` | add token by address | SOL |
 | `Del` | deselect the pool | EVM |
 | `d` | multi-pool view | EVM |
@@ -42,9 +42,14 @@ dashboard has it.
 
 | key | does | where |
 | --- | --- | --- |
-| `t  o  l  c` | trades · orders · logs · chart | both |
-| `O  → ←` | cycle panels | both |
-| `↑ ↓` | scroll | both |
+| `t` | trades panel | both |
+| `o` | orders panel | both |
+| `l` | logs panel | both |
+| `c  v` | chart panel | EVM |
+| `c` | chart panel | SOL |
+| `O  →` | next panel | both |
+| `←` | previous panel | both |
+| `↑  ↓` | scroll | both |
 | `,  .` | candle interval −/+ | both |
 | `m` | chart: price / market cap | both |
 | `L` | PnL calendar | EVM |
@@ -57,8 +62,10 @@ dashboard has it.
 | `;  '` | buy step finer/coarser | EVM |
 | `(  )` | sell size −/+ | EVM |
 | `(  )` | slippage −/+ | SOL |
-| `{  }  0` | slippage −/+ | EVM |
+| `{  }` | slippage −/+ | EVM |
 | `{  }` | priority fee −/+ | SOL |
+| `<  >` | price impact limit −/+ | EVM |
+| `0` | price impact limit off | EVM |
 | `P` | auto priority on/off | SOL |
 
 ## MODE
@@ -72,5 +79,6 @@ dashboard has it.
 | `C` | change chain | both |
 | `W` | change wallet | both |
 | `D` | docs | both |
-| `q` | quit (Q skips the prompt) | both |
+| `q` | quit | both |
+| `Q` | quit without asking | both |
 | `?` | help | both |
