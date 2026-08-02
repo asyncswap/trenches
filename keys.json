@@ -8,7 +8,12 @@
     "of the balance' in the other. Nobody was careless; three lists cannot be kept",
     "in step by remembering to.",
     "",
-    "`key` IS A STRING, OR A LIST when a pair works as one control.",
+    "ONE KEY PER ENTRY. `[` and `]` are two rows, not one \"[  ]\" row. The grouped",
+    "form read well and was useless as data: you could not look up what `]` does,",
+    "and the collision check cannot see inside a string, so a future conflict on",
+    "`]` would have shipped. It also hid `0` filed under \"slippage\" when the code",
+    "has it clearing the price impact limit.",
+    "",
     "control — [ and ] for buy size — shares a description and a row, but each key",
     "is still its own string. The first version of this file wrote those as \"[  ]\",",
     "which reads fine and is useless as data: you cannot look up what `]` does, and",
@@ -17,7 +22,7 @@
     "\"slippage\" while the code has it clearing the price impact limit.",
     "",
     "FIELDS",
-    "  key      what you press — a string, or a list for a pair",
+    "  key      what you press, one key per entry",
     "  desc     what they do, in as few words as say it",
     "  section  the group it belongs to, in the order sections first appear here",
     "  chains   which dashboards have it: evm, sol, or both",
@@ -181,10 +186,15 @@
       ]
     },
     {
-      "key": [
-        "c",
-        "v"
-      ],
+      "key": "c",
+      "desc": "chart panel",
+      "section": "VIEW",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": "v",
       "desc": "chart panel",
       "section": "VIEW",
       "chains": [
@@ -200,10 +210,16 @@
       ]
     },
     {
-      "key": [
-        "O",
-        "→"
-      ],
+      "key": "O",
+      "desc": "next panel",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "key": "→",
       "desc": "next panel",
       "section": "VIEW",
       "chains": [
@@ -221,11 +237,8 @@
       ]
     },
     {
-      "key": [
-        "↑",
-        "↓"
-      ],
-      "desc": "scroll",
+      "key": "↑",
+      "desc": "scroll up",
       "section": "VIEW",
       "chains": [
         "evm",
@@ -233,11 +246,26 @@
       ]
     },
     {
-      "key": [
-        ",",
-        "."
-      ],
-      "desc": "candle interval −/+",
+      "key": "↓",
+      "desc": "scroll down",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "key": ",",
+      "desc": "shorter candles",
+      "section": "VIEW",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "key": ".",
+      "desc": "longer candles",
       "section": "VIEW",
       "chains": [
         "evm",
@@ -262,11 +290,8 @@
       ]
     },
     {
-      "key": [
-        "[",
-        "]"
-      ],
-      "desc": "buy size −/+",
+      "key": "[",
+      "desc": "decrease buy size",
       "section": "SIZE",
       "chains": [
         "evm",
@@ -274,66 +299,105 @@
       ]
     },
     {
-      "key": [
-        ";",
-        "'"
-      ],
-      "desc": "buy step finer/coarser",
+      "key": "]",
+      "desc": "increase buy size",
+      "section": "SIZE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "key": ";",
+      "desc": "decrease buy step",
       "section": "SIZE",
       "chains": [
         "evm"
       ]
     },
     {
-      "key": [
-        "(",
-        ")"
-      ],
-      "desc": "sell size −/+",
+      "key": "'",
+      "desc": "increase buy step",
       "section": "SIZE",
       "chains": [
         "evm"
       ]
     },
     {
-      "key": [
-        "(",
-        ")"
-      ],
-      "desc": "slippage −/+",
+      "key": "(",
+      "desc": "decrease sell size",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": ")",
+      "desc": "increase sell size",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": "(",
+      "desc": "decrease slippage",
       "section": "SIZE",
       "chains": [
         "sol"
       ]
     },
     {
-      "key": [
-        "{",
-        "}"
-      ],
-      "desc": "slippage −/+",
-      "section": "SIZE",
-      "chains": [
-        "evm"
-      ]
-    },
-    {
-      "key": [
-        "{",
-        "}"
-      ],
-      "desc": "priority fee −/+",
+      "key": ")",
+      "desc": "increase slippage",
       "section": "SIZE",
       "chains": [
         "sol"
       ]
     },
     {
-      "key": [
-        "<",
-        ">"
-      ],
-      "desc": "price impact limit −/+",
+      "key": "{",
+      "desc": "decrease slippage",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": "}",
+      "desc": "increase slippage",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": "{",
+      "desc": "decrease priority fee",
+      "section": "SIZE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "key": "}",
+      "desc": "increase priority fee",
+      "section": "SIZE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "key": "<",
+      "desc": "tighten price impact limit",
+      "section": "SIZE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": ">",
+      "desc": "loosen price impact limit",
       "section": "SIZE",
       "chains": [
         "evm"

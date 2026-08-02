@@ -14,48 +14,12 @@
 
 use serde::Deserialize;
 
-/// One key, or a pair that works as one control.
-///
-/// Both spellings are accepted because both read well in their own case: a
-/// list of one is noise, and `"[  ]"` as a single string is not data — you
-/// could not look up what `]` does, and the collision test could not see
-/// inside it. `Many` keeps the pair addressable; `One` keeps the common case
-/// quiet.
-#[derive(Deserialize)]
-#[serde(untagged)]
-pub enum Keys {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Keys {
-    fn each(&self) -> &[String] {
-        match self {
-            Keys::One(k) => std::slice::from_ref(k),
-            Keys::Many(v) => v,
-        }
-    }
-}
-
 #[derive(Deserialize)]
 pub struct Key {
-    pub key: Keys,
+    pub key: String,
     pub desc: String,
     pub section: String,
     pub chains: Vec<String>,
-}
-
-impl Key {
-    /// The keys as one label. Two spaces between a pair, so `[  ]` reads as
-    /// two keys rather than as a single odd one.
-    pub fn shown(&self) -> String {
-        self.key.each().join("  ")
-    }
-
-    /// Every key this entry claims, for checks that must see them separately.
-    pub fn each(&self) -> &[String] {
-        self.key.each()
-    }
 }
 
 #[derive(Deserialize)]
@@ -104,7 +68,7 @@ pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
             section = &k.section;
             out.push((section.to_string(), String::new()));
         }
-        out.push((String::new(), format!("{}|{}", k.shown(), k.desc)));
+        out.push((String::new(), format!("{}|{}", k.key, k.desc)));
     }
     out
 }
@@ -123,7 +87,7 @@ pub fn markdown() -> String {
             (true, false) => "EVM",
             _ => "SOL",
         };
-        out.push_str(&format!("| `{}` | {} | {} |\n", k.shown(), k.desc, where_));
+        out.push_str(&format!("| `{}` | {} | {} |\n", k.key, k.desc, where_));
     }
     out
 }
@@ -140,10 +104,9 @@ mod tests {
     #[test]
     fn every_key_names_at_least_one_chain() {
         for k in all() {
-            assert!(!k.each().is_empty(), "an entry with no keys: \"{}\"", k.desc);
-            assert!(!k.chains.is_empty(), "`{}` belongs to no dashboard", k.shown());
+            assert!(!k.chains.is_empty(), "`{}` belongs to no dashboard", k.key);
             for c in &k.chains {
-                assert!(c == "evm" || c == "sol", "`{}` has unknown chain {c}", k.shown());
+                assert!(c == "evm" || c == "sol", "`{}` has unknown chain {c}", k.key);
             }
         }
     }
@@ -154,15 +117,10 @@ mod tests {
     #[test]
     fn no_key_is_claimed_twice_on_the_same_chain() {
         for chain in ["evm", "sol"] {
-            // EVERY key, not every row — a pair shares a row and the two
-            // keys inside it must still be checked separately, which is the
-            // whole reason `keys` is a list.
             let mut seen: std::collections::HashMap<&str, &str> = Default::default();
             for k in all().iter().filter(|k| k.chains.iter().any(|c| c == chain)) {
-                for key in k.each() {
-                    if let Some(prev) = seen.insert(key, &k.desc) {
-                        panic!("on {chain}, `{key}` is both \"{prev}\" and \"{}\"", k.desc);
-                    }
+                if let Some(prev) = seen.insert(&k.key, &k.desc) {
+                    panic!("on {chain}, `{}` is both \"{prev}\" and \"{}\"", k.key, k.desc);
                 }
             }
         }

@@ -45,12 +45,16 @@ dashboard has it.
 | `t` | trades panel | both |
 | `o` | orders panel | both |
 | `l` | logs panel | both |
-| `c  v` | chart panel | EVM |
+| `c` | chart panel | EVM |
+| `v` | chart panel | EVM |
 | `c` | chart panel | SOL |
-| `O  →` | next panel | both |
+| `O` | next panel | both |
+| `→` | next panel | both |
 | `←` | previous panel | both |
-| `↑  ↓` | scroll | both |
-| `,  .` | candle interval −/+ | both |
+| `↑` | scroll up | both |
+| `↓` | scroll down | both |
+| `,` | shorter candles | both |
+| `.` | longer candles | both |
 | `m` | chart: price / market cap | both |
 | `L` | PnL calendar | EVM |
 
@@ -58,13 +62,20 @@ dashboard has it.
 
 | key | does | where |
 | --- | --- | --- |
-| `[  ]` | buy size −/+ | both |
-| `;  '` | buy step finer/coarser | EVM |
-| `(  )` | sell size −/+ | EVM |
-| `(  )` | slippage −/+ | SOL |
-| `{  }` | slippage −/+ | EVM |
-| `{  }` | priority fee −/+ | SOL |
-| `<  >` | price impact limit −/+ | EVM |
+| `[` | decrease buy size | both |
+| `]` | increase buy size | both |
+| `;` | decrease buy step | EVM |
+| `'` | increase buy step | EVM |
+| `(` | decrease sell size | EVM |
+| `)` | increase sell size | EVM |
+| `(` | decrease slippage | SOL |
+| `)` | increase slippage | SOL |
+| `{` | decrease slippage | EVM |
+| `}` | increase slippage | EVM |
+| `{` | decrease priority fee | SOL |
+| `}` | increase priority fee | SOL |
+| `<` | tighten price impact limit | EVM |
+| `>` | loosen price impact limit | EVM |
 | `0` | price impact limit off | EVM |
 | `P` | auto priority on/off | SOL |
 
