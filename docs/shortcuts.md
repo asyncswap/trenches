@@ -9,9 +9,8 @@ dashboard has it.
 | --- | --- | --- |
 | `b` | buy | both |
 | `s` | sell | both |
-| `x` | sell all | SOL |
-| `x` | close all liquidity positions | EVM |
-| `S` | sell every token you hold | EVM |
+| `x` | sell everything | both |
+| `S` | sweep — close all liquidity, sell every token | EVM |
 | `h` | holdings | EVM |
 | `M` | move funds | both |
 | `u` | swap USDC and SOL | SOL |

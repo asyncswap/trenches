@@ -46,8 +46,8 @@ Trading:
 ```
 b     buy
 s     sell the configured slice
-x     sell everything (Solana)  ·  close all LP positions (EVM)
-S     sell every token you hold (EVM)
+x     sell everything — the coin on screen
+S     sweep: close all liquidity, sell every token (EVM)
 M     move funds out to another address
 u     swap USDC and SOL (Solana)
 ```

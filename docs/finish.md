@@ -20,13 +20,13 @@ loss.
 ```
 b     buy the configured size
 s     sell a slice
-x     sell the lot        (Solana)  ·  close all LP positions  (EVM)
+x     sell the lot — the coin you are on
 ```
 
 Those three are the ones you will reach for. They are not the only keys that
-sign: `S` sells every token you hold, `a` and `r` move liquidity, `e` runs an
-arb, `M` sends funds out, and `u` swaps USDC for SOL. Every one of them asks
-first or acts on a size you set.
+sign: `S` sweeps the wallet — every position closed, every token sold — while
+`a` and `r` move liquidity, `e` runs an arb, `M` sends funds out, and `u` swaps
+USDC for SOL. Every one of them asks first or acts on a size you set.
 
 What none of them do is act on their own. No timer, no strategy, no background
 loop opens a position while you are away from the keyboard. The bot is in
