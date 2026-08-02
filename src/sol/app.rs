@@ -2238,7 +2238,11 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
                 hint("[ ] "),
                 slbl_pad("buy"),
                 val(format!("{:<14}", format!("{}% of SOL", pct(bot.buy_frac)))),
-                hint("[M] "),
+                // No key hint. `M` moves funds now, and mode was never a
+                // toggle anyway — manual is the only mode there is, which is
+                // the point of showing the row at all. Advertising a key that
+                // does something else entirely is worse than showing none.
+                hint("    "),
                 slbl_pad("mode"),
                 val("manual".into()),
             ]),
