@@ -122,6 +122,10 @@ pub fn transfer_sol(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
 /// decimals, and the token program verifies both. A plain transfer will happily
 /// move 1000 base units when 1000 whole tokens were meant, and the difference
 /// between those is a factor of a million on a 6-decimal mint.
+/// `program` is the mint's OWN token program — classic or Token-2022. It is
+/// passed in rather than assumed because it decides the associated-account
+/// address as well as who executes the transfer, so guessing it wrong builds a
+/// correct-looking instruction against an account nobody owns.
 pub fn transfer_token(
     from: &Pubkey,
     to: &Pubkey,
@@ -129,19 +133,20 @@ pub fn transfer_token(
     amount: u64,
     decimals: u8,
     create_ata: bool,
+    program: &Pubkey,
 ) -> Vec<Instruction> {
-    let src = ata(from, mint, &TOKEN_PROGRAM);
-    let dst = ata(to, mint, &TOKEN_PROGRAM);
+    let src = ata(from, mint, program);
+    let dst = ata(to, mint, program);
     let mut ixs = Vec::with_capacity(2);
     if create_ata {
-        ixs.push(super::trade::create_ata_idempotent(from, to, mint, &TOKEN_PROGRAM));
+        ixs.push(super::trade::create_ata_idempotent(from, to, mint, program));
     }
     let mut data = Vec::with_capacity(10);
     data.push(12u8); // TransferChecked
     data.extend_from_slice(&amount.to_le_bytes());
     data.push(decimals);
     ixs.push(Instruction {
-        program_id: TOKEN_PROGRAM,
+        program_id: *program,
         accounts: vec![
             AccountMeta::new(src, false),
             AccountMeta::new_readonly(*mint, false),
@@ -226,7 +231,7 @@ mod tests {
     /// mismatch. The discriminator and layout are what make that true.
     #[test]
     fn the_token_transfer_is_the_checked_one() {
-        let ixs = transfer_token(&key(1), &key(2), &key(3), 1_500_000, 6, false);
+        let ixs = transfer_token(&key(1), &key(2), &key(3), 1_500_000, 6, false, &TOKEN_PROGRAM);
         let ix = ixs.last().unwrap();
         assert_eq!(ix.data[0], 12, "TransferChecked");
         assert_eq!(u64::from_le_bytes(ix.data[1..9].try_into().unwrap()), 1_500_000);
@@ -235,10 +240,26 @@ mod tests {
 
     #[test]
     fn creating_the_recipients_account_adds_an_instruction_before_the_transfer() {
-        let with = transfer_token(&key(1), &key(2), &key(3), 1, 6, true);
-        let without = transfer_token(&key(1), &key(2), &key(3), 1, 6, false);
+        let with = transfer_token(&key(1), &key(2), &key(3), 1, 6, true, &TOKEN_PROGRAM);
+        let without = transfer_token(&key(1), &key(2), &key(3), 1, 6, false, &TOKEN_PROGRAM);
         assert_eq!(with.len(), without.len() + 1);
         assert_eq!(with.last().unwrap().data[0], 12, "the transfer stays last");
+    }
+
+    /// A Token-2022 mint is executed by its own program and its associated
+    /// account is derived against that program — pump.fun issues these, so
+    /// assuming the classic one targets an account that does not exist.
+    #[test]
+    fn a_token_2022_transfer_uses_its_own_program() {
+        let t22 = super::super::TOKEN_2022_PROGRAM;
+        let ixs = transfer_token(&key(1), &key(2), &key(3), 1, 6, false, &t22);
+        assert_eq!(ixs.last().unwrap().program_id, t22);
+        let classic = transfer_token(&key(1), &key(2), &key(3), 1, 6, false, &TOKEN_PROGRAM);
+        assert_ne!(
+            ixs.last().unwrap().accounts[0].pubkey,
+            classic.last().unwrap().accounts[0].pubkey,
+            "and a different source account"
+        );
     }
 
     #[test]

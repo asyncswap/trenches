@@ -714,7 +714,7 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
         "SOL   {:.6}",
         lamports as f64 / 1e9
     )];
-    for (mint, raw, dec) in &tokens {
+    for (mint, raw, dec, _prog) in &tokens {
         let sym = if mint.to_string() == super::jupiter::USDC {
             "USDC".to_string()
         } else {
@@ -729,11 +729,14 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
     }
     let Some(pick) = ui::select(term, "Move — what", &choices)? else { return Ok(()) };
 
+    // The mint carries its OWN token program: classic and Token-2022 derive
+    // different associated accounts, so the two travel together or the
+    // transfer targets an account that does not exist.
     let (mint, decimals, held) = if pick == 0 {
         (None, 9u32, lamports)
     } else {
-        let (m, raw, d) = tokens[pick - 1];
-        (Some(m), d, raw)
+        let (m, raw, d, prog) = tokens[pick - 1];
+        (Some((m, prog)), d, raw)
     };
     let symbol = choices[pick].split_whitespace().next().unwrap_or("?").to_string();
 
@@ -748,14 +751,15 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
         Err(_) => eyre::bail!("{}", send::Refusal::NotAnAddress.say()),
     };
     let executable = rpc.is_executable(&parsed).await;
-    let to = send::check_destination(to_raw.trim(), &me, mint.as_ref(), executable)
+    let mint_key = mint.map(|(m, _)| m);
+    let to = send::check_destination(to_raw.trim(), &me, mint_key.as_ref(), executable)
         .map_err(|r| eyre::eyre!("{}", r.say()))?;
 
     // Does the recipient already have somewhere to put this token?
     let creates_account = match mint {
         None => false,
-        Some(m) => {
-            let dst = super::ata(&to, &m, &super::TOKEN_PROGRAM);
+        Some((m, prog)) => {
+            let dst = super::ata(&to, &m, &prog);
             rpc.account(&dst).await.ok().flatten().is_none()
         }
     };
@@ -782,14 +786,16 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
         eyre::bail!("you hold {:.6} {symbol}", held as f64 / 10f64.powi(decimals as i32));
     }
 
-    let plan = send::Plan { to, mint, symbol, amount, decimals, creates_account };
+    let plan = send::Plan { to, mint: mint_key, symbol, amount, decimals, creates_account };
     if !ui::confirm(term, &plan.sentence())? {
         return Ok(());
     }
 
     let ixs = match mint {
         None => vec![send::transfer_sol(&me, &to, amount)],
-        Some(m) => send::transfer_token(&me, &to, &m, amount, decimals as u8, creates_account),
+        Some((m, prog)) => {
+            send::transfer_token(&me, &to, &m, amount, decimals as u8, creates_account, &prog)
+        }
     };
     bot.status = "sending…".into();
     let sig = super::tx::send(rpc, &bot.signer, ixs, 60_000, bot.cu_price_micro).await?;

@@ -724,13 +724,35 @@ impl Rpc {
     /// Read from the chain rather than from anything the app remembers, because
     /// a wallet holds what it holds — USDC arrived by transfer, not by a trade
     /// this app saw, and nothing in its own records would ever mention it.
-    pub async fn owned_tokens(&self, owner: &Pubkey) -> eyre::Result<Vec<(Pubkey, u64, u32)>> {
+    /// Both token programs, because a wallet can hold either.
+    ///
+    /// Asking only the classic program misses every Token-2022 mint — and
+    /// pump.fun issues those, so "everything you hold" would silently omit
+    /// real holdings. The program comes back with each mint because it decides
+    /// the associated-account address: derive it against the wrong one and the
+    /// transfer targets an account that does not exist.
+    pub async fn owned_tokens(
+        &self,
+        owner: &Pubkey,
+    ) -> eyre::Result<Vec<(Pubkey, u64, u32, Pubkey)>> {
+        let mut all = Vec::new();
+        for program in [super::TOKEN_PROGRAM, super::TOKEN_2022_PROGRAM] {
+            all.extend(self.owned_tokens_of(owner, &program).await.unwrap_or_default());
+        }
+        Ok(all)
+    }
+
+    async fn owned_tokens_of(
+        &self,
+        owner: &Pubkey,
+        program: &Pubkey,
+    ) -> eyre::Result<Vec<(Pubkey, u64, u32, Pubkey)>> {
         let res = self
             .call(
                 "getTokenAccountsByOwner",
                 json!([
                     owner.to_string(),
-                    {"programId": super::TOKEN_PROGRAM.to_string()},
+                    {"programId": program.to_string()},
                     // Parsed: the amount and decimals come back named rather
                     // than as offsets into a byte array we would have to keep
                     // in step with the token program.
@@ -759,7 +781,7 @@ impl Rpc {
             let dec = amt.and_then(|a| a.get("decimals")).and_then(|d| d.as_u64()).unwrap_or(0) as u32;
             // An empty account is a leftover, not a holding.
             if raw > 0 {
-                out.push((mint, raw, dec));
+                out.push((mint, raw, dec, *program));
             }
         }
         Ok(out)
