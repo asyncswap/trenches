@@ -75,7 +75,7 @@ dashboard has it.
 | --- | --- | --- |
 | `R` | refresh everything | EVM |
 | `T` | theme picker | both |
-| `$` | display currency | EVM |
+| `$` | display currency | both |
 | `g` | profit guard on/off | EVM |
 | `n` | buy dedup on/off | EVM |
 | `C` | change chain | both |

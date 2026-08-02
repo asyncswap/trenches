@@ -384,7 +384,8 @@
       "desc": "display currency",
       "section": "MODE",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {

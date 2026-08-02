@@ -683,16 +683,23 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
     // chart, and the same key.
     let supply = bot.coin.as_ref().map(|c| c.supply()).unwrap_or(0.0);
     let can_mcap = supply > 0.0;
-    let candles = if bot.chart_mcap && can_mcap {
-        candles.into_iter().map(|c| c.scaled(supply)).collect()
+    // Market cap is the number people compare launches in, and they compare it
+    // in money — so the axis carries the rate through when we have one. Without
+    // it the scale is supply alone and the axis stays SOL, which is true rather
+    // than convenient. Same shape as the EVM chart, same reason.
+    let mcap_money = bot.chart_mcap && can_mcap && bot.sol_usd > 0.0;
+    let mcap_mul = if bot.chart_mcap && can_mcap {
+        supply * if bot.sol_usd > 0.0 { bot.sol_usd } else { 1.0 }
+    } else {
+        1.0
+    };
+    let candles = if (mcap_mul - 1.0).abs() > f64::EPSILON {
+        candles.into_iter().map(|c| c.scaled(mcap_mul)).collect()
     } else {
         candles
     };
-    let trades: Vec<(i64, f64, bool)> = if bot.chart_mcap && can_mcap {
-        trades.into_iter().map(|(t, p, b)| (t, p * supply, b)).collect()
-    } else {
-        trades
-    };
+    let trades: Vec<(i64, f64, bool)> =
+        trades.into_iter().map(|(t, p, b)| (t, p * mcap_mul, b)).collect();
     crate::view::CandleView {
         title: format!(
             " {}/SOL {} · {} candle [,] [.] · [m] {} ",
@@ -707,8 +714,9 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
         ),
         candles,
         interval_secs: bot.chart_iv,
-        unit: "SOL".to_string(),
-        money: false,
+        // Money carries its own symbol, so the unit label goes away with it.
+        unit: if mcap_money { String::new() } else { "SOL".to_string() },
+        money: mcap_money,
         // Solana swaps carry a real block time, so "now" is the wall clock —
         // no block-derived pseudo-clock to convert from.
         now_t: crate::ledger::now() as i64,
@@ -1929,7 +1937,19 @@ fn market_panel(bot: &SolBot) -> PanelView {
                     p.spans(vec![lbl("Risk"), Cell::toned("checking…", Tone::Dim)])
                 }
             }
-            p.spans(vec![lbl("Price"), Cell::new(format!("{:.9} SOL", c.price_sol()))]);
+            // In the currency the trader reads in, when we know what SOL is
+            // worth. `usd_price` counts leading zeros rather than printing
+            // them, which is the only way a 0.000000035 renders as anything
+            // other than 0.00.
+            p.spans(vec![
+                lbl("Price"),
+                Cell::new(if bot.sol_usd > 0.0 {
+                    crate::view::usd_price(c.price_sol() * bot.sol_usd)
+                } else {
+                    // No rate: SOL is the honest unit, not a converted guess.
+                    format!("{:.9} SOL", c.price_sol())
+                }),
+            ]);
             let mc = c.market_cap_sol();
             p.spans(vec![
                 lbl("Mkt Cap"),
@@ -2912,6 +2932,15 @@ pub async fn run(
                         } else {
                             "chart: price".to_string()
                         });
+                    }
+                    // The panel reads in this currency, so the key that
+                    // changes it belongs on this dashboard too.
+                    KeyCode::Char('$') => {
+                        bot.status = "loading currencies…".into();
+                        match ui::currency_picker(term).await? {
+                            Some(note) => bot.note(note),
+                            None => bot.status = "ready".into(),
+                        }
                     }
                     KeyCode::Char('?') => show_help = true,
                     KeyCode::Char('T') => match ui::widgets::theme_picker(term)? {

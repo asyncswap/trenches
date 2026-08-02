@@ -626,6 +626,48 @@ fn docs_inner(
     }
 }
 
+/// The display-currency picker, for whichever dashboard asked.
+///
+/// Both chains show figures in the chosen currency, so both need the key that
+/// changes it. Lifting it here rather than copying it is the same reasoning as
+/// the shortcuts file: two copies of a screen drift, and this one has an
+/// opinion about what to say when Coinbase is unreachable.
+///
+/// Returns the line to show, or `None` if the picker was dismissed.
+pub async fn currency_picker(term: &mut Term) -> eyre::Result<Option<String>> {
+    if crate::base_currency::available().len() < 2 {
+        crate::base_currency::refresh().await;
+    }
+    let codes = crate::base_currency::available();
+    if codes.len() < 2 {
+        return Ok(Some(
+            "Could not reach Coinbase for exchange rates, so the currency list is empty. Figures stay in USD."
+                .to_string(),
+        ));
+    }
+    let here = crate::base_currency::code();
+    let labels: Vec<String> = codes
+        .iter()
+        .map(|c| {
+            let row = crate::base_currency::label(c);
+            if *c == here { format!("{row}   ✓") } else { row }
+        })
+        .collect();
+    // Opens ON the current currency, not at the top: the list is 160 long and
+    // the row you care about most is the one you are already using.
+    let at = codes.iter().position(|c| *c == here).unwrap_or(0);
+    let Some(i) = select_overlay(term, "Display currency", &labels, at)? else {
+        return Ok(None);
+    };
+    let pick = codes[i].clone();
+    Ok(Some(if crate::base_currency::select(&pick) {
+        crate::base_currency::save(&pick);
+        format!("Reading in {pick}. Prices are still recorded in USD — only the display changed.")
+    } else {
+        format!("No rate for {pick} yet, so the display stays in {here}.")
+    }))
+}
+
 /// Yes/no confirmation./// Yes/no confirmation. Returns true only on an explicit yes.
 ///
 /// Guards actions that are easy to trigger by accident and impossible to undo —

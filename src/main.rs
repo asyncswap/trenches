@@ -3373,43 +3373,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         // changes what you read it in.
                         KeyCode::Char('$') => {
                             bot.status = "loading currencies…".into();
-                            if crate::base_currency::available().len() < 2 {
-                                crate::base_currency::refresh().await;
-                            }
-                            let codes = crate::base_currency::available();
-                            if codes.len() < 2 {
-                                bot.note(
-                                    "Could not reach Coinbase for exchange rates, so the currency list is empty. Figures stay in USD."
-                                        .into(),
-                                );
-                            } else {
-                                let here = crate::base_currency::code();
-                                let labels: Vec<String> = codes
-                                    .iter()
-                                    .map(|c| {
-                                        let row = base_currency::label(c);
-                                        if *c == here { format!("{row}   ✓") } else { row }
-                                    })
-                                    .collect();
-                                // Opens ON the current currency, not at the top:
-                                // the list is 160 long and the row you care
-                                // about most is the one you are already using.
-                                let at = codes.iter().position(|c| *c == here).unwrap_or(0);
-                                if let Some(i) =
-                                    ui::select_overlay(terminal, "Display currency", &labels, at)?
-                                {
-                                    let pick = codes[i].clone();
-                                    if crate::base_currency::select(&pick) {
-                                        crate::base_currency::save(&pick);
-                                        bot.note(format!(
-                                            "Reading in {pick}. Prices are still recorded in USD — only the display changed."
-                                        ));
-                                    } else {
-                                        bot.note(format!("No rate for {pick} yet, so the display stays in {here}."));
-                                    }
-                                } else {
-                                    bot.status = "ready".into();
-                                }
+                            match ui::currency_picker(terminal).await? {
+                                Some(note) => bot.note(note),
+                                None => bot.status = "ready".into(),
                             }
                         }
                         KeyCode::Char(';') => nudge_buy_step(bot, false),
