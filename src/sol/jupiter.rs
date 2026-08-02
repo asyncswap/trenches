@@ -48,6 +48,15 @@ pub struct Quote {
     /// Base units in and out, for showing the trade before it is made.
     pub in_amount: u64,
     pub out_amount: u64,
+    /// The least this can deliver — `outAmount` after slippage, and the number
+    /// the swap program reverts below.
+    ///
+    /// This is the one figure in the quote that is a PROMISE rather than an
+    /// estimate. `out_amount` is what the route expects at this instant and
+    /// nothing enforces it; by the time the transaction lands the pools have
+    /// moved. Confirming against the estimate would be agreeing to a number
+    /// that cannot be held to.
+    pub min_out: u64,
 }
 
 /// Ask what `amount` base units of `in_mint` would fetch in `out_mint`.
@@ -81,7 +90,12 @@ pub async fn quote(
     let (Some(in_amount), Some(out_amount)) = (num("inAmount"), num("outAmount")) else {
         eyre::bail!("no route for that pair and size");
     };
-    Ok(Quote { raw, in_amount, out_amount })
+    // Jupiter calls the enforced floor `otherAmountThreshold`. If it is ever
+    // missing, deriving it from the slippage we asked for is right: assuming
+    // the floor equals the estimate would show a guarantee nobody made.
+    let min_out =
+        num("otherAmountThreshold").unwrap_or_else(|| floor_from_slippage(out_amount, slippage_bps));
+    Ok(Quote { raw, in_amount, out_amount, min_out })
 }
 
 /// Turn a quote into a signed, simulated, submitted swap. Returns the
@@ -155,6 +169,18 @@ fn base64_decode(s: &str) -> eyre::Result<Vec<u8>> {
     super::rpc::b64_decode(s).map_err(|e| eyre::eyre!("bad base64 from Jupiter: {e}"))
 }
 
+/// The worst acceptable output for a quote, from the slippage that was asked
+/// for. Only used when a response omits the threshold.
+///
+/// In u128 deliberately: a 9-decimal mint puts whole SOL amounts within a few
+/// orders of magnitude of `u64::MAX` once multiplied by 10_000, and a swap that
+/// silently wrapped would compute a floor of nearly zero — which is exactly the
+/// number that stops protecting you.
+fn floor_from_slippage(out: u64, bps: u32) -> u64 {
+    let keep = 10_000u128.saturating_sub(bps.min(10_000) as u128);
+    (out as u128 * keep / 10_000) as u64
+}
+
 /// Whole tokens from base units, for display.
 pub fn ui_amount(base: u64, decimals: u32) -> f64 {
     base as f64 / 10f64.powi(decimals as i32)
@@ -170,6 +196,33 @@ mod tests {
         // both are famous enough to check by eye.
         assert_eq!(USDC, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
         assert_eq!(WSOL, "So11111111111111111111111111111111111111112");
+    }
+
+    /// The floor is what the confirmation promises and what the chain enforces,
+    /// so it must come out BELOW the estimate — never equal to it.
+    #[test]
+    fn the_floor_sits_under_the_estimate_by_the_slippage() {
+        assert_eq!(floor_from_slippage(1_000_000, 50), 995_000); // 0.5%
+        assert_eq!(floor_from_slippage(1_000_000, 100), 990_000); // 1%
+        assert!(floor_from_slippage(1_000_000, 1) < 1_000_000, "never equal to the estimate");
+    }
+
+    /// A whole-SOL amount times 10_000 overflows u64. Wrapping there would
+    /// produce a floor near zero and call it protection.
+    #[test]
+    fn a_large_amount_does_not_wrap_the_floor_to_nothing() {
+        let huge = u64::MAX / 2; // far past any real balance, and past u64/10_000
+        let floor = floor_from_slippage(huge, 100);
+        assert!(floor > huge / 2, "the floor stayed proportional: {floor}");
+        assert!(floor < huge);
+    }
+
+    /// Nonsense slippage must clamp to "expect nothing" rather than underflow
+    /// into a floor larger than the trade.
+    #[test]
+    fn absurd_slippage_floors_at_zero() {
+        assert_eq!(floor_from_slippage(1_000_000, 10_000), 0);
+        assert_eq!(floor_from_slippage(1_000_000, 99_999), 0);
     }
 
     #[test]

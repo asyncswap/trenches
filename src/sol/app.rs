@@ -849,6 +849,116 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Swap between the two assets here that are not memecoins: USDC and SOL.
+///
+/// Why this exists: you cannot buy anything on this chain with USDC. Arriving
+/// with dollars and no SOL means the app can see the balance, name it, and do
+/// nothing with it — and the fix, going back to an exchange to convert, is the
+/// slowest possible answer to a problem the wallet is already holding.
+///
+/// Unlike every other trade in this app, the transaction is built by Jupiter
+/// rather than here, because USDC/SOL liquidity is spread across Orca, Raydium
+/// and Meteora and routing it is a different problem from swapping against one
+/// known pool. `jupiter.rs` says what that costs and what narrows it. The part
+/// that matters at this layer: the confirmation quotes the MINIMUM, not the
+/// estimate, because the minimum is the only number the chain will enforce.
+async fn swap_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
+    use super::{jupiter, send};
+    let me = bot.signer.pubkey();
+    let rpc = &bot.rpc;
+
+    bot.status = "reading balances…".into();
+    let lamports = rpc.balance(&me).await.unwrap_or(0);
+    let usdc_mint: solana_pubkey::Pubkey =
+        jupiter::USDC.parse().expect("the USDC mint is a checked constant");
+    let usdc = rpc
+        .owned_tokens(&me)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(m, ..)| *m == usdc_mint)
+        .map(|(_, raw, ..)| raw)
+        .unwrap_or(0);
+
+    // The same reserve a transfer keeps back, for the same reason: swapping the
+    // whole balance leaves nothing to pay for the swap.
+    let sol_cap = send::max_sol_lamports(lamports);
+
+    let ways = vec![
+        format!("USDC → SOL     holding {:.2} USDC", usdc as f64 / 1e6),
+        format!("SOL → USDC     holding {:.6} SOL", lamports as f64 / 1e9),
+    ];
+    let Some(way) = ui::select(term, "Swap — which way", &ways)? else { return Ok(()) };
+
+    let (in_mint, out_mint, in_sym, out_sym, in_dec, out_dec, cap) = if way == 0 {
+        (jupiter::USDC, jupiter::WSOL, "USDC", "SOL", 6u32, 9u32, usdc)
+    } else {
+        (jupiter::WSOL, jupiter::USDC, "SOL", "USDC", 9u32, 6u32, sol_cap)
+    };
+    if cap == 0 {
+        eyre::bail!("no {in_sym} to swap");
+    }
+
+    let places = if in_dec == 6 { 2 } else { 6 };
+    let hint = format!("up to {:.*}", places, cap as f64 / 10f64.powi(in_dec as i32));
+    let Some(typed) = ui::input(term, &format!("Swap — how much {in_sym}"), &hint)? else {
+        return Ok(());
+    };
+    let whole: f64 = typed.trim().parse().map_err(|_| eyre::eyre!("that is not a number"))?;
+    if !(whole > 0.0) {
+        eyre::bail!("nothing to swap");
+    }
+    let amount = (whole * 10f64.powi(in_dec as i32)).round() as u64;
+    if amount > cap {
+        // Named separately for SOL, as in the move flow: "not enough" reads as
+        // wrong when the balance plainly covers it and the reserve is the
+        // actual reason.
+        if in_sym == "SOL" {
+            eyre::bail!(
+                "that would leave nothing for fees — {:.6} SOL is the most this can swap",
+                cap as f64 / 1e9
+            );
+        }
+        eyre::bail!("you hold {:.2} USDC", cap as f64 / 1e6);
+    }
+
+    // The slippage this dashboard already trades at, in the units Jupiter
+    // wants. A second, separate slippage setting for one pair would be a
+    // setting nobody remembers they have.
+    let slippage_bps = (bot.slippage_pct * 100.0).round().clamp(1.0, 5_000.0) as u32;
+
+    bot.status = "asking for a route…".into();
+    let q = jupiter::quote(in_mint, out_mint, amount, slippage_bps).await?;
+    let sent = jupiter::ui_amount(q.in_amount, in_dec);
+    let expected = jupiter::ui_amount(q.out_amount, out_dec);
+    let least = jupiter::ui_amount(q.min_out, out_dec);
+    let out_places = if out_dec == 6 { 2 } else { 6 };
+
+    // Both numbers, and which one is the promise. Showing only the estimate
+    // would be quoting a figure that nothing enforces; showing only the floor
+    // would look like a worse trade than the route expects.
+    let question = format!(
+        "Swap {sent:.*} {in_sym} for about {expected:.*} {out_sym}  (at least {least:.*} {out_sym}, or it reverts)",
+        places, out_places, out_places
+    );
+    if !ui::confirm(term, &question)? {
+        return Ok(());
+    }
+
+    bot.status = "swapping…".into();
+    let sig = jupiter::execute(rpc, &bot.signer, &q).await?;
+
+    // On the orders list, in the SOL column, because the SOL side is the part
+    // of this trade the rest of the dashboard is denominated in. Pending, not
+    // confirmed: `execute` submits, and the settlement poll gets the answer
+    // from the chain like every other row.
+    let sol_moved = if in_sym == "SOL" { sent } else { expected };
+    bot.push_order("SWAP", sol_moved, 0.0, OrderState::Pending, Some(sig.clone()));
+    crate::events::action("Swapped", &[("what", question), ("sig", sig.clone())]);
+    bot.note(format!("Swapped. {sig}"));
+    Ok(())
+}
+
 /// Which panel occupies the lower half — mirrors the EVM `Panel`.
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -1498,15 +1608,14 @@ impl SolBot {
             if let Some(o) = self.orders.get_mut(i) {
                 o.state = if ok { OrderState::Confirmed } else { OrderState::Failed };
             }
-            // A transfer is not a trade. It settles like one — the signature
-            // either landed or it did not — but it buys and sells nothing, so
-            // everything below this line would be wrong for it: it would move
-            // cost basis, count as a trade, and write a fill to the ledger for
-            // a swap that never happened.
-            if action == "SENT" {
+            // Neither a transfer nor a USDC/SOL swap is a trade in the sense
+            // the rest of this loop means. Both settle like one — the signature
+            // either landed or it did not — but neither buys or sells the coin
+            // this dashboard is tracking, so everything below would be wrong
+            // for them: it would move cost basis, count as a trade, and write a
+            // fill to the ledger for a position that never changed.
+            if matches!(action, "SENT" | "SWAP") {
                 continue;
-            }
-            {
             }
             // Your own fill must never depend on the socket having heard it:
             // the signature is RIGHT HERE. Fetch that one transaction and
@@ -1927,8 +2036,9 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
         let atone = match o.action {
             "BUY" => Tone::Good,
             // Money leaving on purpose is not a loss, and colouring it red
-            // beside a column of losses reads as one.
-            "SENT" => Tone::Accent,
+            // beside a column of losses reads as one. A swap moves nothing out
+            // of the wallet at all — it changes which asset holds it.
+            "SENT" | "SWAP" => Tone::Accent,
             _ => Tone::Bad,
         };
         t.push(vec![
@@ -2780,6 +2890,16 @@ pub async fn run(
                             bot.note("Unlock an account first — press W".to_string());
                         } else if let Err(e) = send_flow(term, &mut bot).await {
                             bot.note(format!("Move cancelled. {e}"));
+                        }
+                    }
+                    // USDC into SOL, or back. `u` for USDC — `U` was already
+                    // the update check, which is the kind of collision the
+                    // shortcuts file exists to surface.
+                    KeyCode::Char('u') => {
+                        if !bot.has_account {
+                            bot.note("Unlock an account first — press W".to_string());
+                        } else if let Err(e) = swap_flow(term, &mut bot).await {
+                            bot.note(format!("Swap cancelled. {e}"));
                         }
                     }
                     // Price or market cap — one series, two units. Same key as

@@ -12,6 +12,7 @@ dashboard has it.
 | `x` | sell all | both |
 | `h` | holdings | EVM |
 | `M` | move funds | both |
+| `u` | swap USDC and SOL | SOL |
 
 ## LIQUIDITY
 
@@ -54,7 +55,7 @@ dashboard has it.
 | `,` | shorter candles | both |
 | `.` | longer candles | both |
 | `m` | chart: price / market cap | both |
-| `L` | PnL calendar | EVM |
+| `L` | PnL calendar | both |
 
 ## SIZE
 
@@ -88,6 +89,7 @@ dashboard has it.
 | `n` | buy dedup on/off | EVM |
 | `C` | change chain | both |
 | `W` | change wallet | both |
+| `U` | check for updates | both |
 | `D` | docs | both |
 | `Esc` | back one screen | both |
 | `q` | quit | both |

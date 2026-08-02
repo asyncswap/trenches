@@ -79,6 +79,14 @@
       ]
     },
     {
+      "key": "u",
+      "desc": "swap USDC and SOL",
+      "section": "TRADE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
       "key": "a",
       "desc": "add liquidity",
       "section": "LIQUIDITY",
@@ -273,7 +281,8 @@
       "desc": "PnL calendar",
       "section": "VIEW",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
@@ -459,6 +468,15 @@
     {
       "key": "W",
       "desc": "change wallet",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "key": "U",
+      "desc": "check for updates",
       "section": "MODE",
       "chains": [
         "evm",
