@@ -678,8 +678,33 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
             s.block_time.map(|t| (t, s.sol / s.tokens, matches!(s.kind, discover::SwapKind::Buy)))
         })
         .collect();
+    // Market cap is price times supply — a linear rescale, so the candles keep
+    // their exact shape and only the axis changes. Same reasoning as the EVM
+    // chart, and the same key.
+    let supply = bot.coin.as_ref().map(|c| c.supply()).unwrap_or(0.0);
+    let can_mcap = supply > 0.0;
+    let candles = if bot.chart_mcap && can_mcap {
+        candles.into_iter().map(|c| c.scaled(supply)).collect()
+    } else {
+        candles
+    };
+    let trades: Vec<(i64, f64, bool)> = if bot.chart_mcap && can_mcap {
+        trades.into_iter().map(|(t, p, b)| (t, p * supply, b)).collect()
+    } else {
+        trades
+    };
     crate::view::CandleView {
-        title: format!(" {}/SOL {} candle [,] [.] ", sym, crate::view::iv_label(bot.chart_iv)),
+        title: format!(
+            " {}/SOL {} · {} candle [,] [.] · [m] {} ",
+            sym,
+            match (bot.chart_mcap, can_mcap) {
+                (true, false) => "market cap (no supply yet)",
+                (true, true) => "market cap",
+                _ => "price",
+            },
+            crate::view::iv_label(bot.chart_iv),
+            if bot.chart_mcap { "price" } else { "market cap" },
+        ),
         candles,
         interval_secs: bot.chart_iv,
         unit: "SOL".to_string(),
@@ -881,6 +906,8 @@ pub struct SolBot {
     pub buy_frac: f64,
     pub slippage_pct: f64,
     /// Candle interval for the chart panel, seconds. , and . walk the ladder.
+    /// Chart y axis: false = price, true = market cap. Mirrors the EVM `m`.
+    pub chart_mcap: bool,
     pub chart_iv: u64,
     /// Fraction of the token balance `s` sells. `x` always sells everything.
     /// Mirrors the EVM side's `sell_frac`, adjusted with `<` / `>`.
@@ -1084,6 +1111,7 @@ impl SolBot {
             // The ONE canonical candle to perfect first: the minute. Other
             // intervals share every line of this code path, but the minute is
             // the reference the chart is judged against.
+            chart_mcap: false,
             chart_iv: 60,
             sell_frac: 1.00,
             cu_price_micro: 10_000,
@@ -2753,6 +2781,16 @@ pub async fn run(
                         } else if let Err(e) = send_flow(term, &mut bot).await {
                             bot.note(format!("Move cancelled. {e}"));
                         }
+                    }
+                    // Price or market cap — one series, two units. Same key as
+                    // the EVM chart, because it is the same question.
+                    KeyCode::Char('m') => {
+                        bot.chart_mcap = !bot.chart_mcap;
+                        bot.note(if bot.chart_mcap {
+                            "chart: market cap".to_string()
+                        } else {
+                            "chart: price".to_string()
+                        });
                     }
                     KeyCode::Char('?') => show_help = true,
                     KeyCode::Char('T') => match ui::widgets::theme_picker(term)? {

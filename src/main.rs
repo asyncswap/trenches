@@ -90,6 +90,133 @@ fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
     }
 }
 
+/// Move ETH or a token to another address.
+///
+/// Every field of this transaction is built here — no router, no quote, no
+/// remote service. A transfer is the one operation whose whole content is
+/// knowable in advance, and the one with no undo: a swap that goes wrong
+/// leaves you holding something, a transfer to the wrong address leaves you
+/// holding nothing, with no counterparty and no appeal.
+///
+/// So the checks below are not ceremony. Each one exists because the mistake
+/// is easy and the loss is permanent.
+async fn move_flow<P: Provider>(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    bot: &mut Bot,
+    provider: &P,
+    pools: &[SelPool],
+) -> eyre::Result<()> {
+    use alloy::primitives::{Address, U256};
+    use alloy::sol_types::SolCall;
+
+    let me = bot.trader;
+    if me.is_zero() {
+        eyre::bail!("unlock an account first — press W");
+    }
+
+    // What is actually held. ETH always; a token only if there is a balance,
+    // because offering a coin you hold none of is a menu of dead ends.
+    bot.status = "reading balances…".into();
+    let mut assets: Vec<(Option<Address>, String, f64, u8)> =
+        vec![(None, "ETH".into(), bot.eth, 18)];
+    let mut seen = std::collections::HashSet::new();
+    for p in pools.iter().filter(|p| seen.insert(p.token)) {
+        let erc = contracts::IERC20::new(p.token, provider);
+        // Bound separately: the call builders are temporaries, and joining
+        // them inline drops each before its future is polled.
+        let (cb, cd) = (erc.balanceOf(me), erc.decimals());
+        let (bal, dec) = tokio::join!(cb.call(), cd.call());
+        let dec = dec.map(|d| d._0).unwrap_or(18);
+        let bal = bal.map(|b| engine::units_to_f64(b._0, dec)).unwrap_or(0.0);
+        if bal > 0.0 {
+            assets.push((Some(p.token), p.sym.clone(), bal, dec));
+        }
+    }
+
+    let labels: Vec<String> = assets
+        .iter()
+        .map(|(t, sym, bal, _)| match t {
+            None => format!("{sym:<12} {bal:>18.6}"),
+            Some(a) => format!("{sym:<12} {bal:>18.6}   {a:#x}"),
+        })
+        .collect();
+    let Some(pick) = ui::select(terminal, "Move — what", &labels)? else { return Ok(()) };
+    let (mint, symbol, held, decimals) = assets[pick].clone();
+
+    // The destination first, checked before an amount is typed — discovering
+    // the address was wrong afterwards invites re-entering both.
+    let Some(raw) = ui::input(terminal, "Move — to which address", "paste the recipient's address")?
+    else {
+        return Ok(());
+    };
+    let to: Address = raw.trim().parse().map_err(|_| eyre::eyre!("that is not an address"))?;
+    if to == me {
+        eyre::bail!("that is this wallet's own address");
+    }
+    if Some(to) == mint {
+        // The commonest way tokens are destroyed: pasting the token's own
+        // contract. Nobody can retrieve them from it.
+        eyre::bail!("that is the token's own contract, not a wallet — anything sent there is gone");
+    }
+    // A contract can receive and never release. Not refused outright, because
+    // sending to a multisig or a safe is legitimate — but it is said plainly.
+    let is_contract = provider.get_code_at(to).await.map(|c| !c.is_empty()).unwrap_or(false);
+
+    let cap = match mint {
+        // Leave enough for gas: a wallet that cannot pay a fee cannot move its
+        // own tokens, so "everything" would lock it with its contents inside.
+        None => (held - gas_reserve_eth(bot)).max(0.0),
+        Some(_) => held,
+    };
+    let Some(amount_raw) = ui::input(
+        terminal,
+        &format!("Move — how much {symbol}"),
+        &format!("up to {cap:.6}"),
+    )?
+    else {
+        return Ok(());
+    };
+    let whole: f64 = amount_raw.trim().parse().map_err(|_| eyre::eyre!("that is not a number"))?;
+    if whole <= 0.0 {
+        eyre::bail!("nothing to send");
+    }
+    if whole > cap {
+        if mint.is_none() {
+            eyre::bail!("that would leave nothing for gas — {cap:.6} ETH is the most this can send");
+        }
+        eyre::bail!("you hold {held:.6} {symbol}");
+    }
+
+    let warn = if is_contract { "  ⚠ that address is a CONTRACT" } else { "" };
+    let question = format!("Send {whole} {symbol} to {to:#x}{warn}");
+    if !ui::confirm(terminal, &question)? {
+        return Ok(());
+    }
+
+    bot.status = "sending…".into();
+    let label = format!("SENT {whole} {symbol}");
+    match mint {
+        None => {
+            let wei = U256::from((whole * 1e18) as u128);
+            bot.send_transfer(provider, to, alloy::primitives::Bytes::new(), wei, label).await;
+        }
+        Some(token) => {
+            let units = U256::from((whole * 10f64.powi(decimals as i32)) as u128);
+            let data = contracts::IERC20::transferCall { to, value: units }.abi_encode();
+            bot.send_transfer(provider, token, data.into(), alloy::primitives::U256::ZERO, label)
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// ETH held back from a "send everything", so the account can still pay gas.
+fn gas_reserve_eth(bot: &Bot) -> f64 {
+    // Two ordinary transactions' worth at the current price, floored so a
+    // momentarily-zero gas read does not let the wallet empty itself.
+    (2.0 * 300_000.0 * bot.gas_price / 1e18).max(0.0005)
+}
+
 /// A v3 tick, as a price per token in dollars.
 ///
 /// LP rows carried `tick [-887200, 204200]`, which is the pool's own
@@ -3134,6 +3261,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('C') => {
                             events::action("Changing chain", &[("from", bot.net.clone())]);
                             return Ok(Exit::ChangeChain);
+                        }
+                        // Move ETH or a token to an address. Same key and same
+                        // act as the Solana dashboard.
+                        KeyCode::Char('M') => {
+                            if let Err(e) = move_flow(terminal, bot, provider, &pools).await {
+                                bot.note(format!("Move cancelled. {e}"));
+                            }
                         }
                         KeyCode::Char('?') => { show_help = true; }
                         // Theme picker with live preview (persists the choice).

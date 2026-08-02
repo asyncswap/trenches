@@ -2203,6 +2203,23 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// in the orders queue and the pending list (for cost-basis + reaping).
     /// Returns the tx hash on a successful send. Shared by the arb legs.
     #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
+    /// Send a plain transfer — ETH by value, or a token by calldata.
+    ///
+    /// `side: None` is the point: a transfer is not a trade, so it moves no
+    /// cost basis, counts toward no fill, and writes nothing to the ledger.
+    /// It still becomes an order row and a pending entry, because money left
+    /// the wallet on a keypress and that is exactly what the orders list is.
+    pub async fn send_transfer<P: Provider>(
+        &mut self,
+        provider: &P,
+        to: Address,
+        data: Bytes,
+        value: U256,
+        label: String,
+    ) -> Option<TxHash> {
+        self.send_raw(provider, to, data, value, label, None, 0.0, 0.0).await
+    }
+
     async fn send_raw<P: Provider>(
         &mut self,
         provider: &P,
@@ -3881,7 +3898,7 @@ fn wei_to_f64(x: U256) -> f64 {
 /// On-chain base units -> human amount, using the token's REAL decimals.
 /// `wei_to_f64` is the 18-dec special case; anything token-denominated must come
 /// through here instead, or a 6-dec token reads as ~0.
-fn units_to_f64(x: U256, decimals: u8) -> f64 {
+pub fn units_to_f64(x: U256, decimals: u8) -> f64 {
     x.to_string().parse::<f64>().unwrap_or(0.0) / 10f64.powi(decimals as i32)
 }
 fn u128_to_f64(x: u128) -> f64 {

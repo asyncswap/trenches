@@ -74,6 +74,7 @@
       "desc": "move funds",
       "section": "TRADE",
       "chains": [
+        "evm",
         "sol"
       ]
     },

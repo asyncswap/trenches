@@ -11,7 +11,7 @@ dashboard has it.
 | `s` | sell | both |
 | `x` | sell all | both |
 | `h` | holdings | EVM |
-| `M` | move funds | SOL |
+| `M` | move funds | both |
 
 ## LIQUIDITY
 

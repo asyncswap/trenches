@@ -159,6 +159,16 @@ impl Coin {
         }
     }
 
+    /// Circulating supply, derived rather than stored.
+    ///
+    /// Market cap is supply times price, so the supply is the ratio — and both
+    /// halves already handle the curve/AMM split, which a separate field would
+    /// have to duplicate and keep in step.
+    pub fn supply(&self) -> f64 {
+        let p = self.price_sol();
+        if p > 0.0 { self.market_cap_sol() / p } else { 0.0 }
+    }
+
     /// Real SOL backing the market — the exit liquidity that actually matters.
     pub fn pooled_sol(&self) -> f64 {
         match &self.venue {
