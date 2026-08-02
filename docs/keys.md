@@ -10,15 +10,15 @@ dashboard has it.
 | `b` | buy | both |
 | `s` | sell | both |
 | `x` | sell all | both |
-| `h` | token holdings | EVM |
-| `M` | move funds to an address | SOL |
+| `h` | holdings | EVM |
+| `M` | move funds | SOL |
 
 ## LIQUIDITY
 
 | key | does | where |
 | --- | --- | --- |
 | `a` | add liquidity | EVM |
-| `r` | remove last liquidity | EVM |
+| `r` | remove liquidity | EVM |
 
 ## DISCOVER
 
@@ -32,8 +32,7 @@ dashboard has it.
 
 | key | does | where |
 | --- | --- | --- |
-| `p` | add pool | EVM |
-| `p` | add token by address | SOL |
+| `p` | add pool | both |
 | `Del` | deselect the pool | EVM |
 | `d` | multi-pool view | EVM |
 | `e` | auto arbitrage | EVM |
@@ -45,9 +44,8 @@ dashboard has it.
 | `t` | trades panel | both |
 | `o` | orders panel | both |
 | `l` | logs panel | both |
-| `c` | chart panel | EVM |
+| `c` | chart panel | both |
 | `v` | chart panel | EVM |
-| `c` | chart panel | SOL |
 | `O` | next panel | both |
 | `→` | next panel | both |
 | `←` | previous panel | both |

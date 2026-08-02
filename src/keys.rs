@@ -61,14 +61,38 @@ fn all() -> &'static [Key] {
 /// `("", "key|desc")` for a row. That shape belongs to the widget, so building
 /// it here keeps both dashboards from formatting the same data two ways.
 pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
+    let mine: Vec<&Key> =
+        all().iter().filter(|k| k.chains.iter().any(|c| c == chain.tag())).collect();
     let mut out = Vec::new();
     let mut section = "";
-    for k in all().iter().filter(|k| k.chains.iter().any(|c| c == chain.tag())) {
+    let mut i = 0;
+    while i < mine.len() {
+        let k = mine[i];
         if k.section != section {
             section = &k.section;
             out.push((section.to_string(), String::new()));
         }
+        // Two keys that are one control share a line.
+        //
+        // The DATA stays one key per entry — that is what makes `]` findable
+        // and the collision check possible. But a help screen is scanned, not
+        // queried, and "decrease buy size" directly above "increase buy size"
+        // is two lines saying one thing. The pairing is derived rather than
+        // declared: nothing extra to keep in step, and a pair that stops being
+        // adjacent stops being grouped, which is correct.
+        if let Some(next) = mine.get(i + 1) {
+            if let (Some(a), Some(b)) =
+                (k.desc.strip_prefix("decrease "), next.desc.strip_prefix("increase "))
+            {
+                if a == b && k.section == next.section && k.chains == next.chains {
+                    out.push((String::new(), format!("{}  {}|{a} −/+", k.key, next.key)));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
         out.push((String::new(), format!("{}|{}", k.key, k.desc)));
+        i += 1;
     }
     out
 }
@@ -124,6 +148,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The help screen pairs what the data keeps apart. `[` and `]` are two
+    /// entries, so `]` is findable and checkable, and one line on screen.
+    #[test]
+    fn a_decrease_increase_pair_shares_one_help_row() {
+        let rows = help_rows(Chain::Evm);
+        assert!(
+            rows.iter().any(|(_, r)| r == "[  ]|buy size −/+"),
+            "the pair should render as one row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, r)| r.starts_with("[|")),
+            "and not also as its halves"
+        );
+    }
+
+    /// Only genuine pairs. Two unrelated keys that happen to sit together must
+    /// not be welded into one line.
+    #[test]
+    fn unrelated_neighbours_keep_their_own_rows() {
+        let rows = help_rows(Chain::Evm);
+        assert!(rows.iter().any(|(_, r)| r == "b|buy"));
+        assert!(rows.iter().any(|(_, r)| r == "s|sell"));
     }
 
     #[test]

@@ -63,7 +63,7 @@
     },
     {
       "key": "h",
-      "desc": "token holdings",
+      "desc": "holdings",
       "section": "TRADE",
       "chains": [
         "evm"
@@ -71,7 +71,7 @@
     },
     {
       "key": "M",
-      "desc": "move funds to an address",
+      "desc": "move funds",
       "section": "TRADE",
       "chains": [
         "sol"
@@ -87,7 +87,7 @@
     },
     {
       "key": "r",
-      "desc": "remove last liquidity",
+      "desc": "remove liquidity",
       "section": "LIQUIDITY",
       "chains": [
         "evm"
@@ -123,14 +123,7 @@
       "desc": "add pool",
       "section": "POOL",
       "chains": [
-        "evm"
-      ]
-    },
-    {
-      "key": "p",
-      "desc": "add token by address",
-      "section": "POOL",
-      "chains": [
+        "evm",
         "sol"
       ]
     },
@@ -190,7 +183,8 @@
       "desc": "chart panel",
       "section": "VIEW",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
@@ -199,14 +193,6 @@
       "section": "VIEW",
       "chains": [
         "evm"
-      ]
-    },
-    {
-      "key": "c",
-      "desc": "chart panel",
-      "section": "VIEW",
-      "chains": [
-        "sol"
       ]
     },
     {
