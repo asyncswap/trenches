@@ -229,7 +229,7 @@ pub struct Registry {
     /// Token risk scoring. Absent = defaults (enabled, public API, no key).
     #[serde(default)]
     pub rugcheck: RugCheck,
-    /// How many hours a Permit2 grant stays valid. Absent = 24.
+    /// How long a Permit2 grant stays valid, IN HOURS. Absent = 24.
     ///
     /// A Permit2 grant names a spender, an amount and an expiry, and the expiry
     /// is the only part of an approval that revokes itself. Shorter is safer
@@ -242,10 +242,15 @@ pub struct Registry {
     /// month if you would rather not think about it, or to 1 if you would
     /// rather approve every time.
     ///
+    /// The unit is hours and the name does not say so — `24` is a day, `720`
+    /// is a month. The clamp catches a zero or a century but cannot catch
+    /// someone who meant days, so the docs and the schema both lead with the
+    /// unit.
+    ///
     /// Clamped when read, not here — a config file can say anything, and a
     /// zero or a century are both answers this should not simply obey.
     #[serde(default)]
-    pub permit2_hours: Option<u64>,
+    pub permit2_expiry: Option<u64>,
     /// Whether to open on the docs.
     ///
     /// Absent means "until you have been through them once" — the docs are
@@ -285,17 +290,17 @@ pub fn permit2_ttl_secs() -> u64 {
     *TTL.get_or_init(|| {
         let hours = Registry::load(&config_path().to_string_lossy())
             .ok()
-            .and_then(|r| r.permit2_hours)
-            .unwrap_or(DEFAULT_PERMIT2_HOURS);
-        clamp_permit2_hours(hours) * 3_600
+            .and_then(|r| r.permit2_expiry)
+            .unwrap_or(DEFAULT_PERMIT2_EXPIRY);
+        clamp_permit2_expiry(hours) * 3_600
     })
 }
 
 /// The recommended window, and what you get by saying nothing.
-pub const DEFAULT_PERMIT2_HOURS: u64 = 24;
+pub const DEFAULT_PERMIT2_EXPIRY: u64 = 24;
 
 /// An hour at the least, a year at the most.
-fn clamp_permit2_hours(hours: u64) -> u64 {
+fn clamp_permit2_expiry(hours: u64) -> u64 {
     hours.clamp(1, 8_760)
 }
 
@@ -776,22 +781,22 @@ mod permit2_ttl_tests {
 
     #[test]
     fn saying_nothing_gets_you_a_day() {
-        assert_eq!(clamp_permit2_hours(DEFAULT_PERMIT2_HOURS) * 3_600, 86_400);
+        assert_eq!(clamp_permit2_expiry(DEFAULT_PERMIT2_EXPIRY) * 3_600, 86_400);
     }
 
     #[test]
     fn a_zero_becomes_an_hour_rather_than_an_expired_grant() {
-        assert_eq!(clamp_permit2_hours(0), 1);
+        assert_eq!(clamp_permit2_expiry(0), 1);
     }
 
     #[test]
     fn an_absurd_window_is_capped_at_a_year() {
-        assert_eq!(clamp_permit2_hours(1_000_000), 8_760);
-        assert_eq!(clamp_permit2_hours(8_760), 8_760, "a year exactly is allowed");
+        assert_eq!(clamp_permit2_expiry(1_000_000), 8_760);
+        assert_eq!(clamp_permit2_expiry(8_760), 8_760, "a year exactly is allowed");
     }
 
     #[test]
     fn a_month_is_honoured() {
-        assert_eq!(clamp_permit2_hours(720), 720);
+        assert_eq!(clamp_permit2_expiry(720), 720);
     }
 }

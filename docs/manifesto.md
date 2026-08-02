@@ -65,8 +65,8 @@ transaction in front of the sell, which is the one place a delay is expensive.
 the two Permit2 legs, which are commented as this exception.
 `revoke_permit2_if_empty` runs on the confirmed sell that empties the position.
 Grants carry a 24-hour expiry by default — that used to read as the year 2100,
-which was the real defect here. It is yours to set: `permit2_hours` in the
-config, clamped to between an hour and a year, because the tradeoff between
+which was the real defect here. It is yours to set: `permit2_expiry` in the
+config, in hours, clamped to between an hour and a year, because the tradeoff between
 approving often and leaving a permission standing is a judgement about your own
 risk, not one this bot should make silently on your behalf.
 

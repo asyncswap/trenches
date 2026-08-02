@@ -61,11 +61,11 @@ validates fields and completes names as you type.
 ## Approval window
 
 ```json
-{ "permit2_hours": 24 }
+{ "permit2_expiry": 24 }
 ```
 
-How long an approval this bot grants stays valid, in hours. Absent means 24,
-which is what we recommend.
+How long an approval this bot grants stays valid, **in hours**. Absent means
+24, which is what we recommend. `24` is a day, `720` is a month.
 
 An approval is permission to move your tokens, and its expiry is the only part
 of it that revokes itself. Shorter is safer and costs one approval transaction
