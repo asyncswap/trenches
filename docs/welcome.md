@@ -27,8 +27,8 @@ Use `tab` to move between these documents, `↑` `↓` to scroll, `esc` to go ba
   a good idea.
 - **Accounts** — how to make one, and what the bot will never do with it.
 - **Config** — where settings live, and how to set an API key.
-- **Shortcuts** — every binding, including what separates `s` from `S` and `f`
-  from `F`.
+- **Shortcuts** — every binding, generated from the same file the app reads,
+  including what separates `s` from `S`, and `x` on Solana from `x` on EVM.
 - **Terms** and **Privacy** — what this software promises, which is very little.
 - **License** — how you may use and share it.
 - **Finish** — the checks worth doing, and the way in.

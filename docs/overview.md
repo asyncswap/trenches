@@ -22,7 +22,8 @@ What each venue actually lets you do, since it is not the same everywhere:
 - *Wallet* — balances, cost basis, realized and unrealized PnL.
 - *Pool* — the pair, price, market cap, pooled liquidity and age.
 - *Settings* — every adjustable knob, and the most recent message.
-- *Trades / Orders / Logs* — cycle with `l`.
+- *Trades / Orders / Logs / Chart* — `t` `o` `l` `c` jump straight to one,
+  `O` cycles.
 
 **Trenches** (`f`) — live launches as they happen. Enter to trade one.
 
@@ -37,7 +38,7 @@ Sizing and protection:
 [ ]   buy size
 ( )   sell size
 { }   slippage
-< >   price impact cap (EVM) / priority fee (Solana)
+< >   price impact cap (EVM)  ·  priority fee (Solana)
 ```
 
 Trading:
@@ -45,15 +46,18 @@ Trading:
 ```
 b     buy
 s     sell the configured slice
-x     sell everything
+x     sell everything (Solana)  ·  close all LP positions (EVM)
+S     sell every token you hold (EVM)
+M     move funds out to another address
+u     swap USDC and SOL (Solana)
 ```
 
 Navigation:
 
 ```
 f     find a coin or pool
-p     change pool
-l     cycle Trades / Orders / Logs
+p     add a pool by address
+O     cycle the panels
 T     theme picker
 C     change chain
 D     these docs

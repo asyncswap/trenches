@@ -23,11 +23,14 @@ s     sell a slice
 x     sell the lot        (Solana)  ·  close all LP positions  (EVM)
 ```
 
-Everything else moves you around. Those three spend money.
+Those three are the ones you will reach for. They are not the only keys that
+sign: `S` sells every token you hold, `a` and `r` move liquidity, `e` runs an
+arb, `M` sends funds out, and `u` swaps USDC for SOL. Every one of them asks
+first or acts on a size you set.
 
-Nothing else does. No timer, no strategy, no background loop opens a position
-while you are away from the keyboard. The bot is in manual mode — the only
-mode there is.
+What none of them do is act on their own. No timer, no strategy, no background
+loop opens a position while you are away from the keyboard. The bot is in
+manual mode — the only mode there is.
 
 ## When something goes wrong
 

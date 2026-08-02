@@ -20,7 +20,8 @@ A terminal bot for trading memecoins.
 - **Solana** — pump.fun bonding curves and PumpSwap AMM
 - **Base, BNB Chain, Hyperliquid** — next
 - Keys stay on your machine, in a password-encrypted keystore
-- One set of shortcuts, the same on every chain
+- One set of shortcuts, from one file — the app, the docs and the website
+  cannot disagree about them
 - A PnL calendar that remembers what each day made
 
 ## Install

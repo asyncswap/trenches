@@ -57,8 +57,23 @@
       "desc": "sell all",
       "section": "TRADE",
       "chains": [
-        "evm",
         "sol"
+      ]
+    },
+    {
+      "key": "x",
+      "desc": "close all liquidity positions",
+      "section": "TRADE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
+      "key": "S",
+      "desc": "sell every token you hold",
+      "section": "TRADE",
+      "chains": [
+        "evm"
       ]
     },
     {
@@ -201,7 +216,8 @@
       "desc": "chart panel",
       "section": "VIEW",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
@@ -324,7 +340,8 @@
       "desc": "decrease sell size",
       "section": "SIZE",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
@@ -332,22 +349,7 @@
       "desc": "increase sell size",
       "section": "SIZE",
       "chains": [
-        "evm"
-      ]
-    },
-    {
-      "key": "(",
-      "desc": "decrease slippage",
-      "section": "SIZE",
-      "chains": [
-        "sol"
-      ]
-    },
-    {
-      "key": ")",
-      "desc": "increase slippage",
-      "section": "SIZE",
-      "chains": [
+        "evm",
         "sol"
       ]
     },
@@ -356,7 +358,8 @@
       "desc": "decrease slippage",
       "section": "SIZE",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
@@ -364,28 +367,13 @@
       "desc": "increase slippage",
       "section": "SIZE",
       "chains": [
-        "evm"
-      ]
-    },
-    {
-      "key": "{",
-      "desc": "decrease priority fee",
-      "section": "SIZE",
-      "chains": [
-        "sol"
-      ]
-    },
-    {
-      "key": "}",
-      "desc": "increase priority fee",
-      "section": "SIZE",
-      "chains": [
+        "evm",
         "sol"
       ]
     },
     {
       "key": "<",
-      "desc": "tighten price impact limit",
+      "desc": "decrease price impact limit",
       "section": "SIZE",
       "chains": [
         "evm"
@@ -393,10 +381,26 @@
     },
     {
       "key": ">",
-      "desc": "loosen price impact limit",
+      "desc": "increase price impact limit",
       "section": "SIZE",
       "chains": [
         "evm"
+      ]
+    },
+    {
+      "key": "<",
+      "desc": "decrease priority fee",
+      "section": "SIZE",
+      "chains": [
+        "sol"
+      ]
+    },
+    {
+      "key": ">",
+      "desc": "increase priority fee",
+      "section": "SIZE",
+      "chains": [
+        "sol"
       ]
     },
     {

@@ -4,7 +4,7 @@ A TradingView-grade candlestick chart, drawn in text. Press `c` (or `v`) on
 either chain.
 
 ```
-┌ ANSEM/SOL 1m candle [,] [.] ─────────────────[t] [c] [o] [l]┐
+┌ ANSEM/SOL 1m candle [,] [.] [m] ─────────────[t] [c] [o] [l]┐
 │                                    ▂▂▂                      │
 │                              █ ▂▂▂ ███          0.002437 SOL│
 │┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄█┄███┄███┄┄┄┄┄┄┄┄┄ sell        │
@@ -33,6 +33,13 @@ green up, red down, with a dotted rule across the chart at the live price.
 Your own fills draw as horizontal dotted lines at the **price you paid** —
 tagged `buy` (green) and `sell` (red) at the right edge. Entry, exit, and the
 live price rule between them: the whole story of a position at a glance.
+
+## Price or market cap
+
+`m` switches the axis between the two. It is one series read two ways —
+market cap is price times supply — so the candles keep their shape and only
+the scale changes. On a coin whose supply is not known yet the title says so
+and the chart stays on price, rather than drawing a number it cannot compute.
 
 ## Intervals
 

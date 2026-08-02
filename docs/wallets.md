@@ -121,8 +121,9 @@ which is what makes them safe to copy somewhere.
 ## What the bot will not do
 
 - It never sends your key anywhere. Signing happens on your machine.
-- It never trades on its own. `b`, `s` and `x` are the only keys that submit a
-  transaction.
+- It never trades on its own. Nothing signs without a keypress: `b` `s` `x`
+  `S` to trade, `a` `r` for liquidity, `e` to arb, `M` to send, `u` to swap.
+  No timer and no background loop signs anything.
 - Copy modes only pre-fill a size. They do not trade.
 - It never writes a password or a key to a log. Session logs record addresses and
   amounts; skim one before attaching it to a bug report anyway.
