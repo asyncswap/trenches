@@ -14,22 +14,47 @@
 
 use serde::Deserialize;
 
+/// One key, or a pair that works as one control.
+///
+/// Both spellings are accepted because both read well in their own case: a
+/// list of one is noise, and `"[  ]"` as a single string is not data — you
+/// could not look up what `]` does, and the collision test could not see
+/// inside it. `Many` keeps the pair addressable; `One` keeps the common case
+/// quiet.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Keys {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Keys {
+    fn each(&self) -> &[String] {
+        match self {
+            Keys::One(k) => std::slice::from_ref(k),
+            Keys::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct Key {
-    /// Always a list. A genuine pair — `[` and `]` for buy size — shares a
-    /// description and a row while staying two addressable keys, so the
-    /// collision test below can see both.
-    pub keys: Vec<String>,
+    pub key: Keys,
     pub desc: String,
     pub section: String,
     pub chains: Vec<String>,
 }
 
 impl Key {
-    /// The keys as one label. Two spaces between them, so `[  ]` reads as two
-    /// keys rather than as a single odd one.
+    /// The keys as one label. Two spaces between a pair, so `[  ]` reads as
+    /// two keys rather than as a single odd one.
     pub fn shown(&self) -> String {
-        self.keys.join("  ")
+        self.key.each().join("  ")
+    }
+
+    /// Every key this entry claims, for checks that must see them separately.
+    pub fn each(&self) -> &[String] {
+        self.key.each()
     }
 }
 
@@ -115,7 +140,7 @@ mod tests {
     #[test]
     fn every_key_names_at_least_one_chain() {
         for k in all() {
-            assert!(!k.keys.is_empty(), "an entry with no keys: \"{}\"", k.desc);
+            assert!(!k.each().is_empty(), "an entry with no keys: \"{}\"", k.desc);
             assert!(!k.chains.is_empty(), "`{}` belongs to no dashboard", k.shown());
             for c in &k.chains {
                 assert!(c == "evm" || c == "sol", "`{}` has unknown chain {c}", k.shown());
@@ -134,7 +159,7 @@ mod tests {
             // whole reason `keys` is a list.
             let mut seen: std::collections::HashMap<&str, &str> = Default::default();
             for k in all().iter().filter(|k| k.chains.iter().any(|c| c == chain)) {
-                for key in &k.keys {
+                for key in k.each() {
                     if let Some(prev) = seen.insert(key, &k.desc) {
                         panic!("on {chain}, `{key}` is both \"{prev}\" and \"{}\"", k.desc);
                     }

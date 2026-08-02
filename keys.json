@@ -8,7 +8,7 @@
     "of the balance' in the other. Nobody was careless; three lists cannot be kept",
     "in step by remembering to.",
     "",
-    "`keys` IS ALWAYS A LIST, even for one key. A pair that is genuinely one",
+    "`key` IS A STRING, OR A LIST when a pair works as one control.",
     "control — [ and ] for buy size — shares a description and a row, but each key",
     "is still its own string. The first version of this file wrote those as \"[  ]\",",
     "which reads fine and is useless as data: you cannot look up what `]` does, and",
@@ -17,7 +17,7 @@
     "\"slippage\" while the code has it clearing the price impact limit.",
     "",
     "FIELDS",
-    "  keys     what you press — a list, joined for display",
+    "  key      what you press — a string, or a list for a pair",
     "  desc     what they do, in as few words as say it",
     "  section  the group it belongs to, in the order sections first appear here",
     "  chains   which dashboards have it: evm, sol, or both",
@@ -30,9 +30,7 @@
   ],
   "keys": [
     {
-      "keys": [
-        "b"
-      ],
+      "key": "b",
       "desc": "buy",
       "section": "TRADE",
       "chains": [
@@ -41,9 +39,7 @@
       ]
     },
     {
-      "keys": [
-        "s"
-      ],
+      "key": "s",
       "desc": "sell",
       "section": "TRADE",
       "chains": [
@@ -52,9 +48,7 @@
       ]
     },
     {
-      "keys": [
-        "x"
-      ],
+      "key": "x",
       "desc": "sell all",
       "section": "TRADE",
       "chains": [
@@ -63,9 +57,7 @@
       ]
     },
     {
-      "keys": [
-        "h"
-      ],
+      "key": "h",
       "desc": "token holdings",
       "section": "TRADE",
       "chains": [
@@ -73,9 +65,7 @@
       ]
     },
     {
-      "keys": [
-        "M"
-      ],
+      "key": "M",
       "desc": "move funds to an address",
       "section": "TRADE",
       "chains": [
@@ -83,9 +73,7 @@
       ]
     },
     {
-      "keys": [
-        "a"
-      ],
+      "key": "a",
       "desc": "add liquidity",
       "section": "LIQUIDITY",
       "chains": [
@@ -93,9 +81,7 @@
       ]
     },
     {
-      "keys": [
-        "r"
-      ],
+      "key": "r",
       "desc": "remove last liquidity",
       "section": "LIQUIDITY",
       "chains": [
@@ -103,9 +89,7 @@
       ]
     },
     {
-      "keys": [
-        "f"
-      ],
+      "key": "f",
       "desc": "find market",
       "section": "DISCOVER",
       "chains": [
@@ -114,9 +98,7 @@
       ]
     },
     {
-      "keys": [
-        "F"
-      ],
+      "key": "F",
       "desc": "verified tokens",
       "section": "DISCOVER",
       "chains": [
@@ -124,9 +106,7 @@
       ]
     },
     {
-      "keys": [
-        "k"
-      ],
+      "key": "k",
       "desc": "leaderboard",
       "section": "DISCOVER",
       "chains": [
@@ -134,9 +114,7 @@
       ]
     },
     {
-      "keys": [
-        "p"
-      ],
+      "key": "p",
       "desc": "add pool",
       "section": "POOL",
       "chains": [
@@ -144,9 +122,7 @@
       ]
     },
     {
-      "keys": [
-        "p"
-      ],
+      "key": "p",
       "desc": "add token by address",
       "section": "POOL",
       "chains": [
@@ -154,9 +130,7 @@
       ]
     },
     {
-      "keys": [
-        "Del"
-      ],
+      "key": "Del",
       "desc": "deselect the pool",
       "section": "POOL",
       "chains": [
@@ -164,9 +138,7 @@
       ]
     },
     {
-      "keys": [
-        "d"
-      ],
+      "key": "d",
       "desc": "multi-pool view",
       "section": "POOL",
       "chains": [
@@ -174,9 +146,7 @@
       ]
     },
     {
-      "keys": [
-        "e"
-      ],
+      "key": "e",
       "desc": "auto arbitrage",
       "section": "POOL",
       "chains": [
@@ -184,9 +154,7 @@
       ]
     },
     {
-      "keys": [
-        "t"
-      ],
+      "key": "t",
       "desc": "trades panel",
       "section": "VIEW",
       "chains": [
@@ -195,9 +163,7 @@
       ]
     },
     {
-      "keys": [
-        "o"
-      ],
+      "key": "o",
       "desc": "orders panel",
       "section": "VIEW",
       "chains": [
@@ -206,9 +172,7 @@
       ]
     },
     {
-      "keys": [
-        "l"
-      ],
+      "key": "l",
       "desc": "logs panel",
       "section": "VIEW",
       "chains": [
@@ -217,7 +181,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "c",
         "v"
       ],
@@ -228,9 +192,7 @@
       ]
     },
     {
-      "keys": [
-        "c"
-      ],
+      "key": "c",
       "desc": "chart panel",
       "section": "VIEW",
       "chains": [
@@ -238,7 +200,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "O",
         "→"
       ],
@@ -250,9 +212,7 @@
       ]
     },
     {
-      "keys": [
-        "←"
-      ],
+      "key": "←",
       "desc": "previous panel",
       "section": "VIEW",
       "chains": [
@@ -261,7 +221,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "↑",
         "↓"
       ],
@@ -273,7 +233,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         ",",
         "."
       ],
@@ -285,9 +245,7 @@
       ]
     },
     {
-      "keys": [
-        "m"
-      ],
+      "key": "m",
       "desc": "chart: price / market cap",
       "section": "VIEW",
       "chains": [
@@ -296,9 +254,7 @@
       ]
     },
     {
-      "keys": [
-        "L"
-      ],
+      "key": "L",
       "desc": "PnL calendar",
       "section": "VIEW",
       "chains": [
@@ -306,7 +262,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "[",
         "]"
       ],
@@ -318,7 +274,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         ";",
         "'"
       ],
@@ -329,7 +285,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "(",
         ")"
       ],
@@ -340,7 +296,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "(",
         ")"
       ],
@@ -351,7 +307,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "{",
         "}"
       ],
@@ -362,7 +318,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "{",
         "}"
       ],
@@ -373,7 +329,7 @@
       ]
     },
     {
-      "keys": [
+      "key": [
         "<",
         ">"
       ],
@@ -384,9 +340,7 @@
       ]
     },
     {
-      "keys": [
-        "0"
-      ],
+      "key": "0",
       "desc": "price impact limit off",
       "section": "SIZE",
       "chains": [
@@ -394,9 +348,7 @@
       ]
     },
     {
-      "keys": [
-        "P"
-      ],
+      "key": "P",
       "desc": "auto priority on/off",
       "section": "SIZE",
       "chains": [
@@ -404,9 +356,7 @@
       ]
     },
     {
-      "keys": [
-        "T"
-      ],
+      "key": "T",
       "desc": "theme picker",
       "section": "MODE",
       "chains": [
@@ -415,9 +365,7 @@
       ]
     },
     {
-      "keys": [
-        "$"
-      ],
+      "key": "$",
       "desc": "display currency",
       "section": "MODE",
       "chains": [
@@ -425,9 +373,7 @@
       ]
     },
     {
-      "keys": [
-        "g"
-      ],
+      "key": "g",
       "desc": "profit guard on/off",
       "section": "MODE",
       "chains": [
@@ -435,9 +381,7 @@
       ]
     },
     {
-      "keys": [
-        "n"
-      ],
+      "key": "n",
       "desc": "buy dedup on/off",
       "section": "MODE",
       "chains": [
@@ -445,9 +389,7 @@
       ]
     },
     {
-      "keys": [
-        "C"
-      ],
+      "key": "C",
       "desc": "change chain",
       "section": "MODE",
       "chains": [
@@ -456,9 +398,7 @@
       ]
     },
     {
-      "keys": [
-        "W"
-      ],
+      "key": "W",
       "desc": "change wallet",
       "section": "MODE",
       "chains": [
@@ -467,9 +407,7 @@
       ]
     },
     {
-      "keys": [
-        "D"
-      ],
+      "key": "D",
       "desc": "docs",
       "section": "MODE",
       "chains": [
@@ -478,9 +416,7 @@
       ]
     },
     {
-      "keys": [
-        "q"
-      ],
+      "key": "q",
       "desc": "quit",
       "section": "MODE",
       "chains": [
@@ -489,9 +425,7 @@
       ]
     },
     {
-      "keys": [
-        "Q"
-      ],
+      "key": "Q",
       "desc": "quit without asking",
       "section": "MODE",
       "chains": [
@@ -500,9 +434,7 @@
       ]
     },
     {
-      "keys": [
-        "?"
-      ],
+      "key": "?",
       "desc": "help",
       "section": "MODE",
       "chains": [
