@@ -204,9 +204,11 @@ mod tests {
         );
     }
 
-    /// docs/keys.md is generated from this file. If it has drifted, the docs
-    /// are describing a build that no longer exists — which is the failure this
-    /// whole module was written to make impossible.
+    /// docs/keys.md is generated from this file, for people reading the
+    /// repository rather than running the app. The Shortcuts page in the app no
+    /// longer embeds it — that renders `markdown()` directly, so it cannot be
+    /// stale — but a checked-in file that quietly stops matching is still a
+    /// reader being told something untrue.
     #[test]
     fn the_docs_page_matches_the_source() {
         let on_disk = include_str!("../docs/keys.md");

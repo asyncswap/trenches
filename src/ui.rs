@@ -338,23 +338,46 @@ pub fn select_table(
 }
 
 /// Bundled documentation, embedded so the binary stays self-contained.
-pub const DOCS: &[(&str, &str)] = &[
-    ("Welcome", include_str!("../docs/welcome.md")),
-    ("Overview", include_str!("../docs/overview.md")),
-    // Setup first, then the shortcuts. The bindings only mean something once
-    // you have an account and an endpoint to use them against.
-    ("Accounts", include_str!("../docs/wallets.md")),
-    ("Config", include_str!("../docs/config.md")),
-    ("Shortcuts", include_str!("../docs/keys.md")),
-    ("Chart", include_str!("../docs/chart.md")),
-    ("Terms", include_str!("../docs/terms.md")),
-    ("Privacy", include_str!("../docs/privacy.md")),
-    ("License", include_str!("../docs/license.md")),
-    ("Support", include_str!("../docs/support.md")),
-    // Last, and the reason the reader is a sequence rather than a menu: someone
-    // who scrolls to the end should find a door, not run out of pages.
-    ("Finish", include_str!("../docs/finish.md")),
-];
+///
+/// Shortcuts is the one page that is not a file. It is rendered from keys.json,
+/// which is also what the in-app help and the website read, so the page cannot
+/// describe a binding this build does not have. Embedding `docs/keys.md` here
+/// meant the docs screen was only as fresh as the last time someone remembered
+/// to regenerate it — a test caught that, but catching it is worse than not
+/// being able to get it wrong.
+///
+/// `docs/keys.md` still exists, for people reading the repository rather than
+/// running the app, and is still checked against the source. Nothing the app
+/// shows depends on it now.
+pub fn doc_pages() -> &'static [(&'static str, &'static str)] {
+    static DOCS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+        std::sync::OnceLock::new();
+    DOCS.get_or_init(|| {
+        // Leaked on purpose: one allocation that lives as long as the process,
+        // which is exactly what the `include_str!` entries around it are. The
+        // alternative is threading a lifetime through six call sites to avoid
+        // a few hundred bytes.
+        let keys: &'static str = Box::leak(crate::keys::markdown().into_boxed_str());
+        vec![
+            ("Welcome", include_str!("../docs/welcome.md")),
+            ("Overview", include_str!("../docs/overview.md")),
+            // Setup first, then the shortcuts. The bindings only mean something
+            // once you have an account and an endpoint to use them against.
+            ("Accounts", include_str!("../docs/wallets.md")),
+            ("Config", include_str!("../docs/config.md")),
+            ("Shortcuts", keys),
+            ("Chart", include_str!("../docs/chart.md")),
+            ("Terms", include_str!("../docs/terms.md")),
+            ("Privacy", include_str!("../docs/privacy.md")),
+            ("License", include_str!("../docs/license.md")),
+            ("Support", include_str!("../docs/support.md")),
+            // Last, and the reason the reader is a sequence rather than a menu:
+            // someone who scrolls to the end should find a door, not run out of
+            // pages.
+            ("Finish", include_str!("../docs/finish.md")),
+        ]
+    })
+}
 
 /// Scrollable markdown viewer for the bundled docs.
 ///
@@ -466,7 +489,7 @@ fn docs_inner(
             let cols = Layout::horizontal([Constraint::Length(20), Constraint::Min(30)])
                 .split(f.area());
 
-            let items: Vec<ListItem> = DOCS.iter().map(|(t, _)| ListItem::new(*t)).collect();
+            let items: Vec<ListItem> = doc_pages().iter().map(|(t, _)| ListItem::new(*t)).collect();
             let mut st = ListState::default();
             st.select(Some(sel));
             f.render_stateful_widget(
@@ -482,13 +505,13 @@ fn docs_inner(
                 &mut st,
             );
 
-            let block = widgets::themed_block(format!(" {} ", DOCS[sel].0))
+            let block = widgets::themed_block(format!(" {} ", doc_pages()[sel].0))
                 // The footer names what THIS page can do. A fixed strip listing
                 // every key would be a second shortcuts index nobody reads.
                 .title_bottom(if !start {
                     " j/k or tab switch · ↑/↓ scroll · e set API keys · T theme · esc back ".to_string()
                 } else {
-                    let action = match DOCS[sel].0 {
+                    let action = match doc_pages()[sel].0 {
                         "Accounts" => " · W make an account",
                         "Config" => " · e set API keys",
                         "Finish" => " · W account · e API keys",
@@ -497,7 +520,7 @@ fn docs_inner(
                     format!(" j/k switch · ↑/↓ scroll · T theme{action} · enter start · q quit ")
                 });
             let inner = block.inner(cols[1]);
-            let body = markdown::render(DOCS[sel].1);
+            let body = markdown::render(doc_pages()[sel].1);
 
             // Wrapping turns one long line into several, so the scroll limit
             // has to count laid-out rows, not source lines — and only the
@@ -545,9 +568,9 @@ fn docs_inner(
             if let Event::Key(k) = ev {
                 let switch = |forward: bool, sel: &mut usize, scroll: &mut u16| {
                     *sel = if forward {
-                        (*sel + 1) % DOCS.len()
+                        (*sel + 1) % doc_pages().len()
                     } else {
-                        (*sel + DOCS.len() - 1) % DOCS.len()
+                        (*sel + doc_pages().len() - 1) % doc_pages().len()
                     };
                     *scroll = 0;
                 };
