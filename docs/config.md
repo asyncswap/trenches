@@ -58,6 +58,25 @@ endpoint in turn and writes the config itself.
 Every config carries a `$schema` line; any editor that understands JSON Schema
 validates fields and completes names as you type.
 
+## Approval window
+
+```json
+{ "permit2_hours": 24 }
+```
+
+How long an approval this bot grants stays valid, in hours. Absent means 24,
+which is what we recommend.
+
+An approval is permission to move your tokens, and its expiry is the only part
+of it that revokes itself. Shorter is safer and costs one approval transaction
+before the first trade of each window. Longer is fewer transactions and a
+permission that outlives the trading it was for.
+
+Set `720` for a month if you would rather not think about it, or `1` to approve
+before every session. Values below an hour or above a year are clamped — a grant
+that expires before the trade it was for could land is not a safety setting, and
+neither is one that never expires.
+
 ## Adding a chain
 
 Anything in `networks` appears in the chain picker. Any EVM chain is three

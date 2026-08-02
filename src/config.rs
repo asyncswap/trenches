@@ -229,6 +229,23 @@ pub struct Registry {
     /// Token risk scoring. Absent = defaults (enabled, public API, no key).
     #[serde(default)]
     pub rugcheck: RugCheck,
+    /// How many hours a Permit2 grant stays valid. Absent = 24.
+    ///
+    /// A Permit2 grant names a spender, an amount and an expiry, and the expiry
+    /// is the only part of an approval that revokes itself. Shorter is safer
+    /// and costs a re-approval before the first trade of each window; longer is
+    /// fewer transactions and a permission that lives longer than the trading
+    /// it was for.
+    ///
+    /// 24 hours is the recommendation: it covers a session without leaving a
+    /// grant standing across days you were not trading. Set it to 720 for a
+    /// month if you would rather not think about it, or to 1 if you would
+    /// rather approve every time.
+    ///
+    /// Clamped when read, not here — a config file can say anything, and a
+    /// zero or a century are both answers this should not simply obey.
+    #[serde(default)]
+    pub permit2_hours: Option<u64>,
     /// Whether to open on the docs.
     ///
     /// Absent means "until you have been through them once" — the docs are
@@ -254,6 +271,34 @@ fn onboarded_path() -> std::path::PathBuf {
 /// A marker in the CACHE, not the config: it is something that happened, not
 /// something anyone decided, and the app writing to a file it tells you to edit
 /// is exactly what the config/cache split exists to avoid.
+/// How long a Permit2 grant should live, in seconds.
+///
+/// Clamped to between an hour and a year. The floor stops a value that would
+/// expire before the trade it was granted for could land; the ceiling stops a
+/// typo becoming the year 2100 by another route, which is the defect this
+/// setting exists to have fixed.
+pub fn permit2_ttl_secs() -> u64 {
+    // Read once. This is consulted while building an approval, which is on the
+    // path to a trade — re-reading a file there to learn something that cannot
+    // change without a restart would be work in the worst place to do it.
+    static TTL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let hours = Registry::load(&config_path().to_string_lossy())
+            .ok()
+            .and_then(|r| r.permit2_hours)
+            .unwrap_or(DEFAULT_PERMIT2_HOURS);
+        clamp_permit2_hours(hours) * 3_600
+    })
+}
+
+/// The recommended window, and what you get by saying nothing.
+pub const DEFAULT_PERMIT2_HOURS: u64 = 24;
+
+/// An hour at the least, a year at the most.
+fn clamp_permit2_hours(hours: u64) -> u64 {
+    hours.clamp(1, 8_760)
+}
+
 pub fn onboarded() -> bool {
     let Ok(text) = std::fs::read_to_string(onboarded_path()) else {
         return false;
@@ -721,5 +766,32 @@ impl Pool {
     pub fn token(&self) -> eyre::Result<Address> {
         // The non-ETH side (currency1 for an ETH pool).
         Ok(self.currency1.parse()?)
+    }
+}
+
+
+#[cfg(test)]
+mod permit2_ttl_tests {
+    use super::*;
+
+    #[test]
+    fn saying_nothing_gets_you_a_day() {
+        assert_eq!(clamp_permit2_hours(DEFAULT_PERMIT2_HOURS) * 3_600, 86_400);
+    }
+
+    #[test]
+    fn a_zero_becomes_an_hour_rather_than_an_expired_grant() {
+        assert_eq!(clamp_permit2_hours(0), 1);
+    }
+
+    #[test]
+    fn an_absurd_window_is_capped_at_a_year() {
+        assert_eq!(clamp_permit2_hours(1_000_000), 8_760);
+        assert_eq!(clamp_permit2_hours(8_760), 8_760, "a year exactly is allowed");
+    }
+
+    #[test]
+    fn a_month_is_honoured() {
+        assert_eq!(clamp_permit2_hours(720), 720);
     }
 }

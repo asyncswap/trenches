@@ -1106,7 +1106,7 @@ impl Bot {
             //
             // PERMIT2 cannot move anything on its own. It moves tokens only
             // where it holds a grant that names the spender, the amount and an
-            // expiry, and the grant below is exact and lasts an hour. That is
+            // expiry, and the grant below is exact and lasts a day. That is
             // where the bound lives.
             //
             // Bounding this leg too would cost an ERC-20 approval before every
@@ -1119,9 +1119,12 @@ impl Bot {
             last = Some(*self.spent_nonce(sent)?.tx_hash());
         }
         if !p2_ok {
-            // An hour, not the year 2100. A grant that outlives the session
-            // that needed it is a standing permission nobody remembers giving.
-            let expiration48 = now48.saturating_add(U48::from(3600u64));
+            // A day, not the year 2100. Long enough that holding a position
+            // across a session does not put an extra approval in front of the
+            // sell; short enough that a grant cannot outlive the trading it was
+            // for. A standing permission nobody remembers giving is the thing
+            // being avoided, and 2100 was exactly that.
+            let expiration48 = now48.saturating_add(U48::from(crate::config::permit2_ttl_secs()));
             let nonce = self.take_nonce(provider).await?;
             let sent = p2
                 .approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
@@ -1147,6 +1150,47 @@ impl Bot {
     /// no approval and fires instantly. No-op for tokens without a v3 route. Sets
     /// `v3_covered` so the hot sell path can skip the allowance check entirely.
     /// Flaunch routes get the same treatment through Permit2 + the router.
+    /// Hand back the unlimited Permit2 allowance once the position is gone.
+    ///
+    /// The mirror of `pre_approve_exit`: that one grants on a confirmed buy,
+    /// this one gives it back on the sell that empties the balance.
+    ///
+    /// "Your balance is zero, so the allowance grants nothing" is true only
+    /// until the next time you hold that token — an airdrop, a transfer from
+    /// another wallet, a buy somewhere else — and then an unlimited allowance
+    /// nobody remembers granting is live again over funds that were never
+    /// approved for anything. A permission that outlives what it was for is
+    /// the whole failure mode.
+    ///
+    /// It runs AFTER the exit has confirmed, so it costs nothing that matters:
+    /// the money is already out. Bounding the allowance up front would have put
+    /// a transaction in front of the sell instead, which is the one place a
+    /// delay is expensive.
+    ///
+    /// Only the Permit2 leg needs this. Router allowances are exact and spent
+    /// by the trade that used them, so they revoke themselves.
+    async fn revoke_permit2_if_empty<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
+        let erc = IERC20::new(self.pool.token, provider);
+        if !erc.balanceOf(self.trader).call().await?._0.is_zero() {
+            return Ok(());
+        }
+        // Nothing to give back on a token that never went through Permit2.
+        if erc.allowance(self.trader, PERMIT2).call().await?._0.is_zero() {
+            return Ok(());
+        }
+        let nonce = self.take_nonce(provider).await?;
+        let sent = erc.approve(PERMIT2, U256::ZERO).gas(120_000).nonce(nonce).send().await;
+        // Broadcast and let go. Waiting on the receipt would hold the UI for a
+        // block to confirm a cleanup that changes nothing the trader is about
+        // to do — and if it fails, the next trade in this token re-approves
+        // from an allowance that is merely still there rather than wrong.
+        let _ = self.spent_nonce(sent)?;
+        // The next trade in this token approves again from scratch.
+        self.ur_permit2_done = false;
+        self.note(format!("Position closed — revoked the Permit2 allowance for {}", self.pool.sym));
+        Ok(())
+    }
+
     async fn pre_approve_exit<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
         if !self.has_v3_route() && !self.has_flaunch_route() {
             return Ok(());
@@ -2537,6 +2581,10 @@ fn order_fields(o: &Order) -> Vec<String> {
                                 if let Err(e) = self.pre_approve_exit(provider).await {
                                     self.note(format!("Pre approval failed. {}", short_err(&e.to_string())));
                                 }
+                            } else if let Err(e) = self.revoke_permit2_if_empty(provider).await {
+                                // Worth saying, not worth failing the sell over:
+                                // the trade landed, and this is cleanup.
+                                self.note(format!("Could not revoke the approval. {}", short_err(&e.to_string())));
                             }
                         }
                         // A confirmed ADD LP mint: read the REAL tokenId from the
@@ -2681,16 +2729,16 @@ fn order_fields(o: &Order) -> Vec<String> {
         if !self.lp_permit2_done {
             let erc = IERC20::new(self.pool.token, provider);
             let p2 = IPermit2::new(PERMIT2, provider);
-            // EXACT amount, and an hour to use it — not U160::MAX until 2100.
+            // EXACT amount, and a day to use it — not U160::MAX until 2100.
             // An unlimited, effectively permanent grant to a contract that can
             // move the token is exactly what `ensure_ur_allowance` refuses to
             // hand the router; the LP path had no reason to be different.
             //
             // The ERC-20 leg to PERMIT2 stays MAX — the documented exception
             // in docs/manifesto.md. Permit2 moves nothing without a grant, and
-            // the grant is right here: exact, and an hour long.
+            // the grant is right here: exact, and a day long.
             let amount160 = need160;
-            let expiration48 = U48::from(now_secs.saturating_add(3600));
+            let expiration48 = U48::from(now_secs.saturating_add(crate::config::permit2_ttl_secs()));
             self.note("approving token for Permit2…".into());
             // Fire both approvals (broadcast immediately, no wait between).
             let sent = async {

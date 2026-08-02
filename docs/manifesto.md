@@ -41,8 +41,8 @@ Every approval here passes a computed amount, except one.
 
 **The exception: the ERC-20 allowance to Permit2.** Permit2 cannot move anything
 on its own. It moves tokens only where it holds a grant naming the spender, the
-amount and an expiry — and this bot's grants are the exact amount, expiring an
-hour out. That grant is the bound.
+amount and an expiry — and this bot's grants are the exact amount, expiring a
+day out. That grant is the bound.
 
 Bounding this leg too would cost an approval before every single trade, because
 an exact grant is consumed by the trade that uses it: an exit would be three
@@ -50,16 +50,25 @@ transactions instead of two. In a market where getting out is measured in
 seconds, that is not a safety improvement. It swaps a narrow risk for a broader
 one.
 
-**Why nothing is revoked after a sell.** Once you have sold, your balance of that
-token is zero, and an allowance over nothing grants nothing. Spending gas to
-revoke it would buy no protection you do not already have. The spender-side
-grant expires by itself within the hour, so no standing permission is left
-behind either way.
+**The allowance is given back.** When a sell empties your position, the bot
+revokes the Permit2 allowance for that token. Not because the balance is zero —
+zero is not a durable fact. Tokens arrive: an airdrop, a transfer from another
+wallet, a buy somewhere else. An unlimited allowance nobody remembers granting,
+sitting over funds that were never approved for anything, is exactly the failure
+this promise is about.
+
+It happens after the exit has confirmed, so it costs nothing that matters — the
+money is already out. Bounding the allowance up front would instead put a
+transaction in front of the sell, which is the one place a delay is expensive.
 
 *Kept by:* every `approve` in `src/engine.rs` passes a computed amount except
-the two Permit2 legs, which are commented as this exception. Every Permit2 grant
-is exact and carries a one-hour expiry — it used to say the year 2100, which was
-the real defect here.
+the two Permit2 legs, which are commented as this exception.
+`revoke_permit2_if_empty` runs on the confirmed sell that empties the position.
+Grants carry a 24-hour expiry by default — that used to read as the year 2100,
+which was the real defect here. It is yours to set: `permit2_hours` in the
+config, clamped to between an hour and a year, because the tradeoff between
+approving often and leaving a permission standing is a judgement about your own
+risk, not one this bot should make silently on your behalf.
 
 ## 3. Nothing signs without a keypress
 
