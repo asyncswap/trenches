@@ -701,17 +701,9 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
     let trades: Vec<(i64, f64, bool)> =
         trades.into_iter().map(|(t, p, b)| (t, p * mcap_mul, b)).collect();
     crate::view::CandleView {
-        title: format!(
-            " {}/SOL {} · {} candle [,] [.] · [m] {} ",
-            sym,
-            match (bot.chart_mcap, can_mcap) {
-                (true, false) => "market cap (no supply yet)",
-                (true, true) => "market cap",
-                _ => "price",
-            },
-            crate::view::iv_label(bot.chart_iv),
-            if bot.chart_mcap { "price" } else { "market cap" },
-        ),
+        // Coin and interval only — see the EVM chart for why. The axis says
+        // which unit it is in without the title repeating it.
+        title: format!(" {}/SOL · {} candle [,] [.] [m] ", sym, crate::view::iv_label(bot.chart_iv)),
         candles,
         interval_secs: bot.chart_iv,
         // Money carries its own symbol, so the unit label goes away with it.
@@ -2931,10 +2923,13 @@ pub async fn run(
                     // the EVM chart, because it is the same question.
                     KeyCode::Char('m') => {
                         bot.chart_mcap = !bot.chart_mcap;
-                        bot.note(if bot.chart_mcap {
+                        let supply = bot.coin.as_ref().map(|c| c.supply()).unwrap_or(0.0);
+                        bot.note(if !bot.chart_mcap {
+                            "chart: price".to_string()
+                        } else if supply > 0.0 {
                             "chart: market cap".to_string()
                         } else {
-                            "chart: price".to_string()
+                            "chart: market cap — waiting on the token supply".to_string()
                         });
                     }
                     // The panel reads in this currency, so the key that

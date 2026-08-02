@@ -3308,10 +3308,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('m') => {
                             bot.chart_mcap = !bot.chart_mcap;
                             view = Panel::Chart;
-                            bot.status = if bot.chart_mcap {
+                            // The status line carries what the title no longer
+                            // does — including the case where the supply has
+                            // not loaded, which is the only time pressing this
+                            // appears to do nothing.
+                            bot.status = if !bot.chart_mcap {
+                                "chart: price".into()
+                            } else if bot.token_supply > 0.0 {
                                 "chart: market cap".into()
                             } else {
-                                "chart: price".into()
+                                "chart: market cap — waiting on the token supply".into()
                             };
                         }
                         KeyCode::Char(',') => { bot.chart_iv = view::iv_step(bot.chart_iv, false); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
@@ -4689,12 +4695,15 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 // The interval keys first, then the axis key — the two
                 // interval keys are one control and splitting them around
                 // another reads as three unrelated hints.
+                // The title names the coin and the interval, and stops there.
+                // It used to say which axis was showing and what `m` would
+                // switch to — two words that changed places every press, in the
+                // one part of the screen that should hold still. The axis
+                // itself already says which unit it is in.
                 title: format!(
-                    " {} {} · {} candle [,] [.] · [m] {} ",
+                    " {} · {} candle [,] [.] [m] ",
                     bot.pool.sym,
-                    if bot.chart_mcap { "market cap" } else { "price" },
                     view::iv_label(bot.chart_iv),
-                    if bot.chart_mcap { "price" } else { "market cap" },
                 ),
                 candles,
                 interval_secs: bot.chart_iv,
