@@ -183,6 +183,27 @@ mod tests {
         }
     }
 
+    /// The marketing site is a separate repository, so it cannot `include_str!`
+    /// this file — it keeps a copy at `trenches.sh/src/keys.json`. A copy that
+    /// can go stale quietly is the failure this module exists to remove, so
+    /// when that checkout is next to ours, the copy is checked.
+    ///
+    /// Skipped when the sibling is absent: CI and anyone who cloned only this
+    /// repo should not fail a test over a directory they have no reason to
+    /// have. The check runs where the change is made, which is here.
+    #[test]
+    fn the_website_copy_matches_the_source() {
+        let site = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../trenches.sh/src/keys.json");
+        let Ok(theirs) = std::fs::read_to_string(&site) else { return };
+        let ours = include_str!("../keys.json");
+        assert_eq!(
+            theirs.trim(),
+            ours.trim(),
+            "the website's keys.json is stale — refresh it with `cp keys.json ../trenches.sh/src/keys.json`"
+        );
+    }
+
     /// docs/keys.md is generated from this file. If it has drifted, the docs
     /// are describing a build that no longer exists — which is the failure this
     /// whole module was written to make impossible.

@@ -407,6 +407,14 @@
       ]
     },
     {
+      "key": "R",
+      "desc": "refresh everything",
+      "section": "MODE",
+      "chains": [
+        "evm"
+      ]
+    },
+    {
       "key": "T",
       "desc": "theme picker",
       "section": "MODE",
@@ -460,6 +468,15 @@
     {
       "key": "D",
       "desc": "docs",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
+      "key": "Esc",
+      "desc": "back one screen",
       "section": "MODE",
       "chains": [
         "evm",

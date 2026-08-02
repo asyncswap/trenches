@@ -81,6 +81,7 @@ dashboard has it.
 
 | key | does | where |
 | --- | --- | --- |
+| `R` | refresh everything | EVM |
 | `T` | theme picker | both |
 | `$` | display currency | EVM |
 | `g` | profit guard on/off | EVM |
@@ -88,6 +89,7 @@ dashboard has it.
 | `C` | change chain | both |
 | `W` | change wallet | both |
 | `D` | docs | both |
+| `Esc` | back one screen | both |
 | `q` | quit | both |
 | `Q` | quit without asking | both |
 | `?` | help | both |
