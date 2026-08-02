@@ -3,7 +3,7 @@
     "THE keyboard shortcuts. One file, read by everything that shows them.",
     "",
     "There were three copies before this: an array in src/main.rs, another in",
-    "src/sol/app.rs, and prose in docs/keys.md. They disagreed — `M` existed only",
+    "src/sol/app.rs, and prose in docs/shortcuts.md. They disagreed — `M` existed only",
     "on Solana, `m` only on EVM, and `s` was 'sell' in one list and 'sell a slice",
     "of the balance' in the other. Nobody was careless; three lists cannot be kept",
     "in step by remembering to.",
@@ -30,10 +30,10 @@
     "A key on both chains is written ONCE. If it does different things on each,",
     "that is two entries and a sign the key is wrong.",
     "",
-    "Adding a key here is what puts it in the in-app help, docs/keys.md and the",
+    "Adding a key here is what puts it in the in-app help, docs/shortcuts.md and the",
     "website. A test fails if the docs fall behind."
   ],
-  "keys": [
+  "shortcuts": [
     {
       "key": "b",
       "desc": "buy",

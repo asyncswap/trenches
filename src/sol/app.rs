@@ -1991,10 +1991,10 @@ fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
     p
 }
 
-/// The Solana dashboard's shortcuts, from keys.json — see `crate::keys`. The
+/// The Solana dashboard's shortcuts, from shortcuts.json — see `crate::shortcuts`. The
 /// hand-written list that used to live here had drifted from the EVM one.
 fn help_rows() -> Vec<(String, String)> {
-    crate::keys::help_rows(crate::keys::Chain::Sol)
+    crate::shortcuts::help_rows(crate::shortcuts::Chain::Sol)
 }
 
 /// Draws the dashboard and returns where the header logo goes, so the caller

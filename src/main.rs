@@ -8,7 +8,7 @@ mod agent;
 mod verification;
 mod config;
 mod base_currency;
-mod keys;
+mod shortcuts;
 mod launch_stream;
 mod net;
 mod contracts;
@@ -1521,10 +1521,10 @@ async fn main() -> eyre::Result<()> {
                 println!();
                 return Ok(());
             }
-            // Regenerate docs/keys.md from keys.json. A test fails when the
+            // Regenerate docs/shortcuts.md from shortcuts.json. A test fails when the
             // page has drifted; this is how it stops drifting.
-            "--dump-keys" => {
-                print!("{}", keys::markdown());
+            "--dump-shortcuts" => {
+                print!("{}", shortcuts::markdown());
                 return Ok(());
             }
             "--help" | "-h" => {
@@ -5274,8 +5274,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // left, description on the right. Related knobs ( [ ] ( ) { } ) grouped.
     if show_help {
         // (section, key, description). Empty key = section header.
-        // From keys.json, the one place shortcuts are listed. See `keys`.
-        let rows = keys::help_rows(keys::Chain::Evm);
+        // From shortcuts.json, the one place shortcuts are listed. See `shortcuts`.
+        let rows = shortcuts::help_rows(shortcuts::Chain::Evm);
         let items: Vec<(&str, &str)> =
             rows.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         // Shared with the Solana dashboard — one renderer, one look.

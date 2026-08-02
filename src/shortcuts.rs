@@ -2,7 +2,7 @@
 // Copyright (C) 2026 AsyncSwap Labs, Inc.
 //! The keyboard shortcuts, from the one file that lists them.
 //!
-//! `keys.json` is the source. This reads it AT COMPILE TIME, so a malformed
+//! `shortcuts.json` is the source. This reads it AT COMPILE TIME, so a malformed
 //! file is a build failure rather than an empty help screen someone discovers
 //! in production, and the binary carries no runtime dependency on a path.
 //!
@@ -15,7 +15,7 @@
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-pub struct Key {
+pub struct Shortcut {
     pub key: String,
     pub desc: String,
     pub section: String,
@@ -24,7 +24,7 @@ pub struct Key {
 
 #[derive(Deserialize)]
 struct File {
-    keys: Vec<Key>,
+    shortcuts: Vec<Shortcut>,
 }
 
 /// Which dashboard is asking.
@@ -43,25 +43,25 @@ impl Chain {
     }
 }
 
-fn all() -> &'static [Key] {
-    static ALL: std::sync::OnceLock<Vec<Key>> = std::sync::OnceLock::new();
+fn all() -> &'static [Shortcut] {
+    static ALL: std::sync::OnceLock<Vec<Shortcut>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        // Parsed once. A panic here means keys.json is malformed, which is a
+        // Parsed once. A panic here means shortcuts.json is malformed, which is a
         // programming error in this repo and not something to paper over with
         // an empty list — an app that silently shows no shortcuts looks like an
         // app that has none.
-        let raw = include_str!("../keys.json");
-        serde_json::from_str::<File>(raw).expect("keys.json is malformed").keys
+        let raw = include_str!("../shortcuts.json");
+        serde_json::from_str::<File>(raw).expect("shortcuts.json is malformed").shortcuts
     })
 }
 
-/// Every shortcut for one chain, grouped, in the order `keys.json` lists them.
+/// Every shortcut for one chain, grouped, in the order `shortcuts.json` lists them.
 ///
 /// Returns the shape the help widget wants: `("SECTION", "")` for a heading and
 /// `("", "key|desc")` for a row. That shape belongs to the widget, so building
 /// it here keeps both dashboards from formatting the same data two ways.
 pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
-    let mine: Vec<&Key> =
+    let mine: Vec<&Shortcut> =
         all().iter().filter(|k| k.chains.iter().any(|c| c == chain.tag())).collect();
     let mut out = Vec::new();
     let mut section = "";
@@ -99,7 +99,7 @@ pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
 
 /// The shortcuts as markdown, for the docs page.
 pub fn markdown() -> String {
-    let mut out = String::from("# KEYS\n\nEvery shortcut, by section. `EVM` and `SOL` mark which\ndashboard has it.\n");
+    let mut out = String::from("# SHORTCUTS\n\nEvery shortcut, by section. `EVM` and `SOL` mark which\ndashboard has it.\n");
     let mut section = "";
     for k in all() {
         if k.section != section {
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn the_file_parses_and_is_not_empty() {
-        assert!(all().len() > 20, "keys.json should list every shortcut");
+        assert!(all().len() > 20, "shortcuts.json should list every shortcut");
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
     }
 
     /// The marketing site is a separate repository, so it cannot `include_str!`
-    /// this file — it keeps a copy at `trenches.sh/src/keys.json`. A copy that
+    /// this file — it keeps a copy at `trenches.sh/src/shortcuts.json`. A copy that
     /// can go stale quietly is the failure this module exists to remove, so
     /// when that checkout is next to ours, the copy is checked.
     ///
@@ -194,28 +194,28 @@ mod tests {
     #[test]
     fn the_website_copy_matches_the_source() {
         let site = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../trenches.sh/src/keys.json");
+            .join("../trenches.sh/src/shortcuts.json");
         let Ok(theirs) = std::fs::read_to_string(&site) else { return };
-        let ours = include_str!("../keys.json");
+        let ours = include_str!("../shortcuts.json");
         assert_eq!(
             theirs.trim(),
             ours.trim(),
-            "the website's keys.json is stale — refresh it with `cp keys.json ../trenches.sh/src/keys.json`"
+            "the website's shortcuts.json is stale — refresh it with `cp shortcuts.json ../trenches.sh/src/shortcuts.json`"
         );
     }
 
-    /// docs/keys.md is generated from this file, for people reading the
+    /// docs/shortcuts.md is generated from this file, for people reading the
     /// repository rather than running the app. The Shortcuts page in the app no
     /// longer embeds it — that renders `markdown()` directly, so it cannot be
     /// stale — but a checked-in file that quietly stops matching is still a
     /// reader being told something untrue.
     #[test]
     fn the_docs_page_matches_the_source() {
-        let on_disk = include_str!("../docs/keys.md");
+        let on_disk = include_str!("../docs/shortcuts.md");
         assert_eq!(
             on_disk.trim(),
             markdown().trim(),
-            "docs/keys.md is stale — regenerate it with `cargo run -- --dump-keys > docs/keys.md`"
+            "docs/shortcuts.md is stale — regenerate it with `cargo run -- --dump-shortcuts > docs/shortcuts.md`"
         );
     }
 }

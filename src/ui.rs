@@ -339,14 +339,14 @@ pub fn select_table(
 
 /// Bundled documentation, embedded so the binary stays self-contained.
 ///
-/// Shortcuts is the one page that is not a file. It is rendered from keys.json,
+/// Shortcuts is the one page that is not a file. It is rendered from shortcuts.json,
 /// which is also what the in-app help and the website read, so the page cannot
-/// describe a binding this build does not have. Embedding `docs/keys.md` here
+/// describe a binding this build does not have. Embedding `docs/shortcuts.md` here
 /// meant the docs screen was only as fresh as the last time someone remembered
 /// to regenerate it — a test caught that, but catching it is worse than not
 /// being able to get it wrong.
 ///
-/// `docs/keys.md` still exists, for people reading the repository rather than
+/// `docs/shortcuts.md` still exists, for people reading the repository rather than
 /// running the app, and is still checked against the source. Nothing the app
 /// shows depends on it now.
 pub fn doc_pages() -> &'static [(&'static str, &'static str)] {
@@ -357,7 +357,7 @@ pub fn doc_pages() -> &'static [(&'static str, &'static str)] {
         // which is exactly what the `include_str!` entries around it are. The
         // alternative is threading a lifetime through six call sites to avoid
         // a few hundred bytes.
-        let keys: &'static str = Box::leak(crate::keys::markdown().into_boxed_str());
+        let page: &'static str = Box::leak(crate::shortcuts::markdown().into_boxed_str());
         vec![
             ("Welcome", include_str!("../docs/welcome.md")),
             ("Overview", include_str!("../docs/overview.md")),
@@ -365,7 +365,7 @@ pub fn doc_pages() -> &'static [(&'static str, &'static str)] {
             // once you have an account and an endpoint to use them against.
             ("Accounts", include_str!("../docs/wallets.md")),
             ("Config", include_str!("../docs/config.md")),
-            ("Shortcuts", keys),
+            ("Shortcuts", page),
             ("Chart", include_str!("../docs/chart.md")),
             ("Terms", include_str!("../docs/terms.md")),
             ("Privacy", include_str!("../docs/privacy.md")),

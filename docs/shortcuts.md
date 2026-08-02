@@ -1,4 +1,4 @@
-# KEYS
+# SHORTCUTS
 
 Every shortcut, by section. `EVM` and `SOL` mark which
 dashboard has it.

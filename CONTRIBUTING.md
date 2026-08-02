@@ -101,14 +101,15 @@ repository and there is no way to make this automatic. Skipping it costs you a
 test failure rather than a bad commit, which is why it is a line in a file
 rather than a step in the build.
 
-There is one hook. When `keys.json` is staged it regenerates `docs/keys.md`
-from it and refreshes the website's copy at `../trenches.sh/src/keys.json` if
-that checkout is next to this one. Every other commit exits immediately.
+There is one hook. When `shortcuts.json` is staged it regenerates
+`docs/shortcuts.md` from it, and refreshes the website's copy at
+`../trenches.sh/src/shortcuts.json` if that checkout is next to this one.
+Every other commit exits immediately.
 
-`keys.json` is the only place a keyboard shortcut is written down: the in-app
-help and the Shortcuts docs page both render from it at runtime, so they cannot
-disagree with the build. The two files above are copies for readers who are not
-running the app, and copies are what go stale.
+`shortcuts.json` is the only place a keyboard shortcut is written down: the
+in-app help and the Shortcuts docs page both render from it at runtime, so
+they cannot disagree with the build. The two files above are copies for
+readers who are not running the app, and copies are what go stale.
 
 ## Reporting a security issue
 
