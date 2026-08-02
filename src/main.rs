@@ -3591,9 +3591,35 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 .buffered(64)
                                 .collect()
                                 .await;
-                            let visible: Vec<SelPool> = pools.iter().cloned()
-                                .zip(flags).filter_map(|(p, keep)| keep.then_some(p)).collect();
-                            labels.extend(visible.iter().map(|p| p.label.clone()));
+                            // The balance decides ORDER, not membership.
+                            //
+                            // It used to filter: a coin you no longer held was
+                            // dropped from the list entirely, so the whole
+                            // point of pasting a contract address once — going
+                            // back to it without pasting it again — only
+                            // worked while you still owned some. A cache of
+                            // hundreds of tokens rendered as one row.
+                            //
+                            // Held first, marked, then everything else in the
+                            // order it was added. Nothing is hidden; the ones
+                            // you are in are simply at the top where they were
+                            // useful in the first place.
+                            let mut ranked: Vec<(bool, SelPool)> =
+                                pools.iter().cloned().zip(flags).map(|(p, held)| (held, p)).collect();
+                            ranked.sort_by_key(|(held, _)| !*held); // stable: held first
+                            let visible: Vec<SelPool> =
+                                ranked.iter().map(|(_, p)| p.clone()).collect();
+                            labels.extend(
+                                ranked
+                                    .iter()
+                                    .map(|(held, p)| {
+                                        if *held {
+                                            format!("● {}", p.label)
+                                        } else {
+                                            format!("  {}", p.label)
+                                        }
+                                    }),
+                            );
                             if let Some(i) = ui::select(terminal, "Pools", &labels)? {
                                 // Optionally produce a new SelPool to switch to + append.
                                 let new_pool: Option<SelPool> = match i {
