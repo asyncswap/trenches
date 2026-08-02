@@ -97,6 +97,20 @@ pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
                 }
             }
         }
+        // Two keys that ARE the same control share a line too.
+        //
+        // `W` and `w` both change wallet; `c` and `v` both open the chart. The
+        // data lists each separately, because that is what makes a key
+        // findable and a collision detectable — but a help screen printing the
+        // identical description twice reads as two features, and the reader
+        // then goes looking for the difference.
+        if let Some(next) = mine.get(i + 1) {
+            if next.desc == k.desc && next.section == k.section && next.chains == k.chains {
+                out.push((String::new(), format!("{}  {}|{}", k.key, next.key, k.desc)));
+                i += 2;
+                continue;
+            }
+        }
         out.push((String::new(), format!("{}|{}", k.key, k.desc)));
         i += 1;
     }
@@ -168,6 +182,20 @@ mod tests {
         assert!(
             !rows.iter().any(|(_, r)| r.starts_with("[|")),
             "and not also as its halves"
+        );
+    }
+
+    /// Aliases collapse: one control, one line, both ways in.
+    #[test]
+    fn two_keys_for_the_same_thing_share_a_row() {
+        let rows = help_rows(Chain::Evm);
+        assert!(
+            rows.iter().any(|(_, r)| r == "W  w|change wallet"),
+            "W and w are one control: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, r)| r == "w|change wallet"),
+            "and the lowercase half does not also get its own row"
         );
     }
 

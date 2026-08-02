@@ -3235,7 +3235,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             }
                         }
                         // Back to the account list on this same chain.
-                        KeyCode::Char('W') => {
+                        KeyCode::Char('W') | KeyCode::Char('w') => {
                             // Hand the current pool back so the rebuilt session
                             // can restore it. Matched by token: `pools` holds
                             // the selectable form, `bot.pool` the live one.

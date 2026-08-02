@@ -422,6 +422,15 @@
       ]
     },
     {
+      "key": "w",
+      "desc": "change wallet",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
       "key": "U",
       "desc": "check for updates",
       "section": "MODE",
