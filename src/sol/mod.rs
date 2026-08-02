@@ -25,6 +25,7 @@ pub mod pumpfun;
 pub mod pumpswap;
 pub mod rpc;
 pub mod rugcheck;
+pub mod send;
 pub mod trade;
 pub mod tx;
 pub mod wallet;

@@ -692,6 +692,115 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
     }
 }
 
+/// Ask what to move, where, how much — then confirm and send it.
+///
+/// Every prompt is a chance to stop, because the last one cannot be taken back.
+/// The order is deliberate: the asset first (it decides the units), then the
+/// destination (checked against the chain before an amount is ever typed), then
+/// the amount, then the whole thing in one sentence to confirm.
+async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
+    use super::send;
+    let me = bot.signer.pubkey();
+    let rpc = &bot.rpc;
+
+    // What the wallet actually holds, read from the chain. USDC arrives by
+    // transfer, not by a trade this app watched, so nothing it remembers would
+    // ever list it.
+    bot.status = "reading balances…".into();
+    let lamports = rpc.balance(&me).await.unwrap_or(0);
+    let tokens = rpc.owned_tokens(&me).await.unwrap_or_default();
+
+    let mut choices: Vec<String> = vec![format!(
+        "SOL   {:.6}",
+        lamports as f64 / 1e9
+    )];
+    for (mint, raw, dec) in &tokens {
+        let sym = if mint.to_string() == super::jupiter::USDC {
+            "USDC".to_string()
+        } else {
+            match super::metadata::token_meta(rpc, mint).await {
+                Some(m) if !m.symbol.trim().is_empty() => m.symbol.trim().to_string(),
+                // A mint with no on-chain name is still sendable; the address
+                // is the identity and it is on the row either way.
+                _ => format!("{}…", &mint.to_string()[..6]),
+            }
+        };
+        choices.push(format!("{sym:<6} {:.6}   {mint}", *raw as f64 / 10f64.powi(*dec as i32)));
+    }
+    let Some(pick) = ui::select(term, "Move — what", &choices)? else { return Ok(()) };
+
+    let (mint, decimals, held) = if pick == 0 {
+        (None, 9u32, lamports)
+    } else {
+        let (m, raw, d) = tokens[pick - 1];
+        (Some(m), d, raw)
+    };
+    let symbol = choices[pick].split_whitespace().next().unwrap_or("?").to_string();
+
+    // The destination, checked BEFORE an amount is typed — finding out the
+    // address was wrong after entering the amount invites re-entering both.
+    let Some(to_raw) = ui::input(term, "Move — to which address", "paste the recipient's address")?
+    else {
+        return Ok(());
+    };
+    let parsed: solana_pubkey::Pubkey = match to_raw.trim().parse() {
+        Ok(k) => k,
+        Err(_) => eyre::bail!("{}", send::Refusal::NotAnAddress.say()),
+    };
+    let executable = rpc.is_executable(&parsed).await;
+    let to = send::check_destination(to_raw.trim(), &me, mint.as_ref(), executable)
+        .map_err(|r| eyre::eyre!("{}", r.say()))?;
+
+    // Does the recipient already have somewhere to put this token?
+    let creates_account = match mint {
+        None => false,
+        Some(m) => {
+            let dst = super::ata(&to, &m, &super::TOKEN_PROGRAM);
+            rpc.account(&dst).await.ok().flatten().is_none()
+        }
+    };
+
+    let cap = if mint.is_none() { send::max_sol_lamports(held) } else { held };
+    let hint = format!("up to {:.6}", cap as f64 / 10f64.powi(decimals as i32));
+    let Some(amount_raw) = ui::input(term, &format!("Move — how much {symbol}"), &hint)? else {
+        return Ok(());
+    };
+    let whole: f64 = amount_raw.trim().parse().map_err(|_| eyre::eyre!("that is not a number"))?;
+    if !(whole > 0.0) {
+        eyre::bail!("nothing to send");
+    }
+    let amount = (whole * 10f64.powi(decimals as i32)).round() as u64;
+    if amount > cap {
+        // Named separately for SOL: "not enough" is confusing when the balance
+        // clearly covers it, and the reason is the fee reserve.
+        if mint.is_none() {
+            eyre::bail!(
+                "that would leave nothing for fees — {:.6} SOL is the most this can send",
+                cap as f64 / 1e9
+            );
+        }
+        eyre::bail!("you hold {:.6} {symbol}", held as f64 / 10f64.powi(decimals as i32));
+    }
+
+    let plan = send::Plan { to, mint, symbol, amount, decimals, creates_account };
+    if !ui::confirm(term, &plan.sentence())? {
+        return Ok(());
+    }
+
+    let ixs = match mint {
+        None => vec![send::transfer_sol(&me, &to, amount)],
+        Some(m) => send::transfer_token(&me, &to, &m, amount, decimals as u8, creates_account),
+    };
+    bot.status = "sending…".into();
+    let sig = super::tx::send(rpc, &bot.signer, ixs, 60_000, bot.cu_price_micro).await?;
+    crate::events::action(
+        "Sent",
+        &[("what", plan.sentence()), ("sig", sig.clone())],
+    );
+    bot.note(format!("Sent. {sig}"));
+    Ok(())
+}
+
 /// Which panel occupies the lower half — mirrors the EVM `Panel`.
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -1815,7 +1924,7 @@ fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
     p
 }
 
-const HELP: [(&str, &str); 23] = [
+const HELP: [(&str, &str); 24] = [
     ("TRADE", ""),
     ("", "b|buy"),
     ("", "s|sell a slice of the balance"),
@@ -1833,6 +1942,7 @@ const HELP: [(&str, &str); 23] = [
     ("", "{  }|priority fee −/+"),
     ("", "P|auto priority on/off"),
     ("MODE", ""),
+    ("", "M|move SOL or a token to an address"),
     ("", "T|theme picker"),
     ("", "C|change chain"),
     ("", "W|change wallet"),
@@ -2609,6 +2719,19 @@ pub async fn run(
                     KeyCode::Char('C') => {
                         exit = crate::Exit::ChangeChain;
                         break;
+                    }
+                    // Move SOL or a token to another address.
+                    //
+                    // Built here, not routed: a transfer is the one operation
+                    // whose whole transaction is knowable in advance. It is
+                    // also the one with no undo, which is why every step below
+                    // asks rather than assumes.
+                    KeyCode::Char('M') => {
+                        if !bot.has_account {
+                            bot.note("Unlock an account first — press W".to_string());
+                        } else if let Err(e) = send_flow(term, &mut bot).await {
+                            bot.note(format!("Move cancelled. {e}"));
+                        }
                     }
                     KeyCode::Char('?') => show_help = true,
                     KeyCode::Char('T') => match ui::widgets::theme_picker(term)? {

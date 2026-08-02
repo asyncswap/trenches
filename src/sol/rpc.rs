@@ -719,6 +719,63 @@ impl Rpc {
         }
     }
 
+    /// Every SPL token this wallet holds: (mint, base amount, decimals).
+    ///
+    /// Read from the chain rather than from anything the app remembers, because
+    /// a wallet holds what it holds — USDC arrived by transfer, not by a trade
+    /// this app saw, and nothing in its own records would ever mention it.
+    pub async fn owned_tokens(&self, owner: &Pubkey) -> eyre::Result<Vec<(Pubkey, u64, u32)>> {
+        let res = self
+            .call(
+                "getTokenAccountsByOwner",
+                json!([
+                    owner.to_string(),
+                    {"programId": super::TOKEN_PROGRAM.to_string()},
+                    // Parsed: the amount and decimals come back named rather
+                    // than as offsets into a byte array we would have to keep
+                    // in step with the token program.
+                    {"encoding": "jsonParsed", "commitment": "confirmed"}
+                ]),
+            )
+            .await?;
+        let mut out = Vec::new();
+        for item in res.get("value").and_then(|v| v.as_array()).into_iter().flatten() {
+            let info = item
+                .get("account")
+                .and_then(|a| a.get("data"))
+                .and_then(|d| d.get("parsed"))
+                .and_then(|p| p.get("info"));
+            let Some(info) = info else { continue };
+            let Some(mint) = info.get("mint").and_then(|m| m.as_str()).and_then(|s| s.parse().ok())
+            else {
+                continue;
+            };
+            let amt = info.get("tokenAmount");
+            let raw = amt
+                .and_then(|a| a.get("amount"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let dec = amt.and_then(|a| a.get("decimals")).and_then(|d| d.as_u64()).unwrap_or(0) as u32;
+            // An empty account is a leftover, not a holding.
+            if raw > 0 {
+                out.push((mint, raw, dec));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether an account is a program. A transfer to one is unrecoverable, so
+    /// this is checked before a destination is accepted.
+    pub async fn is_executable(&self, key: &Pubkey) -> bool {
+        self.call("getAccountInfo", json!([key.to_string(), {"encoding": "base64"}]))
+            .await
+            .ok()
+            .and_then(|r| r.get("value").cloned())
+            .and_then(|v| v.get("executable").and_then(|e| e.as_bool()))
+            .unwrap_or(false)
+    }
+
     pub async fn send_transaction(&self, wire: &[u8]) -> eyre::Result<String> {
         let res = self
             .call(
