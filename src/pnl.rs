@@ -763,7 +763,9 @@ fn breakdown(
     let header = Line::from(Span::styled(
         format!(
             "  {:<11}{:>10}{:>7}  {:>9} {:>9}  {:>7}  {:>7}",
-            "coin", "profit", "return", "in", "out", "held", "gas"
+            // "entry" and "exit", not "in" and "out": those read as direction
+            // — money in, money out — when they are the two ends of one trade.
+            "coin", "profit", "return", "entry", "exit", "held", "gas"
         ),
         Style::default().fg(tone_color(Tone::Info)).add_modifier(Modifier::BOLD),
     ));
