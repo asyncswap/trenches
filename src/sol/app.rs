@@ -2923,13 +2923,10 @@ pub async fn run(
                     // the EVM chart, because it is the same question.
                     KeyCode::Char('m') => {
                         bot.chart_mcap = !bot.chart_mcap;
-                        let supply = bot.coin.as_ref().map(|c| c.supply()).unwrap_or(0.0);
-                        bot.note(if !bot.chart_mcap {
-                            "chart: price".to_string()
-                        } else if supply > 0.0 {
+                        bot.note(if bot.chart_mcap {
                             "chart: market cap".to_string()
                         } else {
-                            "chart: market cap — waiting on the token supply".to_string()
+                            "chart: price".to_string()
                         });
                     }
                     // The panel reads in this currency, so the key that

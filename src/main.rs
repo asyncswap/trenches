@@ -3308,16 +3308,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('m') => {
                             bot.chart_mcap = !bot.chart_mcap;
                             view = Panel::Chart;
-                            // The status line carries what the title no longer
-                            // does — including the case where the supply has
-                            // not loaded, which is the only time pressing this
-                            // appears to do nothing.
-                            bot.status = if !bot.chart_mcap {
-                                "chart: price".into()
-                            } else if bot.token_supply > 0.0 {
+                            // The status line says what changed, and nothing
+                            // more. A chart that has not got the supply yet
+                            // shows it by staying where it was.
+                            bot.status = if bot.chart_mcap {
                                 "chart: market cap".into()
                             } else {
-                                "chart: market cap — waiting on the token supply".into()
+                                "chart: price".into()
                             };
                         }
                         KeyCode::Char(',') => { bot.chart_iv = view::iv_step(bot.chart_iv, false); bot.status = format!("candles: {}", view::iv_label(bot.chart_iv)); }
