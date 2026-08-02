@@ -1383,6 +1383,22 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 }
             }
         }
+        // Nobody is looking: keep collecting launches, stop paying for the
+        // rest.
+        //
+        // The screen used to abort this task on the way out, so discovery only
+        // existed while you were staring at it — step away to trade and come
+        // back to the same list you left. Now the loop runs for the life of
+        // the app and only the EXPENSIVE half is gated: the metric batch and
+        // the swap tape are what cost bandwidth, and refreshing depth and
+        // tx/sec for a table nobody is reading is the one thing worth skipping.
+        //
+        // What still runs is the part that makes the list grow: the websocket
+        // drain above, and the launch scan below. Both are near-free — one is
+        // pushed, the other is a single windowed getLogs — so returning shows
+        // what launched while you were gone rather than what was there when
+        // you left.
+        let visible = !stop.load(Ordering::Relaxed);
         let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
         if from <= head && wide_ok {
             let (pons, fl, v2) = scan_launchpads(&provider, from, head).await;
@@ -1421,6 +1437,12 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known_v2.sort_by(|a, b| b.block.cmp(&a.block));
         known_v2.truncate(RECENTS_MAX);
 
+        if !visible {
+            // Longer between rounds, too: the stream delivers launches the
+            // moment they happen, so the scan is only a backstop here.
+            tokio::time::sleep(Duration::from_millis(6000)).await;
+            continue;
+        }
         // The swap tape, incrementally: one getLogs over every v3 candidate
         // pool at once, and one over the PoolManager filtered to every Flaunch
         // pool id. This replaces a per-pool history scan that asked the same
@@ -1731,6 +1753,21 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     }
 }
 
+/// The one discovery task's visibility flag, and whether this call created it.
+///
+/// `true` means the screen is closed. The task keeps running either way — see
+/// the visibility gate in `run_discovery` — so this decides how much work it
+/// does, not whether it exists.
+fn discovery_task() -> (Arc<AtomicBool>, bool) {
+    static TASK: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+    let mut created = false;
+    let flag = TASK.get_or_init(|| {
+        created = true;
+        Arc::new(AtomicBool::new(false))
+    });
+    (flag.clone(), created)
+}
+
 /// The live discovery screen. Returns the chosen graduation to enter, or None
 /// on Esc/q. Fetching runs in a background task; the screen just renders the
 /// shared rows (which fill in as they arrive) and handles keys.
@@ -1752,8 +1789,15 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // re-fetched from scratch. Now returning shows the last list instantly
     // and the background task refreshes it in place.
     let shared: Arc<Mutex<Vec<Row>>> = rows_cache();
-    let stop = Arc::new(AtomicBool::new(false));
-    let handle = tokio::spawn(run_discovery(
+    // ONE discovery task per chain, for the life of the app.
+    //
+    // Reopening the screen used to start another, and now that the task no
+    // longer dies on the way out that would stack one per visit. The flag is
+    // shared instead: opening clears it, leaving sets it, and the running task
+    // reads it as "is anyone looking".
+    let (stop, fresh) = discovery_task();
+    stop.store(false, Ordering::Relaxed);
+    let handle = fresh.then(|| tokio::spawn(run_discovery(
         provider.clone(),
         trader,
         shared.clone(),
@@ -1761,7 +1805,7 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
         disc_url,
         eth_usd,
         verified,
-    ));
+    )));
 
     // Index-based selection: the cursor stays at the TOP by default (index 0 =
     // the best-ranked pool) for quick Enter, rather than following a pick down.
@@ -1840,8 +1884,11 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
         }
     };
 
+    // The task is NOT aborted. `stop` now means "the screen is closed", which
+    // parks the expensive half and leaves the launch feed collecting — see the
+    // visibility gate in `run_discovery`.
     stop.store(true, Ordering::Relaxed);
-    handle.abort();
+    let _ = handle;
     result
 }
 
