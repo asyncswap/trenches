@@ -2870,6 +2870,7 @@ pub async fn run(
                         ui::chat_screen(term, &mut chat, &|| bot.agent_context())?;
                     }
                     // Back to the wallet list on this same chain, as on EVM.
+                    // `w` is an unlisted alias for `W`, as on the EVM side.
                     KeyCode::Char('W') | KeyCode::Char('w') => {
                         exit = crate::Exit::ChangeAccount;
                         break;

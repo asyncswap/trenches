@@ -80,7 +80,6 @@ dashboard has it.
 | `n` | buy dedup on/off | EVM |
 | `C` | change chain | both |
 | `W` | change wallet | both |
-| `w` | change wallet | both |
 | `U` | check for updates | both |
 | `D` | docs | both |
 | `Esc` | back one screen | both |

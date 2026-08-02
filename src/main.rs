@@ -3235,6 +3235,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             }
                         }
                         // Back to the account list on this same chain.
+                        // `w` is an unlisted alias for `W`. Not in
+                        // shortcuts.json on purpose: the help names one key per
+                        // control, and a second row saying the same thing reads
+                        // as a second feature.
                         KeyCode::Char('W') | KeyCode::Char('w') => {
                             // Hand the current pool back so the rebuilt session
                             // can restore it. Matched by token: `pools` holds
