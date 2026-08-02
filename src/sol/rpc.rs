@@ -689,6 +689,36 @@ impl Rpc {
         data.get(64..72).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes)
     }
 
+    /// Dry-run a signed transaction. `Some(err)` means it would fail.
+    ///
+    /// Cheaper than finding out on-chain, and the only pre-flight available for
+    /// a transaction this app did not build itself — see `jupiter`.
+    pub async fn simulate_err(&self, wire: &[u8]) -> eyre::Result<Option<String>> {
+        let res = self
+            .call(
+                "simulateTransaction",
+                json!([
+                    b64_encode(wire),
+                    {
+                        "encoding": "base64",
+                        // The signature is ours and already checked; what is
+                        // being tested here is whether the ROUTE executes.
+                        "sigVerify": false,
+                        "replaceRecentBlockhash": true,
+                        "commitment": "processed"
+                    }
+                ]),
+            )
+            .await?;
+        let Some(val) = res.get("value") else {
+            return Ok(Some("simulation returned nothing".into()));
+        };
+        match val.get("err") {
+            Some(e) if !e.is_null() => Ok(Some(e.to_string())),
+            _ => Ok(None),
+        }
+    }
+
     pub async fn send_transaction(&self, wire: &[u8]) -> eyre::Result<String> {
         let res = self
             .call(

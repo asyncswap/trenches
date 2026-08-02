@@ -19,6 +19,7 @@
 pub mod app;
 pub mod discover;
 pub mod engine;
+pub mod jupiter;
 pub mod metadata;
 pub mod pumpfun;
 pub mod pumpswap;
