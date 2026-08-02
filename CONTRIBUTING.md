@@ -88,6 +88,28 @@ cargo test  --release --features solana
 
 The release profile is what ships and what you should test against.
 
+## Hooks
+
+Once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Git keeps `core.hooksPath` in local config, so it does not travel with the
+repository and there is no way to make this automatic. Skipping it costs you a
+test failure rather than a bad commit, which is why it is a line in a file
+rather than a step in the build.
+
+There is one hook. When `keys.json` is staged it regenerates `docs/keys.md`
+from it and refreshes the website's copy at `../trenches.sh/src/keys.json` if
+that checkout is next to this one. Every other commit exits immediately.
+
+`keys.json` is the only place a keyboard shortcut is written down: the in-app
+help and the Shortcuts docs page both render from it at runtime, so they cannot
+disagree with the build. The two files above are copies for readers who are not
+running the app, and copies are what go stale.
+
 ## Reporting a security issue
 
 Do not open a public issue. Email <m@asyncswap.org> with what you found

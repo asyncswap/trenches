@@ -1,0 +1,53 @@
+#!/bin/sh
+# Keep the generated shortcut docs in step with keys.json.
+#
+# keys.json is the only place a binding is written down. The in-app help and
+# the Shortcuts page render from it directly, so they cannot be stale. Two
+# things are files on disk and can be:
+#
+#   docs/keys.md              read on GitHub, not by the app
+#   ../trenches.sh/src/keys.json   the website's copy, a separate repository
+#
+# A test catches both, but only when someone runs it — and it is the commit
+# that already changed keys.json where the fix is free. So this regenerates
+# rather than complains.
+#
+# It does nothing at all unless keys.json is staged, which is the point: the
+# cost lands on the handful of commits that touch the keys and on no others.
+
+set -e
+
+git diff --cached --name-only | grep -qx 'keys.json' || exit 0
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: keys.json changed but cargo is not on PATH — docs/keys.md not regenerated" >&2
+  exit 0
+fi
+
+echo "pre-commit: keys.json changed, regenerating docs/keys.md"
+
+# Written to a temp file first. A failed build must not leave a truncated
+# docs/keys.md behind — a redirect opens the file before the command runs, so
+# `cargo run > docs/keys.md` empties it even when the build fails.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+if ! cargo run --quiet -- --dump-keys > "$tmp" 2>/dev/null; then
+  echo "pre-commit: the build failed, so docs/keys.md was left alone" >&2
+  exit 1
+fi
+[ -s "$tmp" ] || { echo "pre-commit: --dump-keys produced nothing; leaving docs/keys.md alone" >&2; exit 1; }
+
+cp "$tmp" docs/keys.md
+git add docs/keys.md
+
+# The website is a different repository, so its copy is refreshed but NOT
+# committed — staging a change in someone else's checkout behind their back is
+# not a thing a commit hook should do. Saying where it went is.
+site=../trenches.sh/src/keys.json
+if [ -f "$site" ] && ! cmp -s keys.json "$site"; then
+  cp keys.json "$site"
+  echo "pre-commit: refreshed $site — commit it in trenches.sh too"
+fi
