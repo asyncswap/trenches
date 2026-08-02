@@ -4602,8 +4602,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let trades: Vec<(i64, f64, bool)> =
                 trades.into_iter().map(|(t, p, b)| (t, p * mcap_mul, b)).collect();
             let cv = view::CandleView {
+                // The interval keys first, then the axis key — the two
+                // interval keys are one control and splitting them around
+                // another reads as three unrelated hints.
                 title: format!(
-                    " {} {} · {} candle · [m] {} · [,] [.] ",
+                    " {} {} · {} candle [,] [.] · [m] {} ",
                     bot.pool.sym,
                     if bot.chart_mcap { "market cap" } else { "price" },
                     view::iv_label(bot.chart_iv),

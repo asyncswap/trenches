@@ -991,6 +991,29 @@ pub fn candles(f: &mut Frame, area: Rect, cv: &crate::view::CandleView) {
 
 /// A price with exactly enough decimals for labels `range` apart to differ.
 fn price_label(p: f64, range: f64) -> String {
+    // Below a thousandth, count the zeros instead of printing them.
+    //
+    // A memecoin priced at 0.00000119 needs eight decimals to say anything,
+    // and eight decimals plus a unit does not fit a thirteen-column axis — so
+    // the unit was being sliced to "S" and every label read as an amount of
+    // some currency called S. `0.0₅119` is the same number in half the width,
+    // and it is how every chart site writes these.
+    if p > 0.0 && p < 0.001 && p.is_finite() {
+        let zeros = (-p.log10().floor() - 1.0) as usize;
+        if zeros <= 18 {
+            const SUB: [char; 10] =
+                ['\u{2080}', '\u{2081}', '\u{2082}', '\u{2083}', '\u{2084}',
+                 '\u{2085}', '\u{2086}', '\u{2087}', '\u{2088}', '\u{2089}'];
+            let digits = (p * 10f64.powi(zeros as i32 + 3)).round() as u64;
+            let sub: String = zeros
+                .to_string()
+                .chars()
+                .filter_map(|c| c.to_digit(10))
+                .map(|d| SUB[d as usize])
+                .collect();
+            return format!("0.0{sub}{digits}");
+        }
+    }
     let dec = if range > 0.0 && range.is_finite() {
         ((-(range / 4.0).log10()).ceil() as i64 + 1).clamp(0, 10) as usize
     } else {
@@ -1763,3 +1786,31 @@ mod panel_menu_shape {
 }
 
 
+
+#[cfg(test)]
+mod price_label_tests {
+    use super::price_label;
+
+    /// The case from a live SOL chart: eight decimals plus " SOL" overflowed a
+    /// thirteen-column axis, so the unit was sliced down to "S".
+    #[test]
+    fn a_tiny_price_is_short_enough_to_keep_its_unit() {
+        let s = price_label(0.000_001_19, 0.000_001);
+        assert_eq!(s, "0.0₅119");
+        assert!(s.chars().count() + " SOL".len() <= 12, "fits beside its unit");
+    }
+
+    /// Ordinary prices are untouched — the compact form is for the range where
+    /// decimals stop being readable, not everywhere.
+    #[test]
+    fn an_ordinary_price_keeps_its_decimals() {
+        assert_eq!(price_label(1.2345, 1.0), "1.23");
+        assert_eq!(price_label(0.5, 0.1), "0.500");
+    }
+
+    #[test]
+    fn zero_and_nonsense_do_not_produce_subscripts() {
+        assert!(!price_label(0.0, 1.0).contains('₀'));
+        assert!(!price_label(f64::NAN, 1.0).contains('₀'));
+    }
+}
