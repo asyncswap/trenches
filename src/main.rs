@@ -562,8 +562,37 @@ fn save_sizing(bot: &engine::Bot) {
 }
 
 fn save_last_wallet(name: &str) {
+    set_account_name(name);
     let _ = std::fs::create_dir_all(state_dir());
     let _ = std::fs::write(last_wallet_path(), name);
+}
+
+/// The name of the account currently unlocked.
+///
+/// Every successful unlock on either chain passes through `save_last_wallet`,
+/// which makes it the one place this can be recorded without each screen
+/// having to remember to.
+static ACCOUNT_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_account_name(name: &str) {
+    if let Ok(mut g) = ACCOUNT_NAME.lock() {
+        *g = Some(name.to_string());
+    }
+}
+
+/// What to call the loaded wallet on screen.
+///
+/// The name you gave it, or the address with its middle removed. Your own
+/// address is on screen for the whole session and identifies you in every
+/// screenshot, recording and shared terminal — and it is the one address
+/// nobody needs to read, because "which of my accounts is this" is answered by
+/// the name you chose. Token and pool addresses stay whole: those get pasted
+/// and checked against an explorer, and a shortened one cannot be.
+pub fn account_label(address: &str) -> String {
+    match ACCOUNT_NAME.lock().ok().and_then(|g| g.clone()) {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => crate::view::addr_short(address),
+    }
 }
 
 /// The chain used last, remembered across runs.
@@ -4581,7 +4610,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 )
             } else {
                 Span::styled(
-                    format!("{}", bot.trader),
+                    account_label(&bot.trader.to_string()),
                     Style::default().add_modifier(Modifier::BOLD),
                 )
             },

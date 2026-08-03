@@ -655,6 +655,28 @@ pub fn usd_tag(amount: f64, rate: f64) -> Option<String> {
     Some(format!("({sign}{})", usd_compact(v.abs())))
 }
 
+/// An address with its middle taken out — `0xdac4…4ba0`.
+///
+/// For YOUR OWN address, which is on screen the whole session and identifies
+/// you in every screenshot, recording and shared terminal. Enough of both ends
+/// survives to recognise which account is loaded, which is the only question
+/// the wallet panel is answering; nobody reads the middle forty characters to
+/// tell two of their own wallets apart.
+///
+/// Not for token or pool addresses. Those are looked up, pasted and compared
+/// against a block explorer, and a truncated one cannot do any of that — which
+/// is why the pool picker shows them whole.
+pub fn addr_short(s: &str) -> String {
+    // Short enough to be something else already (a name, a placeholder, an
+    // error) — leave it alone rather than mangle it.
+    if s.chars().count() <= 14 {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(6).collect();
+    let tail: String = s.chars().skip(s.chars().count() - 4).collect();
+    format!("{head}…{tail}")
+}
+
 /// A signed money figure, in the reader's currency.
 ///
 /// For PnL, where the sign IS the information — a leading `+` or `-` is read
@@ -958,4 +980,25 @@ mod lp_bound_tests {
         assert_eq!(usd_price_brief(0.02), "$0.02");
         assert_eq!(usd_price_brief(0.000_002_56), "$0.0₅26");
     }
+
+    /// Both ends survive: the prefix says which chain-ish thing it is and the
+    /// last four are what anyone actually eyeballs to tell two wallets apart.
+    #[test]
+    fn a_wallet_address_keeps_both_ends() {
+        let a = "0xdac46eb40ca9ad3b1197dbddec813908e83c4ba0";
+        assert_eq!(super::addr_short(a), "0xdac4…4ba0");
+        let sol = "4qjKc7LNjLMK5W19zUurn8u44GqsUdDw4UFyz5Q8fomo";
+        assert_eq!(super::addr_short(sol), "4qjKc7…fomo");
+    }
+
+    /// Anything too short to have a middle is left exactly as it is — the
+    /// wallet panel puts real sentences in this cell when no account is
+    /// unlocked, and eliding one would read as corruption.
+    #[test]
+    fn something_that_is_not_an_address_is_untouched() {
+        assert_eq!(super::addr_short("—"), "—");
+        assert_eq!(super::addr_short("0x0"), "0x0");
+        assert_eq!(super::addr_short("0x1234567890ab"), "0x1234567890ab");
+    }
+
 }

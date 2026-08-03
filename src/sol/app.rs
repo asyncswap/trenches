@@ -1817,7 +1817,10 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
     }
 
     // "Which account am I?" belongs with the balances, not in the header.
-    p.spans(vec![lbl("Account"), Cell::bold(bot.trader().to_string(), Tone::Normal)]);
+    p.spans(vec![
+        lbl("Account"),
+        Cell::bold(crate::account_label(&bot.trader().to_string()), Tone::Normal),
+    ]);
     p.spans(vec![
         lbl("SOL"),
         Cell::new(if bot.sol_usd > 0.0 && bot.sol > 0.0 {
@@ -2021,7 +2024,7 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
             scroll + 1,
             (scroll + h).min(total),
             total,
-            bot.trader()
+            crate::account_label(&bot.trader().to_string())
         )
     } else {
         // The trader is the same wallet on every row, so it belongs in the
