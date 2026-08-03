@@ -2795,4 +2795,46 @@ mod pons_v2_tests {
         };
         assert!(decode_pons_v2_log(&lg).is_none(), "wrong topic must not decode");
     }
+
+    /// Age is told by ONE clock, and that clock is the live head.
+    ///
+    /// A row measured six rounds ago must not still report the age it had then.
+    /// This is what made the whole screen look alive while it was frozen: the
+    /// task that advances the head was the same task that refreshes the
+    /// metrics, so when it died, every age stopped with it — and a list of
+    /// unchanging ages reads as a list that simply has not changed.
+    #[test]
+    fn age_is_measured_against_the_live_head_not_the_row_stamp() {
+        fn row(launch_block: u64, measured_at: u64) -> Row {
+            Row {
+                grad: Grad {
+                    token: Address::ZERO,
+                    kind: engine::PoolKind::V3 { pool_addr: Address::ZERO, weth_is_token0: true },
+                    quote: engine::Quote::Eth,
+                    sym: "T".into(),
+                    fee: 3000,
+                    launch_block,
+                    socials: Default::default(),
+                },
+                pooled_eth: 0.0,
+                mkt_cap_eth: 0.0,
+                tx_per_sec: 0.0,
+                my_bal: 0.0,
+                head_block: measured_at,
+                verified: false,
+            }
+        }
+        // Measured long ago, at a head only two blocks past its launch.
+        let stale = row(1_000, 1_002);
+        let then = age_secs(&stale);
+        // The chain moves on. Nothing re-measured this row.
+        note_head(1_100);
+        let now = age_secs(&stale);
+        assert!(now > then, "the age must grow with the chain: {then} -> {now}");
+        assert!(
+            (now - 100.0 * SECS_PER_BLOCK).abs() < f64::EPSILON,
+            "and be told from the live head, not the row's own"
+        );
+    }
+
 }
