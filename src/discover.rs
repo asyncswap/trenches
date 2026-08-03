@@ -1302,7 +1302,15 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         ],
     );
 
-    while !stop.load(Ordering::Relaxed) {
+    // Runs for the life of the process, NOT for the life of the screen.
+    //
+    // This used to be `while !stop`, which read as "stop when nobody is
+    // looking" and meant "end the task". Leaving the screen sets that flag, and
+    // `discovery_task` only ever creates ONE task — so the first time you left
+    // discovery, the loop exited, nothing respawned it, and every later visit
+    // showed the rows frozen at the moment you walked away. `stop` is the
+    // visibility gate below, and only that.
+    loop {
         // A head read that did not answer is not block zero. It used to fall
         // back to 0, which made the window below `0..0` — a real getLogs call
         // for the genesis block, issued every round, finding nothing and
@@ -1653,8 +1661,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // a refreshed row replaces its previous self, everything else stays
         // untouched, and the ranking is applied once per round.
         for (i, d) in due.iter().enumerate() {
+            // Stop ranking, not stop existing. `return` here ended the task
+            // outright, which was the second way a closed screen killed
+            // discovery for the rest of the session.
             if stop.load(Ordering::Relaxed) {
-                return;
+                break;
             }
             let sqrt = res
                 .get(i * per)
