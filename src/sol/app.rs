@@ -717,6 +717,50 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
     }
 }
 
+/// Lamports, and every token held: mint, raw amount, decimals, token program,
+/// symbol.
+type WalletAssets = (u64, Vec<(Pubkey, u64, u32, Pubkey, String)>);
+
+/// The last read of what this wallet holds.
+///
+/// Process-wide and deliberately not expiring on a timer: it is refreshed
+/// every time the move screen opens, which is the only place that reads it, so
+/// a clock would only ever agree with what the last open already decided.
+fn wallet_assets() -> &'static std::sync::Mutex<Option<WalletAssets>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<WalletAssets>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(Default::default)
+}
+
+/// Read the wallet: balance, token accounts, and what each token is called.
+///
+/// The symbols resolve CONCURRENTLY. In series each one was a round trip the
+/// next had to wait for, so the wait grew with the number of coins held —
+/// which is backwards, since the wallets that most need this screen are the
+/// ones holding the most.
+async fn read_wallet_assets(rpc: &Rpc, me: &Pubkey) -> WalletAssets {
+    use futures::StreamExt;
+    let lamports = rpc.balance(me).await.unwrap_or(0);
+    let held = rpc.owned_tokens(me).await.unwrap_or_default();
+    let tokens: Vec<(Pubkey, u64, u32, Pubkey, String)> = futures::stream::iter(held)
+        .map(|(mint, raw, dec, prog)| async move {
+            let sym = if mint.to_string() == super::jupiter::USDC {
+                "USDC".to_string()
+            } else {
+                // A mint with no on-chain name is still sendable; the address
+                // is the identity and it is on the row either way.
+                super::metadata::token_symbol(rpc, &mint)
+                    .await
+                    .unwrap_or_else(|| format!("{}…", &mint.to_string()[..6]))
+            };
+            (mint, raw, dec, prog, sym)
+        })
+        .buffered(8)
+        .collect()
+        .await;
+    (lamports, tokens)
+}
+
 /// Ask what to move, where, how much — then confirm and send it.
 ///
 /// Every prompt is a chance to stop, because the last one cannot be taken back.
@@ -731,25 +775,40 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
     // What the wallet actually holds, read from the chain. USDC arrives by
     // transfer, not by a trade this app watched, so nothing it remembers would
     // ever list it.
-    bot.status = "reading balances…".into();
-    let lamports = rpc.balance(&me).await.unwrap_or(0);
-    let tokens = rpc.owned_tokens(&me).await.unwrap_or_default();
-
-    let mut choices: Vec<String> = vec![format!(
-        "SOL   {:.6}",
-        lamports as f64 / 1e9
-    )];
-    for (mint, raw, dec, _prog) in &tokens {
-        let sym = if mint.to_string() == super::jupiter::USDC {
-            "USDC".to_string()
-        } else {
-            match super::metadata::token_meta(rpc, mint).await {
-                Some(m) if !m.symbol.trim().is_empty() => m.symbol.trim().to_string(),
-                // A mint with no on-chain name is still sendable; the address
-                // is the identity and it is on the row either way.
-                _ => format!("{}…", &mint.to_string()[..6]),
+    // What the wallet held last time this was opened, if it has been.
+    //
+    // Building this list costs a getProgramAccounts per token program plus a
+    // metadata read per mint. Paying that before the picker can appear made
+    // pressing M feel broken on a wallet holding more than a couple of things.
+    // So: show what we know immediately, and refresh behind the screen for
+    // next time.
+    let cached = wallet_assets().lock().ok().and_then(|g| g.clone());
+    let (lamports, tokens) = match cached {
+        Some(hit) => hit,
+        None => {
+            bot.status = "reading balances…".into();
+            let fresh = read_wallet_assets(rpc, &me).await;
+            if let Ok(mut g) = wallet_assets().lock() {
+                *g = Some(fresh.clone());
             }
-        };
+            fresh
+        }
+    };
+    // Kick the refresh off now, not on the way out: by the time an address and
+    // an amount have been typed it has long since landed, so the next M opens
+    // on a list that already includes anything that arrived since.
+    {
+        let (rpc2, me2) = (bot.rpc.clone(), me);
+        tokio::spawn(async move {
+            let fresh = read_wallet_assets(&rpc2, &me2).await;
+            if let Ok(mut g) = wallet_assets().lock() {
+                *g = Some(fresh);
+            }
+        });
+    }
+
+    let mut choices: Vec<String> = vec![format!("SOL   {:.6}", lamports as f64 / 1e9)];
+    for (mint, raw, dec, _prog, sym) in &tokens {
         choices.push(format!("{sym:<6} {:.6}   {mint}", *raw as f64 / 10f64.powi(*dec as i32)));
     }
     let Some(pick) = ui::select(term, "Move — what", &choices)? else { return Ok(()) };
@@ -760,8 +819,19 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
     let (mint, decimals, held) = if pick == 0 {
         (None, 9u32, lamports)
     } else {
-        let (m, raw, d, prog) = tokens[pick - 1];
+        let (m, raw, d, prog, _) = tokens[pick - 1];
         (Some((m, prog)), d, raw)
+    };
+    // The LIST may be a moment old; the amount must not be. One read, on the
+    // one asset chosen — a cached balance that has since gone down would size
+    // a transfer the chain then refuses, and "it said I had this" is a bad
+    // thing for a wallet to have said.
+    let held = match mint {
+        None => rpc.balance(&me).await.unwrap_or(held),
+        Some((m, prog)) => rpc
+            .token_balance(&super::ata(&me, &m, &prog))
+            .await
+            .unwrap_or(held),
     };
     let symbol = choices[pick].split_whitespace().next().unwrap_or("?").to_string();
 

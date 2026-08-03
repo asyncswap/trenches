@@ -132,6 +132,13 @@ pub fn decode_token2022(data: &[u8]) -> Option<TokenMeta> {
 /// then the legacy Metaplex account. `None` when neither exists — never an
 /// error the caller has to handle, since a nameless coin is still tradeable.
 pub async fn token_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
+    let mut meta = on_chain_meta(rpc, mint).await?;
+    meta.socials = fetch_socials(meta.uri.as_deref()).await;
+    Some(meta)
+}
+
+/// The on-chain half only — no socials, so no HTTP.
+async fn on_chain_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
     let mut meta = None;
     if let Ok(Some((data, _))) = rpc.account(mint).await {
         meta = decode_token2022(&data);
@@ -140,9 +147,35 @@ pub async fn token_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
         let (data, _owner) = rpc.account(&metadata_pda(mint)).await.ok()??;
         meta = decode(&data);
     }
-    let mut meta = meta?;
-    meta.socials = fetch_socials(meta.uri.as_deref()).await;
-    Some(meta)
+    meta
+}
+
+/// Just what a token is called, cached for the life of the process.
+///
+/// `token_meta` fetches the creator's metadata JSON over HTTP to find socials.
+/// That is right for the pool panel, which shows them, and pure cost for a list
+/// that only prints a symbol — it was a three-second timeout per token, in
+/// series, so a wallet holding ten of them spent half a minute waiting for
+/// links nobody asked to see.
+///
+/// Cached without expiry on purpose: a mint's symbol is fixed at creation and
+/// cannot change, so the only wrong answer this can give is one it never had.
+pub async fn token_symbol(rpc: &Rpc, mint: &Pubkey) -> Option<String> {
+    static SYMBOLS: std::sync::Mutex<Option<std::collections::HashMap<Pubkey, Option<String>>>> =
+        std::sync::Mutex::new(None);
+    if let Ok(g) = SYMBOLS.lock() {
+        if let Some(hit) = g.as_ref().and_then(|m| m.get(mint)) {
+            return hit.clone();
+        }
+    }
+    let sym = on_chain_meta(rpc, mint)
+        .await
+        .map(|m| m.symbol.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Ok(mut g) = SYMBOLS.lock() {
+        g.get_or_insert_with(Default::default).insert(*mint, sym.clone());
+    }
+    sym
 }
 
 /// The socials, from the URI's off-chain JSON. The POINTER is on chain; the

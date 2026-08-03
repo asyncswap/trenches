@@ -100,6 +100,13 @@ fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
 ///
 /// So the checks below are not ceremony. Each one exists because the mistake
 /// is easy and the loss is permanent.
+/// Below this, a balance is a leftover rather than a holding.
+///
+/// One wei of an 18-decimal token is `1e-18` — greater than zero, indisputably
+/// held, and worth nothing anyone can spend. Every screen that lists what you
+/// hold uses this, so they cannot disagree about whether you hold something.
+const DUST: f64 = 1e-9;
+
 async fn move_flow<P: Provider>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     bot: &mut Bot,
@@ -128,7 +135,13 @@ async fn move_flow<P: Provider>(
         let (bal, dec) = tokio::join!(cb.call(), cd.call());
         let dec = dec.map(|d| d._0).unwrap_or(18);
         let bal = bal.map(|b| engine::units_to_f64(b._0, dec)).unwrap_or(0.0);
-        if bal > 0.0 {
+        // The same floor the holdings screen uses, and for the same reason:
+        // `> 0.0` admits a single wei, which prints as 0.000000 and offers a
+        // row you cannot send anything from. Holdings said you had nothing
+        // while this said you had four coins, all reading zero — two screens
+        // disagreeing about the same wallet because one had a threshold and
+        // the other had none.
+        if bal > DUST {
             assets.push((Some(p.token), p.sym.clone(), bal, dec));
         }
     }
@@ -3569,7 +3582,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 .collect()
                                 .await;
                             let mut held: Vec<(SelPool, f64, f64)> =
-                                rows.into_iter().filter(|(_, bal, _)| *bal > 1e-9).collect();
+                                rows.into_iter().filter(|(_, bal, _)| *bal > DUST).collect();
                             held.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
                             if held.is_empty() {
                                 bot.status = "no leftover tokens in wallet".into();

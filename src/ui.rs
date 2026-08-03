@@ -16,7 +16,7 @@ pub mod widgets;
 use std::io::Stdout;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{prelude::*, widgets::*};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -127,25 +127,26 @@ pub fn select_overlay(
     image::clear();
     let mut state = ListState::default();
     state.select(Some(start.min(items.len().saturating_sub(1))));
-    // What a typed letter seeks on: the first ASCII letter of each row, past
-    // any flag or marker in front of it.
-    let keys: Vec<char> = items
-        .iter()
-        .map(|s| s.chars().find(|c| c.is_ascii_alphabetic()).unwrap_or(' ').to_ascii_lowercase())
-        .collect();
+    // How far a page moves. Taken from the panel as drawn rather than fixed,
+    // because a "page" that is not what you can see is not a page.
+    let mut page = 10usize;
     loop {
         term.draw(|f| {
             widgets::paint_bg(f);
             // Tall enough to be worth scrolling, short enough to read as a
             // panel rather than a page.
             let h = (f.area().height * 3 / 5).clamp(7, 22);
+            page = (h as usize).saturating_sub(2).max(1); // less the two borders
             let area = centered(f.area(), 34, h);
             f.render_widget(ratatui::widgets::Clear, area);
             let sel = state.selected().unwrap_or(0) + 1;
             let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
                 .block(
                     widgets::themed_block(format!(" {title} "))
-                        .title_bottom(format!(" {sel}/{}  ↑/↓ · a–z jump · enter · esc ", items.len())),
+                        .title_bottom(format!(
+                            " {sel}/{}  jk ↑↓ · ^d ^u · g G · enter · esc ",
+                            items.len()
+                        )),
                 )
                 .highlight_style(
                     Style::default()
@@ -159,28 +160,63 @@ pub fn select_overlay(
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
+        let ev = event::read()?;
         let i = state.selected().unwrap_or(0);
+        // The wheel, for the hand that is already on the mouse. `select` has
+        // had this all along; this list is the longer of the two and had only
+        // the keyboard.
+        if let Event::Mouse(m) = ev {
+            use crossterm::event::MouseEventKind as K;
+            match m.kind {
+                K::ScrollUp => state.select(Some(i.saturating_sub(3))),
+                K::ScrollDown => state.select(Some((i + 3).min(items.len() - 1))),
+                _ => {}
+            }
+            continue;
+        }
+        let Event::Key(k) = ev else { continue };
         match k.code {
-            KeyCode::Up => state.select(Some(if i == 0 { items.len() - 1 } else { i - 1 })),
-            KeyCode::Down => state.select(Some((i + 1) % items.len())),
-            KeyCode::PageUp => state.select(Some(i.saturating_sub(10))),
-            KeyCode::PageDown => state.select(Some((i + 10).min(items.len() - 1))),
+            // hjkl moves, as everywhere else here.
+            //
+            // Letters used to SEEK: `j` walked JPY → JMD → JOD and `h` walked
+            // HKD → HUF, so a hand in the vim position went sideways through
+            // four currencies while the list never scrolled. Seeking is gone
+            // rather than merely moved off those four keys — one key meaning
+            // "move" in one list and "find" in another is the thing that made
+            // this confusing, and a wrong guess about which is worse in a
+            // screen you are about to press enter on.
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.select(Some(if i == 0 { items.len() - 1 } else { i - 1 }))
+            }
+            KeyCode::Down | KeyCode::Char('j') => state.select(Some((i + 1) % items.len())),
+            // Horizontal keys in a vertical list: inert, not surprising.
+            KeyCode::Char('h') | KeyCode::Char('l') => {}
+            // The vim page keys, on the panel's real height: ctrl-d/u move a
+            // half screen, ctrl-f/b a whole one. A list this long is walked in
+            // pages, and reaching for the arrow key 80 times is not walking.
+            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.select(Some((i + page / 2).min(items.len() - 1)))
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.select(Some(i.saturating_sub(page / 2)))
+            }
+            KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.select(Some((i + page).min(items.len() - 1)))
+            }
+            KeyCode::Char('b') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.select(Some(i.saturating_sub(page)))
+            }
+            KeyCode::PageDown => state.select(Some((i + page).min(items.len() - 1))),
+            KeyCode::PageUp => state.select(Some(i.saturating_sub(page))),
+            // gg is two keystrokes for what one can say here. G is vim's, and g
+            // is its opposite — no other letter does anything, so neither can
+            // be mistaken for a jump to a row beginning with it.
+            KeyCode::Char('g') => state.select(Some(0)),
+            KeyCode::Char('G') => state.select(Some(items.len() - 1)),
             KeyCode::Home => state.select(Some(0)),
             KeyCode::End => state.select(Some(items.len() - 1)),
             KeyCode::Enter => return Ok(state.selected()),
             KeyCode::Esc => return Ok(None),
-            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
-                // Seek to the next row starting with that letter, wrapping —
-                // so holding it cycles the matches rather than sticking.
-                let c = c.to_ascii_lowercase();
-                let next = (1..=items.len())
-                    .map(|d| (i + d) % items.len())
-                    .find(|&j| keys[j] == c);
-                if let Some(j) = next {
-                    state.select(Some(j));
-                }
-            }
             _ => {}
         }
     }
