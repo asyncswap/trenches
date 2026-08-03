@@ -655,6 +655,16 @@ pub fn usd_tag(amount: f64, rate: f64) -> Option<String> {
     Some(format!("({sign}{})", usd_compact(v.abs())))
 }
 
+/// A signed money figure, in the reader's currency.
+///
+/// For PnL, where the sign IS the information — a leading `+` or `-` is read
+/// before the digits are, and a figure that only shows its sign when negative
+/// makes the reader check twice.
+pub fn money_signed(usd: f64) -> String {
+    let sign = if usd < 0.0 { "-" } else { "+" };
+    format!("{sign}{}", usd_compact(usd.abs()))
+}
+
 /// Marker for our own rows on a tape.
 ///
 /// Emoji presentation (U+2B50) rather than the text-weight `★` (U+2605): the

@@ -1831,26 +1831,34 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
     let unit = bot.meta.as_ref().map(|m| m.symbol.as_str()).unwrap_or("tok");
     p.spans(vec![lbl("Basis"), Cell::new(format!("{:.9} SOL/{unit}", bot.avg_basis()))]);
     p.spans(vec![lbl("Inventory"), Cell::new(format!("{:.2} (bought)", bot.bought_qty))]);
-    // The dollar figure rides beside the SOL one, dimmed: SOL stays the number
-    // being read, dollars are the aside that says what it means.
-    let with_usd = |v: f64, text: String| -> Vec<Cell> {
-        match crate::view::usd_tag(v, bot.sol_usd) {
-            Some(tag) => vec![Cell::bold(text, pnl_tone(v)), Cell::toned(format!("  {tag}"), Tone::Dim)],
-            None => vec![Cell::bold(text, pnl_tone(v))],
+    // Money leads, SOL rides beside it dimmed — the other way round from how
+    // this started. A profit is a thing you reason about in the currency you
+    // think in; six decimals of SOL is the raw figure, kept because it is what
+    // the chain actually moved, not because it is what anyone reads first.
+    //
+    // With no rate, SOL is all there is, and it takes the front.
+    let in_money = |v: f64| -> Vec<Cell> {
+        if bot.sol_usd > 0.0 {
+            vec![
+                Cell::bold(crate::view::money_signed(v * bot.sol_usd), pnl_tone(v)),
+                Cell::toned(format!("  {v:+.6} SOL"), Tone::Dim),
+            ]
+        } else {
+            vec![Cell::bold(format!("{v:+.6} SOL"), pnl_tone(v))]
         }
     };
     let mut realized = vec![lbl("Realized")];
-    realized.extend(with_usd(bot.realized_pnl, format!("{:+.6} SOL", bot.realized_pnl)));
+    realized.extend(in_money(bot.realized_pnl));
     p.spans(realized);
     let mut last_fill = vec![lbl("Last Fill")];
     match bot.last_fill_pnl {
-        Some(v) => last_fill.extend(with_usd(v, format!("{v:+.6} SOL"))),
+        Some(v) => last_fill.extend(in_money(v)),
         None => last_fill.push(Cell::bold("—", Tone::Dim)),
     }
     p.spans(last_fill);
     let edge = bot.live_edge();
     let mut edge_row = vec![lbl("Edge")];
-    edge_row.extend(with_usd(edge, format!("{edge:+.7} SOL")));
+    edge_row.extend(in_money(edge));
     p.spans(edge_row);
     p.spans(vec![
         lbl("Activity"),
