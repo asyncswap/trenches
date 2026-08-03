@@ -100,6 +100,56 @@ fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
 ///
 /// So the checks below are not ceremony. Each one exists because the mistake
 /// is easy and the loss is permanent.
+/// Every token this wallet holds: address, symbol, balance, decimals.
+type HeldTokens = Vec<(alloy::primitives::Address, String, f64, u8)>;
+
+/// The last read of what is held, and when it was taken.
+fn held_tokens() -> &'static std::sync::Mutex<Option<(std::time::Instant, HeldTokens)>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, HeldTokens)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(Default::default)
+}
+
+/// How long a read of the wallet's tokens is worth trusting.
+///
+/// Tokens arrive by trading, and a trade you just made is one you know about.
+/// Re-reading every pool on every press cost a round trip per pool to confirm
+/// what the last press already established — and on a wallet holding nothing
+/// but ETH, which is most of them, that is the entire cost of the screen paid
+/// for an answer that has not changed.
+const HELD_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Read every known token's balance, all at once.
+///
+/// In series this was one round trip per pool before the next could start, so
+/// the wait grew with how many pools the chain had shown us — a number that
+/// only ever goes up, and has nothing to do with how many coins are held.
+pub async fn read_held_tokens<P: Provider>(
+    provider: &P,
+    me: alloy::primitives::Address,
+    pools: &[SelPool],
+) -> HeldTokens {
+    use futures::StreamExt;
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<SelPool> =
+        pools.iter().filter(|p| seen.insert(p.token)).cloned().collect();
+    futures::stream::iter(targets)
+        .map(|p| async move {
+            let erc = contracts::IERC20::new(p.token, provider);
+            // Bound separately: the call builders are temporaries, and joining
+            // them inline drops each before its future is polled.
+            let (cb, cd) = (erc.balanceOf(me), erc.decimals());
+            let (bal, dec) = tokio::join!(cb.call(), cd.call());
+            let dec = dec.map(|d| d._0).unwrap_or(18);
+            let bal = bal.map(|b| engine::units_to_f64(b._0, dec)).unwrap_or(0.0);
+            (p.token, p.sym.clone(), bal, dec)
+        })
+        .buffered(16)
+        .filter(|(_, _, bal, _)| futures::future::ready(*bal > DUST))
+        .collect()
+        .await
+}
+
 /// Below this, a balance is a leftover rather than a holding.
 ///
 /// One wei of an 18-decimal token is `1e-18` — greater than zero, indisputably
@@ -107,7 +157,7 @@ fn pnl_tone(v: f64, decimals: i32) -> view::Tone {
 /// hold uses this, so they cannot disagree about whether you hold something.
 const DUST: f64 = 1e-9;
 
-async fn move_flow<P: Provider>(
+async fn move_flow<P: Provider + Clone + Send + Sync + 'static>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     bot: &mut Bot,
     provider: &P,
@@ -121,29 +171,41 @@ async fn move_flow<P: Provider>(
         eyre::bail!("unlock an account first — press W");
     }
 
-    // What is actually held. ETH always; a token only if there is a balance,
-    // because offering a coin you hold none of is a menu of dead ends.
-    bot.status = "reading balances…".into();
+    // ETH is live from the dashboard; the tokens come from the cache.
+    //
+    // Reading them here is what made M feel broken: a balance and a decimals
+    // call for every pool the chain has ever shown us, one pool at a time,
+    // on the thread that draws. The screen froze for as long as that took and
+    // there was nothing to look at while it did.
     let mut assets: Vec<(Option<Address>, String, f64, u8)> =
         vec![(None, "ETH".into(), bot.eth, 18)];
-    let mut seen = std::collections::HashSet::new();
-    for p in pools.iter().filter(|p| seen.insert(p.token)) {
-        let erc = contracts::IERC20::new(p.token, provider);
-        // Bound separately: the call builders are temporaries, and joining
-        // them inline drops each before its future is polled.
-        let (cb, cd) = (erc.balanceOf(me), erc.decimals());
-        let (bal, dec) = tokio::join!(cb.call(), cd.call());
-        let dec = dec.map(|d| d._0).unwrap_or(18);
-        let bal = bal.map(|b| engine::units_to_f64(b._0, dec)).unwrap_or(0.0);
-        // The same floor the holdings screen uses, and for the same reason:
-        // `> 0.0` admits a single wei, which prints as 0.000000 and offers a
-        // row you cannot send anything from. Holdings said you had nothing
-        // while this said you had four coins, all reading zero — two screens
-        // disagreeing about the same wallet because one had a threshold and
-        // the other had none.
-        if bal > DUST {
-            assets.push((Some(p.token), p.sym.clone(), bal, dec));
+    let cached = held_tokens().lock().ok().and_then(|g| g.clone());
+    let fresh_enough = cached.as_ref().is_some_and(|(at, _)| at.elapsed() < HELD_TTL);
+    match &cached {
+        Some((_, rows)) => {
+            assets.extend(rows.iter().cloned().map(|(a, s, b, d)| (Some(a), s, b, d)))
         }
+        None => {
+            // Nothing known yet — the one open that waits, and it waits on
+            // requests running together rather than in a queue.
+            bot.status = "reading balances…".into();
+            let rows = read_held_tokens(provider, me, pools).await;
+            assets.extend(rows.iter().cloned().map(|(a, s, b, d)| (Some(a), s, b, d)));
+            if let Ok(mut g) = held_tokens().lock() {
+                *g = Some((std::time::Instant::now(), rows));
+            }
+        }
+    }
+    // Refresh for next time, off the drawing thread — and only when the last
+    // read is old enough to have missed something.
+    if cached.is_some() && !fresh_enough {
+        let (p2, pools2) = (provider.clone(), pools.to_vec());
+        tokio::spawn(async move {
+            let rows = read_held_tokens(&p2, me, &pools2).await;
+            if let Ok(mut g) = held_tokens().lock() {
+                *g = Some((std::time::Instant::now(), rows));
+            }
+        });
     }
 
     let labels: Vec<String> = assets
@@ -155,6 +217,18 @@ async fn move_flow<P: Provider>(
         .collect();
     let Some(pick) = ui::select(terminal, "Move — what", &labels)? else { return Ok(()) };
     let (mint, symbol, held, decimals) = assets[pick].clone();
+    // The LIST may be a moment old; the amount must not be. One read, on the
+    // one asset chosen — sizing a transfer off a cached balance that has since
+    // gone down produces a transaction the chain refuses.
+    let held = match mint {
+        None => bot.eth,
+        Some(t) => contracts::IERC20::new(t, provider)
+            .balanceOf(me)
+            .call()
+            .await
+            .map(|b| engine::units_to_f64(b._0, decimals))
+            .unwrap_or(held),
+    };
 
     // The destination first, checked before an amount is typed — discovering
     // the address was wrong afterwards invites re-entering both.
@@ -2542,6 +2616,23 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // 6-dec USDG pool restored from last-pool) shows price 0.000000.
     refresh_token_decimals(provider, bot).await;
     trace_pool("startup", &bot.pool);
+
+    // Learn what the wallet holds before anyone asks.
+    //
+    // The move screen needs a balance per known pool, and doing that when M is
+    // pressed means the first press waits on all of it. Started here, it has
+    // long since landed by the time anyone reaches for the key — and if the
+    // answer is "nothing but ETH", which it usually is, that answer is already
+    // sitting there rather than being rediscovered on every press.
+    if !bot.trader.is_zero() {
+        let (p2, pools2, me2) = (provider.clone(), pools.to_vec(), bot.trader);
+        tokio::spawn(async move {
+            let rows = read_held_tokens(&p2, me2, &pools2).await;
+            if let Ok(mut g) = held_tokens().lock() {
+                *g = Some((std::time::Instant::now(), rows));
+            }
+        });
+    }
 
     // Shared state written by the background poll task, read by the UI thread.
     let market = Arc::new(Mutex::new(engine::Market::default()));

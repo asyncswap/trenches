@@ -721,6 +721,29 @@ fn chart_view(bot: &SolBot) -> crate::view::CandleView {
 /// symbol.
 type WalletAssets = (u64, Vec<(Pubkey, u64, u32, Pubkey, String)>);
 
+/// How long a read of the wallet's tokens is worth trusting. Matches the EVM
+/// dashboard's, and for the same reason.
+const HELD_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn read_clock() -> &'static std::sync::Mutex<std::time::Instant> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+        std::sync::OnceLock::new();
+    // Far enough back that the first open is never considered fresh.
+    CELL.get_or_init(|| {
+        std::sync::Mutex::new(std::time::Instant::now() - HELD_TTL - HELD_TTL)
+    })
+}
+
+fn last_read() -> std::time::Instant {
+    read_clock().lock().map(|g| *g).unwrap_or_else(|_| std::time::Instant::now())
+}
+
+fn mark_read() {
+    if let Ok(mut g) = read_clock().lock() {
+        *g = std::time::Instant::now();
+    }
+}
+
 /// The last read of what this wallet holds.
 ///
 /// Process-wide and deliberately not expiring on a timer: it is refreshed
@@ -791,19 +814,23 @@ async fn send_flow(term: &mut Term, bot: &mut SolBot) -> eyre::Result<()> {
             if let Ok(mut g) = wallet_assets().lock() {
                 *g = Some(fresh.clone());
             }
+            mark_read();
             fresh
         }
     };
-    // Kick the refresh off now, not on the way out: by the time an address and
-    // an amount have been typed it has long since landed, so the next M opens
-    // on a list that already includes anything that arrived since.
-    {
+    // Refresh for next time, off the drawing thread — but only when the last
+    // read is old enough to have missed something. Re-reading on every press
+    // spends a round trip per token to confirm what the previous press already
+    // established, which on a wallet holding nothing is the whole cost of the
+    // screen for an answer that has not changed.
+    if last_read().elapsed() >= HELD_TTL {
         let (rpc2, me2) = (bot.rpc.clone(), me);
         tokio::spawn(async move {
             let fresh = read_wallet_assets(&rpc2, &me2).await;
             if let Ok(mut g) = wallet_assets().lock() {
                 *g = Some(fresh);
             }
+            mark_read();
         });
     }
 
@@ -2783,6 +2810,19 @@ pub async fn run(
         meta: Option<super::metadata::TokenMeta>,
         coin: eyre::Result<engine::Coin>,
     }
+    // Learn what the wallet holds before anyone presses M — see the same
+    // warm-up on the EVM dashboard for why.
+    if bot.has_account {
+        let (rpc2, me2) = (bot.rpc.clone(), bot.trader());
+        tokio::spawn(async move {
+            let fresh = read_wallet_assets(&rpc2, &me2).await;
+            if let Ok(mut g) = wallet_assets().lock() {
+                *g = Some(fresh);
+            }
+            mark_read();
+        });
+    }
+
     let pending_coin: Arc<Mutex<Option<PendingCoin>>> = Default::default();
     let spawn_resolve = {
         let rpc = bot.rpc.clone();
