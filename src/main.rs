@@ -591,6 +591,10 @@ fn set_account_name(name: &str) {
 pub fn account_label(address: &str) -> String {
     match ACCOUNT_NAME.lock().ok().and_then(|g| g.clone()) {
         Some(n) if !n.trim().is_empty() => n,
+        // No name. Either say enough to recognise the account, or say nothing
+        // at all — `hide_address` in the config is for the second, and it is
+        // the setting to reach for before sharing a screen.
+        _ if config::hide_address() => "account".to_string(),
         _ => crate::view::addr_short(address),
     }
 }

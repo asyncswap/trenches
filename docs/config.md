@@ -58,6 +58,21 @@ endpoint in turn and writes the config itself.
 Every config carries a `$schema` line; any editor that understands JSON Schema
 validates fields and completes names as you type.
 
+## Hiding your address
+
+```json
+{ "hide_address": true }
+```
+
+The wallet panel shows the account NAME you gave it, so your address is
+normally not on screen at all. This covers the case where a keystore has no
+name — one imported with `cast`, say — which otherwise falls back to the
+address with its middle removed. With this set it reads `account` instead.
+
+Only your own address. Token and pool addresses are unaffected: those exist to
+be pasted and checked against an explorer, and hiding them would break the
+screen without protecting anything.
+
 ## Approval window
 
 ```json

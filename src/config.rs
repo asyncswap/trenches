@@ -229,6 +229,20 @@ pub struct Registry {
     /// Token risk scoring. Absent = defaults (enabled, public API, no key).
     #[serde(default)]
     pub rugcheck: RugCheck,
+    /// Keep your own address off the screen entirely. Absent = false.
+    ///
+    /// The wallet panel already prefers the account NAME, so the address only
+    /// appears when a keystore has none. That is still an address on screen for
+    /// a whole session, which is a whole session of screenshots, recordings and
+    /// anyone glancing at the terminal. With this set, a nameless account reads
+    /// as "account" rather than as the first and last characters of who you
+    /// are.
+    ///
+    /// Only YOUR address. Token and pool addresses are unaffected: those are
+    /// looked up and compared against an explorer, and hiding them would break
+    /// the screen rather than protect anything.
+    #[serde(default)]
+    pub hide_address: Option<bool>,
     /// How long a Permit2 grant stays valid, IN HOURS. Absent = 24.
     ///
     /// A Permit2 grant names a spender, an amount and an expiry, and the expiry
@@ -276,6 +290,17 @@ fn onboarded_path() -> std::path::PathBuf {
 /// A marker in the CACHE, not the config: it is something that happened, not
 /// something anyone decided, and the app writing to a file it tells you to edit
 /// is exactly what the config/cache split exists to avoid.
+/// Whether to keep the wallet's own address off the screen.
+pub fn hide_address() -> bool {
+    static HIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDE.get_or_init(|| {
+        Registry::load(&config_path().to_string_lossy())
+            .ok()
+            .and_then(|r| r.hide_address)
+            .unwrap_or(false)
+    })
+}
+
 /// How long a Permit2 grant should live, in seconds.
 ///
 /// Clamped to between an hour and a year. The floor stops a value that would
