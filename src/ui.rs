@@ -145,10 +145,7 @@ pub fn select_overlay(
             let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
                 .block(
                     widgets::themed_block(format!(" {title} "))
-                        .title_bottom(format!(
-                            " {sel}/{}  ↑/↓ jk · a–z jump · enter · esc ",
-                            items.len()
-                        )),
+                        .title_bottom(format!(" {sel}/{}  ↑/↓ · a–z jump · enter · esc ", items.len())),
                 )
                 .highlight_style(
                     Style::default()
@@ -165,22 +162,8 @@ pub fn select_overlay(
         let Event::Key(k) = event::read()? else { continue };
         let i = state.selected().unwrap_or(0);
         match k.code {
-            // hjkl moves, the same as in every other list here. It used to
-            // seek: `j` walked JPY → JMD → JOD and `h` walked HKD → HUF, so
-            // hands that expected to go down the list went sideways through
-            // four currencies instead. One key cannot mean "move" in one
-            // picker and "find" in another.
-            //
-            // The cost is single-letter seek for J, K, H and L. It is small:
-            // JPY is a major and sits in the first ten rows, and the rest are
-            // a few arrow presses from wherever the letter before them lands.
-            KeyCode::Up | KeyCode::Char('k') => {
-                state.select(Some(if i == 0 { items.len() - 1 } else { i - 1 }))
-            }
-            KeyCode::Down | KeyCode::Char('j') => state.select(Some((i + 1) % items.len())),
-            // Horizontal keys in a vertical list: ignored rather than seeking,
-            // because a hand resting on hjkl should not fire off a jump.
-            KeyCode::Char('h') | KeyCode::Char('l') => {}
+            KeyCode::Up => state.select(Some(if i == 0 { items.len() - 1 } else { i - 1 })),
+            KeyCode::Down => state.select(Some((i + 1) % items.len())),
             KeyCode::PageUp => state.select(Some(i.saturating_sub(10))),
             KeyCode::PageDown => state.select(Some((i + 10).min(items.len() - 1))),
             KeyCode::Home => state.select(Some(0)),
