@@ -111,6 +111,7 @@ static BASE: Venues = Venues {
     pons_v2_hook: Address::ZERO,
 };
 
+#[allow(dead_code)] // the pair reads as a pair; only one is matched on
 pub const ROBINHOOD_MAINNET: u64 = 4663;
 pub const BASE_MAINNET: u64 = 8453;
 

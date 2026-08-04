@@ -2279,7 +2279,15 @@ fn help_rows() -> Vec<(String, String)> {
 
 /// Draws the dashboard and returns where the header logo goes, so the caller
 /// can place a real terminal image there after the frame.
-fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool) -> Option<Rect> {
+/// Returns the header logo box and, when a coin is loaded, a small box in the
+/// market panel for its artwork.
+fn draw(
+    f: &mut Frame,
+    bot: &SolBot,
+    view: Panel,
+    scroll: usize,
+    show_help: bool,
+) -> (Option<Rect>, Option<Rect>) {
     ui::widgets::paint_bg(f);
     let c = Layout::vertical([
         Constraint::Length(5),  // header (square logo + status line)
@@ -2365,6 +2373,15 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
     let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(c[1]);
     ui::widgets::panel(f, cols[0], &wallet_panel(bot));
     ui::widgets::panel(f, cols[1], &market_panel(bot));
+    // Top-right of the market panel, inside its border. Small: this is the
+    // coin's face, not a picture — it says "yes, that one" at a glance, which
+    // a symbol alone does not on a chain with four coins called MOON.
+    let coin_box = (cols[1].width > 30 && cols[1].height > 5).then(|| Rect {
+        x: cols[1].x + cols[1].width - 9,
+        y: cols[1].y + 1,
+        width: 8,
+        height: 4,
+    });
 
     // Everything adjustable in one box, with the most recent message beneath.
     // Key hints and labels share the border colour; values stay normal text so
@@ -2522,7 +2539,7 @@ fn draw(f: &mut Frame, bot: &SolBot, view: Panel, scroll: usize, show_help: bool
             rows.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         ui::widgets::help(f, &items, " Shortcuts  (any key to close) ");
     }
-    Some(logo_box)
+    (Some(logo_box), coin_box)
 }
 
 /// With a coin loaded the venue is its pump.fun launch; with none selected
@@ -2841,6 +2858,7 @@ pub async fn run(
     // Header logo. Screens that take over clear images on entry, which marks
     // this stale, so it redraws on return without bookkeeping here.
     let mut chain_logo = ui::image::Placement::default();
+    let mut coin_art = ui::image::Placement::default();
     let mut show_help = false;
     let mut view = Panel::Orders;
     let mut scroll: usize = 0;
@@ -2933,9 +2951,12 @@ pub async fn run(
     let mut chat = crate::agent::Chat::default();
     loop {
         let mut logo_box = None;
+        let mut coin_box = None;
         let mut grabbed: Option<String> = None;
         term.draw(|f| {
-            logo_box = draw(f, &bot, view, scroll, show_help);
+            let (l, c) = draw(f, &bot, view, scroll, show_help);
+            logo_box = l;
+            coin_box = c;
             ui::mouse::paint(f, &msel);
             if copy_armed {
                 if let Some((a, b)) = msel.region() {
@@ -2955,6 +2976,18 @@ pub async fn run(
         let term_size = term.size().map(|s| (s.width, s.height)).unwrap_or((0, 0));
         if let (Some(r), Some(png)) = (logo_box, ui::image::for_venue(venue, &bot.net)) {
             chain_logo.show(png, venue as usize, r.x, r.y, r.width, r.height, term_size);
+        }
+        // The coin's own art, if the fetch has landed. Keyed on the mint so
+        // switching coins redraws rather than leaving the last one up.
+        match (coin_box, bot.coin.as_ref()) {
+            (Some(r), Some(c)) => match super::metadata::token_png_cached(&c.mint) {
+                Some(png) => {
+                    let id = c.mint.to_bytes()[..8].iter().fold(0usize, |a, b| a << 8 | *b as usize);
+                    coin_art.show(&png, id, r.x, r.y, r.width, r.height, term_size);
+                }
+                None => coin_art.forget(),
+            },
+            _ => coin_art.forget(),
         }
 
         crate::ui_alive();
@@ -3433,6 +3466,14 @@ pub async fn run(
                     let tgt = poll_target(&c, &bot.trader(), bot.priority_auto.then(|| bot.priority_level.key()));
                     let graduated = c.graduated();
                     bot.meta = p.meta;
+                    // The artwork, in the background. It is decoration: it must
+                    // never be a reason the numbers arrive later.
+                    if let Some(url) = bot.meta.as_ref().and_then(|m| m.image.clone()) {
+                        let mint = p.mint;
+                        tokio::spawn(async move {
+                            let _ = super::metadata::token_png(&mint, Some(&url)).await;
+                        });
+                    }
                     bot.remember_coin(&c);
                     save_last_coin(&p.mint);
                     bot.coin = Some(c);

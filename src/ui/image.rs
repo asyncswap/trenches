@@ -141,7 +141,7 @@ impl Placement {
     /// the placement would look unchanged and never be re-emitted, leaving the
     /// header blank until something else forced it.
     #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
-    pub fn show(&mut self, png: &'static [u8], id: usize, x: u16, y: u16, w: u16, h: u16, term: (u16, u16)) {
+    pub fn show(&mut self, png: &[u8], id: usize, x: u16, y: u16, w: u16, h: u16, term: (u16, u16)) {
         let key = (id, x, y, w, h, term, generation());
         if self.shown == Some(key) || !supported() {
             return;

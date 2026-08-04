@@ -42,6 +42,9 @@ pub struct TokenMeta {
     pub uri: Option<String>,
     /// `("X" | "TG" | "Web", url)` — read from the URI's JSON, best-effort.
     pub socials: Vec<(&'static str, String)>,
+    /// The coin's artwork, from the same JSON. A URL, not the bytes — fetching
+    /// it is a separate decision made by whatever wants to draw it.
+    pub image: Option<String>,
 }
 
 /// Read a borsh string (u32 LE length + bytes) at `off`, returning it and the
@@ -80,6 +83,7 @@ pub fn decode(data: &[u8]) -> Option<TokenMeta> {
         symbol: super::discover::clean_text(&symbol, 12),
         uri,
         socials: Vec::new(),
+        image: None,
     })
 }
 
@@ -119,6 +123,7 @@ pub fn decode_token2022(data: &[u8]) -> Option<TokenMeta> {
                 symbol: super::discover::clean_text(&symbol, 12),
                 uri,
                 socials: Vec::new(),
+        image: None,
             });
         }
         off = end;
@@ -133,7 +138,9 @@ pub fn decode_token2022(data: &[u8]) -> Option<TokenMeta> {
 /// error the caller has to handle, since a nameless coin is still tradeable.
 pub async fn token_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
     let mut meta = on_chain_meta(rpc, mint).await?;
-    meta.socials = fetch_socials(meta.uri.as_deref()).await;
+    let (socials, image) = fetch_socials(meta.uri.as_deref()).await;
+    meta.socials = socials;
+    meta.image = image;
     Some(meta)
 }
 
@@ -148,6 +155,70 @@ async fn on_chain_meta(rpc: &Rpc, mint: &Pubkey) -> Option<TokenMeta> {
         meta = decode(&data);
     }
     meta
+}
+
+/// The coin's artwork as PNG bytes, or None.
+///
+/// PNG ONLY, checked by the file's own magic bytes rather than by its URL or
+/// what the server claims. The terminal is handed these bytes directly (Kitty
+/// `f=100`), so anything else is not a picture that fails to draw, it is a
+/// malformed payload sent to someone else's decoder. A creator writes this URL
+/// and its contents; the app decodes nothing itself, and adding a decoder for
+/// attacker-supplied bytes to a process holding keys is not a trade worth
+/// making for artwork.
+///
+/// Capped and cached. The cap is on what is READ, not on what is promised —
+/// a content-length header is a claim, and a hostile host can send forever.
+pub async fn token_png(mint: &Pubkey, url: Option<&str>) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some(hit) = pngs().lock().ok().and_then(|g| g.get(mint).cloned()) {
+        return hit;
+    }
+    // 512 KB. Coin art is a few tens of kilobytes; past this it is either not
+    // artwork or not worth the wait on a launch that lives for minutes.
+    const CAP: usize = 512 * 1024;
+    let got = async {
+        let url = crate::net::metadata_url(url?)?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(4_000))
+            .build()
+            .ok()?;
+        let mut resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        // Read in pieces and stop at the cap. `content-length` is a claim, and
+        // a hostile host can send past it forever.
+        let mut body = Vec::new();
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            body.extend_from_slice(&chunk);
+            if body.len() > CAP {
+                return None;
+            }
+        }
+        // The magic bytes, not the extension and not the content type.
+        (body.starts_with(b"\x89PNG\r\n\x1a\n")).then(|| std::sync::Arc::new(body))
+    }
+    .await;
+    if let Ok(mut g) = pngs().lock() {
+        g.insert(*mint, got.clone());
+    }
+    got
+}
+
+type PngCache = std::collections::HashMap<Pubkey, Option<std::sync::Arc<Vec<u8>>>>;
+
+fn pngs() -> &'static std::sync::Mutex<PngCache> {
+    static PNGS: std::sync::OnceLock<std::sync::Mutex<PngCache>> = std::sync::OnceLock::new();
+    PNGS.get_or_init(Default::default)
+}
+
+/// What `token_png` already fetched, without waiting for anything.
+///
+/// The draw loop cannot await. It asks; a background fetch answers, and the
+/// next frame has the picture — which is also why a coin's art appears a moment
+/// after its numbers rather than holding them up.
+pub fn token_png_cached(mint: &Pubkey) -> Option<std::sync::Arc<Vec<u8>>> {
+    pngs().lock().ok().and_then(|g| g.get(mint).cloned()).flatten()
 }
 
 /// Just what a token is called, cached for the life of the process.
@@ -182,18 +253,19 @@ pub async fn token_symbol(rpc: &Rpc, mint: &Pubkey) -> Option<String> {
 /// contents are one HTTP fetch away — pump.fun writes twitter/telegram/website
 /// keys when the creator fills them in. Best-effort with a short timeout:
 /// a coin whose metadata host is down is still a coin.
-async fn fetch_socials(uri: Option<&str>) -> Vec<(&'static str, String)> {
-    let Some(uri) = uri else { return Vec::new() };
+async fn fetch_socials(uri: Option<&str>) -> (Vec<(&'static str, String)>, Option<String>) {
+    let none = (Vec::new(), None);
+    let Some(uri) = uri else { return none };
     // The URI is attacker-controlled — whoever launched the coin wrote it.
-    let Some(url) = crate::net::metadata_url(uri) else { return Vec::new() };
+    let Some(url) = crate::net::metadata_url(uri) else { return none };
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(3_000))
         .build()
     else {
-        return Vec::new();
+        return none;
     };
-    let Ok(resp) = client.get(&url).send().await else { return Vec::new() };
-    let Ok(v) = resp.json::<serde_json::Value>().await else { return Vec::new() };
+    let Ok(resp) = client.get(&url).send().await else { return none };
+    let Ok(v) = resp.json::<serde_json::Value>().await else { return none };
     let mut out = Vec::new();
     let grab = |v: &serde_json::Value, key: &str| -> Option<String> {
         let s = v.get(key)?.as_str()?.trim();
@@ -210,7 +282,15 @@ async fn fetch_socials(uri: Option<&str>) -> Vec<(&'static str, String)> {
     if let Some(w) = grab(&v, "website").or_else(|| grab(&ext, "website")) {
         out.push(("Web", w));
     }
-    out
+    // The artwork lives in the same document. Taken raw rather than through
+    // `clean_text`, which shortens for display and would truncate a URL.
+    let image = v
+        .get("image")
+        .and_then(|i| i.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (out, image)
 }
 
 #[cfg(test)]
@@ -335,6 +415,29 @@ mod tests {
         ] {
             let mint: Pubkey = m.parse().expect("valid mint");
             println!("{mint} -> {:?}", token_meta(&rpc, &mint).await);
+        }
+    }
+}
+
+#[cfg(test)]
+mod png_tests {
+    /// The terminal is handed these bytes directly. Anything that is not a PNG
+    /// is not a picture that fails to draw — it is a malformed payload sent to
+    /// someone else's decoder, from a URL the coin's creator chose.
+    #[test]
+    fn only_real_pngs_are_recognised() {
+        let png = b"\x89PNG\r\n\x1a\n\x00rest";
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        // The shapes a metadata host actually serves instead.
+        for other in [
+            &b"\xff\xd8\xff\xe0JFIF"[..],       // jpeg
+            &b"GIF89a"[..],                      // gif
+            &b"RIFF\x00\x00\x00\x00WEBP"[..],   // webp
+            &b"<svg xmlns="[..],                 // svg
+            &b"<!DOCTYPE html>"[..],             // an error page
+            &b""[..],
+        ] {
+            assert!(!other.starts_with(b"\x89PNG\r\n\x1a\n"), "{other:?} must not pass");
         }
     }
 }
