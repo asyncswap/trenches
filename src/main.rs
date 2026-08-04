@@ -2429,6 +2429,7 @@ async fn app(
         buy_step_override: load_sizing().buy_step,
         acting_key: String::new(),
         ur_permit2_done: false,
+        ur_permit2_until: 0,
         routes: routes_for(&pools, pool.token),
         socials: engine::TokenSocials::default(),
         pool_launch_block: None,

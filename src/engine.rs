@@ -480,6 +480,14 @@ pub struct Bot {
     // Permit2 + UniversalRouter allowances cover the full position (Flaunch
     // sells settle the coin through Permit2, which needs both grants).
     pub ur_permit2_done: bool,
+    /// Unix seconds at which the Permit2 grant behind `ur_permit2_done` runs
+    /// out. 0 = unknown.
+    ///
+    /// The flag alone says "approved once". A grant expires, so a position held
+    /// longer than the window would have found the flag still true, skipped the
+    /// allowance check, and sent a swap the router refuses — the trader's first
+    /// attempt to LEAVE failing, which is the worst possible moment for it.
+    pub ur_permit2_until: u64,
     pub routes: Vec<Route>, // candidate ETH-quoted venues for best-execution routing
     pub socials: TokenSocials,     // current token's on-chain socials/metadata (for the market view)
     /// Pons graduation block, for the pool-age display and the venue logo.
@@ -1094,6 +1102,14 @@ impl Bot {
             .map(|a| a.amount >= need160 && a.expiration > now48)
             .unwrap_or(false);
         if erc_ok && p2_ok {
+            // Trust the chain's expiry, not a guess about when it was made —
+            // this grant may predate the session.
+            self.ur_permit2_until = p2
+                .allowance(self.trader, self.pool.token, UNIVERSAL_ROUTER)
+                .call()
+                .await
+                .map(|a| a.expiration.to::<u64>())
+                .unwrap_or(0);
             return Ok(true);
         }
         self.note(format!("Approving {} for the Universal Router", self.pool.sym));
@@ -1125,6 +1141,10 @@ impl Bot {
             // for. A standing permission nobody remembers giving is the thing
             // being avoided, and 2100 was exactly that.
             let expiration48 = now48.saturating_add(U48::from(crate::config::permit2_ttl_secs()));
+            // Remember when it runs out, so the cached "approved" flag can stop
+            // being believed at the right moment rather than at the next
+            // failure.
+            self.ur_permit2_until = expiration48.to::<u64>();
             let nonce = self.take_nonce(provider).await?;
             let sent = p2
                 .approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
@@ -1187,8 +1207,25 @@ impl Bot {
         let _ = self.spent_nonce(sent)?;
         // The next trade in this token approves again from scratch.
         self.ur_permit2_done = false;
+        self.ur_permit2_until = 0;
         self.note(format!("Position closed — revoked the Permit2 allowance for {}", self.pool.sym));
         Ok(())
+    }
+
+    /// Whether the Permit2 grant is still good, rather than merely once made.
+    ///
+    /// Ten seconds of margin: a grant expiring while the swap is in flight is
+    /// refused on arrival, and re-approving early costs one transaction where
+    /// being late costs the exit.
+    fn ur_ready(&self) -> bool {
+        if !self.ur_permit2_done {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.ur_permit2_until == 0 || self.ur_permit2_until > now + 10
     }
 
     async fn pre_approve_exit<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
@@ -2046,7 +2083,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         }
         // Flaunch sells settle the coin through Permit2 — grant it before the
         // routing pre-flight, or every simulated sell reverts.
-        if !buying && self.has_flaunch_route() && !self.ur_permit2_done {
+        if !buying && self.has_flaunch_route() && !self.ur_ready() {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
@@ -2453,7 +2490,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 }
             }
         }
-        if matches!(sk, PoolKind::FlaunchV4 { .. }) && !self.ur_permit2_done {
+        if matches!(sk, PoolKind::FlaunchV4 { .. }) && !self.ur_ready() {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
@@ -3063,7 +3100,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 }
             }
         }
-        if self.has_flaunch_route() && !self.ur_permit2_done {
+        if self.has_flaunch_route() && !self.ur_ready() {
             match self.ensure_ur_allowance(provider, bal_u256).await {
                 Ok(true) => self.ur_permit2_done = true,
                 Ok(false) => { self.note("Approval is still confirming. Try selling everything again shortly".into()); return Ok(()); }
