@@ -1504,12 +1504,18 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known_v2.sort_by(|a, b| b.block.cmp(&a.block));
         known_v2.truncate(RECENTS_MAX);
 
-        if !visible {
-            // Longer between rounds, too: the stream delivers launches the
-            // moment they happen, so the scan is only a backstop here.
-            tokio::time::sleep(Duration::from_millis(6000)).await;
-            continue;
-        }
+        // NOT a `continue` any more.
+        //
+        // Skipping the rest of the round while the screen was closed meant
+        // launches piled into `known` and no ROWS were ever built from them —
+        // so leaving the trenches list and coming back showed the same list
+        // you left, and it only started growing once you were watching it.
+        // Which is precisely backwards: the screen you are not looking at is
+        // the one that should be catching up.
+        //
+        // It still costs less when nobody is looking: the round-robin sweep of
+        // the older tail is dropped, so only the newest candidates are
+        // measured, and the wait at the end of the round is longer.
         // The swap tape, incrementally: one getLogs over every v3 candidate
         // pool at once, and one over the PoolManager filtered to every Flaunch
         // pool id. This replaces a per-pool history scan that asked the same
@@ -1639,7 +1645,10 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             .map(|(t, p, b)| Due::Pons(*t, *p, *b))
             .chain(fl_live.iter().skip(MAX_SCAN).cloned().map(Due::Fl))
             .collect();
-        if !tail.is_empty() {
+        // Only while someone is watching. Refreshing depth and tx/sec for rows
+        // nobody is reading is the one thing genuinely worth skipping — new
+        // launches are not.
+        if visible && !tail.is_empty() {
             for k in 0..SWEEP_CHUNK.min(tail.len()) {
                 due.push(tail[(sweep_at + k) % tail.len()].clone());
             }
@@ -1819,7 +1828,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 ));
             }
         }
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_millis(if visible { 2000 } else { 6000 })).await;
     }
 }
 
