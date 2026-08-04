@@ -2036,6 +2036,28 @@ fn market_panel(bot: &SolBot) -> PanelView {
                 p.spans(vec![lbl("Token"), Cell::new(format!("{} ({})", m.name, m.symbol))]);
             }
             p.spans(vec![lbl("Mint"), Cell::new(c.mint.to_string())]);
+            // Where to read more, on one row.
+            //
+            // High up, because a panel this tall runs out before it reaches the
+            // bottom — these used to be six rows below Creator and were simply
+            // never on screen. The coin's own page leads: every launch has one,
+            // whether or not its creator filled in a single social.
+            //
+            // No "n/3 filled" count. It said nothing the links beside it do not,
+            // and it cost the row they needed.
+            {
+                let mut links = vec![format!("https://pump.fun/coin/{}", c.mint)];
+                if let Some(m) = &bot.meta {
+                    links.extend(m.socials.iter().map(|(_, u)| u.clone()));
+                    // The metadata file itself — the one thing that says whether
+                    // a coin with no socials had none written or has a host that
+                    // is down.
+                    if let Some(url) = m.uri.as_deref().and_then(crate::net::metadata_url) {
+                        links.push(url);
+                    }
+                }
+                p.spans(vec![lbl("Links"), Cell::toned(links.join("  "), Tone::Dim)]);
+            }
             // The pool is what you actually trade against, and it's the address
             // every chart and explorer keys off — worth showing next to the mint.
             if let Some(pair) = c.pair_address() {
@@ -2128,35 +2150,6 @@ fn market_panel(bot: &SolBot) -> PanelView {
             // in itself: the pool carries no creator-fee recipient, which is
             // how a third-party-created pool differs from a pump migration.
             p.spans(vec![lbl("Creator"), Cell::new(c.creator().to_string())]);
-            // Socials, from the launch metadata. An empty set is a signal in
-            // itself — a coin nobody bothered to give a twitter is telling
-            // you something at second 49.
-            if let Some(m) = &bot.meta {
-                p.spans(vec![lbl("Socials"), Cell::new(format!("{}/3 filled", m.socials.len()))]);
-                for (label, url) in m.socials.iter().take(3) {
-                    p.spans(vec![lbl(label), Cell::new(url.clone())]);
-                }
-                // The metadata itself, not just what was read out of it.
-                //
-                // Everything above comes from this file — the socials, the
-                // image, the description. When a coin shows 0/3 the useful
-                // question is whether the creator wrote nothing or the host is
-                // down, and that is answerable by opening the link and not
-                // answerable by anything else on this screen.
-                //
-                // Shown as a URL you can fetch: an `ipfs://` is not something a
-                // browser opens, and the gateway form is the same document.
-                if let Some(url) = m.uri.as_deref().and_then(crate::net::metadata_url) {
-                    p.spans(vec![lbl("Meta"), Cell::toned(url, Tone::Dim)]);
-                }
-            }
-            // The coin's own page. Every launch has one, whether or not its
-            // creator filled in a single social, and it is where anyone would
-            // look next — so it does not hang off metadata that may be empty.
-            p.spans(vec![
-                lbl("pump.fun"),
-                Cell::toned(format!("https://pump.fun/coin/{}", c.mint), Tone::Dim),
-            ]);
 
         }
     }
