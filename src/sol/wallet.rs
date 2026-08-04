@@ -106,6 +106,67 @@ pub fn create_keystore(phrase: &str, account: u32, name: &str, password: &str) -
     Ok(address)
 }
 
+/// A pasted Solana private key, in any of the shapes people actually have one.
+///
+/// Phantom and Solflare export base58 of the 64-byte keypair — secret then
+/// public. `solana-keygen` writes those same 64 bytes as a JSON array, which is
+/// what `id.json` holds. Some tools hand out only the 32-byte seed. All three
+/// end at the same place, and refusing two of them means telling someone their
+/// own key is invalid.
+///
+/// For the 64-byte forms the halves are CHECKED against each other: the public
+/// half must be what the secret half derives. A paste that lost characters
+/// still decodes to plausible bytes, and the alternative to catching it here is
+/// a keystore that opens onto an address holding nothing.
+pub fn secret_from_text(text: &str) -> eyre::Result<[u8; 32]> {
+    use zeroize::Zeroize;
+    let t = text.trim();
+    if t.is_empty() {
+        eyre::bail!("no key was entered");
+    }
+    let mut bytes: Vec<u8> = if t.starts_with('[') {
+        let nums: Vec<i64> = serde_json::from_str(t)
+            .map_err(|_| eyre::eyre!("that starts like a JSON array but does not parse"))?;
+        nums.iter()
+            .map(|n| u8::try_from(*n).map_err(|_| eyre::eyre!("{n} is not a byte")))
+            .collect::<eyre::Result<Vec<u8>>>()?
+    } else {
+        bs58::decode(t)
+            .into_vec()
+            .map_err(|_| eyre::eyre!("that is neither base58 nor a JSON byte array"))?
+    };
+    let out = match bytes.len() {
+        64 => {
+            let seed: [u8; 32] = bytes[..32].try_into().expect("checked length");
+            if Keypair::new_from_array(seed).pubkey().to_bytes() != bytes[32..] {
+                bytes.zeroize();
+                eyre::bail!(
+                    "the two halves of that key do not agree — it looks truncated or altered in the paste"
+                );
+            }
+            Ok(seed)
+        }
+        32 => Ok(bytes[..32].try_into().expect("checked length")),
+        n => Err(eyre::eyre!("a Solana private key is 32 or 64 bytes; that decodes to {n}")),
+    };
+    bytes.zeroize();
+    out
+}
+
+/// Encrypt a pasted private key into the same keystore format as everything
+/// else here. Returns the address, so it can be checked against the wallet the
+/// key was supposed to be.
+pub fn import_private_key(name: &str, key: &str, password: &str) -> eyre::Result<String> {
+    let secret = secret_from_text(key)?;
+    let address = Keypair::new_from_array(secret).pubkey().to_string();
+    let dir = keystore_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let mut rng = rand::rngs::OsRng;
+    eth_keystore::encrypt_key(&dir, &mut rng, secret, password, Some(name))
+        .map_err(|e| eyre::eyre!("failed to write keystore '{name}': {e}"))?;
+    Ok(address)
+}
+
 /// Unlock a Solana keystore by password.
 pub fn keypair_from_keystore(name: &str, password: &str) -> eyre::Result<Keypair> {
     let path = crate::wallet::keystore_path(name)
@@ -122,6 +183,63 @@ pub fn keypair_from_keystore(name: &str, password: &str) -> eyre::Result<Keypair
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key exported from Phantom is base58 of 64 bytes. Refusing that format
+    /// is refusing the way almost everyone actually holds a Solana key.
+    #[test]
+    fn a_phantom_style_base58_keypair_imports() {
+        let seed = [7u8; 32];
+        let kp = Keypair::new_from_array(seed);
+        let mut full = seed.to_vec();
+        full.extend_from_slice(&kp.pubkey().to_bytes());
+        let text = bs58::encode(&full).into_string();
+        assert_eq!(secret_from_text(&text).unwrap(), seed);
+    }
+
+    /// `solana-keygen` writes those same bytes as a JSON array — an id.json
+    /// pasted straight in has to work.
+    #[test]
+    fn a_solana_keygen_json_array_imports() {
+        let seed = [9u8; 32];
+        let kp = Keypair::new_from_array(seed);
+        let mut full = seed.to_vec();
+        full.extend_from_slice(&kp.pubkey().to_bytes());
+        let text = format!("{full:?}");
+        assert_eq!(secret_from_text(&text).unwrap(), seed);
+        // Whitespace and newlines are what a paste from a file carries.
+        assert_eq!(secret_from_text(&format!("  {text}\n")).unwrap(), seed);
+    }
+
+    /// Some tools hand out the 32-byte seed alone.
+    #[test]
+    fn a_bare_seed_imports() {
+        let seed = [3u8; 32];
+        assert_eq!(secret_from_text(&bs58::encode(seed).into_string()).unwrap(), seed);
+    }
+
+    /// A paste that lost characters still decodes to plausible bytes. The
+    /// public half is the only thing that can catch it, and the alternative is
+    /// a keystore that opens onto an address holding nothing.
+    #[test]
+    fn a_keypair_whose_halves_disagree_is_refused() {
+        let mut full = [7u8; 32].to_vec();
+        full.extend_from_slice(&[1u8; 32]); // not the matching public key
+        let text = bs58::encode(&full).into_string();
+        let e = secret_from_text(&text).unwrap_err().to_string();
+        assert!(e.contains("do not agree"), "{e}");
+    }
+
+    #[test]
+    fn nonsense_is_refused_by_shape_not_by_luck() {
+        assert!(secret_from_text("").is_err());
+        assert!(secret_from_text("   ").is_err());
+        // Valid base58, wrong length.
+        assert!(secret_from_text(&bs58::encode([1u8; 20]).into_string()).is_err());
+        // Base58 has no 0, O, I or l — a seed phrase pasted here is not base58.
+        assert!(secret_from_text("abandon abandon abandon").is_err());
+        assert!(secret_from_text("[1,2,3]").is_err());
+        assert!(secret_from_text("[999]").is_err());
+    }
 
     /// The canonical (public, never-funded) BIP39 test mnemonic. Deriving it here
     /// lets the path be checked against Phantom/Solflare, which use the same

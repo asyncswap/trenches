@@ -20,6 +20,12 @@ keystore in `~/.config/trenches/keystores`:
 ＋ Import a seed phrase       derives the key at an index you choose
 ```
 
+A private key can be pasted in the form your wallet exports it: base58 of the
+64-byte keypair (Phantom, Solflare), the JSON byte array `solana-keygen` writes
+to `id.json`, or a bare 32-byte seed. On EVM it is the usual hex key. Either
+way the halves are checked before anything is written — a paste that lost
+characters is refused rather than saved as a wallet holding nothing.
+
 **Importing a phrase does not store it.** The key is derived, encrypted and
 written; the phrase is not saved. If you want a second account from the same
 phrase, import it again at a different index.

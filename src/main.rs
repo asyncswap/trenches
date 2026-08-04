@@ -1924,9 +1924,11 @@ fn wallet_screen(
         let made: eyre::Result<String> = match i {
             1 => match kind {
                 #[cfg(feature = "solana")]
-                config::ChainKind::Solana => {
-                    Err(eyre::eyre!("import a Solana key from its seed phrase instead"))
-                }
+                config::ChainKind::Solana => sol::wallet::import_private_key(
+                    &name,
+                    secret.as_ref().map(|s| s.as_str()).unwrap_or(""),
+                    pass.as_str(),
+                ),
                 _ => wallet::import_private_key(
                     &name,
                     secret.as_ref().map(|s| s.as_str()).unwrap_or(""),
