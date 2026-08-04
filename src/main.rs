@@ -4645,9 +4645,19 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // numbers are what the panel is for.
     let coin_box = {
         let inner = ui::widgets::themed_block("").inner(mkt_rect);
-        let h = inner.height;
+        // Shrink to fit, rather than vanish.
+        //
+        // A square `h` rows tall needs `2h` columns, so on a tall narrow panel
+        // the square the height asked for was wider than the panel had — and
+        // the whole box was dropped. The picture did not get smaller, it
+        // stopped existing, which is what "no images on EVM" was.
+        //
+        // 24 columns are kept for the text, and the height follows whatever
+        // width is left.
+        let by_width = inner.width.saturating_sub(24) / 2;
+        let h = inner.height.min(by_width);
         let w = h.saturating_mul(2);
-        (h >= 3 && inner.width > w + 24).then(|| Rect {
+        (h >= 3).then(|| Rect {
             x: inner.x + inner.width - w,
             y: inner.y,
             width: w,
