@@ -2980,13 +2980,17 @@ pub async fn run(
         // The coin's own art, if the fetch has landed. Keyed on the mint so
         // switching coins redraws rather than leaving the last one up.
         match (coin_box, bot.coin.as_ref()) {
-            (Some(r), Some(c)) => match super::metadata::token_png_cached(&c.mint) {
-                Some(png) => {
-                    let id = c.mint.to_bytes()[..8].iter().fold(0usize, |a, b| a << 8 | *b as usize);
-                    coin_art.show(&png, id, r.x, r.y, r.width, r.height, term_size);
+            (Some(r), Some(c)) => {
+                let url = bot.meta.as_ref().and_then(|m| m.image.as_deref()).unwrap_or("");
+                match crate::art::cached(url) {
+                    Some(png) => {
+                        let id =
+                            c.mint.to_bytes()[..8].iter().fold(0usize, |a, b| a << 8 | *b as usize);
+                        coin_art.show(png.as_slice(), id, r.x, r.y, r.width, r.height, term_size);
+                    }
+                    None => coin_art.hide(),
                 }
-                None => coin_art.hide(),
-            },
+            }
             _ => coin_art.hide(),
         }
 
@@ -3469,9 +3473,8 @@ pub async fn run(
                     // The artwork, in the background. It is decoration: it must
                     // never be a reason the numbers arrive later.
                     if let Some(url) = bot.meta.as_ref().and_then(|m| m.image.clone()) {
-                        let mint = p.mint;
                         tokio::spawn(async move {
-                            let _ = super::metadata::token_png(&mint, Some(&url)).await;
+                            let _ = crate::art::png(&url).await;
                         });
                     }
                     bot.remember_coin(&c);

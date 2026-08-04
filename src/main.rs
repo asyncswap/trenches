@@ -8,6 +8,7 @@ mod agent;
 mod verification;
 mod config;
 mod base_currency;
+mod art;
 mod shortcuts;
 mod launch_stream;
 mod net;
@@ -148,6 +149,18 @@ async fn read_held_tokens<P: Provider>(
         .filter(|(_, _, bal, _)| futures::future::ready(*bal > DUST))
         .collect()
         .await
+}
+
+/// Start fetching a coin's artwork, if it has any. Never awaited by the caller:
+/// a picture must not be a reason the pool's numbers arrive later.
+fn fetch_coin_art(socials: &engine::TokenSocials) {
+    let url = socials.logo.trim().to_string();
+    if url.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = art::png(&url).await;
+    });
 }
 
 /// Below this, a balance is a leftover rather than a holding.
@@ -1185,6 +1198,7 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
             if f.launch_block.unwrap_or(0) > 0 && !f.socials.is_empty() {
                 bot.pool_launch_block = f.launch_block;
                 bot.socials = f.socials;
+                fetch_coin_art(&bot.socials);
                 return;
             }
         }
@@ -1192,6 +1206,7 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
             Some(fl) => {
                 bot.pool_launch_block = Some(fl.launch_block);
                 bot.socials = engine::fetch_flaunch_meta(&fl.token_uri).await;
+                fetch_coin_art(&bot.socials);
                 let (meta, block) = (bot.socials.clone(), fl.launch_block);
                 token_metadata_chain_id::merge(bot.pool.token, move |f| {
                     if block > 0 {
@@ -1209,6 +1224,7 @@ async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
         }
     } else {
         bot.socials = token_metadata_chain_id::ensure(provider, bot.pool.token, None).await.socials;
+        fetch_coin_art(&bot.socials);
         bot.pool_launch_block = token_metadata_chain_id::launch_block(provider, bot.pool.token).await;
     }
 }
@@ -2629,6 +2645,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // Header logo. Any screen that takes over clears images on entry, which
     // marks this stale, so it redraws itself on return with no bookkeeping here.
     let mut chain_logo = ui::image::Placement::default();
+    let mut coin_art = ui::image::Placement::default();
 
 
     use std::sync::{Arc, Mutex};
@@ -3017,13 +3034,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 let mut tape_snap: Vec<engine::Swap> = tape.lock().unwrap().iter().copied().collect();
                 tape_snap.sort_by_key(|s| s.block); // merged pools -> chronological
                 let mut logo_box = None;
+                let mut coin_box = None;
                 let mut grabbed: Option<String> = None;
                 // Named so a freeze here is attributable: a draw blocks when
                 // the TERMINAL stops consuming output — scrollback, a dragged
                 // window, a busy tab — not because of anything in the app.
                 phase!("drawing (a stalled draw usually means the terminal itself was busy)");
                 terminal.draw(|f| {
-                    logo_box = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, orders_all, &tape_snap, show_help);
+                    let (l, c) = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, orders_all, &tape_snap, show_help);
+                    logo_box = l;
+                    coin_box = c;
                     ui::mouse::paint(f, &msel);
                     if copy_armed {
                         if let Some((a, b)) = msel.region() {
@@ -3047,6 +3067,23 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 let term_size = terminal.size().map(|s| (s.width, s.height)).unwrap_or((0, 0));
                 if let (Some(r), Some(png)) = (logo_box, ui::image::for_venue(venue, &bot.net)) {
                     chain_logo.show(png, venue as usize, r.x, r.y, r.width, r.height, term_size);
+                }
+                // The coin's own art, once the background fetch has it. Keyed
+                // on the token so switching pools redraws instead of leaving
+                // the last coin's face up.
+                match coin_box {
+                    Some(r) if !bot.socials.logo.trim().is_empty() => {
+                        match art::cached(bot.socials.logo.trim()) {
+                            Some(png) => {
+                                let id = bot.pool.token.into_word().0[..8]
+                                    .iter()
+                                    .fold(0usize, |a, b| a << 8 | *b as usize);
+                                coin_art.show(png.as_slice(), id, r.x, r.y, r.width, r.height, term_size);
+                            }
+                            None => coin_art.hide(),
+                        }
+                    }
+                    _ => coin_art.hide(),
                 }
             }
             // slower action tick — auto-strategy + reap, each timeout-bounded
@@ -4198,7 +4235,10 @@ enum Panel {
 /// Draws the dashboard and returns where the header logo goes, so the caller
 /// can place a real terminal image there after the frame.
 #[allow(clippy::too_many_arguments)] // a swap needs every one of these; bundling them into a struct would only move the list
-fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders_scroll: usize, orders_all: bool, tape: &[engine::Swap], show_help: bool) -> Option<Rect> {
+/// Returns the header logo box and, when a pool is loaded, a small box in the
+/// Pool panel for the coin's artwork.
+#[allow(clippy::too_many_arguments)] // a frame needs every one of these
+fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders_scroll: usize, orders_all: bool, tape: &[engine::Swap], show_help: bool) -> (Option<Rect>, Option<Rect>) {
     // Paint the theme background FIRST. Without this a light theme renders dark
     // text on the terminal's own dark background — unreadable.
     ui::widgets::paint_bg(f);
@@ -4594,7 +4634,16 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         " Pool [p] ".to_string()
     };
     let market = Paragraph::new(mkt).block(ui::widgets::themed_block(mkt_title));
-    f.render_widget(market, cols[mkt_a_col]);
+    let mkt_rect = cols[mkt_a_col];
+    f.render_widget(market, mkt_rect);
+    // Top-right of the Pool panel, inside its border — the same place the
+    // Solana dashboard puts it, so the two read alike.
+    let coin_box = (mkt_rect.width > 30 && mkt_rect.height > 5).then(|| Rect {
+        x: mkt_rect.x + mkt_rect.width - 9,
+        y: mkt_rect.y + 1,
+        width: 8,
+        height: 4,
+    });
 
     // Arb mode: second pool's own panel in the middle column.
     if bot.arb_mode {
@@ -5401,7 +5450,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // Shared with the Solana dashboard — one renderer, one look.
         ui::widgets::help(f, &items, " Shortcuts  (any key to close) ");
     }
-    Some(logo_box)
+    (Some(logo_box), coin_box)
 }
 
 /// Ask for a v4 fee tier; returns (fee, tickSpacing).
