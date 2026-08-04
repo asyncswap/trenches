@@ -118,20 +118,44 @@ pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
 }
 
 /// The shortcuts as markdown, for the docs page.
+///
+/// Laid out in fenced blocks rather than tables. The in-app reader renders
+/// markdown itself, and it has no table support — a pipe table came out as one
+/// unbroken run of text with the cells jammed together, which is how this page
+/// shipped looking like a wall of `keydoeswherebbuybothssell`. A fenced block
+/// keeps its own newlines and spacing on the way through, and reads the same on
+/// GitHub, so one format serves both rather than two formats drifting.
 pub fn markdown() -> String {
-    let mut out = String::from("# SHORTCUTS\n\nEvery shortcut, by section. `EVM` and `SOL` mark which\ndashboard has it.\n");
+    let mut out = String::from(
+        "# SHORTCUTS\n\nEvery shortcut, by section. `EVM` and `SOL` mark which\ndashboard has it.\n",
+    );
     let mut section = "";
     for k in all() {
         if k.section != section {
+            if !section.is_empty() {
+                out.push_str("```\n");
+            }
             section = &k.section;
-            out.push_str(&format!("\n## {section}\n\n| key | does | where |\n| --- | --- | --- |\n"));
+            out.push_str(&format!("\n## {section}\n\n```\n"));
         }
-        let where_ = match (k.chains.iter().any(|c| c == "evm"), k.chains.iter().any(|c| c == "sol")) {
+        let where_ = match (
+            k.chains.iter().any(|c| c == "evm"),
+            k.chains.iter().any(|c| c == "sol"),
+        ) {
             (true, true) => "both",
             (true, false) => "EVM",
             _ => "SOL",
         };
-        out.push_str(&format!("| `{}` | {} | {} |\n", k.key, k.desc, where_));
+        // Padded on character count. Every key is one character wide except the
+        // four arrows and the two named ones, and the description column is
+        // wide enough that a glyph the terminal renders double cannot push the
+        // last column into the next.
+        let key = format!("{}{}", k.key, " ".repeat(8usize.saturating_sub(k.key.chars().count())));
+        let desc = format!("{}{}", k.desc, " ".repeat(38usize.saturating_sub(k.desc.chars().count())));
+        out.push_str(&format!("{key}{desc}{where_}\n"));
+    }
+    if !section.is_empty() {
+        out.push_str("```\n");
     }
     out
 }
@@ -243,6 +267,19 @@ mod tests {
     /// longer embeds it — that renders `markdown()` directly, so it cannot be
     /// stale — but a checked-in file that quietly stops matching is still a
     /// reader being told something untrue.
+    /// The in-app reader has no table support, so a pipe table renders as one
+    /// run of jammed-together words. Fenced blocks survive it. This is the
+    /// check that the page is in a form the app can actually draw.
+    #[test]
+    fn the_page_uses_fenced_blocks_rather_than_tables() {
+        let md = markdown();
+        assert!(!md.contains(" | "), "no pipe tables: the reader cannot draw them");
+        assert!(md.contains("```"), "the rows are fenced");
+        // Every shortcut gets its own line inside a block.
+        let rows = md.lines().filter(|l| l.starts_with(char::is_alphanumeric) || l.starts_with(['[', ']', '(', ')', '{', '}', '<', '>', ';', '\'', '$', '?', ',', '.', '←', '→', '↑', '↓'])).count();
+        assert!(rows >= all().len(), "one line per key: {rows} lines for {} keys", all().len());
+    }
+
     #[test]
     fn the_docs_page_matches_the_source() {
         let on_disk = include_str!("../docs/shortcuts.md");
