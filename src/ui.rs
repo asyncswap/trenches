@@ -88,6 +88,7 @@ pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Op
                     continue;
                 }
                 Event::Key(k) => {
+                    if widgets::theme_key(term, k.code)? { continue; }
                     copied = None; // the note belongs to the moment
                     match k.code {
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -175,6 +176,7 @@ pub fn select_overlay(
             continue;
         }
         let Event::Key(k) = ev else { continue };
+        if widgets::theme_key(term, k.code)? { continue; }
         match k.code {
             // hjkl moves, as everywhere else here.
             //
@@ -358,6 +360,7 @@ pub fn select_table(
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => state.select(Some(step(sel, false))),
                     KeyCode::Down | KeyCode::Char('j') => state.select(Some(step(sel, true))),
@@ -791,6 +794,7 @@ pub fn multi_select(
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         let i = state.selected().unwrap_or(0);
@@ -989,6 +993,7 @@ pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
         })?;
         if event::poll(std::time::Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
+                if widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up => scroll = scroll.saturating_sub(1),
                     KeyCode::Down => scroll = scroll.saturating_add(1),

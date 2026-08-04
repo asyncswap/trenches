@@ -1267,6 +1267,29 @@ mod theme_tests {
 /// whatever was active on entry.
 ///
 /// Chain-agnostic, like everything else here — both dashboards call it.
+/// `T` opens the theme picker, from wherever you are.
+///
+/// Returns true if the key was handled, so a screen's loop can `continue`.
+///
+/// One function rather than the same arm copied into ten match blocks: a key
+/// that works "everywhere" by being written out everywhere works nowhere new,
+/// and the next screen is the one that forgets it.
+///
+/// NOT called from anything that takes typed text — `input`, `password`, the
+/// chat box. There a capital T is a letter someone meant to type, and a picker
+/// opening over a half-entered address is worse than no shortcut at all.
+pub fn theme_key(
+    term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    code: crossterm::event::KeyCode,
+) -> eyre::Result<bool> {
+    if code != crossterm::event::KeyCode::Char('T') {
+        return Ok(false);
+    }
+    // The picker applies and persists the choice itself.
+    theme_picker(term)?;
+    Ok(true)
+}
+
 pub fn theme_picker(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> eyre::Result<Option<String>> {
     // This screen owns the terminal now: take down any image the last one left.
     // Clearing also marks every placement stale, so the dashboard redraws its

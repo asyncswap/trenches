@@ -222,6 +222,9 @@ pub fn screen(term: &mut Term) -> eyre::Result<()> {
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        if crate::ui::widgets::theme_key(term, k.code)? {
+            continue;
+        }
         // Any keypress retires the "copied" note — it belongs to the moment.
         copied = None;
         match k.code {
