@@ -79,13 +79,47 @@ static ROBINHOOD: Venues = Venues {
     pons_v2_hook: address!("8e99D2009D60A917e9B1c00C04C077b8c0c3a044"),
 };
 
-/// The addresses for the chain currently selected.
+/// Base mainnet.
 ///
-/// One chain in the table today. The point of the table is that adding the next
-/// one is an entry here rather than a hunt through a hundred call sites — which
-/// is what it was until this existed.
+/// Uniswap addresses from the Uniswap/contracts registry (commit 3793618).
+/// The same file lists Robinhood Chain, and five of the six addresses we
+/// already trade through match it exactly — which is why it is trusted for a
+/// chain we cannot test by eye.
+///
+/// Flaunch addresses from flaunchgg-contracts' own README, Base column. Base is
+/// Flaunch's home chain, so these are the canonical deployment rather than a
+/// port of it.
+///
+/// WETH is the OP Stack predeploy. Not in the Uniswap registry — corroborated
+/// instead by Flaunch's Base fork tests, which name it as ETH_TOKEN.
+static BASE: Venues = Venues {
+    pool_manager: address!("498581fF718922c3f8e6A244956aF099B2652b2b"),
+    position_manager: address!("7C5f5A4bBd8fD63184577525326123B519429bDc"),
+    state_view: address!("A3c0c9b65baD0b08107Aa264b0f3dB444b867A71"),
+    universal_router: address!("6fF5693b99212Da76ad316178A184AB56D299b43"),
+    v3_factory: address!("33128a8fC17869897dcE68Ed026d694621f6FDfD"),
+    swap_router_02: address!("2626664c2603336E57B271c5C0b26F421741e481"),
+    weth: address!("4200000000000000000000000000000000000006"),
+    flaunch_pm: address!("23321f11a6d44fd1ab790044fdfde5758c902fdc"),
+    fleth: address!("000000000d564d5be76f7f0d28fe52605afc7cf8"),
+    fleth_hooks: address!("9e433f32bb5481a9ca7dff5b3af74a7ed041a888"),
+    // pons is Robinhood Chain's launchpad and is not deployed here. Zero, not
+    // omitted: discovery reads these to decide what to scan for, and a zero
+    // says "not on this chain" in a way a wrong address cannot.
+    pons_factory: Address::ZERO,
+    pons_v2_factory: Address::ZERO,
+    pons_v2_hook: Address::ZERO,
+};
+
+pub const ROBINHOOD_MAINNET: u64 = 4663;
+pub const BASE_MAINNET: u64 = 8453;
+
+/// The addresses for the chain currently selected.
 pub fn venues() -> &'static Venues {
-    &ROBINHOOD
+    match crate::chain_id() {
+        BASE_MAINNET => &BASE,
+        _ => &ROBINHOOD,
+    }
 }
 
 pub fn pool_manager() -> Address { venues().pool_manager }
@@ -380,3 +414,61 @@ pub const SWEEP: u8 = 0x14;
 pub const BURN_POSITION: u8 = 0x03;
 #[cfg(feature = "liquidity")]
 pub const TAKE_PAIR: u8 = 0x11;
+
+#[cfg(test)]
+mod venue_tests {
+    use super::*;
+
+    /// A chain's table must be complete for what that chain HAS. A zero where a
+    /// contract exists routes a swap at nothing; the whole point of the table
+    /// is that this is checkable rather than discovered by a failed trade.
+    #[test]
+    fn every_chain_names_the_venues_it_trades_through() {
+        for (name, v) in [("robinhood", &ROBINHOOD), ("base", &BASE)] {
+            for (what, a) in [
+                ("pool_manager", v.pool_manager),
+                ("position_manager", v.position_manager),
+                ("state_view", v.state_view),
+                ("universal_router", v.universal_router),
+                ("v3_factory", v.v3_factory),
+                ("swap_router_02", v.swap_router_02),
+                ("weth", v.weth),
+                ("flaunch_pm", v.flaunch_pm),
+                ("fleth", v.fleth),
+                ("fleth_hooks", v.fleth_hooks),
+            ] {
+                assert!(!a.is_zero(), "{name} has no {what}");
+            }
+        }
+    }
+
+    /// Two chains must not share an address by accident — a copy-paste from one
+    /// table into the other is the likeliest way this file goes wrong, and it
+    /// would send Base trades at Robinhood contracts.
+    #[test]
+    fn the_two_chains_do_not_share_addresses() {
+        let r = [
+            ROBINHOOD.pool_manager, ROBINHOOD.position_manager, ROBINHOOD.state_view,
+            ROBINHOOD.universal_router, ROBINHOOD.v3_factory, ROBINHOOD.swap_router_02,
+            ROBINHOOD.weth, ROBINHOOD.flaunch_pm, ROBINHOOD.fleth, ROBINHOOD.fleth_hooks,
+        ];
+        let b = [
+            BASE.pool_manager, BASE.position_manager, BASE.state_view,
+            BASE.universal_router, BASE.v3_factory, BASE.swap_router_02,
+            BASE.weth, BASE.flaunch_pm, BASE.fleth, BASE.fleth_hooks,
+        ];
+        for (i, x) in b.iter().enumerate() {
+            assert!(!r.contains(x), "base slot {i} carries a Robinhood address: {x}");
+        }
+    }
+
+    /// pons is Robinhood's launchpad. Base must say so with a zero rather than
+    /// inheriting an address that means nothing there.
+    #[test]
+    fn base_claims_no_pons() {
+        assert!(BASE.pons_factory.is_zero());
+        assert!(BASE.pons_v2_factory.is_zero());
+        assert!(BASE.pons_v2_hook.is_zero());
+        assert!(!ROBINHOOD.pons_factory.is_zero(), "and Robinhood still has it");
+    }
+}

@@ -555,6 +555,17 @@ pub fn starter_json() -> String {
                 "public_pools": []
             },
             {
+                "name": "base-mainnet",
+                "kind": "evm",
+                "chain_id": 8453,
+                // Flaunch's home chain. Uniswap v3 and v4 both live here, so
+                // the same trading path serves it — only the addresses differ.
+                "rpc": ["https://mainnet.base.org"],
+                "rpc_alchemy_example": "https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+                "tokens": [],
+                "public_pools": []
+            },
+            {
                 "name": "solana-mainnet",
                 // Explicitly null, not absent: Solana has no EVM chain id, and a
                 // reader should see that the question was asked and answered

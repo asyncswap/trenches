@@ -173,6 +173,7 @@ pub const PUMP_PNG: &[u8] = include_bytes!("../../assets/pump.png");
 pub const PONS_PNG: &[u8] = include_bytes!("../../assets/pons.png");
 pub const UNISWAP_PNG: &[u8] = include_bytes!("../../assets/uniswap.png");
 pub const FLAUNCH_PNG: &[u8] = include_bytes!("../../assets/flaunch.png");
+pub const BASE_PNG: &[u8] = include_bytes!("../../assets/base.png");
 
 impl Venue {
     /// The venue spelled out for large type in the header.
@@ -246,6 +247,8 @@ pub fn for_network(name: &str) -> Option<&'static [u8]> {
         Some(SOLANA_PNG)
     } else if n.starts_with("robinhood") {
         Some(ROBINHOOD_PNG)
+    } else if n.starts_with("base") {
+        Some(BASE_PNG)
     } else {
         None
     }
@@ -269,7 +272,7 @@ mod tests {
 
     #[test]
     fn embedded_assets_are_real_pngs() {
-        for png in [ROBINHOOD_PNG, SOLANA_PNG, PUMP_PNG, PONS_PNG, UNISWAP_PNG, FLAUNCH_PNG] {
+        for png in [ROBINHOOD_PNG, SOLANA_PNG, PUMP_PNG, PONS_PNG, UNISWAP_PNG, FLAUNCH_PNG, BASE_PNG] {
             assert!(png.len() > 1000, "asset looks truncated");
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
         }
@@ -291,6 +294,8 @@ mod tests {
         // Display names too: that is what the dashboards pass in.
         assert_eq!(for_network("Solana Mainnet"), Some(SOLANA_PNG));
         assert_eq!(for_network("Robinhood Mainnet"), Some(ROBINHOOD_PNG));
+        assert_eq!(for_network("base-mainnet"), Some(BASE_PNG));
+        assert_eq!(for_network("Base Mainnet"), Some(BASE_PNG));
         assert_eq!(for_network("anvil-local"), None);
     }
 }

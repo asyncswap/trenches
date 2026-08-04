@@ -294,8 +294,19 @@ async fn scan_launchpads<P: Provider>(
     let (mut ok, mut failed) = (0u32, 0u32);
     while start <= to {
         let end = (start + chunk - 1).min(to);
+        // Only the launchpads this chain actually has. A zero address means
+        // "not deployed here", and asking a node to watch for logs from
+        // address zero is a filter that can only ever match nothing — paid for
+        // on every round, on a metered endpoint.
+        let pads: Vec<Address> = [pons_factory(), flaunch_pm(), pons_v2_factory()]
+            .into_iter()
+            .filter(|a| !a.is_zero())
+            .collect();
+        if pads.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
         let filter = Filter::new()
-            .address(vec![pons_factory(), flaunch_pm(), pons_v2_factory()])
+            .address(pads)
             .event_signature(vec![
                 IPonsFactory::TokenLaunched::SIGNATURE_HASH,
                 IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
