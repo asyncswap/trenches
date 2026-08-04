@@ -44,7 +44,6 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const SOCIAL_FIELDS: u8 = 7; // logo, description, twitter, telegram, discord, website, farcaster
 const HOT_TX_PER_SEC: f64 = 1.0; // threshold for the 🔥 (active) marker + top-of-list
 const HOT_MKTCAP_ETH: f64 = 5.0; // 🔥 fire needs cap ≥ this (and < 1 min old); bumped to top
-const MIN_MKTCAP_ETH: f64 = 2.0; // Discovery hides pools below this market cap
 
 // Tiered discovery: small-caps must be FRESH, "big fish" show at ANY age.
 const FRESH_MAX_SECS: f64 = 120.0; // ≥2 ETH caps only show if this fresh (≤2 min)
@@ -2048,8 +2047,7 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     let mut copy_armed = false;
     let result: eyre::Result<Option<Grad>> = loop {
         let rows = {
-            let mut r = shared.lock().unwrap().clone();
-            r.retain(|row| row.mkt_cap_eth >= MIN_MKTCAP_ETH); // hide anything under the min cap
+            let r = shared.lock().unwrap().clone();
             // NOT truncated, and deliberately not sized to a screen either.
             // The list was capped at ten while the pane had room for fifty, so
             // a four-minute-old launch was already unreachable on the one
