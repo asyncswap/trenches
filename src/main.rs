@@ -4636,14 +4636,24 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     let market = Paragraph::new(mkt).block(ui::widgets::themed_block(mkt_title));
     let mkt_rect = cols[mkt_a_col];
     f.render_widget(market, mkt_rect);
-    // Top-right of the Pool panel, inside its border — the same place the
-    // Solana dashboard puts it, so the two read alike.
-    let coin_box = (mkt_rect.width > 30 && mkt_rect.height > 5).then(|| Rect {
-        x: mkt_rect.x + mkt_rect.width - 9,
-        y: mkt_rect.y + 1,
-        width: 8,
-        height: 4,
-    });
+    // As tall as the panel, and square: terminal cells are about twice as tall
+    // as they are wide, so an `h`-row square needs `2h` columns — the same
+    // reasoning `header_box` uses for the venue mark.
+    //
+    // Only when the text still has room to its left. A picture that overlaps
+    // the mint address is worse than no picture, and on a narrow window the
+    // numbers are what the panel is for.
+    let coin_box = {
+        let inner = ui::widgets::themed_block("").inner(mkt_rect);
+        let h = inner.height;
+        let w = h.saturating_mul(2);
+        (h >= 3 && inner.width > w + 24).then(|| Rect {
+            x: inner.x + inner.width - w,
+            y: inner.y,
+            width: w,
+            height: h,
+        })
+    };
 
     // Arb mode: second pool's own panel in the middle column.
     if bot.arb_mode {

@@ -2373,15 +2373,24 @@ fn draw(
     let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(c[1]);
     ui::widgets::panel(f, cols[0], &wallet_panel(bot));
     ui::widgets::panel(f, cols[1], &market_panel(bot));
-    // Top-right of the market panel, inside its border. Small: this is the
-    // coin's face, not a picture — it says "yes, that one" at a glance, which
-    // a symbol alone does not on a chain with four coins called MOON.
-    let coin_box = (cols[1].width > 30 && cols[1].height > 5).then(|| Rect {
-        x: cols[1].x + cols[1].width - 9,
-        y: cols[1].y + 1,
-        width: 8,
-        height: 4,
-    });
+    // As tall as the panel, and square: terminal cells are about twice as tall
+    // as they are wide, so an `h`-row square needs `2h` columns — the same
+    // reasoning `header_box` uses for the venue mark.
+    //
+    // Only when the text still has room to its left. A picture that overlaps
+    // the mint address is worse than no picture, and on a narrow window the
+    // numbers are what the panel is for.
+    let coin_box = {
+        let inner = ui::widgets::themed_block("").inner(cols[1]);
+        let h = inner.height;
+        let w = h.saturating_mul(2);
+        (h >= 3 && inner.width > w + 24).then(|| Rect {
+            x: inner.x + inner.width - w,
+            y: inner.y,
+            width: w,
+            height: h,
+        })
+    };
 
     // Everything adjustable in one box, with the most recent message beneath.
     // Key hints and labels share the border colour; values stay normal text so
