@@ -1111,6 +1111,9 @@ pub struct SolBot {
     /// Buy size as a FRACTION of the SOL balance, like the EVM side's
     /// buy_frac — an absolute SOL amount was meaningless across wallet sizes.
     pub buy_frac: f64,
+    /// The step `[` and `]` move by, when you have chosen one with `;` / `'`.
+    /// None = derived from the wallet's size.
+    pub buy_step_override: Option<f64>,
     pub slippage_pct: f64,
     /// Candle interval for the chart panel, seconds. , and . walk the ladder.
     /// Chart y axis: false = price, true = market cap. Mirrors the EVM `m`.
@@ -1243,20 +1246,46 @@ impl SolBot {
     }
 }
 
-/// The buy-size ladder, as fractions of the SOL balance. Multiplicative
-/// steps so a large wallet can go FINE — 0.1% is the finest precision — while
-/// the top still reaches all-in.
-const BUY_STEPS: [f64; 10] =
-    [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.10, 0.25, 0.50, 1.0];
+/// The steps `;` and `'` move between, coarsest last. The EVM ladder, because
+/// a key that adjusts the same thing should adjust it the same way.
+const BUY_STEPS: [f64; 5] = [0.0001, 0.001, 0.005, 0.01, 0.05];
 
-/// The next ladder rung from `cur`, up or down, clamped at the ends.
-fn buy_step(cur: f64, up: bool) -> f64 {
+/// How much one press of `[` or `]` moves the buy size.
+///
+/// This used to walk a MULTIPLICATIVE ladder — 5% then 10, 25, 50, 100 — so
+/// past the middle a single press could double the position. The EVM side has
+/// always moved in even steps of 0.5%, and the same key doing something that
+/// different depending on the chain is the thing this app keeps having to fix.
+///
+/// Finer on a large wallet, for the reason the EVM version gives: the step is a
+/// fraction of the balance, so the bigger the balance the coarser the smallest
+/// change you can make, which is backwards.
+fn buy_step(bot: &SolBot) -> f64 {
+    if let Some(s) = bot.buy_step_override {
+        return s; // you said; that settles it
+    }
+    let wallet_usd = bot.sol * bot.sol_usd;
+    if wallet_usd >= 1_000.0 { 0.001 } else { 0.005 }
+}
+
+/// Move the buy-size step one rung, and remember that you chose.
+fn nudge_buy_step(bot: &mut SolBot, coarser: bool) {
+    let now = buy_step(bot);
     let i = BUY_STEPS
         .iter()
-        .position(|s| (s - cur).abs() < 1e-9)
-        .unwrap_or_else(|| BUY_STEPS.iter().position(|s| *s > cur).unwrap_or(BUY_STEPS.len() - 1));
-    let j = if up { (i + 1).min(BUY_STEPS.len() - 1) } else { i.saturating_sub(1) };
-    BUY_STEPS[j]
+        .enumerate()
+        .min_by(|a, b| {
+            (a.1 - now).abs().partial_cmp(&(b.1 - now).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(2);
+    let next = if coarser { (i + 1).min(BUY_STEPS.len() - 1) } else { i.saturating_sub(1) };
+    bot.buy_step_override = Some(BUY_STEPS[next]);
+    // A finer step is pointless if the size cannot sit on it, and a coarser one
+    // must not leave the size off its own grid.
+    let step = BUY_STEPS[next];
+    bot.buy_frac = ((bot.buy_frac / step).round() * step).clamp(step, 1.0);
+    bot.note(format!("Buy step is now {}%", pct(step)));
 }
 
 /// A percentage label without noise: "0.1", "2.5", "5", "100".
@@ -1313,7 +1342,8 @@ impl SolBot {
             token_bal: 0.0,
             slot: 0,
             round_ms: 0.0,
-            buy_frac: 0.05, // 5% of balance; [ ] walk the ladder below
+            buy_frac: 0.05, // 5% of balance; [ ] move it by `buy_step`
+            buy_step_override: None,
             slippage_pct: 5.0,
             // The ONE canonical candle to perfect first: the minute. Other
             // intervals share every line of this code path, but the minute is
@@ -3139,8 +3169,22 @@ pub async fn run(
                         scroll = (scroll + 1).min(n.saturating_sub(1));
                     }
                     KeyCode::Down => scroll = scroll.saturating_sub(1),
-                    KeyCode::Char(']') => bot.buy_frac = buy_step(bot.buy_frac, true),
-                    KeyCode::Char('[') => bot.buy_frac = buy_step(bot.buy_frac, false),
+                    KeyCode::Char(']') => {
+                        let step = buy_step(&bot);
+                        // Snap to the step's grid, so a size set under a coarse
+                        // step does not leave every later press landing on
+                        // 1.35%, 1.45%, 1.55%.
+                        bot.buy_frac = (((bot.buy_frac / step).round() + 1.0) * step).min(1.0);
+                        bot.note(format!("Buy size is now {}% of your SOL", pct(bot.buy_frac)));
+                    }
+                    KeyCode::Char('[') => {
+                        let step = buy_step(&bot);
+                        bot.buy_frac = (((bot.buy_frac / step).round() - 1.0) * step).max(step);
+                        bot.note(format!("Buy size is now {}% of your SOL", pct(bot.buy_frac)));
+                    }
+                    // The step itself, as on the EVM dashboard.
+                    KeyCode::Char(';') => nudge_buy_step(&mut bot, false),
+                    KeyCode::Char('\'') => nudge_buy_step(&mut bot, true),
                     // [] buy · () sell · {} slippage · <> priority, matching
                     // the header labels and the EVM dashboard.
                     KeyCode::Char(')') => {

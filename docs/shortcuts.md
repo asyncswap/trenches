@@ -54,8 +54,8 @@ L       PnL calendar                          evm, sol
 ```
 [       decrease buy size                     evm, sol
 ]       increase buy size                     evm, sol
-;       decrease buy step                     evm
-'       increase buy step                     evm
+;       decrease buy step                     evm, sol
+'       increase buy step                     evm, sol
 (       decrease sell size                    evm, sol
 )       increase sell size                    evm, sol
 {       decrease slippage                     evm, sol

@@ -683,16 +683,15 @@ fn set_account_name(name: &str) {
 /// expected is exactly when you need the address, which is exactly when it was
 /// missing.
 ///
-/// `hide_address: true` drops it and leaves the name. Anything else shows it
-/// WHOLE: a setting called hide_address, set to false, has to mean the address
-/// is not hidden, and half an address is mostly hidden. `y` copies it either
-/// way.
+/// `hide_address: true` shows the account NAME instead. Anything else shows the
+/// address and only the address — it is the thing you copy out of this panel,
+/// and a name in front of it is one more thing to drag across. `y` copies it
+/// either way.
 pub fn account_line(address: &str) -> String {
-    let name = account_label(address);
-    if config::hide_address() || name == address {
-        return name;
+    if config::hide_address() {
+        return account_label(address);
     }
-    format!("{name}   {address}")
+    address.to_string()
 }
 
 pub fn account_label(address: &str) -> String {

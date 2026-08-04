@@ -267,7 +267,8 @@
       "desc": "decrease buy step",
       "section": "SIZE",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
@@ -275,7 +276,8 @@
       "desc": "increase buy step",
       "section": "SIZE",
       "chains": [
-        "evm"
+        "evm",
+        "sol"
       ]
     },
     {
