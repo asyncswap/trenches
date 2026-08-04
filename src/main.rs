@@ -124,7 +124,7 @@ const HELD_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 /// In series this was one round trip per pool before the next could start, so
 /// the wait grew with how many pools the chain had shown us — a number that
 /// only ever goes up, and has nothing to do with how many coins are held.
-pub async fn read_held_tokens<P: Provider>(
+async fn read_held_tokens<P: Provider>(
     provider: &P,
     me: alloy::primitives::Address,
     pools: &[SelPool],
