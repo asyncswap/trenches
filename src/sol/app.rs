@@ -2994,6 +2994,7 @@ pub async fn run(
         match (coin_box, bot.coin.as_ref()) {
             (Some(r), Some(c)) => {
                 let url = bot.meta.as_ref().and_then(|m| m.image.as_deref()).unwrap_or("");
+                crate::art::request(url);
                 match crate::art::cached(url) {
                     Some(png) => {
                         let id =

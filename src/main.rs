@@ -3078,6 +3078,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // the last coin's face up.
                 match coin_box {
                     Some(r) if !bot.socials.logo.trim().is_empty() => {
+                        // Ask from here as well as on load. This costs nothing
+                        // when it is already cached or in flight, and it means
+                        // no code path can forget.
+                        art::request(bot.socials.logo.trim());
                         match art::cached(bot.socials.logo.trim()) {
                             Some(png) => {
                                 let id = bot.pool.token.into_word().0[..8]

@@ -29,3 +29,6 @@ target/
 # macOS
 .DS_Store
 hero-*.png
+
+# Vendor documentation kept locally for reference, not redistributed.
+pons-v2.txt

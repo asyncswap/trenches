@@ -246,6 +246,42 @@ pub fn cached(url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     pngs().lock().ok().and_then(|g| g.get(url).cloned()).flatten()
 }
 
+/// Ask for a picture, at most once per URL, from anywhere.
+///
+/// The eager fetch hangs off whichever code path loaded the pool's metadata,
+/// and there are several — a pool restored at startup, one picked from
+/// discovery, one whose socials arrive a moment later. Miss one and the art
+/// never loads for pools that arrived that way, which is exactly what
+/// happened: the log said "no logo url" because the fetch ran before the
+/// metadata did, and nothing asked again afterwards.
+///
+/// So the drawing code asks every frame instead, and this makes that cheap:
+/// already cached, already failed, or already in flight, and it returns.
+pub fn request(url: &str) {
+    let url = url.trim();
+    if url.is_empty() {
+        return;
+    }
+    // Cached, or a fetch that already answered — including one that answered
+    // "no". Retrying a refusal every frame would be a denial of service we
+    // aimed at ourselves.
+    if pngs().lock().ok().is_some_and(|g| g.contains_key(url)) {
+        return;
+    }
+    static INFLIGHT: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    {
+        let Ok(mut g) = INFLIGHT.lock() else { return };
+        if !g.get_or_insert_with(Default::default).insert(url.to_string()) {
+            return; // someone is already fetching it
+        }
+    }
+    let owned = url.to_string();
+    tokio::spawn(async move {
+        let _ = png(&owned).await;
+    });
+}
+
 /// A JSON document from an IPFS URI, from whichever gateway answers first.
 ///
 /// The same race the artwork gets, for the file that NAMES the artwork. This

@@ -71,12 +71,20 @@ static ROBINHOOD: Venues = Venues {
     //
     // v1 is a different contract with a different event; both are live, so
     // discovery watches both.
-    pons_v2_factory: address!("7E1EAbd52Ae29598e6483F72dCf1a70b14284dB8"),
+    //
+    // These are the CURRENT v2 addresses, from ponsfamily's own docs. The pair
+    // before them was a previous deployment: both are still on chain with
+    // bytecode, which is why the mistake was invisible — the old factory simply
+    // never emits, and an address that answers nothing looks the same as a
+    // launchpad nobody is using. The docs are explicit that a hook binds to one
+    // factory permanently and a launchpad is replaced as a whole set, so these
+    // two move together or not at all.
+    pons_v2_factory: address!("7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e"),
     // The v4 hook every graduated v2 pool carries. The pool's own fee is ZERO —
     // the hook charges instead, so it can split the fee under the same policy
     // the curve used rather than paying a liquidity provider that does not
     // exist.
-    pons_v2_hook: address!("8e99D2009D60A917e9B1c00C04C077b8c0c3a044"),
+    pons_v2_hook: address!("E5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"),
 };
 
 /// Base mainnet.
