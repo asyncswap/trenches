@@ -109,9 +109,19 @@ fn to_disk(url: &str, bytes: &[u8]) {
 /// session log — a picture that does not appear is otherwise
 /// indistinguishable from one never fetched.
 async fn fetch_one(url: String) -> Option<std::sync::Arc<Vec<u8>>> {
-    // 512 KB. Coin art is a few tens of kilobytes; past this it is either not
-    // artwork or not worth the wait on a launch that lives for minutes.
-    const CAP: usize = 512 * 1024;
+    // 2 MB.
+    //
+    // 512 KB was a guess from pump.fun art, which runs to tens of kilobytes.
+    // Flaunch art is routinely larger and was being refused wholesale — the
+    // logs are full of "is over 524288 bytes", which is a picture nobody chose
+    // not to show.
+    //
+    // The cap is not what makes this safe. The dimension check does that, from
+    // the header, before anything is allocated; this only bounds the download
+    // and the wait on a coin that may live for minutes. And whatever arrives is
+    // re-encoded to 512px before it is cached, so a large original is paid for
+    // once and never again.
+    const CAP: usize = 2 * 1024 * 1024;
     async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(4_000))
