@@ -138,20 +138,86 @@ async fn fetch_one(url: String) -> Option<std::sync::Arc<Vec<u8>>> {
                 return None;
             }
         }
-        // The magic bytes, not the extension and not the content type.
-        if !body.starts_with(b"\x89PNG\r\n\x1a\n") {
+        // Already a PNG: hand it over untouched, decoding nothing.
+        if body.starts_with(b"\x89PNG\r\n\x1a\n") {
+            crate::trace(&format!("art: {url} ok, {} bytes", body.len()));
+            return Some(std::sync::Arc::new(body));
+        }
+        // Not a PNG. With `art-formats` it becomes one; without it, it is a
+        // format this build declines to decode.
+        if let Some(png) = to_png(&body, &url) {
+            crate::trace(&format!("art: {url} converted, {} bytes", png.len()));
+            return Some(std::sync::Arc::new(png));
+        }
+        {
             let head: Vec<String> = body.iter().take(8).map(|b| format!("{b:02x}")).collect();
             crate::trace(&format!(
                 "art: {url} is not a PNG ({} bytes, starts {})",
                 body.len(),
                 head.join(" ")
             ));
-            return None;
+            None
         }
-        crate::trace(&format!("art: {url} ok, {} bytes", body.len()));
-        Some(std::sync::Arc::new(body))
     }
     .await
+}
+
+/// The widest and tallest a coin's artwork may claim to be.
+///
+/// Checked from the HEADER, before a single pixel is allocated. A 40 KB file
+/// can declare 60,000 x 60,000 pixels — fourteen gigabytes once decoded — and
+/// the only defence against that is refusing to start.
+#[cfg(feature = "art-formats")]
+const MAX_DIM: u32 = 4_096;
+
+/// What the picture is scaled to before it is re-encoded. The panel is a few
+/// dozen cells; anything larger is bytes the terminal throws away.
+#[cfg(feature = "art-formats")]
+const FIT: u32 = 512;
+
+/// Turn JPEG, WebP or GIF into the PNG the terminal wants. `None` when the
+/// build cannot, or the file will not, or should not.
+///
+/// Everything hostile about this is bounded before it costs anything:
+///
+///   - the download is already capped at 512 KB;
+///   - the dimensions come from the header and are refused above `MAX_DIM`,
+///     so a decompression bomb never reaches an allocator;
+///   - the decode runs inside `catch_unwind`, because a malformed file that
+///     panics a decoder must not take the app down mid-trade;
+///   - the result is scaled to `FIT` before re-encoding.
+#[cfg(feature = "art-formats")]
+fn to_png(body: &[u8], url: &str) -> Option<Vec<u8>> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    let reader = ImageReader::new(Cursor::new(body)).with_guessed_format().ok()?;
+    let (w, h) = reader.into_dimensions().ok()?;
+    if w > MAX_DIM || h > MAX_DIM || w == 0 || h == 0 {
+        crate::trace(&format!("art: {url} claims {w}x{h}, refused before decoding"));
+        return None;
+    }
+    // A panic in a decoder is a bug in the decoder, not a reason to lose the
+    // session — this runs while a coin is on screen and possibly held.
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let img = ImageReader::new(Cursor::new(body)).with_guessed_format().ok()?.decode().ok()?;
+        let img = img.thumbnail(FIT, FIT);
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+        Some(out)
+    }))
+    .ok()
+    .flatten();
+    if decoded.is_none() {
+        crate::trace(&format!("art: {url} could not be converted"));
+    }
+    decoded
+}
+
+/// Without the feature, a non-PNG is simply not shown.
+#[cfg(not(feature = "art-formats"))]
+fn to_png(_body: &[u8], _url: &str) -> Option<Vec<u8>> {
+    None
 }
 
 type PngCache = std::collections::HashMap<String, Option<std::sync::Arc<Vec<u8>>>>;
@@ -232,6 +298,50 @@ mod disk_tests {
     fn the_same_url_maps_to_the_same_file() {
         assert_eq!(disk_path("ipfs://QmAbc/a.png"), disk_path("ipfs://QmAbc/a.png"));
         assert_ne!(disk_path("ipfs://QmAbc/a.png"), disk_path("ipfs://QmAbc/b.png"));
+    }
+}
+
+#[cfg(all(test, feature = "art-formats"))]
+mod convert_tests {
+    use super::*;
+
+    /// A real JPEG becomes a PNG the terminal will take.
+    #[test]
+    fn a_jpeg_is_converted() {
+        use image::{ImageFormat, RgbImage};
+        let mut jpg = Vec::new();
+        RgbImage::from_pixel(24, 16, image::Rgb([200, 40, 40]))
+            .write_to(&mut std::io::Cursor::new(&mut jpg), ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!(&jpg[..2], b"\xff\xd8", "fixture really is a JPEG");
+        let png = to_png(&jpg, "test").expect("should convert");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "and comes out a PNG");
+    }
+
+    /// Rubbish that merely looks like an image is refused, not guessed at.
+    #[test]
+    fn nonsense_does_not_convert() {
+        assert!(to_png(b"", "test").is_none());
+        assert!(to_png(b"<!DOCTYPE html><html>not an image", "test").is_none());
+        // A truncated JPEG: a real header with nothing behind it.
+        assert!(to_png(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00", "test").is_none());
+    }
+
+    /// The dimension guard is the one that matters: it must refuse from the
+    /// HEADER, before anything is allocated for pixels.
+    #[test]
+    fn an_oversized_image_is_refused_before_decoding() {
+        // A valid PNG header declaring 60000x60000 — about 14 GB decoded.
+        let mut png: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr: Vec<u8> = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&60_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&[0, 0, 0, 0]); // crc, unchecked by the header read
+        assert!(to_png(&png, "test").is_none(), "must not start decoding this");
     }
 }
 
