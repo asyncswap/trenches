@@ -127,7 +127,7 @@ pub fn help_rows(chain: Chain) -> Vec<(String, String)> {
 /// GitHub, so one format serves both rather than two formats drifting.
 pub fn markdown() -> String {
     let mut out = String::from(
-        "# SHORTCUTS\n\nEvery shortcut, by section. `EVM` and `SOL` mark which\ndashboard has it.\n",
+        "# SHORTCUTS\n\nEvery shortcut, by section, with the dashboards it works on.\n",
     );
     let mut section = "";
     for k in all() {
@@ -138,13 +138,15 @@ pub fn markdown() -> String {
             section = &k.section;
             out.push_str(&format!("\n## {section}\n\n```\n"));
         }
+        // The chains named, not counted. "both" makes the reader work out what
+        // both means, and it is the wrong word the moment a third chain lands.
         let where_ = match (
             k.chains.iter().any(|c| c == "evm"),
             k.chains.iter().any(|c| c == "sol"),
         ) {
-            (true, true) => "both",
-            (true, false) => "EVM",
-            _ => "SOL",
+            (true, true) => "evm, sol",
+            (true, false) => "evm",
+            _ => "sol",
         };
         // Padded on character count. Every key is one character wide except the
         // four arrows and the two named ones, and the description column is

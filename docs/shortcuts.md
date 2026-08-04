@@ -1,88 +1,87 @@
 # SHORTCUTS
 
-Every shortcut, by section. `EVM` and `SOL` mark which
-dashboard has it.
+Every shortcut, by section, with the dashboards it works on.
 
 ## TRADE
 
 ```
-b       buy                                   both
-s       sell                                  both
-x       sell everything                       both
-h       holdings                              EVM
-M       move funds                            both
-u       swap USDC and SOL                     SOL
+b       buy                                   evm, sol
+s       sell                                  evm, sol
+x       sell everything                       evm, sol
+h       holdings                              evm
+M       move funds                            evm, sol
+u       swap USDC and SOL                     sol
 ```
 
 ## DISCOVER
 
 ```
-f       find market                           both
-F       verified tokens                       EVM
-k       leaderboard                           EVM
+f       find market                           evm, sol
+F       verified tokens                       evm
+k       leaderboard                           evm
 ```
 
 ## POOL
 
 ```
-p       add pool                              both
-Del     deselect the pool                     EVM
-d       multi-pool view                       EVM
-e       auto arbitrage                        EVM
+p       add pool                              evm, sol
+Del     deselect the pool                     evm
+d       multi-pool view                       evm
+e       auto arbitrage                        evm
 ```
 
 ## VIEW
 
 ```
-t       trades panel                          both
-o       orders panel                          both
-l       logs panel                            both
-c       chart panel                           both
-v       chart panel                           both
-O       next panel                            both
-→       next panel                            both
-←       previous panel                        both
-↑       scroll up                             both
-↓       scroll down                           both
-,       shorter candles                       both
-.       longer candles                        both
-m       chart: price / market cap             both
-L       PnL calendar                          both
+t       trades panel                          evm, sol
+o       orders panel                          evm, sol
+l       logs panel                            evm, sol
+c       chart panel                           evm, sol
+v       chart panel                           evm, sol
+O       next panel                            evm, sol
+→       next panel                            evm, sol
+←       previous panel                        evm, sol
+↑       scroll up                             evm, sol
+↓       scroll down                           evm, sol
+,       shorter candles                       evm, sol
+.       longer candles                        evm, sol
+m       chart: price / market cap             evm, sol
+L       PnL calendar                          evm, sol
 ```
 
 ## SIZE
 
 ```
-[       decrease buy size                     both
-]       increase buy size                     both
-;       decrease buy step                     EVM
-'       increase buy step                     EVM
-(       decrease sell size                    both
-)       increase sell size                    both
-{       decrease slippage                     both
-}       increase slippage                     both
-<       decrease price impact limit           EVM
->       increase price impact limit           EVM
-<       decrease priority fee                 SOL
->       increase priority fee                 SOL
-0       price impact limit off                EVM
-P       auto priority on/off                  SOL
+[       decrease buy size                     evm, sol
+]       increase buy size                     evm, sol
+;       decrease buy step                     evm
+'       increase buy step                     evm
+(       decrease sell size                    evm, sol
+)       increase sell size                    evm, sol
+{       decrease slippage                     evm, sol
+}       increase slippage                     evm, sol
+<       decrease price impact limit           evm
+>       increase price impact limit           evm
+<       decrease priority fee                 sol
+>       increase priority fee                 sol
+0       price impact limit off                evm
+P       auto priority on/off                  sol
 ```
 
 ## MODE
 
 ```
-R       refresh everything                    EVM
-T       theme picker                          both
-$       display currency                      both
-g       profit guard on/off                   EVM
-n       buy dedup on/off                      EVM
-C       change chain                          both
-W       change wallet                         both
-U       check for updates                     both
-D       docs                                  both
-Esc     back one screen                       both
-q       quit                                  both
-Q       quit without asking                   both
-?       help                                  both
+R       refresh everything                    evm
+T       theme picker                          evm, sol
+$       display currency                      evm, sol
+g       profit guard on/off                   evm
+n       buy dedup on/off                      evm
+C       change chain                          evm, sol
+W       change wallet                         evm, sol
+U       check for updates                     evm, sol
+D       docs                                  evm, sol
+Esc     back one screen                       evm, sol
+q       quit                                  evm, sol
+Q       quit without asking                   evm, sol
+?       help                                  evm, sol
 ```
