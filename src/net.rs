@@ -67,7 +67,11 @@ pub fn metadata_url(uri: &str) -> Option<String> {
 /// them waiting for its own picture. Asking several and taking the first
 /// answer costs a few extra requests and turns the slowest gateway's day into
 /// somebody else's problem.
-pub const IPFS_GATEWAYS: [&str; 3] = ["https://ipfs.io", "https://dweb.link", "https://cf-ipfs.com"];
+///
+/// cf-ipfs.com was here and is gone: Cloudflare retired it, so every fetch
+/// spent a connection failing to reach it. A gateway that never answers is not
+/// redundancy, it is a request nobody gets anything for.
+pub const IPFS_GATEWAYS: [&str; 2] = ["https://ipfs.io", "https://dweb.link"];
 
 /// The CID and path of an IPFS document, from either form it arrives in:
 /// `ipfs://<cid>/...` or `https://<any-gateway>/ipfs/<cid>/...`.
