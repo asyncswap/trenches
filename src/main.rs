@@ -3918,12 +3918,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     trace_pool("switch", &bot.pool);
                                     bot.socials = g.socials.clone(); // socials already read during discovery
                                     bot.pool_launch_block = Some(g.launch_block); // for the age display
-                                    // A picked token stays on the discovery list even after it
-                                    // stops being a fresh graduation — so it is still there
-                                    // when you come back from trading it.
-                                    if let engine::PoolKind::V3 { pool_addr, .. } = g.kind {
-                                        discover::remember(g.token, pool_addr, g.launch_block);
-                                    }
+                                    // No cross-session remembering. The discovery cache keeps a
+                                    // picked coin for the rest of THIS session — nothing removes a
+                                    // row but the cap — and the trenches page is for what is
+                                    // launching now, not what was traded last week.
                                     bot.restore_basis(); // basis is per-token, and survives restarts
                                     bot.recover_basis(block.load(Ordering::Relaxed));
                                     bot.lp_permit2_done = false;

@@ -37,7 +37,6 @@ const SWAP_V3: B256 =
     alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
 const SECS_PER_BLOCK: f64 = 0.1; // ~10 blocks/sec on Robinhood Chain
-const LAUNCH_WINDOW: u64 = 6_000; // ~10 min of launches to discover
 const ACTIVITY_WINDOW: u64 = 200; // ~20 s sample for tx/sec
 const MAX_SCAN: usize = 48; // newest launches to track (bounds RPC)
 const CONCURRENCY: usize = 12; // in-flight RPC cap
@@ -378,6 +377,22 @@ pub fn sort_launch_logs(
 /// and the caller must not move its cursor past it: a chunk the provider
 /// rejected is blocks nobody looked at, and skipping them loses every launch
 /// inside them permanently.
+fn launch_addresses() -> Vec<Address> {
+    [pons_factory(), flaunch_pm(), pons_v2_factory()]
+        .into_iter()
+        .filter(|a| !a.is_zero())
+        .collect()
+}
+
+fn launch_topics() -> Vec<B256> {
+    vec![
+        IPonsFactory::TokenDeployed::SIGNATURE_HASH,
+        IPonsFactory::TokenLaunched::SIGNATURE_HASH,
+        IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
+        IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
+    ]
+}
+
 async fn scan_launchpads<P: Provider>(
     provider: &P,
     from: u64,
@@ -396,25 +411,13 @@ async fn scan_launchpads<P: Provider>(
         // "not deployed here", and asking a node to watch for logs from
         // address zero is a filter that can only ever match nothing — paid for
         // on every round, on a metered endpoint.
-        let pads: Vec<Address> = [pons_factory(), flaunch_pm(), pons_v2_factory()]
-            .into_iter()
-            .filter(|a| !a.is_zero())
-            .collect();
+        let pads = launch_addresses();
         if pads.is_empty() {
             return (Vec::new(), Vec::new(), Vec::new(), Some(to));
         }
         let filter = Filter::new()
             .address(pads)
-            .event_signature(vec![
-                // Creation AND graduation. The first is when a coin becomes
-                // tradeable; the second is only when it crosses a threshold.
-                IPonsFactory::TokenDeployed::SIGNATURE_HASH,
-                IPonsFactory::TokenLaunched::SIGNATURE_HASH,
-                IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
-                // v2's TokenLaunched is a DIFFERENT event from v1's, so both
-                // are matched by topic and told apart by it below.
-                IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
-            ])
+            .event_signature(launch_topics())
             .from_block(start)
             .to_block(end);
         match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await {
@@ -1248,123 +1251,6 @@ fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
 /// session's launches are what a session is for. This does the same.
 const ROW_MAX: usize = 1_000;
 
-/// Tokens discovery has seen before, newest first.
-///
-/// The launch window is ten minutes wide, so without this the screen could only
-/// ever show what graduated since you opened it — a coin found twenty minutes
-/// ago fell off and was gone, including one you had just been looking at. The
-/// window still decides what is NEW; this decides what is remembered.
-const RECENTS_MAX: usize = 150;
-
-fn recents_path() -> String {
-    // Pons is Robinhood Chain's launchpad and this scan only runs there, so one
-    // file needs no chain key.
-    format!("{}/discovered-pons.json", crate::state_dir())
-}
-
-fn load_recents() -> Vec<(Address, Address, u64)> {
-    let Ok(text) = std::fs::read_to_string(recents_path()) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        crate::trace("recents: cache is not readable JSON, starting empty");
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for it in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-        let get = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("").parse::<Address>();
-        if let (Ok(token), Ok(pool)) = (get("token"), get("pool")) {
-            out.push((token, pool, it.get("block").and_then(|b| b.as_u64()).unwrap_or(0)));
-        }
-    }
-    crate::trace(&format!("recents: loaded {} remembered tokens", out.len()));
-    out
-}
-
-fn save_recents(rows: &[(Address, Address, u64)]) {
-    let arr: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|(t, p, b)| {
-            serde_json::json!({ "token": format!("{t:#x}"), "pool": format!("{p:#x}"), "block": b })
-        })
-        .collect();
-    let Ok(text) = serde_json::to_string_pretty(&arr) else { return };
-    // Written to a temporary name and renamed, so an interrupted write cannot
-    // leave a half-file that fails to parse on the next open.
-    let path = recents_path();
-    let tmp = format!("{path}.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
-/// Remember a token that was picked, so it is on the list next time even if it
-/// was never a fresh graduation — a top-tokens choice, or one added by address.
-pub fn remember(token: Address, pool: Address, block: u64) {
-    let mut rows = load_recents();
-    rows.retain(|(t, _, _)| *t != token);
-    rows.insert(0, (token, pool, block));
-    rows.truncate(RECENTS_MAX);
-    save_recents(&rows);
-}
-
-/// Flaunch keeps its own recents file — the Pons cache and format are left
-/// exactly as they were.
-fn flaunch_recents_path() -> String {
-    format!("{}/discovered-flaunch.json", crate::state_dir())
-}
-
-fn load_flaunch_recents() -> Vec<FlCand> {
-    let Ok(text) = std::fs::read_to_string(flaunch_recents_path()) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        crate::trace("flaunch recents: cache is not readable JSON, starting empty");
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for it in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-        let s = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let (Ok(token), Ok(pool_id)) = (s("token").parse::<Address>(), s("pool_id").parse::<B256>()) else {
-            continue;
-        };
-        out.push(FlCand {
-            token,
-            pool_id,
-            coin_is_0: it.get("coin_is_0").and_then(|x| x.as_bool()).unwrap_or(false),
-            block: it.get("block").and_then(|b| b.as_u64()).unwrap_or(0),
-            sym: s("sym"),
-            token_uri: s("token_uri"),
-            flaunch_at: it.get("flaunch_at").and_then(|b| b.as_u64()).unwrap_or(0),
-        });
-    }
-    crate::trace(&format!("flaunch recents: loaded {} remembered tokens", out.len()));
-    out
-}
-
-fn save_flaunch_recents(rows: &[FlCand]) {
-    let arr: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "token": format!("{:#x}", c.token),
-                "pool_id": format!("{:#x}", c.pool_id),
-                "coin_is_0": c.coin_is_0,
-                "block": c.block,
-                "sym": c.sym,
-                "token_uri": c.token_uri,
-                "flaunch_at": c.flaunch_at,
-            })
-        })
-        .collect();
-    let Ok(text) = serde_json::to_string_pretty(&arr) else { return };
-    let path = flaunch_recents_path();
-    let tmp = format!("{path}.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
 /// How many of the older (non-fresh) candidates get their metrics refreshed
 /// per round, round-robin. The newest MAX_SCAN refresh every round; the rest
 /// take turns, so the whole remembered list stays current within ~10s without
@@ -1433,18 +1319,21 @@ async fn ingest_live<P: Provider>(
     for c in pons {
         crate::token_metadata_chain_id::record_launch(c.0, c.2);
         if !known.iter().any(|(t, _, _)| *t == c.0) {
+            crate::trace(&format!("launch: pons {} block {} via ws", c.0, c.2));
             known.push(c);
             n_pons += 1;
         }
     }
     for c in fl {
         if !known_fl.iter().any(|k| k.token == c.token) {
+            crate::trace(&format!("launch: flaunch {} {} block {} via ws", c.sym, c.token, c.block));
             known_fl.push(c);
             n_fl += 1;
         }
     }
     for c in v2 {
         if !known_v2.iter().any(|k| k.token == c.token) {
+            crate::trace(&format!("launch: pons-v2 {} curve {} block {} via ws", c.token, c.curve, c.block));
             known_v2.push(c);
             n_v2 += 1;
         }
@@ -1463,8 +1352,11 @@ async fn ingest_live<P: Provider>(
 
 /// Discovery is a STREAM, and this is the whole model:
 ///
+///  0. The list is THIS session's. Nothing is loaded from disk and nothing is
+///     fetched from before the task started — the socket is the source, and
+///     the scan exists only to cover its gaps while we run.
 ///  1. A launch joins the list the MOMENT it is seen — from the websocket, or
-///     from the backstop scan. Its identity (token, pool, symbol, block) comes
+///     from the gap-cover scan. Its identity (token, pool, symbol, block) comes
 ///     from the event; its numbers start empty.
 ///  2. Nothing ever removes a row except the count cap, oldest first. Not age,
 ///     not depth, not "it has no trades". A session shows what launched during
@@ -1494,11 +1386,12 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let mut scanned_to: Option<u64> = None;
     // Consecutive rounds the cursor could not move, for the warning below.
     let mut stalled: u32 = 0;
-    // Seeded from disk, so the screen has something to show the instant it
-    // opens rather than an empty table waiting on a scan.
-    let mut known: Vec<(Address, Address, u64)> = load_recents();
+    // Empty on purpose. This list is THIS session's launches — nothing is
+    // loaded from disk, and nothing reaches back before the task started. The
+    // page is for what is launching, not for what once launched.
+    let mut known: Vec<(Address, Address, u64)> = Vec::new();
     // Flaunch launches ride the same incremental window, in their own list.
-    let mut known_fl: Vec<FlCand> = load_flaunch_recents();
+    let mut known_fl: Vec<FlCand> = Vec::new();
     // pons v2 launches still on their curve. Not persisted: a curve is a
     // TRANSIENT state — it graduates into a pool and the entry stops being
     // true — so a saved one would come back as a venue that no longer exists.
@@ -1519,12 +1412,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let stream = crate::launch_stream::spawn(
         crate::chain_id(),
         crate::ws_pool(),
-        vec![pons_factory(), flaunch_pm(), pons_v2_factory()],
-        vec![
-            IPonsFactory::TokenLaunched::SIGNATURE_HASH,
-            IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
-            IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
-        ],
+        launch_addresses(),
+        launch_topics(),
     );
 
     // Runs for the life of the process, NOT for the life of the screen.
@@ -1569,7 +1458,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // queued behind it. A round now costs one small query covering the
         // handful of blocks actually mined since the last one.
         let from = match scanned_to {
-            None => head.saturating_sub(LAUNCH_WINDOW),
+            // From the current block, not from the past. The scan exists to
+            // cover the socket's gaps WHILE WE RUN — a disconnect, a dropped
+            // message — never to reach into history. Prefetching old launches
+            // is exactly what this page is not for.
+            None => head,
             Some(t) if head > t => t + 1,
             Some(_) => head + 1, // nothing new; the scan returns at once
         };
@@ -1609,16 +1502,19 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             for c in pons {
                 crate::token_metadata_chain_id::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
+                    crate::trace(&format!("launch: pons {} block {} via scan", c.0, c.2));
                     known.push(c);
                 }
             }
             for c in fl {
                 if !known_fl.iter().any(|k| k.token == c.token) {
+                    crate::trace(&format!("launch: flaunch {} {} block {} via scan", c.sym, c.token, c.block));
                     known_fl.push(c);
                 }
             }
             for c in v2 {
                 if !known_v2.iter().any(|k| k.token == c.token) {
+                    crate::trace(&format!("launch: pons-v2 {} curve {} block {} via scan", c.token, c.curve, c.block));
                     known_v2.push(c);
                 }
             }
@@ -1657,18 +1553,15 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         } else {
             scanned_to = Some(head);
         }
-        // Newest first, and bounded — but NOT aged out by the launch window.
-        // Falling off the window means "no longer a new graduation", not "no
-        // longer worth showing"; dropping it was what made a coin you were
-        // looking at vanish while you looked at it.
+        // Newest first, and bounded by the same cap as the rows. In memory
+        // only: writing these to disk was how last week's launches greeted
+        // every new session.
         known.sort_by(|a, b| b.2.cmp(&a.2));
-        known.truncate(RECENTS_MAX);
-        save_recents(&known);
+        known.truncate(ROW_MAX);
         known_fl.sort_by(|a, b| b.block.cmp(&a.block));
-        known_fl.truncate(RECENTS_MAX);
-        save_flaunch_recents(&known_fl);
+        known_fl.truncate(ROW_MAX);
         known_v2.sort_by(|a, b| b.block.cmp(&a.block));
-        known_v2.truncate(RECENTS_MAX);
+        known_v2.truncate(ROW_MAX);
 
         // NOT a `continue` any more.
         //

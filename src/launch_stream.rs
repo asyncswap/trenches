@@ -86,6 +86,8 @@ impl LaunchStream {
         if v.len() < 4_096 {
             v.push(lg);
             self.notify.notify_one();
+        } else {
+            crate::trace("launch stream: buffer full, dropped a log; the scan will recover it");
         }
     }
 }
@@ -211,8 +213,29 @@ async fn run_once(
         .await
         .map_err(|e| format!("subscribe failed: {e}"))?;
 
+    let ack = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await;
+    match ack {
+        Err(_) => return Err("subscribe ack timed out".into()),
+        Ok(None) => return Ok(()),
+        Ok(Some(Err(e))) => return Err(format!("subscribe ack read failed: {e}")),
+        Ok(Some(Ok(Message::Text(t)))) => {
+            let v: serde_json::Value =
+                serde_json::from_str(&t).map_err(|e| format!("subscribe ack unreadable: {e}"))?;
+            if let Some(err) = v.get("error") {
+                return Err(format!("subscribe refused: {err}"));
+            }
+            if let Some(result) = v.get("params").and_then(|p| p.get("result")) {
+                if let Ok(lg) = serde_json::from_value::<Log>(result.clone()) {
+                    stream.push(lg);
+                }
+            } else if v.get("result").is_none() {
+                return Err(format!("subscribe ack unexpected: {t}"));
+            }
+        }
+        Ok(Some(Ok(_))) => {}
+    }
     stream.live.store(true, Ordering::Relaxed);
-    crate::trace("launch stream: subscribed");
+    crate::trace("launch stream: subscribed and acknowledged");
 
     while !stop.load(Ordering::Relaxed) {
         // A silent socket is indistinguishable from a dead one, and a dead one
@@ -231,7 +254,19 @@ async fn run_once(
             Ok(Some(Err(e))) => return Err(format!("read failed: {e}")),
             Ok(Some(Ok(m))) => m,
         };
-        let Message::Text(t) = msg else { continue };
+        let t = match msg {
+            Message::Text(t) => t,
+            Message::Binary(b) => match String::from_utf8(b) {
+                Ok(t) => t,
+                Err(_) => continue,
+            },
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await.map_err(|e| format!("pong failed: {e}"))?;
+                continue;
+            }
+            Message::Close(_) => return Ok(()),
+            _ => continue,
+        };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
         // Subscription notifications only; the ack for our own request carries
         // an `id` and no params.
