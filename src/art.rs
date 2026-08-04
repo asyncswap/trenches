@@ -27,6 +27,14 @@ pub async fn png(url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     // appear is otherwise indistinguishable from a picture that was never
     // fetched, a host that refused, or a format we decline — and those want
     // four different answers.
+    // On disk from a previous session? Then it is not a fetch at all.
+    if let Some(bytes) = from_disk(&key) {
+        let arc = std::sync::Arc::new(bytes);
+        if let Ok(mut g) = pngs().lock() {
+            g.insert(key, Some(arc.clone()));
+        }
+        return Some(arc);
+    }
     let urls = crate::net::fetch_urls(&key);
     if urls.is_empty() {
         crate::trace(&format!("art: refused url {key}"));
@@ -57,10 +65,44 @@ pub async fn png(url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
         }
         won
     };
+    if let Some(bytes) = got.as_deref() {
+        to_disk(&key, bytes);
+    }
     if let Ok(mut g) = pngs().lock() {
         g.insert(key, got.clone());
     }
     got
+}
+
+/// Where one artwork is cached, named by a hash of its URL.
+///
+/// The URL is attacker-written, so it never becomes a path: a coin creator
+/// could otherwise choose the filename this app writes. A hash is fixed-width,
+/// has no separators and cannot climb out of the directory.
+fn disk_path(url: &str) -> std::path::PathBuf {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    std::path::Path::new(crate::state_dir()).join(format!("art-{h:016x}.png"))
+}
+
+fn from_disk(url: &str) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(disk_path(url)).ok()?;
+    // Checked on the way IN as well as on the way out. A file in the state
+    // directory is not evidence of anything by the time it is read back.
+    (bytes.starts_with(b"\x89PNG\r\n\x1a\n")).then_some(bytes)
+}
+
+fn to_disk(url: &str, bytes: &[u8]) {
+    let path = disk_path(url);
+    let _ = std::fs::create_dir_all(crate::state_dir());
+    // Written beside and renamed, so a half-written file is never read as art.
+    let tmp = path.with_extension("png.tmp");
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// One gateway. `None` for every way this can fail, each with a reason in the
@@ -126,5 +168,70 @@ fn pngs() -> &'static std::sync::Mutex<PngCache> {
 /// after its numbers rather than holding them up.
 pub fn cached(url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     pngs().lock().ok().and_then(|g| g.get(url).cloned()).flatten()
+}
+
+/// A JSON document from an IPFS URI, from whichever gateway answers first.
+///
+/// The same race the artwork gets, for the file that NAMES the artwork. This
+/// document is fetched first and the picture cannot start until it lands, so a
+/// slow gateway here delays everything behind it — and it was the one fetch
+/// still going to a single host.
+pub async fn fetch_json(uri: &str, timeout_ms: u64) -> Option<serde_json::Value> {
+    let urls = crate::net::fetch_urls(uri);
+    if urls.is_empty() {
+        return None;
+    }
+    let mut tasks: Vec<_> = urls.into_iter().map(|u| Box::pin(one_json(u, timeout_ms))).collect();
+    while !tasks.is_empty() {
+        let (res, _, rest) = futures::future::select_all(tasks).await;
+        if res.is_some() {
+            return res;
+        }
+        tasks = rest;
+    }
+    None
+}
+
+async fn one_json(url: String, timeout_ms: u64) -> Option<serde_json::Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    /// The URL is written by whoever launched the coin. It must never reach the
+    /// filesystem as a path — a creator choosing where this app writes is a
+    /// creator choosing what it overwrites.
+    #[test]
+    fn a_hostile_url_cannot_choose_the_filename() {
+        for nasty in [
+            "ipfs://../../../../etc/passwd",
+            "https://x/%2e%2e%2fetc%2fpasswd",
+            "https://x/a\u{0000}b",
+            "ipfs://" .to_string().as_str(),
+        ] {
+            let p = disk_path(nasty);
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name.starts_with("art-") && name.ends_with(".png"), "{name}");
+            assert!(!name.contains('/') && !name.contains(".."), "{name}");
+            assert_eq!(name.len(), "art-".len() + 16 + ".png".len(), "fixed width: {name}");
+        }
+    }
+
+    /// Same URL, same file — otherwise the cache never hits.
+    #[test]
+    fn the_same_url_maps_to_the_same_file() {
+        assert_eq!(disk_path("ipfs://QmAbc/a.png"), disk_path("ipfs://QmAbc/a.png"));
+        assert_ne!(disk_path("ipfs://QmAbc/a.png"), disk_path("ipfs://QmAbc/b.png"));
+    }
 }
 

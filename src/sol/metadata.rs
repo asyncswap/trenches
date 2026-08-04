@@ -193,15 +193,8 @@ async fn fetch_socials(uri: Option<&str>) -> (Vec<(&'static str, String)>, Optio
     let none = (Vec::new(), None);
     let Some(uri) = uri else { return none };
     // The URI is attacker-controlled — whoever launched the coin wrote it.
-    let Some(url) = crate::net::metadata_url(uri) else { return none };
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(3_000))
-        .build()
-    else {
-        return none;
-    };
-    let Ok(resp) = client.get(&url).send().await else { return none };
-    let Ok(v) = resp.json::<serde_json::Value>().await else { return none };
+    // Every gateway at once: this document gates the artwork behind it.
+    let Some(v) = crate::art::fetch_json(uri, 3_000).await else { return none };
     let mut out = Vec::new();
     let grab = |v: &serde_json::Value, key: &str| -> Option<String> {
         let s = v.get(key)?.as_str()?.trim();

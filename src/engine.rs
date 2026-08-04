@@ -588,19 +588,12 @@ pub async fn fetch_flaunch_meta(token_uri: &str) -> TokenSocials {
     if token_uri.trim().is_empty() {
         return TokenSocials::default();
     }
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build() {
-        Ok(c) => c,
-        Err(_) => return TokenSocials::default(),
-    };
-    // The URI is attacker-written on-chain data — the guard decides whether
-    // it is fetchable at all, and refuses anything aimed at this machine.
-    let Some(url) = crate::net::metadata_url(token_uri) else { return TokenSocials::default() };
-    let json: serde_json::Value = match client.get(url).send().await {
-        Ok(r) => match r.json().await {
-            Ok(j) => j,
-            Err(_) => return TokenSocials::default(),
-        },
-        Err(_) => return TokenSocials::default(),
+    // The URI is attacker-written on-chain data — the guard inside `fetch_json`
+    // decides whether it is fetchable at all, and refuses anything aimed at
+    // this machine. Every gateway at once: this document names the artwork, so
+    // whatever waits on it delays the picture too.
+    let Some(json) = crate::art::fetch_json(token_uri, 4_000).await else {
+        return TokenSocials::default();
     };
     let s = |keys: &[&str]| -> String {
         keys.iter()
