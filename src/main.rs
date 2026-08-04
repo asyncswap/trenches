@@ -2678,6 +2678,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         });
     }
 
+    // Discovery runs from HERE, not from the first visit to the trenches
+    // screen — so pressing `f` an hour in opens onto an hour of launches, the
+    // way the Solana side has always behaved.
+    discover::ensure_discovery(provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone());
+
     // Shared state written by the background poll task, read by the UI thread.
     let market = Arc::new(Mutex::new(engine::Market::default()));
     let pool_cell = Arc::new(Mutex::new(bot.pool.as_ref()));
@@ -4539,12 +4544,17 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Span::raw(view::usd_compact(bot.market_cap_usd())),
     ]));
     if let Some(lb) = bot.pons_launch() {
-        let s = block.saturating_sub(lb) / 10; // ~10 blocks/sec since graduation
+        let s = block.saturating_sub(lb) / 10; // blocks -> seconds at ~10/s
         let a = view::age_compact(s as f64);
+        // "since launch", because that is what the recorded block now is: pons
+        // coins are seen at TokenDeployed, before graduation, so "since
+        // graduation" was simply false for them. A coin recorded from the old
+        // graduation event shows a lower bound on its age, which is the honest
+        // direction to be wrong in.
         let since = if matches!(bot.pool.kind, engine::PoolKind::FlaunchV4 { .. }) {
             "since flaunch"
         } else {
-            "since graduation"
+            "since launch"
         };
         mkt.push(Line::from(vec![mlbl("Age"), Span::raw(format!("{a} ({since})"))]));
     }

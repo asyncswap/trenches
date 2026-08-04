@@ -57,12 +57,25 @@ pub struct LaunchStream {
     logs: Arc<Mutex<Vec<Log>>>,
     /// Whether a socket is currently up, for the status line.
     live: Arc<AtomicBool>,
+    /// Rung on every push, so a consumer can SLEEP on the stream instead of
+    /// polling its buffer. This is what turns "listening" into "streaming":
+    /// without it, a launch sat in the buffer until the next round looked.
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl LaunchStream {
     /// Take everything delivered since the last call.
     pub fn drain(&self) -> Vec<Log> {
         std::mem::take(&mut *lock(&self.logs))
+    }
+
+    /// Resolves when something has been pushed since the last drain.
+    ///
+    /// `Notify` holds one permit, so a push that lands while the consumer is
+    /// mid-round is not lost — the next wait returns at once and the drain
+    /// picks up everything.
+    pub async fn wait(&self) {
+        self.notify.notified().await;
     }
 
     fn push(&self, lg: Log) {
@@ -72,6 +85,7 @@ impl LaunchStream {
         // has stopped — and then the poll is the one still covering us.
         if v.len() < 4_096 {
             v.push(lg);
+            self.notify.notify_one();
         }
     }
 }

@@ -308,6 +308,11 @@ fn seed_rows(
         cur.push(build_fl_row(c, 0.0, 0.0, 0.0, 0, head));
         added += 1;
     }
+    if added > 0 {
+        // In canonical order immediately. A streamed row that appears at the
+        // bottom and jumps to the top a round later reads as two events.
+        sort_rows(&mut cur);
+    }
     added
 }
 
@@ -1377,6 +1382,74 @@ const FACTS_PER_ROUND: usize = 16;
 ///      to disk by src/token_metadata_chain_id.rs, never asked again). Flaunch tokens carry
 ///      symbol and metadata in the launch event itself, so only their total
 ///      supply ever needs a call.
+/// Fold what the socket has delivered into the candidate lists and put a row
+/// on the list for each new launch — the streaming half of discovery.
+///
+/// Called from two places: once at the top of every round, and from the wait
+/// at the bottom of the loop THE MOMENT the socket delivers. When this
+/// returns, the launch is visible; its numbers follow on the round cadence.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_live<P: Provider>(
+    stream: &crate::launch_stream::LaunchStream,
+    provider: &P,
+    known: &mut Vec<(Address, Address, u64)>,
+    known_fl: &mut Vec<FlCand>,
+    known_v2: &mut Vec<PonsV2Cand>,
+    shared: &Arc<Mutex<Vec<Row>>>,
+    head: u64,
+) {
+    let live = stream.drain();
+    if live.is_empty() {
+        return;
+    }
+    let (mut pons, fl, v2, deployed) = sort_launch_logs(&live);
+    // A creation pushed over the socket is the earliest anything can know
+    // about a coin. Its pool is one call away, and the whole point of the
+    // socket is not waiting for the next scan.
+    for (token, block) in deployed {
+        if pons.iter().any(|(t, _, _)| *t == token) {
+            continue;
+        }
+        let fac = IV3Factory::new(v3_factory(), provider);
+        let call = fac.getPool(token, weth(), pons_fee());
+        if let Ok(Ok(p)) = tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+            if !p.pool.is_zero() {
+                pons.push((token, p.pool, block));
+            }
+        }
+    }
+    let (mut n_pons, mut n_fl, mut n_v2) = (0usize, 0usize, 0usize);
+    for c in pons {
+        crate::token_metadata_chain_id::record_launch(c.0, c.2);
+        if !known.iter().any(|(t, _, _)| *t == c.0) {
+            known.push(c);
+            n_pons += 1;
+        }
+    }
+    for c in fl {
+        if !known_fl.iter().any(|k| k.token == c.token) {
+            known_fl.push(c);
+            n_fl += 1;
+        }
+    }
+    for c in v2 {
+        if !known_v2.iter().any(|k| k.token == c.token) {
+            known_v2.push(c);
+            n_v2 += 1;
+        }
+    }
+    if n_pons + n_fl + n_v2 > 0 {
+        crate::trace(&format!(
+            "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2, live"
+        ));
+        // On the list before this function returns, not at the next round.
+        let seeded = seed_rows(shared, known, known_fl, head);
+        if seeded > 0 {
+            crate::trace(&format!("discovery: {seeded} streamed row(s) on the list"));
+        }
+    }
+}
+
 /// Discovery is a STREAM, and this is the whole model:
 ///
 ///  1. A launch joins the list the MOMENT it is seen — from the websocket, or
@@ -1501,52 +1574,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // when the wide-logs endpoint is resting, and narrowed when it is rate
         // limited, and neither of those touches the stream. A launch that
         // arrives during a deferred scan is on screen anyway.
-        {
-            let live = stream.drain();
-            if !live.is_empty() {
-                let (mut pons, fl, v2, deployed) = sort_launch_logs(&live);
-                // A creation pushed over the socket is the earliest anything
-                // can know about a coin. Its pool is one call away, and the
-                // whole point of the socket is not waiting for the next scan.
-                for (token, block) in deployed {
-                    if pons.iter().any(|(t, _, _)| *t == token) {
-                        continue;
-                    }
-                    let fac = IV3Factory::new(v3_factory(), &provider);
-                    let call = fac.getPool(token, weth(), pons_fee());
-                    if let Ok(Ok(p)) = tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
-                        if !p.pool.is_zero() {
-                            pons.push((token, p.pool, block));
-                        }
-                    }
-                }
-                let (mut n_pons, mut n_fl, mut n_v2) = (0usize, 0usize, 0usize);
-                for c in pons {
-                    crate::token_metadata_chain_id::record_launch(c.0, c.2);
-                    if !known.iter().any(|(t, _, _)| *t == c.0) {
-                        known.push(c);
-                        n_pons += 1;
-                    }
-                }
-                for c in fl {
-                    if !known_fl.iter().any(|k| k.token == c.token) {
-                        known_fl.push(c);
-                        n_fl += 1;
-                    }
-                }
-                for c in v2 {
-                    if !known_v2.iter().any(|k| k.token == c.token) {
-                        known_v2.push(c);
-                        n_v2 += 1;
-                    }
-                }
-                if n_pons + n_fl + n_v2 > 0 {
-                    crate::trace(&format!(
-                        "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2, live"
-                    ));
-                }
-            }
-        }
+        ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &shared, head)
+            .await;
         // Nobody is looking: keep collecting launches, stop paying for the
         // rest.
         //
@@ -1956,7 +1985,52 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 ));
             }
         }
-        tokio::time::sleep(Duration::from_millis(if visible { 2000 } else { 6000 })).await;
+        // The wait between rounds is interruptible: the socket rings, the
+        // launch is ingested and ON SCREEN, and the wait resumes for whatever
+        // time is left. This is the difference between listening and
+        // streaming — the old sleep meant a launch could sit in the buffer for
+        // up to six seconds after the node had already pushed it to us.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(if visible { 2000 } else { 6000 });
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = stream.wait() => {
+                    ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &shared, head)
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// Start discovery with the SESSION, not with the first visit to a screen.
+///
+/// The Solana feed has always worked this way — `ensure_launch_feed` runs from
+/// dashboard start, and its trenches screen opens onto everything collected
+/// since. EVM discovery began at the first `f` press, so the first visit could
+/// only show what the backstop scan recovers: ten minutes, against a session
+/// that may be hours old. Idempotent; the screen calls it too.
+pub fn ensure_discovery<P: Provider + Clone + Send + Sync + 'static>(
+    provider: &P,
+    trader: Address,
+    disc_url: Option<String>,
+    eth_usd: f64,
+    verified: Vec<VerifiedPool>,
+) {
+    let (stop, fresh) = discovery_task();
+    if fresh {
+        // Background budgets until a screen opens and clears the flag.
+        stop.store(true, Ordering::Relaxed);
+        tokio::spawn(run_discovery(
+            provider.clone(),
+            trader,
+            rows_cache(),
+            stop,
+            disc_url,
+            eth_usd,
+            verified,
+        ));
     }
 }
 
@@ -2002,17 +2076,9 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // longer dies on the way out that would stack one per visit. The flag is
     // shared instead: opening clears it, leaving sets it, and the running task
     // reads it as "is anyone looking".
-    let (stop, fresh) = discovery_task();
+    ensure_discovery(provider, trader, disc_url, eth_usd, verified);
+    let (stop, _) = discovery_task();
     stop.store(false, Ordering::Relaxed);
-    let handle = fresh.then(|| tokio::spawn(run_discovery(
-        provider.clone(),
-        trader,
-        shared.clone(),
-        stop.clone(),
-        disc_url,
-        eth_usd,
-        verified,
-    )));
 
     // Index-based selection: the cursor stays at the TOP by default (index 0 =
     // the best-ranked pool) for quick Enter, rather than following a pick down.
@@ -2096,7 +2162,6 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // parks the expensive half and leaves the launch feed collecting — see the
     // visibility gate in `run_discovery`.
     stop.store(true, Ordering::Relaxed);
-    let _ = handle;
     result
 }
 
