@@ -39,7 +39,7 @@ const SWAP_V3: B256 =
 const SECS_PER_BLOCK: f64 = 0.1; // ~10 blocks/sec on Robinhood Chain
 const LAUNCH_WINDOW: u64 = 6_000; // ~10 min of launches to discover
 const ACTIVITY_WINDOW: u64 = 200; // ~20 s sample for tx/sec
-const MAX_SCAN: usize = 24; // newest launches to track (bounds RPC)
+const MAX_SCAN: usize = 48; // newest launches to track (bounds RPC)
 const CONCURRENCY: usize = 12; // in-flight RPC cap
 const RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const SOCIAL_FIELDS: u8 = 7; // logo, description, twitter, telegram, discord, website, farcaster
@@ -273,6 +273,42 @@ fn decode_pons_deploy(lg: &alloy::rpc::types::Log) -> Option<(Address, u64)> {
     // Only WETH-paired launches, exactly as the graduation decoder insists.
     let pair = Address::from_slice(&b[12..32]);
     (pair == weth()).then_some((token, lg.block_number.unwrap_or(0)))
+}
+
+/// Put a row on the list for every launch known, whether or not it has been
+/// measured yet.
+///
+/// The list is a STREAM. A launch belongs on it the moment it is seen, and its
+/// numbers fill in behind — rather than the row waiting until a metrics round
+/// reaches it, which is why a chain producing a launch every few seconds
+/// showed six of them.
+///
+/// Existing rows are left exactly as they are: this only adds what is missing,
+/// so nothing measured is overwritten with zeros.
+fn seed_rows(
+    shared: &Arc<Mutex<Vec<Row>>>,
+    known: &[(Address, Address, u64)],
+    known_fl: &[FlCand],
+    head: u64,
+) -> usize {
+    let mut cur = shared.lock().unwrap();
+    let mut added = 0;
+    for (token, pool, block) in known {
+        if cur.iter().any(|r| r.grad.token == *token) {
+            continue;
+        }
+        let f = crate::token_metadata_chain_id::get(*token).unwrap_or_default();
+        cur.push(build_row(*token, *pool, *block, &f, 0.0, 0.0, 0.0, 0, head));
+        added += 1;
+    }
+    for c in known_fl {
+        if cur.iter().any(|r| r.grad.token == c.token) {
+            continue;
+        }
+        cur.push(build_fl_row(c, 0.0, 0.0, 0.0, 0, head));
+        added += 1;
+    }
+    added
 }
 
 /// Turn raw factory logs into launch candidates, whichever launchpad emitted
@@ -1187,11 +1223,14 @@ fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
     CACHE.get_or_init(Default::default).clone()
 }
 
-/// How long a discovered pool stays on the screen without being re-seen.
-/// ~10 blocks/sec, so this is about two hours.
-const ROW_TTL_BLOCKS: u64 = 72_000;
 /// Ceiling on the list, so a busy day cannot grow it without bound.
-const ROW_MAX: usize = 400;
+///
+/// The ONLY thing that removes a row. There was an age cut as well — two
+/// hours — and between them the list could shrink while you watched it: seven
+/// launches, then three. The Solana side has never done that; it accumulates
+/// everything the socket has seen since it connected and caps by count, and a
+/// session's launches are what a session is for. This does the same.
+const ROW_MAX: usize = 1_000;
 
 /// Tokens discovery has seen before, newest first.
 ///
@@ -1318,7 +1357,7 @@ const SWEEP_CHUNK: usize = 24;
 /// New tokens whose on-chain metadata is fetched per round — 6 calls
 /// each, once ever — the bound only smooths the burst when a fresh install
 /// meets 150 remembered tokens at once.
-const FACTS_PER_ROUND: usize = 4;
+const FACTS_PER_ROUND: usize = 16;
 
 /// Background loop: rescan launches, refresh metrics, and publish rows into
 /// `shared`. Ends when `stop`.
@@ -1338,6 +1377,24 @@ const FACTS_PER_ROUND: usize = 4;
 ///      to disk by src/token_metadata_chain_id.rs, never asked again). Flaunch tokens carry
 ///      symbol and metadata in the launch event itself, so only their total
 ///      supply ever needs a call.
+/// Discovery is a STREAM, and this is the whole model:
+///
+///  1. A launch joins the list the MOMENT it is seen — from the websocket, or
+///     from the backstop scan. Its identity (token, pool, symbol, block) comes
+///     from the event; its numbers start empty.
+///  2. Nothing ever removes a row except the count cap, oldest first. Not age,
+///     not depth, not "it has no trades". A session shows what launched during
+///     it.
+///  3. Measurement is best-effort and runs behind. It refreshes rows in place
+///     and never decides whether one is worth showing.
+///  4. Closing the screen changes the BUDGET — fewer facts per round, no sweep
+///     of the older tail, a longer wait between rounds — and nothing else. The
+///     list still grows while you are away.
+///
+/// Each of those was learned by breaking it. Rows used to wait for their facts
+/// (so six of a hundred launches appeared), age out at two hours (so a list of
+/// seven became three while being watched), and stop being built entirely when
+/// the screen closed (so leaving and returning showed the list you left).
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     provider: P,
     trader: Address,
@@ -1691,6 +1748,12 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
         }
 
+        // Every launch on the list, immediately. Measurement follows.
+        let seeded = seed_rows(&shared, &known, &known_fl, head);
+        if seeded > 0 {
+            crate::trace(&format!("discovery: {seeded} new row(s) on the list"));
+        }
+
         // Who is due a metrics refresh: every fresh candidate from BOTH
         // feeds, plus the next round-robin slice of the combined older tail.
         // A launch scheduled for later (flaunchAt in the future) would show a
@@ -1730,18 +1793,17 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
             sweep_at = (sweep_at + SWEEP_CHUNK) % tail.len();
         }
-        // Skip rows whose facts have not arrived yet — a row with no symbol
-        // and no supply renders as garbage and re-sorts to nowhere. (Flaunch
-        // symbols come from the event; only the supply gates them.)
-        due.retain(|d| match d {
-            Due::Pons(t, _, _) => {
-                crate::token_metadata_chain_id::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0)
-            }
-            Due::Fl(c) => crate::token_metadata_chain_id::get(c.token).is_some_and(|f| f.supply > 0.0),
-            // A curve holds the whole supply, so its reserves ARE the numbers
-            // worth showing — nothing to wait on.
-            Due::V2(_) => true,
-        });
+        // NOT filtered on whether the facts have arrived.
+        //
+        // This used to drop any launch whose symbol and supply were not yet
+        // known, on the grounds that a row without them renders as garbage.
+        // True, briefly — and the cost was that with facts arriving a few per
+        // round, most launches never became rows at all. A list that shows six
+        // of the last hundred is not tidier, it is wrong.
+        //
+        // A row appears the moment its launch is seen and fills in as the
+        // facts land. Sorting is by block, which is known from the event, so
+        // nothing re-sorts to nowhere while it waits.
 
         // One batched eth_call for the whole refresh set: slot0 + liquidity
         // per pool (v3 pools answer directly, Flaunch pools via StateView by
@@ -1878,26 +1940,16 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // the screen three hours later, and why the list had no ceiling.
         //
         // The reference is the LIVE head, not the newest `head_block` among
-        // the rows. That distinction matters: `head_block` is stamped on a row
-        // when it is seen, so a list that stops being refreshed would carry
-        // its own frozen clock and could never age itself out. The clock has
-        // to come from outside the thing being timed.
+        // The list is capped, and nothing else takes a row off it.
         {
             let mut cur = shared.lock().unwrap();
             let before = cur.len();
-            if head > 0 {
-                cur.retain(|r| head.saturating_sub(r.grad.launch_block) <= ROW_TTL_BLOCKS);
-                // No metric-based prune. Whether a launch has depth or trades
-                // is not what makes it stale — a session shows what launched
-                // during it, and that is decided on the way in, not by a test
-                // applied to every row on the way past.
-            }
             sort_rows(&mut cur);
             // Newest first, so the truncation drops the oldest.
             cur.truncate(ROW_MAX);
             if cur.len() < before {
                 crate::trace(&format!(
-                    "discovery: {} rows aged out or capped ({} -> {})",
+                    "discovery: {} oldest row(s) dropped at the cap ({} -> {})",
                     before - cur.len(),
                     before,
                     cur.len()
