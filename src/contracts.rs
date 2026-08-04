@@ -209,6 +209,11 @@ sol! {
             uint256 launchConfigId,
             uint256 initialBuyAmount
         );
+        // Graduation is a STATUS, not an event — the docs are explicit that
+        // nothing is emitted and integrators should poll. (paired, threshold,
+        // graduatedAt): threshold defaults to 4.2 ETH, graduatedAt is 0 until
+        // it happens.
+        function graduationStatus(address token) external view returns (uint256 paired, uint256 threshold, uint256 graduatedAt);
         event TokenLaunched(
             address indexed token,
             address indexed deployer,

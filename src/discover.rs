@@ -118,6 +118,15 @@ struct Row {
     mkt_cap_eth: f64,
     tx_per_sec: f64,
     my_bal: f64,
+    /// Progress toward graduation, 0.0..=1.0+, where the venue defines one.
+    /// pons v1: WETH paired / threshold, from `graduationStatus`. pons v2: the
+    /// curve's raised quote / its threshold. None: not yet measured, or the
+    /// venue has no such concept (Flaunch).
+    grad_pct: Option<f64>,
+    /// Latched by the factory (`graduatedAt != 0`), not inferred from the
+    /// percentage — paired WETH can fall back below the threshold afterwards,
+    /// and graduation does not un-happen.
+    graduated: bool,
     head_block: u64,   // current block when measured (for age)
     verified: bool,    // a hand-curated verified pool (shown on the Verified tab)
 }
@@ -509,7 +518,7 @@ fn build_row(
     let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
 
-    Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, head_block: head, verified: false }
+    Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, grad_pct: None, graduated: false, head_block: head, verified: false }
 }
 
 /// Seconds since a row's pool graduated (from the block delta at measure time).
@@ -736,6 +745,8 @@ fn build_v2_row(
         mkt_cap_eth: supply * quote_per_token,
         tx_per_sec: 0.0,
         my_bal,
+        grad_pct: None,
+        graduated: false,
         head_block: head,
         verified: false,
     }
@@ -769,7 +780,7 @@ fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: u
     let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
 
-    Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, head_block: head, verified: false }
+    Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, grad_pct: None, graduated: false, head_block: head, verified: false }
 }
 
 /// A token's Flaunch pool, if the token was launched there — the Flaunch
@@ -1001,7 +1012,7 @@ async fn big_fish_rows<L: Provider>(
             launch_block: *b,
             socials: engine::TokenSocials::default(),
         };
-        rows.push(Row { grad, pooled_eth: *eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: false });
+        rows.push(Row { grad, pooled_eth: *eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, grad_pct: None, graduated: false, head_block: head, verified: false });
     }
     rows
 }
@@ -1149,7 +1160,7 @@ async fn v4_rows<L: Provider>(
             launch_block: *block,
             socials: engine::TokenSocials::default(),
         };
-        rows.push(Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: false });
+        rows.push(Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, grad_pct: None, graduated: false, head_block: head, verified: false });
     }
     rows
 }
@@ -1216,7 +1227,7 @@ async fn verified_rows(
             launch_block: 0,
             socials: engine::TokenSocials::default(),
         };
-        rows.push(Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, head_block: head, verified: true });
+        rows.push(Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec: 0.0, my_bal: 0.0, grad_pct: None, graduated: false, head_block: head, verified: true });
     }
     rows
 }
@@ -1888,6 +1899,37 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         };
         let res = batch_call(&client, &url, &calls).await;
 
+        // Graduation, in its own tiny batch. It cannot ride in the main one —
+        // that batch is a fixed stride of `per` calls per row and the decode
+        // indexes into it — and only the pons rows have the question to ask.
+        let pons_tokens: Vec<Address> = due
+            .iter()
+            .filter_map(|d| match d {
+                Due::Pons(t, _, _) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        let mut grad_map: std::collections::HashMap<Address, (f64, bool)> = Default::default();
+        if !pons_tokens.is_empty() {
+            let gcalls: Vec<(Address, Vec<u8>)> = pons_tokens
+                .iter()
+                .map(|t| (pons_factory(), IPonsFactory::graduationStatusCall { token: *t }.abi_encode()))
+                .collect();
+            let gres = batch_call(&client, &url, &gcalls).await;
+            for (t, o) in pons_tokens.iter().zip(gres.iter()) {
+                if let Some(d) = o.as_ref() {
+                    if d.len() >= 96 {
+                        let paired = uf(U256::from_be_slice(&d[..32]));
+                        let thresh = uf(U256::from_be_slice(&d[32..64]));
+                        let done = U256::from_be_slice(&d[64..96]) != U256::ZERO;
+                        if thresh > 0.0 {
+                            grad_map.insert(*t, (paired / thresh, done));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut swap_count: std::collections::HashMap<B256, usize> = Default::default();
         for (_, key) in &swaps {
             *swap_count.entry(*key).or_default() += 1;
@@ -1918,7 +1960,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             if sqrt <= 0.0 && liq <= 0.0 {
                 continue;
             }
-            let row = match d {
+            let mut row = match d {
                 Due::Pons(t, p, b) => {
                     let Some(f) = crate::token_metadata_chain_id::get(*t) else { continue };
                     let n = swap_count.get(&p.into_word()).copied().unwrap_or(0);
@@ -1940,13 +1982,35 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                         ),
                         _ => continue,
                     };
-                    build_v2_row(c, qr, tr, liq, my_bal, head)
+                    let mut r = build_v2_row(c, qr, tr, liq, my_bal, head);
+                    // The curve knows its own progress: `liq` here is its real
+                    // raised quote, and the candidate carries the threshold.
+                    let thresh = uf(c.threshold);
+                    if thresh > 0.0 {
+                        r.grad_pct = Some(liq / thresh);
+                    }
+                    r
                 }
             };
+            if let Due::Pons(t, _, _) = d {
+                if let Some((pct, done)) = grad_map.get(t) {
+                    row.grad_pct = Some(*pct);
+                    row.graduated = *done;
+                }
+            }
             let mut cur = shared.lock().unwrap();
             match cur.iter_mut().find(|r| r.grad.token == row.grad.token) {
-                Some(slot) => *slot = row, // refresh, same position
-                None => cur.push(row),     // genuinely new, at the end
+                Some(slot) => {
+                    // A refresh whose grad batch failed answers None; the
+                    // previous answer is better than forgetting it, and
+                    // graduation never un-happens.
+                    if row.grad_pct.is_none() {
+                        row.grad_pct = slot.grad_pct;
+                    }
+                    row.graduated |= slot.graduated;
+                    *slot = row; // refresh, same position
+                }
+                None => cur.push(row), // genuinely new, at the end
             }
         }
         // Scheduled launches exist as zero-metric rows, so the moment their
@@ -2783,7 +2847,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "source", "symbol", "pooled ETH", "mkt cap", "tx/sec", "age", "mine", "pool",
+        "", "source", "symbol", "pooled ETH", "mkt cap", "grad", "tx/sec", "age", "mine", "pool",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -2806,6 +2870,14 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                 Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(format!("{:.4}", r.pooled_eth)),
                 Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
+                // Graduation: latched "grad", a live percentage, or nothing
+                // where the venue has no such concept.
+                match (r.graduated, r.grad_pct) {
+                    (true, _) => Cell::from("grad")
+                        .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Good))),
+                    (false, Some(p)) => Cell::from(format!("{:.0}%", (p * 100.0).min(999.0))),
+                    (false, None) => Cell::from(""),
+                },
                 Cell::from(format!("{:.2}", r.tx_per_sec))
                     .style(Style::default().fg(if active { crate::ui::widgets::tone_color(crate::view::Tone::Good) } else { crate::ui::widgets::tone_color(crate::view::Tone::Normal) })),
                 Cell::from(age),
@@ -2822,6 +2894,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
         Constraint::Length(12),
         Constraint::Length(11),
         Constraint::Length(11),
+        Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(6),
         Constraint::Length(5),
@@ -3093,6 +3166,8 @@ mod pons_v2_tests {
                 mkt_cap_eth: 0.0,
                 tx_per_sec: 0.0,
                 my_bal: 0.0,
+                grad_pct: None,
+                graduated: false,
                 head_block: measured_at,
                 verified: false,
             }
