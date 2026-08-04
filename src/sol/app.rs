@@ -3484,7 +3484,11 @@ pub async fn run(
                     bot.meta = p.meta;
                     // The artwork, in the background. It is decoration: it must
                     // never be a reason the numbers arrive later.
+                    if bot.meta.as_ref().and_then(|m| m.image.as_deref()).is_none() {
+                        super::trace("art: this coin's metadata names no image");
+                    }
                     if let Some(url) = bot.meta.as_ref().and_then(|m| m.image.clone()) {
+                        super::trace(&format!("art: fetching {url}"));
                         tokio::spawn(async move {
                             let _ = crate::art::png(&url).await;
                         });

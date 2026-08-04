@@ -156,8 +156,13 @@ async fn read_held_tokens<P: Provider>(
 fn fetch_coin_art(socials: &engine::TokenSocials) {
     let url = socials.logo.trim().to_string();
     if url.is_empty() {
+        // Said out loud. "No picture" and "no picture URL" look identical on
+        // screen and want opposite fixes — one is a fetch to chase, the other
+        // is a coin whose metadata never named an image.
+        trace("art: this pool has no logo url");
         return;
     }
+    trace(&format!("art: fetching {url}"));
     tokio::spawn(async move {
         let _ = art::png(&url).await;
     });
