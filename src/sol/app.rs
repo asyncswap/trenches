@@ -1916,7 +1916,7 @@ fn wallet_panel(bot: &SolBot) -> PanelView {
     // "Which account am I?" belongs with the balances, not in the header.
     p.spans(vec![
         lbl("Account"),
-        Cell::bold(crate::account_label(&bot.trader().to_string()), Tone::Normal),
+        Cell::bold(crate::account_line(&bot.trader().to_string()), Tone::Normal),
     ]);
     p.spans(vec![
         lbl("SOL"),
@@ -3057,6 +3057,16 @@ pub async fn run(
                         match ui::currency_picker(term).await? {
                             Some(note) => bot.note(note),
                             None => bot.status = "ready".into(),
+                        }
+                    }
+                    // The full address, on the clipboard — see the EVM side.
+                    KeyCode::Char('y') => {
+                        if !bot.has_account {
+                            bot.note("No account — press [W] to unlock one".to_string());
+                        } else {
+                            let a = bot.trader().to_string();
+                            ui::mouse::copy(&a);
+                            bot.note(format!("Copied {a}"));
                         }
                     }
                     KeyCode::Char('?') => show_help = true,

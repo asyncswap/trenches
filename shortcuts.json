@@ -414,6 +414,15 @@
       ]
     },
     {
+      "key": "y",
+      "desc": "copy your address",
+      "section": "MODE",
+      "chains": [
+        "evm",
+        "sol"
+      ]
+    },
+    {
       "key": "W",
       "desc": "change wallet",
       "section": "MODE",

@@ -675,6 +675,26 @@ fn set_account_name(name: &str) {
 /// nobody needs to read, because "which of my accounts is this" is answered by
 /// the name you chose. Token and pool addresses stay whole: those get pasted
 /// and checked against an explorer, and a shortened one cannot be.
+/// What the wallet panel shows: the account name, then the address.
+///
+/// The name alone answered "which account" and nothing else, and the account
+/// picker lists keystore paths rather than addresses — so there was no way to
+/// see what you were trading from at all. A name that does not match what you
+/// expected is exactly when you need the address, which is exactly when it was
+/// missing.
+///
+/// `hide_address: true` drops it and leaves the name. Anything else shows it
+/// WHOLE: a setting called hide_address, set to false, has to mean the address
+/// is not hidden, and half an address is mostly hidden. `y` copies it either
+/// way.
+pub fn account_line(address: &str) -> String {
+    let name = account_label(address);
+    if config::hide_address() || name == address {
+        return name;
+    }
+    format!("{name}   {address}")
+}
+
 pub fn account_label(address: &str) -> String {
     match ACCOUNT_NAME.lock().ok().and_then(|g| g.clone()) {
         Some(n) if !n.trim().is_empty() => n,
@@ -3412,6 +3432,18 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 bot.note(format!("Move cancelled. {e}"));
                             }
                         }
+                        // The full address, on the clipboard. Not printed to
+                        // the screen: a panel is a thing you screenshot, and
+                        // the clipboard is where an address is going anyway.
+                        KeyCode::Char('y') => {
+                            if bot.trader.is_zero() {
+                                bot.note("No account — press [W] to unlock one".to_string());
+                            } else {
+                                let a = bot.trader.to_string();
+                                ui::mouse::copy(&a);
+                                bot.note(format!("Copied {a}"));
+                            }
+                        }
                         KeyCode::Char('?') => { show_help = true; }
                         // Theme picker with live preview (persists the choice).
                         KeyCode::Char('T') => {
@@ -4719,7 +4751,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 )
             } else {
                 Span::styled(
-                    account_label(&bot.trader.to_string()),
+                    account_line(&bot.trader.to_string()),
                     Style::default().add_modifier(Modifier::BOLD),
                 )
             },

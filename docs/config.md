@@ -64,10 +64,11 @@ validates fields and completes names as you type.
 { "hide_address": true }
 ```
 
-The wallet panel shows the account NAME you gave it, so your address is
-normally not on screen at all. This covers the case where a keystore has no
-name — one imported with `cast`, say — which otherwise falls back to the
-address with its middle removed. With this set it reads `account` instead.
+The wallet panel shows the account name you gave it, then the full address.
+With this set to `true`, the address is dropped and only the name remains.
+
+`y` copies the full address to the clipboard either way. It is never printed to
+the screen, because a panel is a thing people screenshot.
 
 Only your own address. Token and pool addresses are unaffected: those exist to
 be pasted and checked against an explorer, and hiding them would break the

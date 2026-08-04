@@ -77,6 +77,7 @@ $       display currency                      evm, sol
 g       profit guard on/off                   evm
 n       buy dedup on/off                      evm
 C       change chain                          evm, sol
+y       copy your address                     evm, sol
 W       change wallet                         evm, sol
 U       check for updates                     evm, sol
 D       docs                                  evm, sol
