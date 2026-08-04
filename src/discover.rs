@@ -171,6 +171,12 @@ const PUBLIC_RPC: &str = "https://rpc.mainnet.chain.robinhood.com/rpc";
 /// inside what the node will answer.
 const LOG_CHUNK: u64 = 2_000;
 
+/// Every pons launch is a 1% pool — fixed by the launchpad, not chosen per
+/// coin, which is what makes the pool derivable from the token alone.
+fn pons_fee() -> alloy::primitives::Uint<24, 1> {
+    alloy::primitives::Uint::<24, 1>::from(10_000u32)
+}
+
 /// How many chunks a NARROW scan may spend. When every endpoint caps
 /// `eth_getLogs` at ten blocks, a multi-thousand-block backfill would take
 /// hundreds of calls a round — degraded mode instead follows the freshest
@@ -247,6 +253,28 @@ fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64
     (pair == weth()).then_some((token, pool, lg.block_number.unwrap_or(0)))
 }
 
+/// A pons launch at CREATION: the token, and the block it appeared in.
+///
+/// The pool is not in the event because it does not need to be — pons creates
+/// the token and its WETH pool in one transaction, so the pool is
+/// `getPool(token, WETH, 10000)` on the v3 factory. Resolved by the caller,
+/// which has a provider; this stays a pure decode.
+fn decode_pons_deploy(lg: &alloy::rpc::types::Log) -> Option<(Address, u64)> {
+    let topics = lg.topics();
+    if topics.len() < 4 {
+        return None;
+    }
+    let token = Address::from_word(topics[1]);
+    let b = lg.data().data.clone();
+    let b = b.as_ref();
+    if b.len() < 32 {
+        return None;
+    }
+    // Only WETH-paired launches, exactly as the graduation decoder insists.
+    let pair = Address::from_slice(&b[12..32]);
+    (pair == weth()).then_some((token, lg.block_number.unwrap_or(0)))
+}
+
 /// Turn raw factory logs into launch candidates, whichever launchpad emitted
 /// them.
 ///
@@ -255,9 +283,10 @@ fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64
 /// and they would drift the first time an ABI changed.
 pub fn sort_launch_logs(
     logs: &[alloy::rpc::types::Log],
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>) {
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<(Address, u64)>) {
     let mut seen = std::collections::HashSet::new();
     let (mut pons, mut fl, mut v2) = (Vec::new(), Vec::new(), Vec::new());
+    let mut deployed: Vec<(Address, u64)> = Vec::new();
     for lg in logs {
         if lg.address() == pons_v2_factory() {
             if let Some(c) = decode_pons_v2_log(lg) {
@@ -266,7 +295,16 @@ pub fn sort_launch_logs(
                 }
             }
         } else if lg.address() == pons_factory() {
-            if let Some(c) = decode_pons_log(lg) {
+            // Graduation carries the pool; creation does not, and is left for
+            // the caller to resolve. Both are the same coin, so whichever
+            // arrives first wins and the other is a duplicate.
+            if lg.topics().first() == Some(&IPonsFactory::TokenDeployed::SIGNATURE_HASH) {
+                if let Some((token, block)) = decode_pons_deploy(lg) {
+                    if seen.insert(token.into_word()) {
+                        deployed.push((token, block));
+                    }
+                }
+            } else if let Some(c) = decode_pons_log(lg) {
                 if seen.insert(c.1.into_word()) {
                     pons.push(c);
                 }
@@ -277,7 +315,7 @@ pub fn sort_launch_logs(
             }
         }
     }
-    (pons, fl, v2)
+    (pons, fl, v2, deployed)
 }
 
 /// One chunked getLogs covers EVERY launchpad: both factory addresses, both
@@ -318,6 +356,9 @@ async fn scan_launchpads<P: Provider>(
         let filter = Filter::new()
             .address(pads)
             .event_signature(vec![
+                // Creation AND graduation. The first is when a coin becomes
+                // tradeable; the second is only when it crosses a threshold.
+                IPonsFactory::TokenDeployed::SIGNATURE_HASH,
                 IPonsFactory::TokenLaunched::SIGNATURE_HASH,
                 IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
                 // v2's TokenLaunched is a DIFFERENT event from v1's, so both
@@ -360,7 +401,20 @@ async fn scan_launchpads<P: Provider>(
         }
         start = end + 1;
     }
-    let (mut pons, mut fl, v2) = sort_launch_logs(&logs);
+    let (mut pons, mut fl, v2, deployed) = sort_launch_logs(&logs);
+    // A creation names no pool, so ask the factory for it. One call per NEW
+    // coin, and only for coins this scan has not already seen graduate.
+    for (token, block) in deployed {
+        if pons.iter().any(|(t, _, _)| *t == token) {
+            continue;
+        }
+        let f = IV3Factory::new(v3_factory(), provider);
+        let call = f.getPool(token, weth(), pons_fee());
+        match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+            Ok(Ok(p)) if !p.pool.is_zero() => pons.push((token, p.pool, block)),
+            _ => crate::trace(&format!("launch scan: no 1% pool for {token} yet")),
+        }
+    }
     if !v2.is_empty() {
         crate::trace(&format!("launch scan: {} pons v2 launch(es)", v2.len()));
     }
@@ -1393,7 +1447,22 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         {
             let live = stream.drain();
             if !live.is_empty() {
-                let (pons, fl, v2) = sort_launch_logs(&live);
+                let (mut pons, fl, v2, deployed) = sort_launch_logs(&live);
+                // A creation pushed over the socket is the earliest anything
+                // can know about a coin. Its pool is one call away, and the
+                // whole point of the socket is not waiting for the next scan.
+                for (token, block) in deployed {
+                    if pons.iter().any(|(t, _, _)| *t == token) {
+                        continue;
+                    }
+                    let fac = IV3Factory::new(v3_factory(), &provider);
+                    let call = fac.getPool(token, weth(), pons_fee());
+                    if let Ok(Ok(p)) = tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+                        if !p.pool.is_zero() {
+                            pons.push((token, p.pool, block));
+                        }
+                    }
+                }
                 let (mut n_pons, mut n_fl, mut n_v2) = (0usize, 0usize, 0usize);
                 for c in pons {
                     crate::token_metadata_chain_id::record_launch(c.0, c.2);

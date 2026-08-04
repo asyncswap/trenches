@@ -183,6 +183,24 @@ sol! {
     // ---- Pons launchpad ----
     #[sol(rpc)]
     interface IPonsFactory {
+        // Emitted when a launch is CREATED. pons deploys the token and its
+        // WETH pool in one transaction — the docs are explicit that there is no
+        // bonding curve and no migration — so a coin is tradeable from this
+        // event onward. `TokenLaunched` below fires later, when enough WETH has
+        // paired for it to graduate, and trading continues in the same pool.
+        //
+        // Watching only the second one meant a coin was invisible here for its
+        // whole pre-graduation life, which is most of the life anyone trades.
+        // The pool address is absent because it is derivable: getPool(token,
+        // WETH, 10000) on the v3 factory named in topic 3.
+        event TokenDeployed(
+            address indexed token,
+            address indexed deployer,
+            address indexed dexFactory,
+            address pairToken,
+            uint256 launchConfigId,
+            uint256 initialBuyAmount
+        );
         event TokenLaunched(
             address indexed token,
             address indexed deployer,
