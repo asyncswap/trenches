@@ -79,7 +79,7 @@
     },
     {
       "key": "k",
-      "desc": "leaderboard",
+      "desc": "top tokens",
       "section": "DISCOVER",
       "chains": [
         "evm"

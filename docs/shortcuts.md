@@ -18,7 +18,7 @@ u       swap USDC and SOL                     sol
 ```
 f       find market                           evm, sol
 F       verified tokens                       evm
-k       leaderboard                           evm
+k       top tokens                            evm
 ```
 
 ## POOL
