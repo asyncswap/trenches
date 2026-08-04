@@ -2136,7 +2136,27 @@ fn market_panel(bot: &SolBot) -> PanelView {
                 for (label, url) in m.socials.iter().take(3) {
                     p.spans(vec![lbl(label), Cell::new(url.clone())]);
                 }
+                // The metadata itself, not just what was read out of it.
+                //
+                // Everything above comes from this file — the socials, the
+                // image, the description. When a coin shows 0/3 the useful
+                // question is whether the creator wrote nothing or the host is
+                // down, and that is answerable by opening the link and not
+                // answerable by anything else on this screen.
+                //
+                // Shown as a URL you can fetch: an `ipfs://` is not something a
+                // browser opens, and the gateway form is the same document.
+                if let Some(url) = m.uri.as_deref().and_then(crate::net::metadata_url) {
+                    p.spans(vec![lbl("Meta"), Cell::toned(url, Tone::Dim)]);
+                }
             }
+            // The coin's own page. Every launch has one, whether or not its
+            // creator filled in a single social, and it is where anyone would
+            // look next — so it does not hang off metadata that may be empty.
+            p.spans(vec![
+                lbl("pump.fun"),
+                Cell::toned(format!("https://pump.fun/coin/{}", c.mint), Tone::Dim),
+            ]);
 
         }
     }
