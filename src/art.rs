@@ -23,22 +23,54 @@ pub async fn png(url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     if let Some(hit) = pngs().lock().ok().and_then(|g| g.get(&key).cloned()) {
         return hit;
     }
-    // 512 KB. Coin art is a few tens of kilobytes; past this it is either not
-    // artwork or not worth the wait on a launch that lives for minutes.
-    const CAP: usize = 512 * 1024;
     // Every refusal says WHY, in the session log. A picture that does not
     // appear is otherwise indistinguishable from a picture that was never
     // fetched, a host that refused, or a format we decline — and those want
     // four different answers.
-    let got = async {
-        // ipfs:// is not fetchable; the gateway form is the same document.
-        // Already-http URLs pass through, and anything else is refused.
-        let Some(url) = crate::net::metadata_url(&key)
-            .or_else(|| key.starts_with("https://").then(|| key.clone()))
-        else {
-            crate::trace(&format!("art: refused url {key}"));
-            return None;
-        };
+    let urls = crate::net::fetch_urls(&key);
+    if urls.is_empty() {
+        crate::trace(&format!("art: refused url {key}"));
+        if let Ok(mut g) = pngs().lock() {
+            g.insert(key, None);
+        }
+        return None;
+    }
+    // Every gateway at once, first PNG wins.
+    //
+    // One gateway is one queue, and a cold CID on a busy one takes seconds a
+    // coin this age does not have. The losers are dropped mid-flight when the
+    // winner returns.
+    let got = {
+        let mut tasks: Vec<_> = urls
+            .iter()
+            .map(|u| Box::pin(fetch_one(u.clone())))
+            .collect();
+        let mut won = None;
+        while !tasks.is_empty() {
+            let (res, i, rest) = futures::future::select_all(tasks).await;
+            if res.is_some() {
+                won = res;
+                break;
+            }
+            let _ = i;
+            tasks = rest;
+        }
+        won
+    };
+    if let Ok(mut g) = pngs().lock() {
+        g.insert(key, got.clone());
+    }
+    got
+}
+
+/// One gateway. `None` for every way this can fail, each with a reason in the
+/// session log — a picture that does not appear is otherwise
+/// indistinguishable from one never fetched.
+async fn fetch_one(url: String) -> Option<std::sync::Arc<Vec<u8>>> {
+    // 512 KB. Coin art is a few tens of kilobytes; past this it is either not
+    // artwork or not worth the wait on a launch that lives for minutes.
+    const CAP: usize = 512 * 1024;
+    async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(4_000))
             .build()
@@ -77,11 +109,7 @@ pub async fn png(url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
         crate::trace(&format!("art: {url} ok, {} bytes", body.len()));
         Some(std::sync::Arc::new(body))
     }
-    .await;
-    if let Ok(mut g) = pngs().lock() {
-        g.insert(key, got.clone());
-    }
-    got
+    .await
 }
 
 type PngCache = std::collections::HashMap<String, Option<std::sync::Arc<Vec<u8>>>>;

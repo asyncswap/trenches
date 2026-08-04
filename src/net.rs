@@ -60,6 +60,35 @@ pub fn metadata_url(uri: &str) -> Option<String> {
     public_host(&url).then_some(url)
 }
 
+/// The public gateways an IPFS document is worth asking for at once.
+///
+/// One gateway is one queue: ipfs.io alone regularly takes seconds to answer
+/// for a CID it has not cached, and a coin that lives for minutes cannot spend
+/// them waiting for its own picture. Asking several and taking the first
+/// answer costs a few extra requests and turns the slowest gateway's day into
+/// somebody else's problem.
+pub const IPFS_GATEWAYS: [&str; 3] = ["https://ipfs.io", "https://dweb.link", "https://cf-ipfs.com"];
+
+/// The CID and path of an IPFS document, from either form it arrives in:
+/// `ipfs://<cid>/...` or `https://<any-gateway>/ipfs/<cid>/...`.
+pub fn ipfs_path(uri: &str) -> Option<String> {
+    let uri = uri.trim();
+    if let Some(rest) = uri.strip_prefix("ipfs://") {
+        return Some(rest.trim_start_matches('/').to_string());
+    }
+    let (_, rest) = uri.split_once("://")?;
+    let (_, after) = rest.split_once("/ipfs/")?;
+    (!after.is_empty()).then(|| after.to_string())
+}
+
+/// Every URL worth racing for one document, best-effort first.
+pub fn fetch_urls(uri: &str) -> Vec<String> {
+    if let Some(path) = ipfs_path(uri) {
+        return IPFS_GATEWAYS.iter().map(|g| format!("{g}/ipfs/{path}")).collect();
+    }
+    metadata_url(uri).into_iter().collect()
+}
+
 /// Strip secrets out of any string that might quote a URL.
 ///
 /// `reqwest`'s error `Display` embeds the whole request URL, and the transport
@@ -207,3 +236,39 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ipfs_tests {
+    use super::*;
+
+    /// Both forms a metadata file hands out, and the gateway URL we may have
+    /// already rewritten it into — all the same document.
+    #[test]
+    fn a_cid_is_found_in_either_form() {
+        assert_eq!(ipfs_path("ipfs://QmAbc/img.png").as_deref(), Some("QmAbc/img.png"));
+        assert_eq!(ipfs_path("ipfs:///QmAbc").as_deref(), Some("QmAbc"));
+        assert_eq!(ipfs_path("https://ipfs.io/ipfs/QmAbc").as_deref(), Some("QmAbc"));
+        assert_eq!(ipfs_path("https://pump.mypinata.cloud/ipfs/QmAbc").as_deref(), Some("QmAbc"));
+        // Not IPFS at all.
+        assert_eq!(ipfs_path("https://example.com/pic.png"), None);
+    }
+
+    /// One document, every gateway — that is the whole point.
+    #[test]
+    fn an_ipfs_uri_races_every_gateway() {
+        let urls = fetch_urls("ipfs://QmAbc/img.png");
+        assert_eq!(urls.len(), IPFS_GATEWAYS.len());
+        assert!(urls.iter().all(|u| u.ends_with("/ipfs/QmAbc/img.png")));
+        assert!(urls.iter().any(|u| u.starts_with("https://ipfs.io")));
+    }
+
+    /// A plain URL is itself and nothing else — no gateways invented for it.
+    #[test]
+    fn an_ordinary_url_is_fetched_once() {
+        assert_eq!(fetch_urls("https://example.com/pic.png"), vec!["https://example.com/pic.png"]);
+        // http:// and private hosts stay refused.
+        assert!(fetch_urls("http://example.com/pic.png").is_empty());
+        assert!(fetch_urls("https://127.0.0.1/pic.png").is_empty());
+    }
+}
+
