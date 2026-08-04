@@ -79,7 +79,7 @@ pub fn clear() {
 
 /// Draw `png` into a `cols` x `rows` cell box whose top-left is at (`col`,
 /// `row`), both 0-indexed. The image is scaled to fill that box.
-pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
+pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16, img: u32) {
     if !supported() || cols == 0 || rows == 0 {
         return;
     }
@@ -90,6 +90,9 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
     // f=100: PNG payload. a=T: transmit and display. C=1: leave the cursor put,
     // so the placement can't scroll the view. m=1 marks "more chunks follow" —
     // the protocol caps each escape at 4096 base64 bytes.
+    //
+    // i={img}: the image's OWN id, so it can later be deleted without touching
+    // anything else on screen.
     let payload = base64(png);
     let mut chunks = payload.as_bytes().chunks(4096).peekable();
     let mut first = true;
@@ -98,7 +101,7 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
         if first {
             let _ = write!(
                 out,
-                "\x1b_Ga=T,f=100,C=1,c={cols},r={rows},m={more};{}\x1b\\",
+                "\x1b_Ga=T,f=100,C=1,i={img},c={cols},r={rows},m={more};{}\x1b\\",
                 std::str::from_utf8(chunk).unwrap_or("")
             );
             first = false;
@@ -107,6 +110,24 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
         }
     }
     let _ = out.flush();
+}
+
+/// Remove one image, by its id, leaving every other image alone.
+fn delete_image(img: u32) {
+    if !supported() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    // d=I: delete the image and free its data, rather than only its placements.
+    let _ = write!(out, "\x1b_Ga=d,d=I,i={img}\x1b\\");
+    let _ = out.flush();
+}
+
+/// The next free image id. Ids are per-placement and last for the process, so
+/// a placement always deletes exactly what it drew.
+fn next_image_id() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A single on-screen image, redrawn only when it actually changes.
@@ -119,6 +140,8 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
 pub struct Placement {
     #[allow(clippy::type_complexity)] // the shape IS the cache entry; a type alias would hide it, not simplify it
     shown: Option<(usize, u16, u16, u16, u16, (u16, u16), u64)>,
+    /// This placement's own Kitty image id, assigned on first draw.
+    img: u32,
 }
 
 impl Placement {
@@ -129,6 +152,15 @@ impl Placement {
 
     /// Forget what is on screen without clearing, so the next `show` redraws.
     pub fn forget(&mut self) {
+        self.shown = None;
+    }
+
+    /// Take this image off the screen and forget it. Unlike `clear`, nothing
+    /// else placed by this program is touched.
+    pub fn hide(&mut self) {
+        if self.shown.is_some() && self.img != 0 {
+            delete_image(self.img);
+        }
         self.shown = None;
     }
 
@@ -146,10 +178,18 @@ impl Placement {
         if self.shown == Some(key) || !supported() {
             return;
         }
-        // Take down our own previous placement, then draw. This bumps the
-        // generation, so the key is recomputed after the clear.
-        clear();
-        place(png, x, y, w, h);
+        // Take down THIS placement's previous image, by id.
+        //
+        // It used to call the global `clear()`, which deletes every image the
+        // program has placed. With one image on screen that was merely a blunt
+        // way to redraw. With two it meant each wiped the other on every frame
+        // and neither ever settled — the second placement added was simply
+        // invisible.
+        if self.img == 0 {
+            self.img = next_image_id();
+        }
+        delete_image(self.img);
+        place(png, x, y, w, h, self.img);
         self.shown = Some((id, x, y, w, h, term, generation()));
     }
 }
@@ -297,5 +337,21 @@ mod tests {
         assert_eq!(for_network("base-mainnet"), Some(BASE_PNG));
         assert_eq!(for_network("Base Mainnet"), Some(BASE_PNG));
         assert_eq!(for_network("anvil-local"), None);
+    }
+
+    /// Two placements must not fight. `show` used to call the global `clear()`,
+    /// so with a second image on screen each one deleted the other every frame
+    /// and the newer of the two simply never appeared.
+    #[test]
+    fn two_placements_keep_their_own_ids() {
+        let mut a = Placement::default();
+        let mut b = Placement::default();
+        // Ids are assigned on first draw, so before that they are unset.
+        assert_eq!(a.img, 0);
+        assert_eq!(b.img, 0);
+        a.img = next_image_id();
+        b.img = next_image_id();
+        assert_ne!(a.img, b.img, "each placement owns a distinct image");
+        assert!(a.img > 0 && b.img > 0);
     }
 }

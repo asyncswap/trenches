@@ -2985,9 +2985,9 @@ pub async fn run(
                     let id = c.mint.to_bytes()[..8].iter().fold(0usize, |a, b| a << 8 | *b as usize);
                     coin_art.show(&png, id, r.x, r.y, r.width, r.height, term_size);
                 }
-                None => coin_art.forget(),
+                None => coin_art.hide(),
             },
-            _ => coin_art.forget(),
+            _ => coin_art.hide(),
         }
 
         crate::ui_alive();
