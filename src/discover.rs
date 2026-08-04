@@ -1653,9 +1653,16 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // Flaunch launches carry symbol and metadata in the event itself, so
         // only their total supply is ever asked of the chain (socials come
         // from IPFS off-loop, via fl_meta).
+        // A candidate with no symbol and no supply is never turned into a row,
+        // so stopping fact-fetching while the screen is closed meant launches
+        // piled up and NONE of them became visible — the list still did not
+        // grow while you were away, even after the round stopped being skipped.
+        //
+        // Fewer per round when nobody is watching, not none.
+        let facts_budget = if visible { FACTS_PER_ROUND } else { FACTS_PER_ROUND.div_ceil(2) };
         let mut fetched = 0usize;
         for (t, p, _) in known.iter() {
-            if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
+            if fetched >= facts_budget {
                 break;
             }
             let have = crate::token_metadata_chain_id::get(*t).is_some_and(|f| !f.sym.is_empty() && f.supply > 0.0);
@@ -1665,7 +1672,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
         }
         for c in known_fl.iter() {
-            if fetched >= FACTS_PER_ROUND || stop.load(Ordering::Relaxed) {
+            if fetched >= facts_budget {
                 break;
             }
             let have = crate::token_metadata_chain_id::get(c.token).is_some_and(|f| f.supply > 0.0);
