@@ -283,15 +283,25 @@ pub fn sort_launch_logs(
 /// One chunked getLogs covers EVERY launchpad: both factory addresses, both
 /// event topics, dispatched by the emitting address. Scanning them separately
 /// doubled the widest, most rate-limited request the app makes, every round.
+/// The launches in `from..to`, and HOW FAR the scan actually got.
+///
+/// The fourth value is the last block confirmed read — the end of the last
+/// unbroken run of successful chunks. It is not `to` when a chunk was refused,
+/// and the caller must not move its cursor past it: a chunk the provider
+/// rejected is blocks nobody looked at, and skipping them loses every launch
+/// inside them permanently.
 async fn scan_launchpads<P: Provider>(
     provider: &P,
     from: u64,
     to: u64,
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>) {
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Option<u64>) {
     let mut logs = Vec::new();
     let (from, chunk) = clamp_scan("launch scan", from, to, LOG_CHUNK);
     let mut start = from;
     let (mut ok, mut failed) = (0u32, 0u32);
+    // How far the scan is certain of, and whether it is still certain.
+    let mut covered: Option<u64> = None;
+    let mut unbroken = true;
     while start <= to {
         let end = (start + chunk - 1).min(to);
         // Only the launchpads this chain actually has. A zero address means
@@ -303,7 +313,7 @@ async fn scan_launchpads<P: Provider>(
             .filter(|a| !a.is_zero())
             .collect();
         if pads.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Some(to));
         }
         let filter = Filter::new()
             .address(pads)
@@ -319,6 +329,11 @@ async fn scan_launchpads<P: Provider>(
         match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await {
             Ok(Ok(l)) => {
                 ok += 1;
+                // Only extend the confirmed run while it is unbroken: a later
+                // success does not fill the hole a failure left behind.
+                if unbroken {
+                    covered = Some(end);
+                }
                 logs.extend(l);
             }
             // Say so. An empty trenches screen should never be able to mean
@@ -326,6 +341,7 @@ async fn scan_launchpads<P: Provider>(
             Ok(Err(e)) => {
                 failed += 1;
                 crate::trace(&format!("launch scan {start}..{end} failed: {e}"));
+                unbroken = false;
                 // Rate limits are the failure people actually hit, and they are
                 // the reason the screen looks empty. Say so where it is read.
                 let msg = e.to_string();
@@ -339,6 +355,7 @@ async fn scan_launchpads<P: Provider>(
             Err(_) => {
                 failed += 1;
                 crate::trace(&format!("launch scan {start}..{end} timed out"));
+                unbroken = false;
             }
         }
         start = end + 1;
@@ -356,7 +373,7 @@ async fn scan_launchpads<P: Provider>(
     pons.truncate(MAX_SCAN);
     fl.sort_by(|a, b| b.block.cmp(&a.block));
     fl.truncate(MAX_SCAN);
-    (pons, fl, v2)
+    (pons, fl, v2, covered)
 }
 
 /// One row from cached on-chain metadata + batch-read metrics. No RPC of its own: the
@@ -1280,6 +1297,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // How far the launch log has been read. Everything below hangs off this:
     // the window is scanned once, and after that only the blocks that are new.
     let mut scanned_to: Option<u64> = None;
+    // Consecutive rounds the cursor could not move, for the warning below.
+    let mut stalled: u32 = 0;
     // Seeded from disk, so the screen has something to show the instant it
     // opens rather than an empty table waiting on a scan.
     let mut known: Vec<(Address, Address, u64)> = load_recents();
@@ -1420,7 +1439,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         let visible = !stop.load(Ordering::Relaxed);
         let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
         if from <= head && wide_ok {
-            let (pons, fl, v2) = scan_launchpads(&provider, from, head).await;
+            let (pons, fl, v2, covered) = scan_launchpads(&provider, from, head).await;
             for c in pons {
                 crate::token_metadata_chain_id::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
@@ -1437,7 +1456,36 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                     known_v2.push(c);
                 }
             }
-            scanned_to = Some(head);
+            // Only as far as the scan actually READ.
+            //
+            // This used to be `Some(head)` unconditionally, so a chunk the
+            // provider refused — a free-tier block-range cap, a timeout —
+            // advanced the cursor past blocks nobody had looked at. Those
+            // blocks were never scanned again, and every launch inside them
+            // was missed for good. That is the "sometimes a token never shows
+            // up" that no amount of waiting fixed.
+            //
+            // Unchanged on a total failure, so the same range is retried next
+            // round rather than abandoned.
+            if let Some(c) = covered {
+                scanned_to = Some(c);
+                stalled = 0;
+            } else {
+                stalled += 1;
+                // Loudly, and only once a spell: a cursor that cannot move is
+                // a screen that has quietly stopped finding launches, and the
+                // per-chunk errors above do not say that this is happening.
+                if stalled % 30 == 1 {
+                    crate::events::warn(
+                        "Discovery cannot read new blocks — launches are being missed",
+                        &[
+                            ("from", from.to_string()),
+                            ("to", head.to_string()),
+                            ("attempts", stalled.to_string()),
+                        ],
+                    );
+                }
+            }
         } else if !wide_ok {
             crate::trace("discovery: wide-logs endpoint resting, scan deferred");
         } else {
