@@ -34,7 +34,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 
-use crate::contracts::{IPonsFactory, IV3Pool, PONS_FACTORY};
+use crate::contracts::{IPonsFactory, IV3Pool, pons_factory};
 use crate::engine;
 
 /// The immutable facts for one token. Fields fill in as they are first
@@ -205,7 +205,7 @@ pub async fn launch_block<P: Provider>(provider: &P, token: Address) -> Option<u
         }
     }
     let filter = Filter::new()
-        .address(PONS_FACTORY)
+        .address(pons_factory())
         .event_signature(IPonsFactory::TokenLaunched::SIGNATURE_HASH)
         .topic1(token.into_word())
         .from_block(0);

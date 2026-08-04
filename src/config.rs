@@ -147,7 +147,7 @@ pub struct VerifiedPool {
     pub token: String,
     pub pool_id: String,
     #[serde(default)]
-    pub quote: String, // "USDG" (default) or "WETH"
+    pub quote: String, // "USDG" (default) or "weth()"
     #[serde(default)]
     pub tick_spacing: i32,
     #[serde(default)]

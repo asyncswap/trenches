@@ -1105,9 +1105,9 @@ async fn find_v3_pool<P: Provider>(
     provider: &P,
     token: alloy::primitives::Address,
 ) -> Option<(alloy::primitives::Address, u32, bool)> {
-    let factory = contracts::IV3Factory::new(contracts::V3_FACTORY, provider);
+    let factory = contracts::IV3Factory::new(contracts::v3_factory(), provider);
     for fee in [10000u32, 3000, 500, 100] {
-        if let Ok(p) = factory.getPool(token, contracts::WETH, fee.try_into().unwrap()).call().await {
+        if let Ok(p) = factory.getPool(token, contracts::weth(), fee.try_into().unwrap()).call().await {
             let addr = p.pool;
             if addr != alloy::primitives::Address::ZERO {
                 let liq = contracts::IV3Pool::new(addr, provider)
@@ -1117,7 +1117,7 @@ async fn find_v3_pool<P: Provider>(
                     .map(|l| l._0)
                     .unwrap_or(0);
                 if liq > 0 {
-                    return Some((addr, fee, contracts::WETH < token));
+                    return Some((addr, fee, contracts::weth() < token));
                 }
             }
         }
@@ -1141,7 +1141,7 @@ fn quote_from(currency0: &str) -> (engine::Quote, String) {
     let addr = currency0.parse::<alloy::primitives::Address>().unwrap_or(alloy::primitives::Address::ZERO);
     // flETH counts as ETH: it is redeemable 1:1, so a Flaunch pool is
     // ETH-quoted even though its currency0 is the wrapper.
-    if addr == alloy::primitives::Address::ZERO || addr == contracts::WETH || addr == contracts::FLETH {
+    if addr == alloy::primitives::Address::ZERO || addr == contracts::weth() || addr == contracts::fleth() {
         (engine::Quote::Eth, "ETH".to_string())
     } else {
         (engine::Quote::Stable { token: addr, decimals: stable_decimals(addr) }, stable_symbol(addr))
@@ -1267,7 +1267,7 @@ async fn refresh_token_decimals<P: Provider>(provider: &P, bot: &mut engine::Bot
 
 /// v3 orientation: WETH is token0 iff its address sorts below the token's.
 fn weth_is_token0(token: alloy::primitives::Address) -> bool {
-    contracts::WETH < token
+    contracts::weth() < token
 }
 
 /// Menu label with honest ownership + protocol tags: "[ours]   [v4] ETH/SYM 1%".
@@ -1456,7 +1456,7 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                     // Currency ordering is address ordering, so the coin's side
                     // re-derives from the token itself — no extra cached field.
                     Ok(id) if id != B256::ZERO => {
-                        engine::PoolKind::FlaunchV4 { pool_id: id, coin_is_0: tok < contracts::FLETH }
+                        engine::PoolKind::FlaunchV4 { pool_id: id, coin_is_0: tok < contracts::fleth() }
                     }
                     _ => continue,
                 }
@@ -2491,17 +2491,17 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
     let (kind, pool_id, addr, tick_spacing, currency0, state_view) = match p.kind {
         engine::PoolKind::V4 { pool_id, tick_spacing } => (
             "v4", pool_id.to_string(), String::new(), tick_spacing,
-            alloy::primitives::Address::ZERO.to_string(), contracts::STATE_VIEW.to_string(),
+            alloy::primitives::Address::ZERO.to_string(), contracts::state_view().to_string(),
         ),
         // currency0 records flETH so collect_pools can re-derive the coin's
         // side on reload (coin_is_0 = token < flETH).
         engine::PoolKind::FlaunchV4 { pool_id, .. } => (
             "flaunch", pool_id.to_string(), String::new(), contracts::FLAUNCH_TICK_SPACING,
-            contracts::FLETH.to_string(), contracts::STATE_VIEW.to_string(),
+            contracts::fleth().to_string(), contracts::state_view().to_string(),
         ),
         engine::PoolKind::V3 { pool_addr, .. } => (
             "v3", String::new(), pool_addr.to_string(), 0,
-            contracts::WETH.to_string(), String::new(),
+            contracts::weth().to_string(), String::new(),
         ),
         // The curve address goes in the `address` slot, and the quote asset in
         // `currency0`, so a reload can rebuild the variant from what it reads.
@@ -2514,7 +2514,7 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
         ),
         engine::PoolKind::PonsV2Pool { pool_id, quote, tick_spacing, .. } => (
             "pons_v2", pool_id.to_string(), String::new(), tick_spacing,
-            quote.to_string(), contracts::STATE_VIEW.to_string(),
+            quote.to_string(), contracts::state_view().to_string(),
         ),
     };
     let pool_obj = json!({
@@ -2573,7 +2573,7 @@ fn build_verified(net: &config::Network) -> Vec<discover::VerifiedPool> {
             Some(discover::VerifiedPool {
                 token: v.token.parse().ok()?,
                 pool_id: v.pool_id.parse().ok()?,
-                quote: if v.quote.eq_ignore_ascii_case("WETH") {
+                quote: if v.quote.eq_ignore_ascii_case("weth()") {
                     engine::Quote::Eth
                 } else {
                     engine::Quote::Stable { token: usdg, decimals: 6 }
@@ -4038,9 +4038,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             // One side must be WETH — that is
                                                             // the side the app prices and
                                                             // trades against.
-                                                            let token = if t0 == contracts::WETH {
+                                                            let token = if t0 == contracts::weth() {
                                                                 Some(t1)
-                                                            } else if t1 == contracts::WETH {
+                                                            } else if t1 == contracts::weth() {
                                                                 Some(t0)
                                                             } else {
                                                                 None
@@ -4053,7 +4053,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                                         label: pool_label(false, "v3", "ETH", &sym, fee, ""),
                                                                         kind: engine::PoolKind::V3 {
                                                                             pool_addr: addr,
-                                                                            weth_is_token0: t0 == contracts::WETH,
+                                                                            weth_is_token0: t0 == contracts::weth(),
                                                                         },
                                                                         token, sym, fee, owned: false,
                                                                         quote: engine::Quote::Eth,

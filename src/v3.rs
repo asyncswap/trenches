@@ -32,7 +32,7 @@ fn params(
 /// ETH), which SwapRouter02 wraps. Output token goes straight to `recipient`.
 pub fn v3_buy_calldata(token: Address, fee: u32, amount_in: u128, min_out: u128, recipient: Address) -> Bytes {
     ISwapRouter02::exactInputSingleCall {
-        params: params(WETH, token, fee, recipient, amount_in, min_out),
+        params: params(weth(), token, fee, recipient, amount_in, min_out),
     }
     .abi_encode()
     .into()
@@ -42,7 +42,7 @@ pub fn v3_buy_calldata(token: Address, fee: u32, amount_in: u128, min_out: u128,
 /// Requires the token to be approved to SWAP_ROUTER_02 first.
 pub fn v3_sell_calldata(token: Address, fee: u32, amount_in: u128, min_out: u128, recipient: Address) -> Bytes {
     let swap = ISwapRouter02::exactInputSingleCall {
-        params: params(token, WETH, fee, ADDRESS_THIS, amount_in, min_out),
+        params: params(token, weth(), fee, ADDRESS_THIS, amount_in, min_out),
     }
     .abi_encode();
     let unwrap = ISwapRouter02::unwrapWETH9Call {

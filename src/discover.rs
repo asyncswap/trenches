@@ -26,8 +26,8 @@ use ratatui::{prelude::*, widgets::*};
 use crate::contracts::{
     IERC20, IFlaunchPositionManager, IPonsCurve, IPonsFactory, IPonsV2Factory, IStateView,
     IV3Factory, IV3Pool,
-    FLAUNCH_FEE_EST, FLAUNCH_PM, PONS_FACTORY, PONS_V2_FACTORY, POOL_MANAGER, STATE_VIEW,
-    V3_FACTORY, WETH,
+    FLAUNCH_FEE_EST, flaunch_pm, pons_factory, pons_v2_factory, pool_manager, state_view,
+    v3_factory, weth,
 };
 use crate::engine;
 
@@ -244,7 +244,7 @@ fn decode_pons_log(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64
     }
     let pair = Address::from_slice(&b[12..32]);
     let pool = Address::from_slice(&b[44..64]);
-    (pair == WETH).then_some((token, pool, lg.block_number.unwrap_or(0)))
+    (pair == weth()).then_some((token, pool, lg.block_number.unwrap_or(0)))
 }
 
 /// Turn raw factory logs into launch candidates, whichever launchpad emitted
@@ -259,13 +259,13 @@ pub fn sort_launch_logs(
     let mut seen = std::collections::HashSet::new();
     let (mut pons, mut fl, mut v2) = (Vec::new(), Vec::new(), Vec::new());
     for lg in logs {
-        if lg.address() == PONS_V2_FACTORY {
+        if lg.address() == pons_v2_factory() {
             if let Some(c) = decode_pons_v2_log(lg) {
                 if seen.insert(c.token.into_word()) {
                     v2.push(c);
                 }
             }
-        } else if lg.address() == PONS_FACTORY {
+        } else if lg.address() == pons_factory() {
             if let Some(c) = decode_pons_log(lg) {
                 if seen.insert(c.1.into_word()) {
                     pons.push(c);
@@ -295,7 +295,7 @@ async fn scan_launchpads<P: Provider>(
     while start <= to {
         let end = (start + chunk - 1).min(to);
         let filter = Filter::new()
-            .address(vec![PONS_FACTORY, FLAUNCH_PM, PONS_V2_FACTORY])
+            .address(vec![pons_factory(), flaunch_pm(), pons_v2_factory()])
             .event_signature(vec![
                 IPonsFactory::TokenLaunched::SIGNATURE_HASH,
                 IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
@@ -365,7 +365,7 @@ fn build_row(
 ) -> Row {
     let grad = Grad {
         token,
-        kind: engine::PoolKind::V3 { pool_addr, weth_is_token0: WETH < token },
+        kind: engine::PoolKind::V3 { pool_addr, weth_is_token0: weth() < token },
         quote: engine::Quote::Eth,
         sym: f.sym.clone(),
         fee: if f.fee > 0 { f.fee } else { 10_000 },
@@ -446,7 +446,7 @@ async fn scan_flaunch<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<FlCand> 
     while start <= to {
         let end = (start + chunk - 1).min(to);
         let filter = Filter::new()
-            .address(FLAUNCH_PM)
+            .address(flaunch_pm())
             .event_signature(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH)
             .from_block(start)
             .to_block(end);
@@ -661,7 +661,7 @@ pub struct FlaunchPool {
 
 pub async fn fetch_flaunch_pool<P: Provider>(provider: &P, token: Address) -> Option<FlaunchPool> {
     use alloy::sol_types::SolValue;
-    let pm = IFlaunchPositionManager::new(FLAUNCH_PM, provider);
+    let pm = IFlaunchPositionManager::new(flaunch_pm(), provider);
     let key = tokio::time::timeout(RPC_TIMEOUT, pm.poolKey(token).call())
         .await
         .ok()?
@@ -688,7 +688,7 @@ pub async fn fetch_flaunch_by_id<P: Provider>(
     // The balanced transport steers this wide scan to an endpoint that can
     // answer it.
     let filter = Filter::new()
-        .address(FLAUNCH_PM)
+        .address(flaunch_pm())
         .event_signature(IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH)
         .topic1(pool_id)
         .from_block(0);
@@ -798,7 +798,7 @@ async fn scan_all<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<(Address, Ad
     while lo <= to {
         let hi = (lo + chunk).min(to);
         let filter = Filter::new()
-            .address(PONS_FACTORY)
+            .address(pons_factory())
             .event_signature(IPonsFactory::TokenLaunched::SIGNATURE_HASH)
             .from_block(lo)
             .to_block(hi);
@@ -810,7 +810,7 @@ async fn scan_all<L: Provider>(logs: &L, from: u64, to: u64) -> Vec<(Address, Ad
                 let data = l.data().data.clone();
                 let b = data.as_ref();
                 if b.len() < 64 { continue; }
-                if Address::from_slice(&b[12..32]) != WETH { continue; }
+                if Address::from_slice(&b[12..32]) != weth() { continue; }
                 let pool = Address::from_slice(&b[44..64]);
                 if !seen.insert(pool) { continue; }
                 out.push((token, pool, l.block_number.unwrap_or(0)));
@@ -838,7 +838,7 @@ async fn big_fish_rows<L: Provider>(
     if cands.is_empty() { return Vec::new(); }
     // Cheap pre-filter: pooled WETH held by the pool (one batched call each).
     let bal_calls: Vec<(Address, Vec<u8>)> =
-        cands.iter().map(|(_, p, _)| (WETH, balanceof_data(*p))).collect();
+        cands.iter().map(|(_, p, _)| (weth(), balanceof_data(*p))).collect();
     let bals = batch_call(client, url, &bal_calls).await;
     let survivors: Vec<(Address, Address, u64, f64)> = cands
         .iter()
@@ -862,7 +862,7 @@ async fn big_fish_rows<L: Provider>(
         let supply = res.get(i * 3).and_then(|o| o.as_ref()).map(|d| uf(u256_of(d)) / 1e18).unwrap_or(0.0);
         let sqrt = res.get(i * 3 + 1).and_then(|o| o.as_ref()).map(|d| uf(u256_of(d)) / 2f64.powi(96)).unwrap_or(0.0);
         let sym = res.get(i * 3 + 2).and_then(|o| o.as_ref()).map(|d| parse_string(d)).unwrap_or_default();
-        let weth0 = WETH < *t;
+        let weth0 = weth() < *t;
         let p_raw = sqrt * sqrt;
         let tokens_per_eth = if weth0 { p_raw } else if p_raw > 0.0 { 1.0 / p_raw } else { 0.0 };
         let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
@@ -914,7 +914,7 @@ async fn scan_v4_inits<L: Provider>(
     while lo <= to {
         let hi = (lo + chunk).min(to);
         let filter = Filter::new()
-            .address(POOL_MANAGER)
+            .address(pool_manager())
             .event_signature(INIT_TOPIC)
             .from_block(lo)
             .to_block(hi);
@@ -927,16 +927,16 @@ async fn scan_v4_inits<L: Provider>(
                 let id = tp[1];
                 let c0 = Address::from_word(tp[2]);
                 let c1 = Address::from_word(tp[3]);
-                let (token, quote) = if c0 == WETH {
+                let (token, quote) = if c0 == weth() {
                     (c1, engine::Quote::Eth)
-                } else if c1 == WETH {
+                } else if c1 == weth() {
                     (c0, engine::Quote::Eth)
                 } else if c0 == USDG {
                     (c1, engine::Quote::Stable { token: USDG, decimals: 6 })
                 } else if c1 == USDG {
                     (c0, engine::Quote::Stable { token: USDG, decimals: 6 })
                 } else {
-                    continue; // not a WETH/USDG pool → engine can't price it
+                    continue; // not a weth()/USDG pool → engine can't price it
                 };
                 // data: fee(uint24) | tickSpacing(int24) | hooks | sqrtPriceX96 | tick
                 let data = l.data().data.clone();
@@ -980,8 +980,8 @@ async fn v4_rows<L: Provider>(
     // 4 batched calls each: getSlot0(id), getLiquidity(id), totalSupply, symbol.
     let mut calls = Vec::with_capacity(cands.len() * 4);
     for (id, token, _, _, _, _) in &cands {
-        calls.push((STATE_VIEW, poolid_call(SEL_GETSLOT0, *id)));
-        calls.push((STATE_VIEW, poolid_call(SEL_GETLIQ, *id)));
+        calls.push((state_view(), poolid_call(SEL_GETSLOT0, *id)));
+        calls.push((state_view(), poolid_call(SEL_GETLIQ, *id)));
         calls.push((*token, SEL_TOTALSUPPLY.to_vec()));
         calls.push((*token, SEL_SYMBOL.to_vec()));
     }
@@ -1057,8 +1057,8 @@ async fn verified_rows(
     }
     let mut calls = Vec::with_capacity(pools.len() * 3);
     for p in pools {
-        calls.push((STATE_VIEW, poolid_call(SEL_GETSLOT0, p.pool_id)));
-        calls.push((STATE_VIEW, poolid_call(SEL_GETLIQ, p.pool_id)));
+        calls.push((state_view(), poolid_call(SEL_GETSLOT0, p.pool_id)));
+        calls.push((state_view(), poolid_call(SEL_GETLIQ, p.pool_id)));
         calls.push((p.token, SEL_TOTALSUPPLY.to_vec()));
     }
     let res = batch_call(client, url, &calls).await;
@@ -1294,7 +1294,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let stream = crate::launch_stream::spawn(
         crate::chain_id(),
         crate::ws_pool(),
-        vec![PONS_FACTORY, FLAUNCH_PM, PONS_V2_FACTORY],
+        vec![pons_factory(), flaunch_pm(), pons_v2_factory()],
         vec![
             IPonsFactory::TokenLaunched::SIGNATURE_HASH,
             IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
@@ -1490,7 +1490,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             }
             if !fl_ids.is_empty() {
                 let filter = Filter::new()
-                    .address(POOL_MANAGER)
+                    .address(pool_manager())
                     .event_signature(SWAP_V4)
                     .topic1(fl_ids)
                     .from_block(sfrom)
@@ -1616,8 +1616,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                     }
                 }
                 Due::Fl(c) => {
-                    calls.push((STATE_VIEW, IStateView::getSlot0Call { poolId: c.pool_id }.abi_encode()));
-                    calls.push((STATE_VIEW, IStateView::getLiquidityCall { poolId: c.pool_id }.abi_encode()));
+                    calls.push((state_view(), IStateView::getSlot0Call { poolId: c.pool_id }.abi_encode()));
+                    calls.push((state_view(), IStateView::getLiquidityCall { poolId: c.pool_id }.abi_encode()));
                     if with_bal {
                         calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
                     }
@@ -2032,7 +2032,7 @@ async fn pool_swaps<L: Provider>(logs: &L, pool: Address, weth0: bool, from: u64
             continue;
         }
         let weth_amt = if weth0 { i256_to_f64(&d[0..32]) } else { i256_to_f64(&d[32..64]) };
-        let is_buy = weth_amt > 0.0; // WETH INTO the pool = a buy
+        let is_buy = weth_amt > 0.0; // weth() INTO the pool = a buy
         let eth = weth_amt.abs() / 1e18;
         let secs = l.block_number.unwrap_or(base).saturating_sub(base) as f64 * SECS_PER_BLOCK;
         out.push((secs, eth, recipient, is_buy, l.transaction_hash.unwrap_or_default()));
@@ -2233,7 +2233,7 @@ async fn blockscout_top(client: &reqwest::Client) -> Vec<LeaderRow> {
     for it in items {
         let addr_s = it.get("address_hash").or_else(|| it.get("address")).and_then(|v| v.as_str()).unwrap_or("");
         let token = match addr_s.parse::<Address>() { Ok(a) => a, Err(_) => continue };
-        if token == WETH { continue; }
+        if token == weth() { continue; }
         let mc_usd = it.get("circulating_market_cap").map(json_f64).unwrap_or(0.0);
         // Dropped for want of a market cap. Counted, because "every token was
         // skipped" and "there were no tokens" look the same on screen.
@@ -2276,11 +2276,15 @@ struct QuoteAsset {
     decimals: i32,
 }
 
-const QUOTES: [QuoteAsset; 2] = [
-    QuoteAsset { token: WETH, sym: "ETH", decimals: 18 },
-    // 6-dec, not 18. Reading a USDG reserve as 18 shows $2.6M of depth as 0.
-    QuoteAsset { token: USDG, sym: "USDG", decimals: 6 },
-];
+/// A function, not a const: the wrapped-native token is per chain now, and a
+/// table baked at compile time would name Robinhood's WETH on every chain.
+fn quotes() -> [QuoteAsset; 2] {
+    [
+        QuoteAsset { token: weth(), sym: "ETH", decimals: 18 },
+        // 6-dec, not 18. Reading a USDG reserve as 18 shows $2.6M of depth as 0.
+        QuoteAsset { token: USDG, sym: "USDG", decimals: 6 },
+    ]
+}
 
 async fn enrich_pooled(
     client: &reqwest::Client,
@@ -2292,9 +2296,9 @@ async fn enrich_pooled(
     // One batch for every (row, quote, fee) triple. Three times the lookups of
     // the WETH-only version, on a screen that is opened deliberately and reads
     // once — cheap next to listing a $3.9B token as having no pool.
-    let mut pool_calls = Vec::with_capacity(rows.len() * QUOTES.len() * fees.len());
+    let mut pool_calls = Vec::with_capacity(rows.len() * quotes().len() * fees.len());
     for r in rows.iter() {
-        for q in QUOTES.iter() {
+        for q in quotes().iter() {
             for &fee in &fees {
                 let data = IV3Factory::getPoolCall {
                     tokenA: r.token,
@@ -2302,7 +2306,7 @@ async fn enrich_pooled(
                     fee: fee.try_into().unwrap(),
                 }
                 .abi_encode();
-                pool_calls.push((V3_FACTORY, data));
+                pool_calls.push((v3_factory(), data));
             }
         }
     }
@@ -2318,22 +2322,22 @@ async fn enrich_pooled(
         if pool == Address::ZERO {
             continue;
         }
-        let ri = i / (QUOTES.len() * fees.len());
-        let qi = (i / fees.len()) % QUOTES.len();
+        let ri = i / (quotes().len() * fees.len());
+        let qi = (i / fees.len()) % quotes().len();
         pools.push((ri, qi, pool));
     }
     // Each pool's balance of ITS OWN quote asset — not of WETH, which is what
     // made a USDG pool read as empty.
     let bal_calls: Vec<(Address, Vec<u8>)> =
-        pools.iter().map(|(_, qi, p)| (QUOTES[*qi].token, balanceof_data(*p))).collect();
+        pools.iter().map(|(_, qi, p)| (quotes()[*qi].token, balanceof_data(*p))).collect();
     let bals = batch_call(client, url, &bal_calls).await;
     // Keep the DEEPEST pool per row, compared in dollars so a 2.6M USDG pool
     // beats a dust WETH one instead of losing to it on the raw number.
     let mut best_usd = vec![0.0f64; rows.len()];
     for ((ri, qi, _), b) in pools.iter().zip(bals.iter()) {
-        let q = &QUOTES[*qi];
+        let q = &quotes()[*qi];
         let amt = b.as_ref().map(|d| uf(u256_of(d)) / 10f64.powi(q.decimals)).unwrap_or(0.0);
-        let rate = if q.token == WETH { eth_usd } else { 1.0 };
+        let rate = if q.token == weth() { eth_usd } else { 1.0 };
         let usd = amt * rate;
         // With no ETH price yet, dollars cannot rank anything — fall back to
         // the raw amount rather than silently preferring whichever came last.
@@ -2353,11 +2357,11 @@ async fn resolve_v3_grad<P: Provider>(
     token: Address,
     sym: &str,
 ) -> Result<Option<Grad>, String> {
-    let factory = IV3Factory::new(V3_FACTORY, provider);
+    let factory = IV3Factory::new(v3_factory(), provider);
     let mut errors = 0usize;
     let mut last = String::new();
     for fee in [10000u32, 3000, 500, 100] {
-        match factory.getPool(token, WETH, fee.try_into().unwrap()).call().await {
+        match factory.getPool(token, weth(), fee.try_into().unwrap()).call().await {
             Err(e) => {
                 // A lookup that never completed says nothing about whether a
                 // pool exists. Reporting it as "no live WETH pool" told the user
@@ -2381,7 +2385,7 @@ async fn resolve_v3_grad<P: Provider>(
                 if liq > 0 {
                     return Ok(Some(Grad {
                         token,
-                        kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: WETH < token },
+                        kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: weth() < token },
                         quote: engine::Quote::Eth,
                         sym: sym.to_string(),
                         fee,
@@ -2397,7 +2401,7 @@ async fn resolve_v3_grad<P: Provider>(
     if errors > 0 {
         return Err(format!("could not check ({errors} lookups failed: {last})"));
     }
-    crate::trace(&format!("resolve {sym}: no WETH pool with liquidity at any fee tier"));
+    crate::trace(&format!("resolve {sym}: no weth() pool with liquidity at any fee tier"));
     Ok(None)
 }
 
@@ -2482,7 +2486,7 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
                             match resolve_v3_grad(provider, r.token, &r.sym).await {
                                 Ok(Some(g)) => return Ok(Some(g)),
                                 Ok(None) => {
-                                    note = format!("  · {}: no live WETH pool", r.sym)
+                                    note = format!("  · {}: no live weth() pool", r.sym)
                                 }
                                 Err(why) => note = format!("  · {}: {why}", r.sym),
                             }
@@ -2633,7 +2637,7 @@ mod flaunch_discovery_tests {
 
     fn fixture_log() -> alloy::primitives::Log {
         alloy::primitives::Log::new_unchecked(
-            FLAUNCH_PM,
+            flaunch_pm(),
             vec![TOPIC0, POOL_ID],
             Bytes::from(alloy::hex::decode(DATA).unwrap()),
         )
@@ -2659,11 +2663,11 @@ mod flaunch_discovery_tests {
         // derivation must land on the id the launch event indexed.
         let ev = IFlaunchPositionManager::PoolCreated::decode_log(&fixture_log(), true).unwrap();
         let key = crate::contracts::PoolKey {
-            currency0: crate::contracts::FLETH,
+            currency0: crate::contracts::fleth(),
             currency1: ev.data._memecoin,
             fee: alloy::primitives::aliases::U24::ZERO,
             tickSpacing: crate::contracts::FLAUNCH_TICK_SPACING.try_into().unwrap(),
-            hooks: FLAUNCH_PM,
+            hooks: flaunch_pm(),
         };
         assert_eq!(keccak256(key.abi_encode()), POOL_ID);
     }
@@ -2689,7 +2693,7 @@ mod flaunch_discovery_tests {
         assert!(!cands.is_empty(), "no PoolCreated logs in a 1M-block window");
         let c = &cands[0];
         println!("newest: {} {} pool {:#x}", c.sym, c.token, c.pool_id);
-        let sv = IStateView::new(STATE_VIEW, &lp);
+        let sv = IStateView::new(state_view(), &lp);
         let slot0 = sv.getSlot0(c.pool_id).call().await.expect("StateView answers");
         assert!(uf(slot0.sqrtPriceX96) > 0.0, "pool has a price");
         let fl = fetch_flaunch_pool(&lp, c.token).await.expect("poolKey() round-trips");
@@ -2715,9 +2719,9 @@ mod flaunch_discovery_tests {
         let c = cands.iter().find(|c| c.flaunch_at <= now).expect("a live launch");
         let data = crate::v4::flaunch_swap_calldata(c.token, true, 1_000_000_000_000_000, 0);
         // A funded holder: the flETH contract itself always carries ETH.
-        let from = crate::contracts::FLETH;
+        let from = crate::contracts::fleth();
         let tx = alloy::rpc::types::TransactionRequest::default()
-            .to(crate::contracts::UNIVERSAL_ROUTER)
+            .to(crate::contracts::universal_router())
             .input(data.into())
             .value(U256::from(1_000_000_000_000_000u64))
             .from(from);
@@ -2763,7 +2767,7 @@ mod pons_v2_tests {
 
         let lg = alloy::rpc::types::Log {
             inner: alloy::primitives::Log {
-                address: PONS_V2_FACTORY,
+                address: pons_v2_factory(),
                 data: LogData::new_unchecked(
                     vec![
                         IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
@@ -2793,7 +2797,7 @@ mod pons_v2_tests {
         use alloy::primitives::{Bytes, LogData};
         let lg = alloy::rpc::types::Log {
             inner: alloy::primitives::Log {
-                address: PONS_V2_FACTORY,
+                address: pons_v2_factory(),
                 data: LogData::new_unchecked(
                     vec![IPonsFactory::TokenLaunched::SIGNATURE_HASH],
                     Bytes::from(vec![0u8; 96]),

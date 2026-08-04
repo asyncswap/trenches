@@ -158,7 +158,7 @@ impl Order {
 #[derive(Clone, Copy, PartialEq)]
 pub enum PoolKind {
     V4 { pool_id: B256, tick_spacing: i32 },     // native ETH, PoolManager/UniversalRouter
-    V3 { pool_addr: Address, weth_is_token0: bool }, // WETH, SwapRouter02
+    V3 { pool_addr: Address, weth_is_token0: bool }, // weth(), SwapRouter02
     // A Flaunch launch: the same PoolManager, but paired against flETH with the
     // Flaunch hook attached, so swaps route ETH<->flETH<->coin through the
     // UniversalRouter. Not a widened V4: that variant bakes in currency0 =
@@ -286,7 +286,7 @@ impl PoolKind {
 /// assumed to be $1, since stables drift and can depeg.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Quote {
-    Eth,                                     // native ETH (v4) / WETH (v3), 18-dec
+    Eth,                                     // native ETH (v4) / weth() (v3), 18-dec
     Stable { token: Address, decimals: u8 }, // stablecoin-quoted; USD fetched, not assumed
 }
 
@@ -1053,14 +1053,14 @@ impl Bot {
     /// poll so it never hangs.
     async fn ensure_v3_allowance<P: Provider>(&mut self, provider: &P, need: U256) -> eyre::Result<bool> {
         let erc = IERC20::new(self.pool.token, provider);
-        if let Ok(a) = erc.allowance(self.trader, SWAP_ROUTER_02).call().await {
+        if let Ok(a) = erc.allowance(self.trader, swap_router_02()).call().await {
             if a._0 >= need {
                 return Ok(true);
             }
         }
         self.note(format!("Approving {} for the router", self.pool.sym));
         let nonce = self.take_nonce(provider).await?;
-        let sent = erc.approve(SWAP_ROUTER_02, need).gas(120_000).nonce(nonce).send().await;
+        let sent = erc.approve(swap_router_02(), need).gas(120_000).nonce(nonce).send().await;
         let hash = *self.spent_nonce(sent)?.tx_hash();
         for _ in 0..6u32 {
             if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
@@ -1096,7 +1096,7 @@ impl Bot {
         );
         let need160: U160 = need.min(U256::from(U160::MAX)).to();
         let p2_ok = p2
-            .allowance(self.trader, self.pool.token, UNIVERSAL_ROUTER)
+            .allowance(self.trader, self.pool.token, universal_router())
             .call()
             .await
             .map(|a| a.amount >= need160 && a.expiration > now48)
@@ -1105,7 +1105,7 @@ impl Bot {
             // Trust the chain's expiry, not a guess about when it was made —
             // this grant may predate the session.
             self.ur_permit2_until = p2
-                .allowance(self.trader, self.pool.token, UNIVERSAL_ROUTER)
+                .allowance(self.trader, self.pool.token, universal_router())
                 .call()
                 .await
                 .map(|a| a.expiration.to::<u64>())
@@ -1147,7 +1147,7 @@ impl Bot {
             self.ur_permit2_until = expiration48.to::<u64>();
             let nonce = self.take_nonce(provider).await?;
             let sent = p2
-                .approve(self.pool.token, UNIVERSAL_ROUTER, need160, expiration48)
+                .approve(self.pool.token, universal_router(), need160, expiration48)
                 .gas(120_000)
                 .nonce(nonce)
                 .send()
@@ -1703,7 +1703,7 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// Cheap: one call, and only while a curve is actually open.
     pub async fn check_graduation<P: Provider>(&mut self, provider: &P) {
         let PoolKind::PonsCurve { .. } = self.pool.kind else { return };
-        let f = IPonsV2Factory::new(PONS_V2_FACTORY, provider);
+        let f = IPonsV2Factory::new(pons_v2_factory(), provider);
         let Ok(rec) = f.getLaunchedToken(self.pool.token).call().await else { return };
         let rec = rec._0;
         if !rec.exists {
@@ -1723,7 +1723,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                     self.pool.token,
                     rec.pairToken,
                     rec.tickSpacing.as_i32(),
-                    PONS_V2_HOOK,
+                    pons_v2_hook(),
                 );
                 self.pool.kind = PoolKind::PonsV2Pool {
                     pool_id,
@@ -2566,8 +2566,8 @@ fn order_fields(o: &Order) -> Vec<String> {
                                     continue;
                                 }
                                 let val = U256::from_be_slice(&d[d.len() - 32..]);
-                                if lg.address() == WETH
-                                    && (to == SWAP_ROUTER_02 || to == UNIVERSAL_ROUTER)
+                                if lg.address() == weth()
+                                    && (to == swap_router_02() || to == universal_router())
                                 {
                                     weth_out = weth_out.saturating_add(val);
                                 } else if lg.address() == self.pool.token && to == self.trader {
@@ -2633,7 +2633,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                             let minted_l = self.mint_liq.remove(&p.hash).unwrap_or(0.0);
                             for lg in rc.inner.logs() {
                                 let tp = lg.topics();
-                                if lg.address() == POSITION_MANAGER
+                                if lg.address() == position_manager()
                                     && tp.len() == 4
                                     && tp[0] == XFER
                                     && Address::from_word(tp[1]) == Address::ZERO
@@ -2754,7 +2754,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             // An exact grant gets SPENT, and it expires. Both have to still
             // cover this add or it needs approving again.
             let p2_ok = p2
-                .allowance(self.trader, self.pool.token, POSITION_MANAGER)
+                .allowance(self.trader, self.pool.token, position_manager())
                 .call()
                 .await
                 .map(|a| a.amount >= need160 && a.expiration > now48)
@@ -2781,7 +2781,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             let sent = async {
                 let h1 = *erc.approve(PERMIT2, U256::MAX).send().await?.tx_hash();
                 let h2 = *p2
-                    .approve(self.pool.token, POSITION_MANAGER, amount160, expiration48)
+                    .approve(self.pool.token, position_manager(), amount160, expiration48)
                     .send()
                     .await?
                     .tx_hash();
@@ -2830,7 +2830,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             self.trader,
         );
         let tx = TransactionRequest::default()
-            .with_to(POSITION_MANAGER)
+            .with_to(position_manager())
             .with_input(data)
             .with_value(U256::from(amount0_max))
             .with_from(self.trader);
@@ -2876,7 +2876,7 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// case (no scan when nothing is held).
     #[cfg(feature = "liquidity")]
     async fn find_positions<P: Provider>(&self, provider: &P, limit: usize) -> Vec<U256> {
-        let posm = IPositionManager::new(POSITION_MANAGER, provider);
+        let posm = IPositionManager::new(position_manager(), provider);
         let held = posm.balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
         if held.is_zero() {
             return Vec::new();
@@ -2921,7 +2921,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         // Liquidity comes from the chain rather than `pos_liq`: the cache is
         // seeded at mint and a position may predate this session entirely. Two
         // reads, only on a burn, which is rare.
-        let pm = IPositionManager::new(POSITION_MANAGER, provider);
+        let pm = IPositionManager::new(position_manager(), provider);
         let cb_info = pm.getPoolAndPositionInfo(token_id);
         let cb_liq = pm.getPositionLiquidity(token_id);
         let (info, liq) = tokio::join!(cb_info.call(), cb_liq.call());
@@ -2948,7 +2948,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         let data =
             v4::close_liquidity_calldata(token_id, self.pool.token, self.trader, amount0_min, amount1_min);
         let tx = TransactionRequest::default()
-            .with_to(POSITION_MANAGER)
+            .with_to(position_manager())
             .with_input(data)
             .with_from(self.trader);
         // Pre-flight, like every other send path. A burn is the one call that
@@ -3193,7 +3193,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         tick_spacing: i32,
         sqrt_price_x96: alloy::primitives::aliases::U160,
     ) -> eyre::Result<()> {
-        let pm = IPoolManager::new(POOL_MANAGER, provider);
+        let pm = IPoolManager::new(pool_manager(), provider);
         let key = PoolKey {
             currency0: Address::ZERO,
             currency1: token,
@@ -3403,7 +3403,7 @@ async fn read_market_inner<P: Provider>(
         PoolKind::V4 { pool_id, .. }
         | PoolKind::FlaunchV4 { pool_id, .. }
         | PoolKind::PonsV2Pool { pool_id, .. } => {
-            let sv = IStateView::new(STATE_VIEW, provider);
+            let sv = IStateView::new(state_view(), provider);
             let cb0 = sv.getSlot0(pool_id);
             let cbl = sv.getLiquidity(pool_id);
             let (s0, lq) = tokio::join!(cb0.call(), cbl.call());
@@ -3525,8 +3525,8 @@ pub enum TapeAction {
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Swap {
     pub action: TapeAction,
-    pub eth: f64,       // ETH/WETH size of the event
-    pub eth_wei: u128,  // EXACT WETH size in wei (no float rounding) — for copy-step keying
+    pub eth: f64,       // ETH/weth() size of the event
+    pub eth_wei: u128,  // EXACT weth() size in wei (no float rounding) — for copy-step keying
     pub price: f64,     // token per ETH (0 for LP events)
     /// Who the swap is attributed to — the person, not the router.
     ///
@@ -3698,18 +3698,18 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         }
         PoolKind::V4 { pool_id, .. } => (
             true, true,
-            Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
+            Filter::new().address(pool_manager()).topic1(pool_id).from_block(from_block).to_block(to_block),
         ),
         // Same PoolManager events as V4, but the quote side is flETH, whose
         // position follows the launch's _currencyFlipped rather than always 0.
         // pons v2: same PoolManager events, orientation from the launch record.
         PoolKind::PonsV2Pool { pool_id, coin_is_0, .. } => (
             !coin_is_0, true,
-            Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
+            Filter::new().address(pool_manager()).topic1(pool_id).from_block(from_block).to_block(to_block),
         ),
         PoolKind::FlaunchV4 { pool_id, coin_is_0 } => (
             !coin_is_0, true,
-            Filter::new().address(POOL_MANAGER).topic1(pool_id).from_block(from_block).to_block(to_block),
+            Filter::new().address(pool_manager()).topic1(pool_id).from_block(from_block).to_block(to_block),
         ),
         PoolKind::V3 { pool_addr, weth_is_token0 } => (
             weth_is_token0, false,
@@ -4100,7 +4100,7 @@ fn build_swap(
     let value = if buying { U256::from(wi) } else { U256::ZERO };
     match kind {
         PoolKind::V4 { tick_spacing, .. } => (
-            UNIVERSAL_ROUTER,
+            universal_router(),
             v4::swap_calldata(token, fee, tick_spacing, buying, wi, wm),
             value,
         ),
@@ -4108,8 +4108,8 @@ fn build_swap(
         // against whatever the launch was priced in. The hook is part of the
         // key, so it cannot be omitted, and the pool's own fee is zero.
         PoolKind::PonsV2Pool { quote, tick_spacing, .. } => (
-            UNIVERSAL_ROUTER,
-            v4::hop_calldata(token, quote, PONS_V2_HOOK, tick_spacing, buying, wi, wm),
+            universal_router(),
+            v4::hop_calldata(token, quote, pons_v2_hook(), tick_spacing, buying, wi, wm),
             // Native-quote launches pay in ETH; an ERC-20 quote is pulled
             // through Permit2 and must send none.
             if buying && quote == Address::ZERO { value } else { U256::ZERO },
@@ -4144,7 +4144,7 @@ fn build_swap(
         // `fee` is deliberately unused: the Flaunch pool key's fee is 0 (the
         // hook charges its cut), and the builder hardcodes the key layout.
         PoolKind::FlaunchV4 { .. } => (
-            UNIVERSAL_ROUTER,
+            universal_router(),
             v4::flaunch_swap_calldata(token, buying, wi, wm),
             value,
         ),
@@ -4154,7 +4154,7 @@ fn build_swap(
             } else {
                 v3::v3_sell_calldata(token, fee, wi, wm, trader)
             };
-            (SWAP_ROUTER_02, d, value)
+            (swap_router_02(), d, value)
         }
     }
 }
@@ -4572,7 +4572,7 @@ mod pons_v2_pool_tests {
     /// catch it.
     #[test]
     fn the_hook_is_part_of_the_pool_id() {
-        let with = pons_v2_pool_id(TOKEN, Address::ZERO, 60, PONS_V2_HOOK);
+        let with = pons_v2_pool_id(TOKEN, Address::ZERO, 60, pons_v2_hook());
         let without = pons_v2_pool_id(TOKEN, Address::ZERO, 60, Address::ZERO);
         assert_ne!(with, without, "the hook must change the pool id");
     }
@@ -4582,11 +4582,11 @@ mod pons_v2_pool_tests {
     /// wrong yields a different id — again, a pool that does not exist.
     #[test]
     fn currency_order_does_not_depend_on_argument_order() {
-        let a = pons_v2_pool_id(TOKEN, USDG, 60, PONS_V2_HOOK);
-        let b = pons_v2_pool_id(USDG, TOKEN, 60, PONS_V2_HOOK);
+        let a = pons_v2_pool_id(TOKEN, USDG, 60, pons_v2_hook());
+        let b = pons_v2_pool_id(USDG, TOKEN, 60, pons_v2_hook());
         assert_eq!(a, b, "the key sorts its currencies, so the id is stable");
         assert_ne!(
-            pons_v2_pool_id(TOKEN, Address::ZERO, 60, PONS_V2_HOOK),
+            pons_v2_pool_id(TOKEN, Address::ZERO, 60, pons_v2_hook()),
             a,
             "a different quote asset is a different pool"
         );
@@ -4596,8 +4596,8 @@ mod pons_v2_pool_tests {
     #[test]
     fn tick_spacing_changes_the_pool() {
         assert_ne!(
-            pons_v2_pool_id(TOKEN, Address::ZERO, 60, PONS_V2_HOOK),
-            pons_v2_pool_id(TOKEN, Address::ZERO, 200, PONS_V2_HOOK),
+            pons_v2_pool_id(TOKEN, Address::ZERO, 60, pons_v2_hook()),
+            pons_v2_pool_id(TOKEN, Address::ZERO, 200, pons_v2_hook()),
         );
     }
 
@@ -4613,7 +4613,7 @@ mod pons_v2_pool_tests {
         let (to, _, value) = build_swap(
             kind, TOKEN, 0, true, Wei::exact(U256::from(1_000u64)), Wei::ZERO, TOKEN,
         );
-        assert_eq!(to, UNIVERSAL_ROUTER);
+        assert_eq!(to, universal_router());
         assert_eq!(value, U256::from(1_000u64), "a native-quote buy sends ETH");
 
         let erc20 = PoolKind::PonsV2Pool {

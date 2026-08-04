@@ -79,9 +79,9 @@ pub fn flaunch_swap_calldata(token: Address, buy: bool, amount_in: u128, min_out
         hookData: Bytes::new(),
     };
     let (input_cur, output_cur, path) = if buy {
-        (Address::ZERO, token, vec![hop(FLETH, FLETH_HOOKS), hop(token, FLAUNCH_PM)])
+        (Address::ZERO, token, vec![hop(fleth(), fleth_hooks()), hop(token, flaunch_pm())])
     } else {
-        (token, Address::ZERO, vec![hop(FLETH, FLAUNCH_PM), hop(Address::ZERO, FLETH_HOOKS)])
+        (token, Address::ZERO, vec![hop(fleth(), flaunch_pm()), hop(Address::ZERO, fleth_hooks())])
     };
 
     let params0 = ExactInputParams {
@@ -321,12 +321,12 @@ mod flaunch_swap_tests {
             }
             if buy {
                 assert_eq!(p.currencyIn, Address::ZERO);
-                assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks), (FLETH, FLETH_HOOKS));
-                assert_eq!((p.path[1].intermediateCurrency, p.path[1].hooks), (TOKEN, FLAUNCH_PM));
+                assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks), (fleth(), fleth_hooks()));
+                assert_eq!((p.path[1].intermediateCurrency, p.path[1].hooks), (TOKEN, flaunch_pm()));
             } else {
                 assert_eq!(p.currencyIn, TOKEN);
-                assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks), (FLETH, FLAUNCH_PM));
-                assert_eq!((p.path[1].intermediateCurrency, p.path[1].hooks), (Address::ZERO, FLETH_HOOKS));
+                assert_eq!((p.path[0].intermediateCurrency, p.path[0].hooks), (fleth(), flaunch_pm()));
+                assert_eq!((p.path[1].intermediateCurrency, p.path[1].hooks), (Address::ZERO, fleth_hooks()));
             }
         }
     }

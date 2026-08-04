@@ -6,52 +6,119 @@
 use alloy::primitives::{address, Address};
 use alloy::sol;
 
-// Official Robinhood Chain deployment.
-pub const POOL_MANAGER: Address = address!("8366a39CC670B4001A1121B8F6A443A643e40951");
-pub const POSITION_MANAGER: Address = address!("58daec3116aae6D93017bAAea7749052E8a04fA7");
-pub const STATE_VIEW: Address = address!("f3334192d15450cdd385c8b70e03f9a6bd9e673b");
-pub const UNIVERSAL_ROUTER: Address = address!("8876789976dEcBfCbBbe364623C63652db8C0904");
-pub const PERMIT2: Address = address!("000000000022D473030F116dDEE9F6B43aC78BA3");
-
-// pons v2. A launch no longer starts life as a pool: the whole supply sits on a
-// bonding CURVE, and a Uniswap v4 pool is created only at graduation, seeded
-// from what the curve collected. So a v2 launch trades in two different places
-// over its life, and `phase` on the factory record says which — 0 curve,
-// 1 swept (closed, pool not built yet), 2 pool, 3 rescued.
+// The addresses that differ per chain.
 //
-// The v1 factory below is a different contract with a different event; both are
-// live, so discovery has to watch both.
-pub const PONS_V2_FACTORY: Address = address!("7E1EAbd52Ae29598e6483F72dCf1a70b14284dB8");
-// The v4 hook every graduated v2 pool carries. The pool's own fee is ZERO —
-// the hook charges instead, so it can split the fee under the same policy the
-// curve used rather than paying a liquidity provider that does not exist.
-pub const PONS_V2_HOOK: Address = address!("8e99D2009D60A917e9B1c00C04C077b8c0c3a044");
+// These were `const`, which is another way of saying "this app runs on exactly
+// one chain". The config has always accepted several networks, so pointing it
+// at a second EVM chain produced a bot that looked configured and swapped
+// against contracts that are not there.
+//
+// One table per chain, chosen by chain id. Resolved per call rather than cached:
+// `C` changes chain without restarting, and a value latched at startup would
+// quietly outlive the chain it belongs to.
+//
+// PERMIT2 is NOT here. It is deployed deterministically, at the same address on
+// every chain, so it stays a constant — the one thing about this that genuinely
+// does not vary.
+pub struct Venues {
+    pub pool_manager: Address,
+    pub position_manager: Address,
+    pub state_view: Address,
+    pub universal_router: Address,
+    /// Uniswap v3 factory and router, and the wrapped-native token that is the
+    /// ETH side of every v3 pool.
+    pub v3_factory: Address,
+    pub swap_router_02: Address,
+    pub weth: Address,
+    /// Flaunch: the hook-and-factory, its wrapped ETH, and the conversion hook.
+    /// ZERO where Flaunch is not deployed.
+    pub flaunch_pm: Address,
+    pub fleth: Address,
+    pub fleth_hooks: Address,
+    /// pons, Robinhood Chain's launchpad. ZERO elsewhere — discovery skips a
+    /// launchpad whose address is zero rather than scanning for an event that
+    /// cannot be emitted.
+    pub pons_factory: Address,
+    pub pons_v2_factory: Address,
+    pub pons_v2_hook: Address,
+}
+
+/// Official Robinhood Chain deployment.
+static ROBINHOOD: Venues = Venues {
+    pool_manager: address!("8366a39CC670B4001A1121B8F6A443A643e40951"),
+    position_manager: address!("58daec3116aae6D93017bAAea7749052E8a04fA7"),
+    state_view: address!("f3334192d15450cdd385c8b70e03f9a6bd9e673b"),
+    universal_router: address!("8876789976dEcBfCbBbe364623C63652db8C0904"),
+    v3_factory: address!("1f7d7550b1b028f7571e69a784071f0205fd2efa"),
+    swap_router_02: address!("caf681a66d020601342297493863e78c959e5cb2"),
+    weth: address!("0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"),
+    // Flaunch: FLAUNCH_PM is the v4 hook and the launch factory in one. It emits
+    // PoolCreated per coin, and every coin trades in a PoolManager pool keyed
+    // { flETH, coin, fee: 0, tickSpacing: 60, hooks: this }.
+    flaunch_pm: address!("5Cf8e499C7c466C7E2cf127BDF129F57151E65Dc"),
+    // flETH — 18-decimal wrapped ETH, redeemable 1:1, so flETH amounts ARE ETH
+    // amounts everywhere prices and reserves are read.
+    fleth: address!("00000000043C1117DAFA3A3D0C7148Eb48B30130"),
+    // The ETH/flETH conversion pool's hook (first hop of every Flaunch swap).
+    fleth_hooks: address!("EA22Ae03085CAf74Ac3393f9902539fbE9786888"),
+    // pons v1 — emits TokenLaunched on graduation (token + its v3 pool).
+    pons_factory: address!("A5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB"),
+    // pons v2. A launch no longer starts life as a pool: the whole supply sits
+    // on a bonding CURVE, and a Uniswap v4 pool is created only at graduation,
+    // seeded from what the curve collected. So a v2 launch trades in two
+    // different places over its life, and `phase` on the factory record says
+    // which — 0 curve, 1 swept (closed, pool not built yet), 2 pool, 3 rescued.
+    //
+    // v1 is a different contract with a different event; both are live, so
+    // discovery watches both.
+    pons_v2_factory: address!("7E1EAbd52Ae29598e6483F72dCf1a70b14284dB8"),
+    // The v4 hook every graduated v2 pool carries. The pool's own fee is ZERO —
+    // the hook charges instead, so it can split the fee under the same policy
+    // the curve used rather than paying a liquidity provider that does not
+    // exist.
+    pons_v2_hook: address!("8e99D2009D60A917e9B1c00C04C077b8c0c3a044"),
+};
+
+/// The addresses for the chain currently selected.
+///
+/// One chain in the table today. The point of the table is that adding the next
+/// one is an entry here rather than a hunt through a hundred call sites — which
+/// is what it was until this existed.
+pub fn venues() -> &'static Venues {
+    &ROBINHOOD
+}
+
+pub fn pool_manager() -> Address { venues().pool_manager }
+pub fn position_manager() -> Address { venues().position_manager }
+pub fn state_view() -> Address { venues().state_view }
+pub fn universal_router() -> Address { venues().universal_router }
+pub fn v3_factory() -> Address { venues().v3_factory }
+pub fn swap_router_02() -> Address { venues().swap_router_02 }
+pub fn weth() -> Address { venues().weth }
+pub fn flaunch_pm() -> Address { venues().flaunch_pm }
+pub fn fleth() -> Address { venues().fleth }
+pub fn fleth_hooks() -> Address { venues().fleth_hooks }
+pub fn pons_factory() -> Address { venues().pons_factory }
+pub fn pons_v2_factory() -> Address { venues().pons_v2_factory }
+pub fn pons_v2_hook() -> Address { venues().pons_v2_hook }
+
 // Existing tokens placed straight into a v2-style pool, skipping the curve.
+// Nothing reads these yet; they are recorded so the addresses are not looked up
+// again when something does.
+#[allow(dead_code)]
 pub const PONS_MIGRATION_FACTORY: Address = address!("050e5C224466e2d377a7E555E139D51268239b39");
+#[allow(dead_code)]
 pub const PONS_MIGRATION_HOOK: Address = address!("107251FFCC1fc808643DC8dA345e901f59EC2044");
 
-// Pons launch factory — emits TokenLaunched on graduation (token + its v3 pool).
-pub const PONS_FACTORY: Address = address!("A5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB");
+// Deployed deterministically — the same address on every chain it exists on.
+pub const PERMIT2: Address = address!("000000000022D473030F116dDEE9F6B43aC78BA3");
 
-// Flaunch launchpad (flaunch.gg). FLAUNCH_PM is the v4 hook and the launch
-// factory in one: it emits PoolCreated per coin, and every coin trades in a
-// PoolManager pool keyed { flETH, coin, fee: 0, tickSpacing: 60, hooks: this }.
-pub const FLAUNCH_PM: Address = address!("5Cf8e499C7c466C7E2cf127BDF129F57151E65Dc");
-// flETH — 18-decimal wrapped ETH, redeemable 1:1, so flETH amounts ARE ETH
-// amounts everywhere prices and reserves are read.
-pub const FLETH: Address = address!("00000000043C1117DAFA3A3D0C7148Eb48B30130");
-// The ETH/flETH conversion pool's hook (first hop of every Flaunch swap).
-pub const FLETH_HOOKS: Address = address!("EA22Ae03085CAf74Ac3393f9902539fbE9786888");
 pub const FLAUNCH_TICK_SPACING: i32 = 60;
 // The Flaunch swap fee is charged by the hook, not the pool (lpFee reads 0),
 // so quotes need it supplied out-of-band: ~1% standard, in hundredths of a bip.
 // Display/estimate only — PoolKey and PathKey carry the real on-chain fee, 0.
 pub const FLAUNCH_FEE_EST: u32 = 10_000;
 
-// Uniswap v3 (mainnet only). WETH is the ETH side of v3 pools.
-pub const V3_FACTORY: Address = address!("1f7d7550b1b028f7571e69a784071f0205fd2efa");
-pub const SWAP_ROUTER_02: Address = address!("caf681a66d020601342297493863e78c959e5cb2");
-pub const WETH: Address = address!("0Bd7D308f8E1639FAb988df18A8011f41EAcAD73");
 // SwapRouter02 recipient sentinels for multicall chaining.
 pub const ADDRESS_THIS: Address = address!("0000000000000000000000000000000000000002");
 
