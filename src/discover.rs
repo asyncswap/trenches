@@ -1913,16 +1913,21 @@ fn trenches_title(rows: usize) -> Line<'static> {
     // is empty or full. An empty list and a refused endpoint look identical
     // otherwise, and only one of them is worth waiting through.
     //
-    // And with nothing found yet the title says so. "Trenches live (0)" reads
-    // as a finished search that came back empty, which is a different thing
-    // from one still running — and the keys it advertises do nothing until
-    // there is a row to press them on.
+    // With nothing found yet the title says only what it always says. It used
+    // to add "discovering token launches…", which the body of the screen was
+    // already saying in the middle of an otherwise empty page — the same
+    // sentence twice, once in the place meant to hold still.
+    //
+    // The keys it advertises DO change, because those are what the screen can
+    // do rather than what it is currently doing: with no rows there is nothing
+    // to select or trade, and offering keys that do nothing is worse than
+    // offering none.
     let v = env!("CARGO_PKG_VERSION");
     // No live count in the title: the list IS the count, and a number that
     // ticks up makes the whole header jitter. Keys wear their brackets, same
     // as everywhere else in the app.
     let text = if rows == 0 {
-        format!(" Trenches Bot v{v} — discovering token launches…  [Esc] back ")
+        format!(" Trenches Bot v{v}  [Esc] back ")
     } else {
         format!(" Trenches Bot v{v}  [j/k] select  [Enter] trade  [Esc] back ")
     };
