@@ -560,7 +560,11 @@ pub fn log_scale(v: f64, min: f64) -> f64 {
 pub fn usd_compact(x: f64) -> String {
     let sym = crate::base_currency::symbol();
     let x = crate::base_currency::from_usd(x);
-    if x >= 1e6 {
+    if x >= 1e12 {
+        format!("{sym}{:.2}T", x / 1e12)
+    } else if x >= 1e9 {
+        format!("{sym}{:.2}B", x / 1e9)
+    } else if x >= 1e6 {
         format!("{sym}{:.2}M", x / 1e6)
     } else if x >= 1e3 {
         // Two decimals: "$9k" hides the difference between $9,001 and $9,999,
