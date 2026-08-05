@@ -218,6 +218,7 @@ pub struct PonsV2Cand {
     pub token: Address,
     pub curve: Address,
     pub config_id: U256,
+    pub tx: B256,
     /// What the launch is priced in. Zero means native ETH; anything else is
     /// an approved ERC-20, and then EVERYTHING — price, the graduation target,
     /// creator payouts — is denominated in it rather than in ETH.
@@ -240,6 +241,7 @@ fn decode_pons_v2_log(lg: &alloy::rpc::types::Log) -> Option<PonsV2Cand> {
         token: Address::from_word(t[1]),
         curve: Address::from_word(t[2]),
         config_id: U256::from_be_slice(&d[32..64]),
+        tx: lg.transaction_hash.unwrap_or_default(),
         pair_token: Address::from_slice(&d[12..32]),
         threshold: U256::from_be_slice(&d[64..96]),
         block: lg.block_number.unwrap_or(0),
@@ -378,6 +380,73 @@ pub fn sort_launch_logs(
 /// and the caller must not move its cursor past it: a chunk the provider
 /// rejected is blocks nobody looked at, and skipping them loses every launch
 /// inside them permanently.
+fn calldata_strings(input: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if input.len() < 4 {
+        return out;
+    }
+    let d = &input[4..];
+    let words = d.len() / 32;
+    let mut i = 0;
+    while i < words {
+        let w = &d[i * 32..i * 32 + 32];
+        let n = U256::from_be_slice(w);
+        if n > U256::ZERO && n <= U256::from(256u64) {
+            let n = n.to::<usize>();
+            let need = n.div_ceil(32);
+            if i + 1 + need <= words {
+                let bytes = &d[(i + 1) * 32..(i + 1) * 32 + n];
+                if let Ok(t) = std::str::from_utf8(bytes) {
+                    if !t.is_empty()
+                        && t.chars().all(|ch| !ch.is_control())
+                        && t.chars().any(|ch| ch.is_alphanumeric())
+                    {
+                        out.push(t.to_string());
+                        i += 1 + need;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PonsV2Cand) {
+    if c.tx.is_zero() {
+        return;
+    }
+    let (p, token, tx) = (provider.clone(), c.token, c.tx);
+    tokio::spawn(async move {
+        let got = tokio::time::timeout(RPC_TIMEOUT, p.get_transaction_by_hash(tx)).await;
+        let Ok(Ok(Some(t))) = got else {
+            crate::trace(&format!("pons-v2 identity: tx {tx} unavailable for {token}"));
+            return;
+        };
+        use alloy::consensus::Transaction as _;
+        let strings = calldata_strings(t.input());
+        let name = strings.first().cloned().unwrap_or_default();
+        let sym = strings.get(1).cloned().unwrap_or_default();
+        let uri = strings
+            .iter()
+            .find(|s| s.starts_with("ipfs://") || s.starts_with("https://"))
+            .cloned()
+            .unwrap_or_default();
+        if sym.is_empty() {
+            crate::trace(&format!("pons-v2 identity: no strings decoded for {token} tx {tx}"));
+            return;
+        }
+        crate::trace(&format!("pons-v2 identity: {token} \"{name}\" ({sym}) uri {uri}"));
+        let s2 = sym.clone();
+        crate::token_metadata_chain_id::merge(token, move |f| {
+            if f.sym.is_empty() {
+                f.sym = s2;
+            }
+        });
+    });
+}
+
 fn note_v2_supply<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PonsV2Cand) {
     static SEEN: std::sync::Mutex<Option<std::collections::HashSet<Address>>> = std::sync::Mutex::new(None);
     {
@@ -1365,6 +1434,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
         if !known_v2.iter().any(|k| k.token == c.token) {
             crate::trace(&format!("launch: pons-v2 {} curve {} block {} via ws", c.token, c.curve, c.block));
             note_v2_supply(provider, &c);
+            note_v2_identity(provider, &c);
             known_v2.push(c);
             n_v2 += 1;
         }
@@ -1547,6 +1617,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 if !known_v2.iter().any(|k| k.token == c.token) {
                     crate::trace(&format!("launch: pons-v2 {} curve {} block {} via scan", c.token, c.curve, c.block));
                     note_v2_supply(&provider, &c);
+                    note_v2_identity(&provider, &c);
                     known_v2.push(c);
                 }
             }
