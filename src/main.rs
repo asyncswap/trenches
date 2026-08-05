@@ -175,7 +175,14 @@ fn pons_grad_cache() -> &'static std::sync::Mutex<Option<PonsGrad>> {
     C.get_or_init(Default::default)
 }
 
-fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, bot: &engine::Bot) {
+fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, bot: &mut engine::Bot) {
+    if bot.socials.is_empty() && matches!(bot.pool.kind, engine::PoolKind::PonsCurve { .. }) {
+        if let Some(f) = token_metadata_chain_id::get(bot.pool.token) {
+            if !f.socials.is_empty() {
+                bot.socials = f.socials;
+            }
+        }
+    }
     let token = bot.pool.token;
     let fresh = pons_grad_cache()
         .lock()

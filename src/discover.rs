@@ -907,7 +907,7 @@ fn build_v2_row(
         // means "not known yet", not "free".
         fee: 0,
         launch_block: c.block,
-        socials: engine::TokenSocials::default(),
+        socials: f.as_ref().map(|f| f.socials.clone()).unwrap_or_default(),
     };
     let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
