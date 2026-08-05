@@ -622,7 +622,41 @@ async fn poller(
         // nothing on this path ever called it, so a whole Solana session went
         // by with the calls counted but the summary never written.
         crate::rpcstats::maybe_report();
-        tokio::time::sleep(REFRESH).await;
+        // The rest of the round is spent LISTENING, not sleeping: a trade the
+        // websocket delivers goes on screen the moment it arrives, instead of
+        // sitting in the channel until the next round drained it — which made
+        // a live subscription feel like a 1.5s poll.
+        let until = tokio::time::Instant::now() + REFRESH;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                break;
+            }
+            match tokio::time::timeout(until - now, rows_rx.recv()).await {
+                Ok(Some((mint, sig, rows))) => {
+                    let mut fresh = false;
+                    if tape_cache.mint == Some(mint) && tape_cache.seen.insert(sig) {
+                        discover::merge_tape(&mut tape_cache.rows, rows);
+                        fresh = true;
+                    }
+                    while let Ok((mint, sig, rows)) = rows_rx.try_recv() {
+                        if tape_cache.mint == Some(mint) && tape_cache.seen.insert(sig) {
+                            discover::merge_tape(&mut tape_cache.rows, rows);
+                            fresh = true;
+                        }
+                    }
+                    if fresh {
+                        if let Ok(mut snap) = out.lock() {
+                            if snap.mint == tape_cache.mint {
+                                snap.tape = tape_cache.rows.clone();
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
     }
 }
 

@@ -1511,6 +1511,11 @@ pub async fn watch_tape_ha(
                 return;
             }
             let r = watch_tape_once(&rpc, url, &target, &trader, &rows, &alive, &stop).await;
+            // The socket is down, so say so NOW. Leaving the last heartbeat
+            // standing kept the safety-net poll throttled for its full window
+            // while nothing was listening — trades in a reconnect gap waited
+            // out the slow cadence instead of being picked up next round.
+            alive.store(0, std::sync::atomic::Ordering::Relaxed);
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
