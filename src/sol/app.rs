@@ -2070,7 +2070,8 @@ fn market_panel(bot: &SolBot) -> PanelView {
                 p.spans(vec![lbl("Token"), Cell::new(format!("{} ({})", m.name, m.symbol))]);
             }
             p.spans(vec![lbl("Mint"), Cell::new(c.mint.to_string())]);
-            // Where to read more, on one row.
+            // Where to read more, one per row — two urls sharing a line
+            // truncate each other on any normal width.
             //
             // High up, because a panel this tall runs out before it reaches the
             // bottom — these used to be six rows below Creator and were simply
@@ -2090,7 +2091,10 @@ fn market_panel(bot: &SolBot) -> PanelView {
                         links.push(url);
                     }
                 }
-                p.spans(vec![lbl("Links"), Cell::toned(links.join("  "), Tone::Dim)]);
+                for (i, url) in links.iter().enumerate() {
+                    let label = if i == 0 { lbl("Links") } else { lbl("") };
+                    p.spans(vec![label, Cell::toned(url.clone(), Tone::Dim)]);
+                }
             }
             // The pool is what you actually trade against, and it's the address
             // every chart and explorer keys off — worth showing next to the mint.
