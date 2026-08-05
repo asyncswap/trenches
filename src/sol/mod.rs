@@ -44,6 +44,15 @@ use solana_pubkey::Pubkey;
 ///
 /// Writes to `.bot/sol-trace-<start>.log`. Never panics and never blocks the
 /// caller on failure: tracing must not be able to take the bot down.
+static TRACE_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static SESSION_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The Solana log filenames, for the Logs panel title — empty before the
+/// first write creates them.
+pub fn log_names() -> (String, String) {
+    (crate::lock(&SESSION_NAME).clone(), crate::lock(&TRACE_NAME).clone())
+}
+
 pub fn trace(msg: &str) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
@@ -58,10 +67,12 @@ pub fn trace(msg: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let name = format!("sol-trace-{ts}.log");
+        *crate::lock(&TRACE_NAME) = name.clone();
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/sol-trace-{ts}.log", crate::state_dir()))
+            .open(format!("{}/{name}", crate::state_dir()))
             .ok()
             .map(Mutex::new)
     });
@@ -104,10 +115,12 @@ pub fn session(line: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let name = format!("session-{ts}.log");
+        *crate::lock(&SESSION_NAME) = name.clone();
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/session-{ts}.log", crate::state_dir()))
+            .open(format!("{}/{name}", crate::state_dir()))
             .ok()
             .map(Mutex::new)
     });

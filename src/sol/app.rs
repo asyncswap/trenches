@@ -2263,9 +2263,12 @@ fn orders_table(bot: &SolBot, scroll: usize, h: usize) -> TableView {
 }
 
 fn logs_panel(bot: &SolBot, scroll: usize, h: usize) -> PanelView {
-    let mut p = PanelView::new(match crate::session_log_name() {
-        n if n.is_empty() => " Logs ".to_string(),
-        n => format!(" Logs — ~/.trenches/{n} "),
+    let (session, trace) = super::log_names();
+    let mut p = PanelView::new(match (session.is_empty(), trace.is_empty()) {
+        (true, true) => " Logs ".to_string(),
+        (false, true) => format!(" Logs — ~/.trenches/{session} "),
+        (true, false) => format!(" Logs — ~/.trenches/{trace} "),
+        (false, false) => format!(" Logs — ~/.trenches/{session} · {trace} "),
     });
 
     // Both streams, as on the EVM side: what the bot did, and what the
