@@ -283,6 +283,31 @@ impl Inner {
         CACHED.iter().find(|(m, _)| *m == method).copied()
     }
 
+    /// Does the chain know this raw transaction? Returns its quoted hash —
+    /// the exact payload `eth_sendRawTransaction` would have returned — when
+    /// the tx is in the mempool or a block. Bounded: three looks, then no.
+    async fn tx_landed(&self, url: &reqwest::Url, raw_tx: &str) -> Option<Box<RawValue>> {
+        let bytes = alloy::primitives::hex::decode(raw_tx).ok()?;
+        let hash = alloy::primitives::keccak256(&bytes);
+        let q = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionByHash",
+            "params": [format!("{hash}")],
+        });
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let Ok(resp) = self.client.post(url.clone()).json(&q).send().await else { continue };
+            let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+            if v.get("result").is_some_and(|r| !r.is_null()) {
+                return RawValue::from_string(format!("\"{hash}\"")).ok();
+            }
+        }
+        None
+    }
+
     fn cache_get(&self, key: &'static str, ttl: Duration) -> Option<Box<RawValue>> {
         let cache = lock(&self.cache);
         let (at, raw) = cache.get(key)?;
@@ -454,6 +479,34 @@ impl Inner {
                 }
             }
 
+            // A send that failed over can be a send that already succeeded:
+            // endpoint A accepts the raw tx, the HTTP response is lost, and
+            // endpoint B answers "nonce too low" because the tx is already in
+            // a block. The tx hash is knowable before broadcast — it is the
+            // keccak of the raw payload — so an errored send is checked
+            // against the chain, and a tx that is actually there is reported
+            // as the success it is. Without this the app records a failed
+            // sell while the tokens leave the wallet.
+            if method == "eth_sendRawTransaction" && packet.as_error().is_some() {
+                if let Some(raw_tx) = raw_tx_param(&body) {
+                    if let Some(hash) = self.tx_landed(&ep.url, &raw_tx).await {
+                        let msg = packet
+                            .as_error()
+                            .map(|e| e.message.to_string())
+                            .unwrap_or_default();
+                        crate::trace(&format!(
+                            "rpc: send answered \"{msg}\" but the tx is on chain — treating as sent"
+                        ));
+                        if let Some(id) = id.clone() {
+                            return Ok(ResponsePacket::Single(Response {
+                                id,
+                                payload: ResponsePayload::Success(hash),
+                            }));
+                        }
+                    }
+                }
+            }
+
             ep.observe(t0.elapsed());
             if attempt > 0 {
                 crate::trace(&format!("rpc: {} answered {method} after failover", ep.host));
@@ -469,6 +522,13 @@ impl Inner {
             TransportErrorKind::custom_str("no RPC endpoint could be tried")
         }))
     }
+}
+
+/// The raw tx hex out of a serialized `eth_sendRawTransaction` request.
+fn raw_tx_param(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let p = v.get("params")?.get(0)?.as_str()?;
+    p.starts_with("0x").then(|| p.to_string())
 }
 
 /// True when this error text is a provider refusing a getLogs RANGE — the
@@ -571,6 +631,19 @@ impl tower::Service<RequestPacket> for Balanced {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The landed-anyway check starts from the raw payload in the request; a
+    /// batch, another method's params, or a non-hex param must all yield None
+    /// rather than a hash of the wrong thing.
+    #[test]
+    fn the_raw_tx_comes_out_of_a_send_request_and_nothing_else() {
+        let send = r#"{"jsonrpc":"2.0","id":7,"method":"eth_sendRawTransaction","params":["0x02f870"]}"#;
+        assert_eq!(raw_tx_param(send).as_deref(), Some("0x02f870"));
+        let call = r#"{"jsonrpc":"2.0","id":7,"method":"eth_call","params":[{"to":"0x1"}]}"#;
+        assert_eq!(raw_tx_param(call), None);
+        let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02"]}]"#;
+        assert_eq!(raw_tx_param(batch), None);
+    }
 
     #[test]
     fn the_reset_hint_in_a_429_body_is_honored() {
