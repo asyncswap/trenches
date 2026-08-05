@@ -312,6 +312,8 @@ sol! {
     // realQuoteReserve.
     #[sol(rpc)]
     interface IPonsCurve {
+        event CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax);
+        event CurveSell(address indexed seller, address indexed recipient, uint256 tokensIn, uint256 quoteOut, uint256 fee, uint256 tax);
         function getReserves() external view returns (uint256 quoteReserve, uint256 tokenReserve);
         function realQuoteReserve() external view returns (uint256);
         function graduationThreshold() external view returns (uint256);

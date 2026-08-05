@@ -98,12 +98,12 @@ impl LaunchStream {
 /// `addresses` and `topics` are passed in rather than imported so this file
 /// stays about the transport: what counts as a launch belongs with the
 /// decoders, in one place.
-pub fn spawn(
-    chain: u64,
-    urls: Vec<String>,
-    addresses: Vec<alloy::primitives::Address>,
-    topics: Vec<alloy::primitives::B256>,
-) -> LaunchStream {
+pub struct Sub {
+    pub addresses: Vec<alloy::primitives::Address>,
+    pub topics: Vec<alloy::primitives::B256>,
+}
+
+pub fn spawn(chain: u64, urls: Vec<String>, subs: Vec<Sub>) -> LaunchStream {
     // ONE subscription per chain, however many times this is called.
     //
     // The discovery task starts each time that screen opens, so this used to
@@ -147,7 +147,7 @@ pub fn spawn(
             // A provider having a bad minute should cost one reconnect, not
             // the whole session's feed.
             let url = urls[(attempt as usize) % urls.len()].clone();
-            match run_once(&url, &addresses, &topics, &stream, &stop).await {
+            match run_once(&url, &subs, &stream, &stop).await {
                 Ok(()) => attempt = 0, // clean close: treat the next try as fresh
                 Err(e) => {
                     attempt = attempt.saturating_add(1);
@@ -177,8 +177,7 @@ pub fn spawn(
 /// One connection's lifetime. Returns when the socket closes.
 async fn run_once(
     url: &str,
-    addresses: &[alloy::primitives::Address],
-    topics: &[alloy::primitives::B256],
+    subs: &[Sub],
     stream: &LaunchStream,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -193,49 +192,62 @@ async fn run_once(
     .map_err(|_| "connect timed out".to_string())?
     .map_err(|e| format!("connect failed: {e}"))?;
 
-    let sub = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_subscribe",
-        "params": [
-            "logs",
-            {
-                "address": addresses.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>(),
-                // ONE topic slot holding the alternatives, not one slot each:
-                // `[[a,b,c]]` means "topic0 is any of these", where
-                // `[a,b,c]` would mean "topic0 is a AND topic1 is b" and match
-                // nothing at all.
-                "topics": [topics.iter().map(|t| format!("{t:#x}")).collect::<Vec<_>>()],
-            }
-        ],
-    });
-    ws.send(Message::Text(sub.to_string()))
-        .await
-        .map_err(|e| format!("subscribe failed: {e}"))?;
+    for (i, sub) in subs.iter().enumerate() {
+        let mut filter = serde_json::Map::new();
+        if !sub.addresses.is_empty() {
+            filter.insert(
+                "address".into(),
+                serde_json::json!(sub.addresses.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>()),
+            );
+        }
+        filter.insert(
+            "topics".into(),
+            serde_json::json!([sub.topics.iter().map(|t| format!("{t:#x}")).collect::<Vec<_>>()]),
+        );
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": i + 1,
+            "method": "eth_subscribe",
+            "params": ["logs", filter],
+        });
+        ws.send(Message::Text(req.to_string()))
+            .await
+            .map_err(|e| format!("subscribe {} failed: {e}", i + 1))?;
+    }
 
-    let ack = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await;
-    match ack {
-        Err(_) => return Err("subscribe ack timed out".into()),
-        Ok(None) => return Ok(()),
-        Ok(Some(Err(e))) => return Err(format!("subscribe ack read failed: {e}")),
-        Ok(Some(Ok(Message::Text(t)))) => {
-            let v: serde_json::Value =
-                serde_json::from_str(&t).map_err(|e| format!("subscribe ack unreadable: {e}"))?;
-            if let Some(err) = v.get("error") {
+    let mut acked = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while acked < subs.len() {
+        let next = tokio::time::timeout_at(deadline, ws.next()).await;
+        let msg = match next {
+            Err(_) => return Err(format!("subscribe acks timed out ({acked}/{})", subs.len())),
+            Ok(None) => return Ok(()),
+            Ok(Some(Err(e))) => return Err(format!("subscribe ack read failed: {e}")),
+            Ok(Some(Ok(m))) => m,
+        };
+        let Message::Text(t) = msg else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+        if let Some(result) = v.get("params").and_then(|p| p.get("result")) {
+            if let Ok(lg) = serde_json::from_value::<Log>(result.clone()) {
+                stream.push(lg);
+            }
+            continue;
+        }
+        let id = v.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
+        if let Some(err) = v.get("error") {
+            if id <= 1 {
                 return Err(format!("subscribe refused: {err}"));
             }
-            if let Some(result) = v.get("params").and_then(|p| p.get("result")) {
-                if let Ok(lg) = serde_json::from_value::<Log>(result.clone()) {
-                    stream.push(lg);
-                }
-            } else if v.get("result").is_none() {
-                return Err(format!("subscribe ack unexpected: {t}"));
-            }
+            crate::trace(&format!("launch stream: sub {id} refused: {err}"));
+            acked += 1;
+            continue;
         }
-        Ok(Some(Ok(_))) => {}
+        if v.get("result").is_some() {
+            acked += 1;
+        }
     }
     stream.live.store(true, Ordering::Relaxed);
-    crate::trace("launch stream: subscribed and acknowledged");
+    crate::trace(&format!("launch stream: {} subscription(s) acknowledged", subs.len()));
 
     while !stop.load(Ordering::Relaxed) {
         // A silent socket is indistinguishable from a dead one, and a dead one

@@ -413,14 +413,49 @@ fn calldata_strings(input: &[u8]) -> Vec<String> {
     out
 }
 
+fn v2_tape() -> &'static Mutex<std::collections::HashMap<Address, Vec<u64>>> {
+    static T: std::sync::OnceLock<Mutex<std::collections::HashMap<Address, Vec<u64>>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+fn v2_tape_note(curve: Address, block: u64) {
+    if let Ok(mut g) = v2_tape().lock() {
+        g.entry(curve).or_default().push(block);
+    }
+}
+
+fn v2_tape_count(curve: Address, head: u64) -> usize {
+    let cutoff = head.saturating_sub(ACTIVITY_WINDOW);
+    match v2_tape().lock() {
+        Ok(mut g) => match g.get_mut(&curve) {
+            Some(v) => {
+                v.retain(|b| *b >= cutoff);
+                v.len()
+            }
+            None => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
 fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PonsV2Cand) {
     if c.tx.is_zero() {
         return;
     }
     let (p, token, tx) = (provider.clone(), c.token, c.tx);
     tokio::spawn(async move {
-        let got = tokio::time::timeout(RPC_TIMEOUT, p.get_transaction_by_hash(tx)).await;
-        let Ok(Ok(Some(t))) = got else {
+        let mut found = None;
+        for attempt in 0..4u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1500 << attempt)).await;
+            }
+            if let Ok(Ok(Some(t))) = tokio::time::timeout(RPC_TIMEOUT, p.get_transaction_by_hash(tx)).await {
+                found = Some(t);
+                break;
+            }
+        }
+        let Some(t) = found else {
             crate::trace(&format!("pons-v2 identity: tx {tx} unavailable for {token}"));
             return;
         };
@@ -444,6 +479,38 @@ fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c
                 f.sym = s2;
             }
         });
+        if uri.is_empty() {
+            return;
+        }
+        let Some(v) = crate::art::fetch_json(&uri, 4_000).await else {
+            crate::trace(&format!("pons-v2 meta: {uri} unreachable for {token}"));
+            return;
+        };
+        let grab = |k: &str| {
+            v.get(k).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+        };
+        let img = grab("image").unwrap_or_default();
+        let logo = crate::net::metadata_url(&img)
+            .or_else(|| img.starts_with("https://").then(|| img.clone()))
+            .unwrap_or_default();
+        let socials = engine::TokenSocials {
+            logo: logo.clone(),
+            description: grab("description").unwrap_or_default(),
+            twitter: grab("twitter").or_else(|| grab("twitterUrl")).unwrap_or_default(),
+            telegram: grab("telegram").or_else(|| grab("telegramUrl")).unwrap_or_default(),
+            website: grab("website").or_else(|| grab("websiteUrl")).unwrap_or_default(),
+            discord: grab("discord").unwrap_or_default(),
+            farcaster: String::new(),
+        };
+        crate::trace(&format!("pons-v2 meta: {token} logo={} socials={}", !logo.is_empty(), socials.score()));
+        crate::token_metadata_chain_id::merge(token, move |f| {
+            if f.socials.is_empty() {
+                f.socials = socials;
+            }
+        });
+        if !logo.is_empty() {
+            crate::art::request(&logo);
+        }
     });
 }
 
@@ -805,6 +872,7 @@ fn build_v2_row(
     token_reserve: f64,
     raised: f64,
     my_bal: f64,
+    swaps_in_window: usize,
     head: u64,
 ) -> Row {
     let f = crate::token_metadata_chain_id::get(c.token);
@@ -841,11 +909,13 @@ fn build_v2_row(
         launch_block: c.block,
         socials: engine::TokenSocials::default(),
     };
+    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
     Row {
         grad,
         pooled_eth: pooled,
         mkt_cap_eth: supply * quote_per_token,
-        tx_per_sec: 0.0,
+        tx_per_sec,
         my_bal,
         grad_pct: None,
         graduated: false,
@@ -1398,6 +1468,28 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
     if live.is_empty() {
         return;
     }
+    let mut curve_hits = 0usize;
+    let live: Vec<_> = live
+        .into_iter()
+        .filter(|lg| {
+            let t0 = lg.topics().first().copied();
+            if t0 == Some(IPonsCurve::CurveBuy::SIGNATURE_HASH)
+                || t0 == Some(IPonsCurve::CurveSell::SIGNATURE_HASH)
+            {
+                v2_tape_note(lg.address(), lg.block_number.unwrap_or(0));
+                curve_hits += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if curve_hits > 0 {
+        crate::trace(&format!("curve tape: {curve_hits} event(s) via ws"));
+    }
+    if live.is_empty() {
+        return;
+    }
     let (mut pons, fl, v2, deployed) = sort_launch_logs(&live);
     // A creation pushed over the socket is the earliest anything can know
     // about a coin. Its pool is one call away, and the whole point of the
@@ -1513,8 +1605,16 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     let stream = crate::launch_stream::spawn(
         crate::chain_id(),
         crate::ws_pool(),
-        launch_addresses(),
-        launch_topics(),
+        vec![
+            crate::launch_stream::Sub { addresses: launch_addresses(), topics: launch_topics() },
+            crate::launch_stream::Sub {
+                addresses: Vec::new(),
+                topics: vec![
+                    IPonsCurve::CurveBuy::SIGNATURE_HASH,
+                    IPonsCurve::CurveSell::SIGNATURE_HASH,
+                ],
+            },
+        ],
     );
 
     // Runs for the life of the process, NOT for the life of the screen.
@@ -1978,7 +2078,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                         ),
                         _ => continue,
                     };
-                    let mut r = build_v2_row(c, qr, tr, liq, my_bal, head);
+                    let n = v2_tape_count(c.curve, head);
+                    let mut r = build_v2_row(c, qr, tr, liq, my_bal, n, head);
                     // The curve knows its own progress: `liq` here is its real
                     // raised quote, and the candidate carries the threshold.
                     let thresh = uf(c.threshold);

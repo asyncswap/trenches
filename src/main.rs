@@ -168,6 +168,77 @@ fn fetch_coin_art(socials: &engine::TokenSocials) {
     });
 }
 
+type PonsGrad = (alloy::primitives::Address, f64, bool, std::time::Instant);
+
+fn pons_grad_cache() -> &'static std::sync::Mutex<Option<PonsGrad>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<PonsGrad>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, bot: &engine::Bot) {
+    let token = bot.pool.token;
+    let fresh = pons_grad_cache()
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .is_some_and(|(t, _, _, at)| t == token && at.elapsed() < std::time::Duration::from_secs(5));
+    if fresh {
+        return;
+    }
+    if let Ok(mut g) = pons_grad_cache().lock() {
+        match *g {
+            Some((t, _, _, ref mut at)) if t == token => *at = std::time::Instant::now(),
+            _ => *g = Some((token, -1.0, false, std::time::Instant::now())),
+        }
+    }
+    enum Kind {
+        V1,
+        Curve(alloy::primitives::Address),
+    }
+    let kind = match bot.pool.kind {
+        engine::PoolKind::PonsCurve { curve, .. } => Kind::Curve(curve),
+        engine::PoolKind::V3 { .. } if bot.pons_launch().is_some() => Kind::V1,
+        _ => return,
+    };
+    let p = provider.clone();
+    tokio::spawn(async move {
+        let got = match kind {
+            Kind::V1 => {
+                let fac = contracts::IPonsFactory::new(contracts::pons_factory(), &p);
+                let call = fac.graduationStatus(token);
+                match tokio::time::timeout(std::time::Duration::from_secs(6), call.call()).await {
+                    Ok(Ok(r)) => {
+                        let thresh = engine::units_to_f64(r.threshold, 18);
+                        let paired = engine::units_to_f64(r.paired, 18);
+                        (thresh > 0.0).then(|| (paired / thresh, r.graduatedAt > alloy::primitives::U256::ZERO))
+                    }
+                    _ => None,
+                }
+            }
+            Kind::Curve(curve) => {
+                let c = contracts::IPonsCurve::new(curve, &p);
+                let (a, b, d) = (c.realQuoteReserve(), c.graduationThreshold(), c.graduated());
+                let (ra, rb, rd) = tokio::join!(a.call(), b.call(), d.call());
+                match (ra, rb) {
+                    (Ok(raised), Ok(thresh)) => {
+                        let thresh = engine::units_to_f64(thresh._0, 18);
+                        let raised = engine::units_to_f64(raised._0, 18);
+                        let done = rd.map(|x| x._0).unwrap_or(false);
+                        (thresh > 0.0).then_some((raised / thresh, done))
+                    }
+                    _ => None,
+                }
+            }
+        };
+        if let Some((pct, done)) = got {
+            trace(&format!("grad: {token} {:.1}% graduated={done}", pct * 100.0));
+            if let Ok(mut g) = pons_grad_cache().lock() {
+                *g = Some((token, pct, done, std::time::Instant::now()));
+            }
+        }
+    });
+}
+
 /// Below this, a balance is a leftover rather than a holding.
 ///
 /// One wei of an 18-decimal token is `1e-18` — greater than zero, indisputably
@@ -3049,6 +3120,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // Named so a freeze here is attributable: a draw blocks when
                 // the TERMINAL stops consuming output — scrollback, a dragged
                 // window, a busy tab — not because of anything in the app.
+                refresh_pons_grad(provider, bot);
                 phase!("drawing (a stalled draw usually means the terminal itself was busy)");
                 terminal.draw(|f| {
                     let (l, c) = draw(f, bot, blk, bot.last_read_ms, view, orders_scroll, orders_all, &tape_snap, show_help);
@@ -4541,6 +4613,18 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         mlbl("Mkt Cap"),
         Span::raw(view::usd_compact(bot.market_cap_usd())),
     ]));
+    if let Some((t, pct, done, _)) = pons_grad_cache().lock().ok().and_then(|g| *g) {
+        if t == bot.pool.token && pct >= 0.0 {
+            mkt.push(Line::from(vec![
+                mlbl("Grad"),
+                if done {
+                    Span::styled("graduated", Style::default().fg(ui::widgets::tone_color(view::Tone::Good)))
+                } else {
+                    Span::raw(format!("{:.0}%", (pct * 100.0).min(999.0)))
+                },
+            ]));
+        }
+    }
     if let Some(lb) = bot.pons_launch() {
         let s = block.saturating_sub(lb) / 10; // blocks -> seconds at ~10/s
         let a = view::age_compact(s as f64);
