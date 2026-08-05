@@ -322,6 +322,7 @@ sol! {
         function graduated() external view returns (bool);
         function feeBps() external view returns (uint256);
         function creatorTaxBps() external view returns (uint256);
+        function currentSnipeTaxBps(address recipient) external view returns (uint256);
         function isNativeQuote() external view returns (bool);
         function pairToken() external view returns (address);
         function buy(uint256 quoteIn, uint256 minTokensOut, address recipient) external payable returns (uint256 tokensOut);

@@ -1927,19 +1927,33 @@ fn order_fields(o: &Order) -> Vec<String> {
                 quote: Quote::Eth,
                 token_decimals: self.pool.token_decimals,
             };
-            // The light read: slot0 + liquidity, which is all the quote below
-            // uses. The full read here re-fetched balance, gas price and total
-            // supply PER ROUTE — three identical answers per candidate, spent
-            // from the same rate budget the trade itself is about to need.
-            let m = match read_price_only(provider, pref, self.trader).await {
-                Ok(m) => m,
-                Err(e) => { self.logline(&format!("route {venue}: read failed {}", short_err(&e.to_string()))); continue; }
+            // A curve is not a constant-product pool from the quote's point of
+            // view: buys are taxed off the input (fee + creator + snipe) and
+            // priced against the PHANTOM-inclusive reserves, and a launch that
+            // has raised nothing still has a price. `curve_quote` follows the
+            // protocol's own quoting maths; the generic path below would
+            // overstate a taxed buy by orders of magnitude and the send's
+            // min-out would revert every time.
+            let out = if let PoolKind::PonsCurve { curve, .. } = r.kind {
+                match curve_quote(provider, curve, buying, amount, self.trader, 18, self.pool.token_decimals).await {
+                    Some(o) => o,
+                    None => { self.logline(&format!("route {venue}: curve read failed")); continue; }
+                }
+            } else {
+                // The light read: slot0 + liquidity, which is all the quote below
+                // uses. The full read here re-fetched balance, gas price and total
+                // supply PER ROUTE — three identical answers per candidate, spent
+                // from the same rate budget the trade itself is about to need.
+                let m = match read_price_only(provider, pref, self.trader).await {
+                    Ok(m) => m,
+                    Err(e) => { self.logline(&format!("route {venue}: read failed {}", short_err(&e.to_string()))); continue; }
+                };
+                if m.r0 <= 0.0 || m.r1 <= 0.0 {
+                    self.logline(&format!("route {venue}: no liquidity"));
+                    continue;
+                }
+                v4::quote_out(m.r0, m.r1, amount, buying, r.fee)
             };
-            if m.r0 <= 0.0 || m.r1 <= 0.0 {
-                self.logline(&format!("route {venue}: no liquidity"));
-                continue;
-            }
-            let out = v4::quote_out(m.r0, m.r1, amount, buying, r.fee);
             if out <= 0.0 {
                 self.logline(&format!("route {venue}: zero quote"));
                 continue;
@@ -1983,7 +1997,13 @@ fn order_fields(o: &Order) -> Vec<String> {
         // pre-flights, so this can't cause a blind gas-wasting revert.
         if best.is_none() {
             self.logline("route: none verified — falling back to active pool");
-            let out = v4::quote_out(self.r0, self.r1, amount, buying, self.pool.fee).max(0.0);
+            let out = if let PoolKind::PonsCurve { curve, .. } = active.kind {
+                curve_quote(provider, curve, buying, amount, self.trader, 18, self.pool.token_decimals)
+                    .await
+                    .unwrap_or(0.0)
+            } else {
+                v4::quote_out(self.r0, self.r1, amount, buying, self.pool.fee).max(0.0)
+            };
             best = Some((active, out));
         }
         best
@@ -4071,6 +4091,69 @@ pub fn units_to_f64(x: U256, decimals: u8) -> f64 {
 fn u128_to_f64(x: u128) -> f64 {
     x as f64
 }
+
+const CURVE_BPS: u64 = 10_000;
+
+pub fn curve_buy_out(spent: U256, qr: U256, tr: U256, fee: U256, tax: U256, snipe: U256, sellable: U256) -> U256 {
+    let bps = U256::from(CURVE_BPS);
+    let snipe = if snipe.is_zero() {
+        snipe
+    } else {
+        snipe.min(bps.saturating_sub(fee).saturating_sub(tax).saturating_sub(U256::from(100u64)))
+    };
+    let net = spent
+        .saturating_sub(spent * fee / bps)
+        .saturating_sub(spent * tax / bps)
+        .saturating_sub(spent * snipe / bps);
+    if qr.is_zero() || tr.is_zero() || net.is_zero() {
+        return U256::ZERO;
+    }
+    (net * tr / (qr + net)).min(sellable)
+}
+
+pub fn curve_sell_out(tokens_in: U256, qr: U256, tr: U256, fee: U256, tax: U256) -> U256 {
+    if qr.is_zero() || tr.is_zero() || tokens_in.is_zero() {
+        return U256::ZERO;
+    }
+    let bps = U256::from(CURVE_BPS);
+    let gross = tokens_in * qr / (tr + tokens_in);
+    gross.saturating_sub(gross * fee / bps).saturating_sub(gross * tax / bps)
+}
+
+pub async fn curve_quote<P: Provider>(
+    provider: &P,
+    curve: Address,
+    buying: bool,
+    amount: f64,
+    recipient: Address,
+    quote_decimals: u8,
+    token_decimals: u8,
+) -> Option<f64> {
+    let c = IPonsCurve::new(curve, provider);
+    let cb_res = c.getReserves();
+    let cb_fee = c.feeBps();
+    let cb_tax = c.creatorTaxBps();
+    let (res, fee, tax) = tokio::join!(cb_res.call(), cb_fee.call(), cb_tax.call());
+    let res = res.ok()?;
+    let (qr, tr) = (res.quoteReserve, res.tokenReserve);
+    let fee = fee.ok()?._0;
+    let tax = tax.ok()?._0;
+    if buying {
+        let cb_sellable = c.sellableTokens();
+        let cb_snipe = c.currentSnipeTaxBps(recipient);
+        let (sellable, snipe) = tokio::join!(cb_sellable.call(), cb_snipe.call());
+        let snipe = snipe.ok()?._0;
+        let sellable = sellable.map(|s| s._0).unwrap_or(U256::MAX);
+        if !snipe.is_zero() {
+            crate::trace(&format!("curve quote: snipe tax {snipe} bps on buys to {recipient}"));
+        }
+        let spent = U256::from(Wei::of_token(amount, quote_decimals).raw());
+        Some(units_to_f64(curve_buy_out(spent, qr, tr, fee, tax, snipe, sellable), token_decimals))
+    } else {
+        let tokens_in = U256::from(Wei::of_token(amount, token_decimals).raw());
+        Some(units_to_f64(curve_sell_out(tokens_in, qr, tr, fee, tax), quote_decimals))
+    }
+}
 fn u160_to_f64(x: alloy::primitives::Uint<160, 3>) -> f64 {
     // Overflow-safe: a broken/empty pool's sqrtPriceX96 can sit near 2^160
     // (max tick), which overflows u128. Parse the decimal string instead.
@@ -4290,6 +4373,53 @@ mod decimals_tests {
         for v in [0.0, 0.000001, 0.5, 1.0, 12345.678] {
             assert_eq!(Wei::rounded(v).raw(), Wei::of_token(v, 18).raw(), "mismatch at {v}");
         }
+    }
+
+    /// The curve buy that got skipped on 2026-08-04: the untaxed quote said
+    /// ~42M tokens, the curve delivered ~255k, because the opening snipe tax
+    /// was at its cap. A quote that applies the taxes lands under the actual
+    /// fill, so a 3% floor derived from it settles instead of reverting.
+    #[test]
+    fn snipe_tax_at_cap_shrinks_a_buy_quote_below_the_actual_fill() {
+        let qr = U256::from(4u64) * U256::from(10u64).pow(U256::from(18u64));
+        let tr = U256::from(10u64).pow(U256::from(27u64));
+        let spent = U256::from(437_360_023_141_760u64);
+        let fee = U256::from(100u64);
+        let tax = U256::from(100u64);
+        let untaxed = curve_buy_out(spent, qr, tr, U256::ZERO, U256::ZERO, U256::ZERO, U256::MAX);
+        let taxed = curve_buy_out(spent, qr, tr, fee, tax, U256::from(9_999u64), U256::MAX);
+        assert!(taxed * U256::from(50u64) < untaxed, "cap nets ~1% of spend: {taxed} vs {untaxed}");
+        assert!(!taxed.is_zero(), "the buyer always nets at least 1% of spend");
+    }
+
+    #[test]
+    fn curve_buy_clamps_to_the_sellable_allocation() {
+        let qr = U256::from(10u64).pow(U256::from(18u64));
+        let tr = U256::from(10u64).pow(U256::from(27u64));
+        let sellable = U256::from(5u64) * U256::from(10u64).pow(U256::from(20u64));
+        let out = curve_buy_out(qr, qr, tr, U256::ZERO, U256::ZERO, U256::ZERO, sellable);
+        assert_eq!(out, sellable);
+    }
+
+    #[test]
+    fn curve_sell_takes_fees_off_the_output() {
+        let qr = U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64));
+        let tr = U256::from(10u64).pow(U256::from(27u64));
+        let tokens_in = U256::from(10u64).pow(U256::from(24u64));
+        let gross = curve_sell_out(tokens_in, qr, tr, U256::ZERO, U256::ZERO);
+        let net = curve_sell_out(tokens_in, qr, tr, U256::from(100u64), U256::from(100u64));
+        let bps = U256::from(10_000u64);
+        let cut = gross * U256::from(100u64) / bps;
+        assert_eq!(net, gross - cut - cut);
+    }
+
+    #[test]
+    fn empty_curve_quotes_zero_not_a_panic() {
+        assert_eq!(
+            curve_buy_out(U256::from(1u64), U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO, U256::MAX),
+            U256::ZERO
+        );
+        assert_eq!(curve_sell_out(U256::from(1u64), U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO), U256::ZERO);
     }
 
     /// Base units -> human must invert `of_token`, at both precisions.
