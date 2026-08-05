@@ -4302,6 +4302,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     // freshly-added pool is itself a routing candidate.
                                     bot.routes = routes_for(&pools, bot.pool.token);
                                     refresh_venue_meta(provider, bot).await;
+                                    view = Panel::Tape;
+                                    orders_scroll = 0;
                                 }
                             }
                         }
