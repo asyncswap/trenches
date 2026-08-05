@@ -5226,22 +5226,19 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                         _ if lo_open && hi_open => "full range".to_string(),
                         (Some(a), Some(b)) => {
                             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                            // One open side is a half-line, and an arrow says
-                            // so in less space than a fabricated bound.
+                            let f = |v: f64| {
+                                if v >= 1_000.0 {
+                                    view::usd_compact(v)
+                                } else {
+                                    view::usd_price_brief(v)
+                                }
+                            };
                             if lo_open {
-                                format!("up to {}", view::usd_price_brief(hi))
+                                format!("[$0, {}]", f(hi))
                             } else if hi_open {
-                                format!("{} and up", view::usd_price_brief(lo))
+                                format!("[{}, max]", f(lo))
                             } else {
-                                // Bracketed, both sides carrying their own
-                                // dollar sign: a bare second number reads as a
-                                // quantity, and a range is two prices or it is
-                                // nothing.
-                                format!(
-                                    "[{}, {}]",
-                                    view::usd_price_brief(lo),
-                                    view::usd_price_brief(hi)
-                                )
+                                format!("[{}, {}]", f(lo), f(hi))
                             }
                         }
                         // Orientation unknown for this venue: the raw ticks are
