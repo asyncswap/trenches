@@ -217,6 +217,7 @@ fn clamp_scan(what: &str, from: u64, to: u64, default_chunk: u64) -> (u64, u64) 
 pub struct PonsV2Cand {
     pub token: Address,
     pub curve: Address,
+    pub config_id: U256,
     /// What the launch is priced in. Zero means native ETH; anything else is
     /// an approved ERC-20, and then EVERYTHING — price, the graduation target,
     /// creator payouts — is denominated in it rather than in ETH.
@@ -238,6 +239,7 @@ fn decode_pons_v2_log(lg: &alloy::rpc::types::Log) -> Option<PonsV2Cand> {
     Some(PonsV2Cand {
         token: Address::from_word(t[1]),
         curve: Address::from_word(t[2]),
+        config_id: U256::from_be_slice(&d[32..64]),
         pair_token: Address::from_slice(&d[12..32]),
         threshold: U256::from_be_slice(&d[64..96]),
         block: lg.block_number.unwrap_or(0),
@@ -376,6 +378,35 @@ pub fn sort_launch_logs(
 /// and the caller must not move its cursor past it: a chunk the provider
 /// rejected is blocks nobody looked at, and skipping them loses every launch
 /// inside them permanently.
+fn note_v2_supply<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PonsV2Cand) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<Address>>> = std::sync::Mutex::new(None);
+    {
+        let Ok(mut g) = SEEN.lock() else { return };
+        if !g.get_or_insert_with(Default::default).insert(c.token) {
+            return;
+        }
+    }
+    let (p, token, id) = (provider.clone(), c.token, c.config_id);
+    tokio::spawn(async move {
+        let fac = IPonsV2Factory::new(pons_v2_factory(), &p);
+        let call = fac.getLaunchConfig(id);
+        match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+            Ok(Ok(cfg)) => {
+                let supply = uf(cfg.supply) / 1e18;
+                if supply > 0.0 {
+                    crate::trace(&format!("pons-v2 supply: {token} = {supply}"));
+                    crate::token_metadata_chain_id::merge(token, move |f| {
+                        if f.supply <= 0.0 {
+                            f.supply = supply;
+                        }
+                    });
+                }
+            }
+            _ => crate::trace(&format!("pons-v2 supply: config {id} read failed for {token}")),
+        }
+    });
+}
+
 fn launch_addresses() -> Vec<Address> {
     [pons_factory(), flaunch_pm(), pons_v2_factory()]
         .into_iter()
@@ -1285,7 +1316,7 @@ const FACTS_PER_ROUND: usize = 16;
 /// at the bottom of the loop THE MOMENT the socket delivers. When this
 /// returns, the launch is visible; its numbers follow on the round cadence.
 #[allow(clippy::too_many_arguments)]
-async fn ingest_live<P: Provider>(
+async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
     stream: &crate::launch_stream::LaunchStream,
     provider: &P,
     known: &mut Vec<(Address, Address, u64)>,
@@ -1333,6 +1364,7 @@ async fn ingest_live<P: Provider>(
     for c in v2 {
         if !known_v2.iter().any(|k| k.token == c.token) {
             crate::trace(&format!("launch: pons-v2 {} curve {} block {} via ws", c.token, c.curve, c.block));
+            note_v2_supply(provider, &c);
             known_v2.push(c);
             n_v2 += 1;
         }
@@ -1514,6 +1546,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             for c in v2 {
                 if !known_v2.iter().any(|k| k.token == c.token) {
                     crate::trace(&format!("launch: pons-v2 {} curve {} block {} via scan", c.token, c.curve, c.block));
+                    note_v2_supply(&provider, &c);
                     known_v2.push(c);
                 }
             }

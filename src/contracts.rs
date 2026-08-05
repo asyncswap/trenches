@@ -282,6 +282,7 @@ sol! {
             uint256 graduationThreshold
         );
         function getLaunchedToken(address token) external view returns (PonsV2Launch);
+        function getLaunchConfig(uint256 id) external view returns (uint256 supply, uint256 curveFeeBps, uint256 phantomQuote, uint256 graduationThreshold, uint24 poolFee, int24 tickSpacing, bool enabled);
     }
 
     // The factory's record of a launch. `phase` is authoritative for routing —
