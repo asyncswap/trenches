@@ -439,9 +439,22 @@ fn v2_tape_count(curve: Address, head: u64) -> usize {
     }
 }
 
+fn v2_id_state() -> &'static Mutex<(std::collections::HashSet<Address>, std::collections::HashSet<Address>)> {
+    static S: std::sync::OnceLock<Mutex<(std::collections::HashSet<Address>, std::collections::HashSet<Address>)>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
 fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PonsV2Cand) {
     if c.tx.is_zero() {
         return;
+    }
+    {
+        let Ok(mut g) = v2_id_state().lock() else { return };
+        let (done, trying) = &mut *g;
+        if done.contains(&c.token) || !trying.insert(c.token) {
+            return;
+        }
     }
     let (p, token, tx) = (provider.clone(), c.token, c.tx);
     tokio::spawn(async move {
@@ -456,7 +469,10 @@ fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c
             }
         }
         let Some(t) = found else {
-            crate::trace(&format!("pons-v2 identity: tx {tx} unavailable for {token}"));
+            crate::trace(&format!("pons-v2 identity: tx {tx} unavailable for {token}, will retry"));
+            if let Ok(mut g) = v2_id_state().lock() {
+                g.1.remove(&token);
+            }
             return;
         };
         use alloy::consensus::Transaction as _;
@@ -470,7 +486,14 @@ fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c
             .unwrap_or_default();
         if sym.is_empty() {
             crate::trace(&format!("pons-v2 identity: no strings decoded for {token} tx {tx}"));
+            if let Ok(mut g) = v2_id_state().lock() {
+                g.1.remove(&token);
+            }
             return;
+        }
+        if let Ok(mut g) = v2_id_state().lock() {
+            g.0.insert(token);
+            g.1.remove(&token);
         }
         crate::trace(&format!("pons-v2 identity: {token} \"{name}\" ({sym}) uri {uri}"));
         let s2 = sym.clone();
@@ -2084,6 +2107,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 // returns TWO, so it is decoded from the raw response here
                 // rather than through the pool-shaped path above.
                 Due::V2(c) => {
+                    if crate::token_metadata_chain_id::get(c.token).map(|f| f.sym).unwrap_or_default().is_empty() {
+                        note_v2_identity(&provider, c);
+                    }
                     let raw = res.get(i * per).and_then(|o| o.as_ref());
                     let (qr, tr) = match raw {
                         Some(d) if d.len() >= 64 => (
