@@ -2001,6 +2001,14 @@ fn order_fields(o: &Order) -> Vec<String> {
         }
         if !self.ready || self.price() <= 0.0 {
             self.skips += 1;
+            crate::trace(&format!(
+                "place skip: ready={} price={} sqrt={} kind={} token_dec={}",
+                self.ready,
+                self.price(),
+                self.sqrt_price,
+                self.pool.kind.proto(),
+                self.pool.token_decimals
+            ));
             self.note(format!("Skipped the {} because there is no market yet", side_str(side).to_lowercase()));
             return Ok(());
         }
@@ -3369,6 +3377,11 @@ async fn read_market_inner<P: Provider>(
         let q = units_to_f64(res.quoteReserve, pref.quote.decimals());
         let t = units_to_f64(res.tokenReserve, pref.token_decimals);
         let raised = real.map(|r| units_to_f64(r._0, pref.quote.decimals())).unwrap_or(0.0);
+        crate::trace(&format!(
+            "curve market: q={q} t={t} raised={raised} qdec={} tdec={}",
+            pref.quote.decimals(),
+            pref.token_decimals
+        ));
         let eth = if full {
             crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)).await.ok()
         } else {
