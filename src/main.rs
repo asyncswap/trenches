@@ -3506,7 +3506,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                 engine::TapeAction::Add => "ADD-LP",
                                                 engine::TapeAction::Remove => "REMOVE-LP",
                                             };
-                                            let mine = bot.own_txs.contains(&s.tx);
+                                            let mine = bot.is_mine(s);
                                             ctx.push_str(&format!(
                                                 "  {kind} {:.4} ETH pooled {:.2} ETH{}\n",
                                                 s.eth,
@@ -5015,7 +5015,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let mut seen_fill = std::collections::HashSet::new();
             let trades: Vec<(i64, f64, bool)> = tape
                 .iter()
-                .filter(|s| bot.own_txs.contains(&s.tx) && s.price > 0.0)
+                .filter(|s| bot.is_mine(s) && s.price > 0.0)
                 .filter(|s| matches!(s.action, engine::TapeAction::Buy | engine::TapeAction::Sell))
                 .filter(|s| seen_fill.insert(s.tx))
                 .map(|s| ((s.block / 10) as i64, 1.0 / s.price, matches!(s.action, engine::TapeAction::Buy)))
@@ -5121,10 +5121,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         }
         Panel::Tape => {
             // Live tape: every trader's swaps on the current pool, newest first.
-            // Our own trades (tx hash matches an order) get a ★ marker.
-            // The persisted own-transaction set: a buy made LAST session keeps
-            // its mark next to this session's sell.
-            let ours = &bot.own_txs;
+            // Our own trades (matched by order hash or by signer) get a ★.
             let h = mid_area.height.saturating_sub(3).max(1) as usize;
             // ~10 blocks/sec on Robinhood Chain — estimate age from block delta.
             let age = |blk: u64| -> String {
@@ -5216,7 +5213,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                     engine::TapeAction::Add => ("ADD", view::Tone::Info),
                     engine::TapeAction::Remove => ("REMOVE", view::Tone::Accent),
                 };
-                let mine = ours.contains(&s.tx);
+                let mine = bot.is_mine(s);
                 // For LP add/remove, show the tick range in the price column.
                 let is_lp = matches!(s.action, engine::TapeAction::Add | engine::TapeAction::Remove);
                 let mid = if is_lp {

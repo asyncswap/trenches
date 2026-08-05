@@ -1287,6 +1287,14 @@ impl Bot {
     /// The persisted own-transaction set for one account. Bounded on load —
     /// the newest keep their marks, ancient history ages out of the tape
     /// anyway.
+    /// A tape row is ours when its hash matches an order we placed — or when
+    /// the signer is this wallet. The hash set misses a trade whose send
+    /// errored after landing, and anything sent outside the app; the signer
+    /// does not.
+    pub fn is_mine(&self, s: &Swap) -> bool {
+        self.own_txs.contains(&s.tx) || (!self.trader.is_zero() && s.trader == self.trader)
+    }
+
     pub fn load_own_txs(trader: Address) -> std::collections::HashSet<TxHash> {
         let Ok(text) = std::fs::read_to_string(Self::own_tx_path_of(trader)) else {
             return Default::default();
