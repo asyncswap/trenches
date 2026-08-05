@@ -2947,6 +2947,14 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
+    let mut first_seen: std::collections::HashMap<String, u64> = Default::default();
+    for r in rows {
+        let k = r.grad.sym.to_lowercase();
+        let e = first_seen.entry(k).or_insert(r.grad.launch_block);
+        if r.grad.launch_block < *e {
+            *e = r.grad.launch_block;
+        }
+    }
     let trows: Vec<ratatui::widgets::Row> = rows
         .iter()
         .map(|r| {
@@ -2963,7 +2971,19 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                 Cell::from(if fire { "🔥" } else { "" }),
                 Cell::from(venue_tag(&r.grad))
                     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Dim))),
-                Cell::from(r.grad.sym.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+                {
+                    let dup = first_seen
+                        .get(&r.grad.sym.to_lowercase())
+                        .is_some_and(|b| *b < r.grad.launch_block);
+                    let style = if dup {
+                        Style::default()
+                            .fg(crate::ui::widgets::tone_color(crate::view::Tone::Warn))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    };
+                    Cell::from(r.grad.sym.clone()).style(style)
+                },
                 Cell::from(format!("{:.4}", r.pooled_eth)),
                 Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
                 // Graduation: latched "grad", a live percentage, or nothing
