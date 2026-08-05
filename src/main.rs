@@ -3598,11 +3598,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             view = Panel::Orders;
                             orders_scroll = 0;
                         }
-                        KeyCode::Char('l') => { view = Panel::Logs; orders_scroll = 0; }
+                        KeyCode::Char('l') => { crate::trace("panel: logs (l)"); view = Panel::Logs; orders_scroll = 0; }
                         // Capital O spins the carousel for one-handed browsing;
                         // the lowercase keys stay the fast direct jumps.
-                        KeyCode::Char('O') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; orders_scroll = 0; }
-                        KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; orders_scroll = 0; }
+                        KeyCode::Char('O') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; crate::trace("panel: cycled right"); orders_scroll = 0; }
+                        KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; crate::trace("panel: cycled left"); orders_scroll = 0; }
                         // Straight to the chart; , . walk the candle interval.
                         KeyCode::Char('c') | KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
                         // Price or market cap — one series, two units.
