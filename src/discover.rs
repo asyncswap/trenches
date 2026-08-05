@@ -2943,7 +2943,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "source", "symbol", "pooled ETH", "mkt cap", "grad", "tx/sec", "age", "mine", "pool",
+        "", "source", "symbol", "pooled ETH", "mkt cap", "grad", "tx/sec", "age", "mine", "token",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -2998,7 +2998,7 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                     .style(Style::default().fg(if active { crate::ui::widgets::tone_color(crate::view::Tone::Good) } else { crate::ui::widgets::tone_color(crate::view::Tone::Normal) })),
                 Cell::from(age),
                 Cell::from(mine).style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Warn))),
-                Cell::from(r.grad.pool_display()).style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Normal))),
+                Cell::from(format!("{:#x}", r.grad.token)).style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Normal))),
             ])
         })
         .collect();
