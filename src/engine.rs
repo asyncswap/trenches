@@ -3697,6 +3697,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         // than filter for logs this decoder cannot read, say so once and return
         // nothing. An empty tape that explains itself beats one that does not.
         PoolKind::PonsCurve { curve, .. } => {
+            use alloy::sol_types::SolEvent as _;
             let filter = Filter::new().address(curve).from_block(from_block).to_block(to_block);
             let logs = crate::rpcstats::timed("eth_getLogs", provider.get_logs(&filter)).await?;
             let word = |b: &[u8], i: usize| -> U256 {
