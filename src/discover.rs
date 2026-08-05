@@ -483,7 +483,21 @@ fn note_v2_identity<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c
             return;
         }
         let Some(v) = crate::art::fetch_json(&uri, 4_000).await else {
-            crate::trace(&format!("pons-v2 meta: {uri} unreachable for {token}"));
+            let logo = crate::net::metadata_url(&uri)
+                .or_else(|| uri.starts_with("https://").then(|| uri.clone()))
+                .unwrap_or_default();
+            if logo.is_empty() {
+                crate::trace(&format!("pons-v2 meta: {uri} unreachable for {token}"));
+            } else {
+                crate::trace(&format!("pons-v2 meta: {token} uri is the image itself"));
+                let l2 = logo.clone();
+                crate::token_metadata_chain_id::merge(token, move |f| {
+                    if f.socials.logo.is_empty() {
+                        f.socials.logo = l2;
+                    }
+                });
+                crate::art::request(&logo);
+            }
             return;
         };
         let grab = |k: &str| {
