@@ -1038,6 +1038,34 @@ impl Bot {
         sent
     }
 
+    /// The curve pulls the launch token itself on a sell — no router in the
+    /// path — so the grant goes straight to the launch's own curve, exact
+    /// amount, same policy as every other approval here. A no-op on any other
+    /// pool kind.
+    async fn ensure_curve_allowance<P: Provider>(&mut self, provider: &P, need: U256) -> eyre::Result<()> {
+        let PoolKind::PonsCurve { curve, .. } = self.pool.kind else { return Ok(()) };
+        if need.is_zero() {
+            return Ok(());
+        }
+        let erc = IERC20::new(self.pool.token, provider);
+        let have =
+            erc.allowance(self.trader, curve).call().await.map(|a| a._0).unwrap_or(U256::ZERO);
+        if have >= need {
+            return Ok(());
+        }
+        self.note("Approving the token for this launch's curve".into());
+        let nonce = self.take_nonce(provider).await?;
+        let sent = erc.approve(curve, need).gas(120_000).nonce(nonce).send().await;
+        let hash = *self.spent_nonce(sent)?.tx_hash();
+        for _ in 0..8u32 {
+            if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Ok(())
+    }
+
     /// Ensure the token's allowance to SwapRouter02 covers `need` wei, using an
     /// EXACT-amount approval — never MAX (no-infinite-approval policy). If the
     /// current allowance is short, approve exactly `need`. Returns Ok(true) when
@@ -2150,6 +2178,20 @@ fn order_fields(o: &Order) -> Vec<String> {
             }
         }
 
+        // A curve sell pulls the launch token with transferFrom — no router,
+        // no Permit2 — so the token needs an exact approval TO THE CURVE, the
+        // mirror of the quote-asset grant a buy makes above. Without it every
+        // simulated sell reverts with ERC20InsufficientAllowance and the
+        // routing declares "no venue".
+        if !buying {
+            let need =
+                U256::from(Wei::of_token(amount_in, self.pool.token_decimals).min(sell_cap).raw());
+            if let Err(e) = self.ensure_curve_allowance(provider, need).await {
+                self.note(format!("Approval failed. {}", short_err(&e.to_string())));
+                return Ok(());
+            }
+        }
+
         // Best-execution routing: simulate this trade on every candidate venue
         // and take the one that nets the most (fee tiers + depth + hook take).
         let (route, expected) = match self.best_venue(provider, amount_in, buying).await {
@@ -3127,6 +3169,10 @@ fn order_fields(o: &Order) -> Vec<String> {
                 Ok(false) => { self.note("Approval is still confirming. Try selling everything again shortly".into()); return Ok(()); }
                 Err(e) => { self.note(format!("Approval for selling everything failed. {}", short_err(&e.to_string()))); return Ok(()); }
             }
+        }
+        if let Err(e) = self.ensure_curve_allowance(provider, bal_u256).await {
+            self.note(format!("Approval for selling everything failed. {}", short_err(&e.to_string())));
+            return Ok(());
         }
         let (route, expected) = match self.best_venue(provider, amount_in, false).await {
             Some(x) => x,
