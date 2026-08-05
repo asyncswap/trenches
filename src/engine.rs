@@ -3684,10 +3684,48 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         // than filter for logs this decoder cannot read, say so once and return
         // nothing. An empty tape that explains itself beats one that does not.
         PoolKind::PonsCurve { curve, .. } => {
-            crate::trace(&format!(
-                "tape: {curve:#x} is a pons curve — CurveBuy/CurveSell are not decoded yet"
-            ));
-            return Ok(Vec::new());
+            let filter = Filter::new().address(curve).from_block(from_block).to_block(to_block);
+            let logs = crate::rpcstats::timed("eth_getLogs", provider.get_logs(&filter)).await?;
+            let word = |b: &[u8], i: usize| -> U256 {
+                if b.len() < (i + 1) * 32 {
+                    return U256::ZERO;
+                }
+                U256::from_be_slice(&b[i * 32..(i + 1) * 32])
+            };
+            let mut out = Vec::new();
+            for lg in &logs {
+                let topics = lg.topics();
+                let Some(t0) = topics.first() else { continue };
+                let buying = *t0 == IPonsCurve::CurveBuy::SIGNATURE_HASH;
+                if !buying && *t0 != IPonsCurve::CurveSell::SIGNATURE_HASH {
+                    continue;
+                }
+                let d = lg.data().data.as_ref();
+                let (quote_raw, token_raw) = if buying {
+                    (word(d, 0), word(d, 1))
+                } else {
+                    (word(d, 1), word(d, 0))
+                };
+                let q = units_to_f64(quote_raw, quote_dec);
+                let t = units_to_f64(token_raw, token_dec);
+                if q <= 0.0 || t <= 0.0 {
+                    continue;
+                }
+                out.push(Swap {
+                    action: if buying { TapeAction::Buy } else { TapeAction::Sell },
+                    eth: q,
+                    eth_wei: quote_raw.to_string().parse::<u128>().unwrap_or(0),
+                    price: t / q,
+                    trader: topics.get(1).map(|w| Address::from_word(*w)).unwrap_or_default(),
+                    liq_eth: 0.0,
+                    block: lg.block_number.unwrap_or(0),
+                    tx: lg.transaction_hash.unwrap_or_default(),
+                    tick_lo: 0,
+                    tick_hi: 0,
+                    is_v4: false,
+                });
+            }
+            return Ok(out);
         }
         PoolKind::V4 { pool_id, .. } => (
             true, true,
