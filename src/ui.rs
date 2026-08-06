@@ -21,6 +21,29 @@ use ratatui::{prelude::*, widgets::*};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// One physical keypress is one event, whoever reads it.
+///
+/// The user's terminal delivers a single press as two events a few
+/// milliseconds apart. Each screen reads keys in its own loop, so the modal
+/// that consumed the first copy is often gone when the second arrives — and
+/// the letters of a password replayed into the dashboard as commands, walking
+/// the panel to Logs after every wallet unlock. One shared gate, consulted by
+/// every reader, drops the ghost no matter which loop it lands in. No human
+/// repeats a key inside 25ms; nothing real is lost.
+pub fn fresh_key(code: KeyCode) -> bool {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<(KeyCode, std::time::Instant)>> = Mutex::new(None);
+    let mut g = crate::lock(&LAST);
+    if let Some((c, at)) = *g {
+        if c == code && at.elapsed().as_millis() < 25 {
+            crate::trace(&format!("input: dropped duplicate {code:?}"));
+            return false;
+        }
+    }
+    *g = Some((code, std::time::Instant::now()));
+    true
+}
+
 /// Arrow-key list selection. Returns the chosen index, or None if cancelled.
 pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Option<usize>> {
     // This screen owns the terminal now: take down any image the previous one
@@ -88,6 +111,7 @@ pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Op
                     continue;
                 }
                 Event::Key(k) => {
+                    if !fresh_key(k.code) { continue; }
                     if widgets::theme_key(term, k.code)? { continue; }
                     copied = None; // the note belongs to the moment
                     match k.code {
@@ -176,6 +200,7 @@ pub fn select_overlay(
             continue;
         }
         let Event::Key(k) = ev else { continue };
+        if !fresh_key(k.code) { continue; }
         if widgets::theme_key(term, k.code)? { continue; }
         match k.code {
             // hjkl moves, as everywhere else here.
@@ -360,6 +385,7 @@ pub fn select_table(
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 if widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => state.select(Some(step(sel, false))),
@@ -608,6 +634,7 @@ fn docs_inner(
                 }
             }
             if let Event::Key(k) = ev {
+                if !fresh_key(k.code) { continue; }
                 let switch = |forward: bool, sel: &mut usize, scroll: &mut u16| {
                     *sel = if forward {
                         (*sel + 1) % doc_pages().len()
@@ -737,6 +764,7 @@ pub fn confirm(term: &mut Term, question: &str) -> eyre::Result<bool> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 match k.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
@@ -794,6 +822,7 @@ pub fn multi_select(
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 if widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -860,6 +889,7 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 match k.code {
                     KeyCode::Enter => return Ok(Some(buf.trim().to_string())),
                     KeyCode::Esc => return Ok(None),
@@ -901,6 +931,7 @@ pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 match k.code {
                     KeyCode::Enter => return Ok(Some(buf)),
                     KeyCode::Esc => return Ok(None),
@@ -967,6 +998,7 @@ pub fn wait_for_answer<T: Send + 'static>(
         })?;
         if event::poll(std::time::Duration::from_millis(30))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 if k.code == KeyCode::Esc {
                     return Ok(None);
                 }
@@ -993,6 +1025,7 @@ pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
         })?;
         if event::poll(std::time::Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 if widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up => scroll = scroll.saturating_sub(1),
@@ -1154,6 +1187,7 @@ pub fn chat_screen(
 
         if event::poll(std::time::Duration::from_millis(33))? {
             if let Event::Key(k) = event::read()? {
+                if !fresh_key(k.code) { continue; }
                 if k.kind == crossterm::event::KeyEventKind::Release {
                     continue;
                 }

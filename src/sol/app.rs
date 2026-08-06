@@ -2840,6 +2840,7 @@ async fn screen_trenches(
                 }
             }
             if let Event::Key(k) = evt {
+                if !crate::ui::fresh_key(k.code) { continue; }
                 // Ask for a sweep now rather than waiting out the interval.
                 if matches!(k.code, KeyCode::Char('r') | KeyCode::Char('R')) {
                     refresh_now.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3075,6 +3076,7 @@ pub async fn run(
                 }
             }
             if let Event::Key(k) = evt {
+                if !crate::ui::fresh_key(k.code) { continue; }
                 // Any await a key arm does holds the UI; name the key so a
                 // freeze report says which action was responsible.
                 crate::ui_phase_set(&format!("the {:?} key's action on Solana", k.code));

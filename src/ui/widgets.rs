@@ -1373,6 +1373,7 @@ pub fn theme_picker(term: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> e
 
         if event::poll(std::time::Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
+                if !crate::ui::fresh_key(k.code) { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { themes.len() - 1 } else { sel - 1 },
                     KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % themes.len(),

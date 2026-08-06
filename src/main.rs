@@ -3058,12 +3058,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     let mut last_status = String::new();
     let mut status_since = std::time::Instant::now();
     let mut view = Panel::Tape; // default to the live tape
-    // The last key seen and when. Some terminals deliver one physical press
-    // as two events a few milliseconds apart — the trace showed panel cycles
-    // 3ms apart, which no hand produces — and every duplicated arrow walked
-    // the panel two steps, landing a freshly opened token on Logs. No human
-    // repeats a key inside 25ms; nothing real is lost by dropping it.
-    let mut last_key: Option<(KeyCode, std::time::Instant)> = None;
     // When a pool was adopted. Keys pressed while adoption was resolving
     // queue up and replay against the NEW screen — two buffered arrow
     // presses walked the panel from Tape to Logs on every open that took a
@@ -3390,13 +3384,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 if let Some(Ok(Event::Key(k))) = ev {
 
                     if k.kind != crossterm::event::KeyEventKind::Press { continue; }
-                    if let Some((code, at)) = last_key {
-                        if code == k.code && at.elapsed().as_millis() < 25 {
-                            crate::trace(&format!("input: dropped duplicate {:?}", k.code));
-                            continue;
-                        }
-                    }
-                    last_key = Some((k.code, std::time::Instant::now()));
+                    if !ui::fresh_key(k.code) { continue; }
                     // Any await a key arm does holds the UI; name the key so a
                     // freeze report says which action was responsible.
                     phase!(format!("the {:?} key's action", k.code));

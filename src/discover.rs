@@ -2603,6 +2603,7 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
                 }
             }
             if let Event::Key(k) = evt {
+                if !crate::ui::fresh_key(k.code) { continue; }
                 if crate::ui::widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     // A launchpad producing one a minute outgrows what j/k
@@ -2782,7 +2783,10 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
         loop {
             crate::ui_alive();
             if event::poll(Duration::from_millis(200))? {
-                if let Event::Key(_) = event::read()? {
+                if let Event::Key(k) = event::read()? {
+                    if !crate::ui::fresh_key(k.code) {
+                        continue;
+                    }
                     return Ok(None);
                 }
             }
@@ -2855,6 +2859,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
         crate::ui_alive();
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
+                if !crate::ui::fresh_key(k.code) { continue; }
                 if crate::ui::widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
@@ -3204,6 +3209,7 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
         crate::ui_alive();
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(k) = event::read()? {
+                if !crate::ui::fresh_key(k.code) { continue; }
                 if crate::ui::widgets::theme_key(term, k.code)? { continue; }
                 match k.code {
                     KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
