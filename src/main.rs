@@ -4156,12 +4156,22 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 None => bot.status = "discovery cancelled".into(),
                             }
                         }
-                        KeyCode::Char('p') => {
-                            let mut labels = vec![
-                                "＋ Add token by contract address".to_string(),
-                                "＋ Add pool by address".to_string(),
-                                "＋ Create new v4 pool (select assets)".to_string(),
-                            ];
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            // Two doors, split on request: lowercase adds
+                            // something new, uppercase browses what you have.
+                            // One menu did both and the three add-actions
+                            // pushed the list you actually scroll below the
+                            // fold.
+                            let adding = k.code == KeyCode::Char('p');
+                            let mut labels = if adding {
+                                vec![
+                                    "＋ Add token by contract address".to_string(),
+                                    "＋ Add pool by address".to_string(),
+                                    "＋ Create new v4 pool (select assets)".to_string(),
+                                ]
+                            } else {
+                                Vec::new()
+                            };
                             // Prune sold-out tokens from the picker: keep pools we still
                             // hold a real balance of, plus any we own (LP). A SELL-ALL often
                             // leaves a few wei of dust (rounding / post-tx airdrops), so we
@@ -4171,11 +4181,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let trader = bot.trader;
                             // 1e15 wei = 0.001 token at 18 decimals (these launch tokens are 18-dec).
                             let dust = alloy::primitives::U256::from(1_000_000_000_000_000u64);
+                            let ranked_pools: Vec<SelPool> = if adding { Vec::new() } else { pools.clone() };
                             // The registry accumulates every pool ever traded (hundreds), so this
                             // is a big burst of balance reads. Parallelize hard and bound each call
                             // so the menu opens fast; a slow/failed read keeps the pool (never hide
                             // a real holding behind a timeout).
-                            let flags: Vec<bool> = futures::stream::iter(pools.iter().cloned())
+                            let flags: Vec<bool> = futures::stream::iter(ranked_pools.iter().cloned())
                                 .map(|p| async move {
                                     if p.owned { return true; }
                                     let erc = contracts::IERC20::new(p.token, provider);
@@ -4204,7 +4215,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             // you are in are simply at the top where they were
                             // useful in the first place.
                             let mut ranked: Vec<(bool, SelPool)> =
-                                pools.iter().cloned().zip(flags).map(|(p, held)| (held, p)).collect();
+                                ranked_pools.into_iter().zip(flags).map(|(p, held)| (held, p)).collect();
                             ranked.sort_by_key(|(held, _)| !*held); // stable: held first
                             let visible: Vec<SelPool> =
                                 ranked.iter().map(|(_, p)| p.clone()).collect();
@@ -4221,9 +4232,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     p.token
                                 )
                             }));
-                            if let Some(i) = ui::select(terminal, "Pools", &labels)? {
+                            let title = if adding { "Add a token or pool" } else { "Pools" };
+                            if let Some(i) = ui::select(terminal, title, &labels)? {
                                 // Optionally produce a new SelPool to switch to + append.
-                                let new_pool: Option<SelPool> = match i {
+                                let new_pool: Option<SelPool> = if !adding {
+                                    visible.get(i).cloned()
+                                } else {
+                                    match i {
                                     0 => {
                                         // Paste a token address → auto-find its liquid WETH
                                         // v3 pool. Fast path for tokens found in the wild.
@@ -4386,7 +4401,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                             Pick::Cancelled => None,
                                         }
                                     }
-                                    _ => Some(visible[i - 3].clone()),
+                                    _ => None,
+                                    }
                                 };
                                 if let Some(p) = new_pool {
                                     bot.pool = to_poolcfg(&p);
@@ -4406,7 +4422,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     prices.clear();
                                     bot.status = format!("Now trading {}", pool_sentence(&p.label));
                                     events::action("Loaded pool", &pool_facts(&bot.pool));
-                                    if i < 3 {
+                                    if adding {
                                         // Persist created/added pools to the registry so
                                         // they survive restarts (not just this session).
                                         match persist_pool(&network, &p) {

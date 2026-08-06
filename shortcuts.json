@@ -87,11 +87,19 @@
     },
     {
       "key": "p",
-      "desc": "add pool",
+      "desc": "add token or pool",
       "section": "POOL",
       "chains": [
         "evm",
         "sol"
+      ]
+    },
+    {
+      "key": "P",
+      "desc": "your pools",
+      "section": "POOL",
+      "chains": [
+        "evm"
       ]
     },
     {

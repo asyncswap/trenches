@@ -24,7 +24,8 @@ k       top tokens                            evm
 ## POOL
 
 ```
-p       add pool                              evm, sol
+p       add token or pool                     evm, sol
+P       your pools                            evm
 Del     deselect the pool                     evm
 d       multi-pool view                       evm
 e       auto arbitrage                        evm
