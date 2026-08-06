@@ -4183,7 +4183,12 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             let trader = bot.trader;
                             // 1e15 wei = 0.001 token at 18 decimals (these launch tokens are 18-dec).
                             let dust = alloy::primitives::U256::from(1_000_000_000_000_000u64);
-                            let ranked_pools: Vec<SelPool> = if adding { Vec::new() } else { pools.clone() };
+                            // Newest additions first — the token you just
+                            // added is the one you came back for, and making
+                            // it row one beats hunting the bottom of a list
+                            // that grew all session.
+                            let ranked_pools: Vec<SelPool> =
+                                if adding { Vec::new() } else { pools.iter().rev().cloned().collect() };
                             // The registry accumulates every pool ever traded (hundreds), so this
                             // is a big burst of balance reads. Parallelize hard and bound each call
                             // so the menu opens fast; a slow/failed read keeps the pool (never hide
