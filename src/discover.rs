@@ -3315,8 +3315,8 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
 
     let widths = [
         Constraint::Length(2),
-        // Wide enough for "flaunch" spelled out — see `venue_tag`.
-        Constraint::Length(7),
+        // Wide enough for "pools.trade" spelled out — see `venue_tag`.
+        Constraint::Length(11),
         Constraint::Length(12),
         Constraint::Length(11),
         Constraint::Length(11),
