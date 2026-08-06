@@ -289,6 +289,47 @@ fn pt_pool_from_receipt(
     None
 }
 
+/// Backfill the creator for a pools.trade token whose launch was seen before
+/// creators were recorded. The launch BLOCK is already in the facts, so the
+/// launcher's event is three blocks of logs away — a range no cap refuses.
+pub fn note_pools_creator<P: Provider + Clone + Send + Sync + 'static>(provider: &P, token: Address) {
+    let Some(f) = crate::token_metadata_chain_id::get(token) else { return };
+    if f.launchpad.is_none() || f.launch_creator.is_some() {
+        return;
+    }
+    let Some(lb) = f.launch_block.filter(|b| *b > 0) else { return };
+    if pools_launcher().is_zero() {
+        return;
+    }
+    let p = provider.clone();
+    tokio::spawn(async move {
+        use alloy::sol_types::SolEvent as _;
+        let filter = Filter::new()
+            .address(pools_launcher())
+            .event_signature(ILiquidityLauncher::TokenCreated::SIGNATURE_HASH)
+            .topic1(token.into_word())
+            .from_block(lb.saturating_sub(1))
+            .to_block(lb + 1);
+        let Ok(Ok(logs)) = tokio::time::timeout(RPC_TIMEOUT, p.get_logs(&filter)).await else { return };
+        let Some(tx) = logs.first().and_then(|l| l.transaction_hash) else { return };
+        let Ok(Ok(Some(r))) = tokio::time::timeout(RPC_TIMEOUT, p.get_transaction_receipt(tx)).await else { return };
+        let creator = r.from;
+        crate::trace(&format!("pools creator: {token} launched by {creator:#x}"));
+        crate::token_metadata_chain_id::merge(token, move |f| {
+            if f.launch_creator.is_none() {
+                f.launch_creator = Some(creator);
+            }
+        });
+        if let Some(name) = crate::ens::reverse(creator).await {
+            crate::token_metadata_chain_id::merge(token, move |f| {
+                if f.creator_ens.is_none() {
+                    f.creator_ens = Some(name);
+                }
+            });
+        }
+    });
+}
+
 /// A native-ETH v4 pool for `token`, found by ASKING THE CHAIN FOR STATE
 /// rather than scanning logs. The pool id is the keccak of its key, and a
 /// plain pool's key has only two unknowns — fee and tick spacing — so a

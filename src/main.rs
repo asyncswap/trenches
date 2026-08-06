@@ -1289,7 +1289,8 @@ fn quote_from(currency0: &str) -> (engine::Quote, String) {
 /// block, or the Flaunch metadata + launch block when the pool is a Flaunch
 /// one. Kind-gated so a Flaunch launch block can never make a plain Uniswap
 /// pool wear the Pons mark (the Pons signal is `pool_launch_block` alone).
-async fn refresh_venue_meta<P: Provider>(provider: &P, bot: &mut Bot) {
+async fn refresh_venue_meta<P: Provider + Clone + Send + Sync + 'static>(provider: &P, bot: &mut Bot) {
+    discover::note_pools_creator(provider, bot.pool.token);
     if matches!(bot.pool.kind, engine::PoolKind::FlaunchV4 { .. }) {
         // The facts cache answers first — a coin picked from discovery (or
         // revisited) has its launch block and IPFS metadata on disk already,
