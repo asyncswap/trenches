@@ -59,6 +59,11 @@ pub struct TokenMetadata {
     /// is cached, so a failed read is retried rather than frozen at a guess.
     #[serde(default)]
     pub decimals: Option<u8>,
+    /// Which launchpad created this token, when discovery saw it happen —
+    /// "pools.trade" today. The venue line names the launchpad, not just the
+    /// AMM the pool happens to live on.
+    #[serde(default)]
+    pub launchpad: Option<String>,
 }
 
 impl TokenMetadata {

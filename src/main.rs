@@ -4662,7 +4662,14 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Line::from(vec![
             mlbl("Protocol"),
             Span::styled(
-                format!("{} ETH/{} {}", bot.pool.kind.venue_label(), bot.pool.sym, fee_label(bot.pool.fee)),
+                {
+                    let venue = bot.pool.kind.venue_label();
+                    let named = token_metadata_chain_id::get(bot.pool.token)
+                        .and_then(|f| f.launchpad)
+                        .map(|lp| format!("{lp} · {venue}"))
+                        .unwrap_or_else(|| venue.to_string());
+                    format!("{named} ETH/{} {}", bot.pool.sym, fee_label(bot.pool.fee))
+                },
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),

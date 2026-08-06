@@ -331,6 +331,11 @@ fn note_pools_launch<P: Provider + Clone + Send + Sync + 'static>(provider: &P, 
                 }
             }
         }
+        crate::token_metadata_chain_id::merge(token, |f| {
+            if f.launchpad.is_none() {
+                f.launchpad = Some("pools.trade".into());
+            }
+        });
         if let Ok(mut g) = pt_state().lock() {
             if let Some(pl) = pool {
                 g.0.insert(token, pl);
