@@ -2028,6 +2028,24 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 let _ = crate::token_metadata_chain_id::ensure(&p2, t2, None).await;
             });
         }
+        // Auction rows have no pool, so the metrics batch never rebuilds them
+        // — which kept a resolved symbol OFF the screen while the row aged as
+        // hex. Rebuilt from the facts cache alone: no calls, just honesty.
+        {
+            let mut cur = shared.lock().unwrap();
+            for c in known_pt.iter().filter(|c| c.pool_id.is_zero()) {
+                let Some(fx) = crate::token_metadata_chain_id::get(c.token) else { continue };
+                if fx.sym.is_empty() {
+                    continue;
+                }
+                if let Some(slot) = cur.iter_mut().find(|r| r.grad.token == c.token) {
+                    if slot.grad.sym != fx.sym {
+                        let (hb, my) = (slot.head_block, slot.my_bal);
+                        *slot = build_pt_row(c, 0.0, 0.0, my, 0, hb);
+                    }
+                }
+            }
+        }
 
         // NOT a `continue` any more.
         //
@@ -3219,7 +3237,10 @@ fn venue_tag(g: &Grad) -> &'static str {
         engine::PoolKind::PonsCurve { .. } => "Pons v2",
         // Graduated: same launchpad, now a pool.
         engine::PoolKind::PonsV2Pool { .. } => "Pons v2",
-        engine::PoolKind::V4 { .. } => "Uniswap",
+        // In this list, a plain v4 row can only have come from the
+        // pools.trade launcher — generic v4 pools arrive by CA or the pool
+        // menu, never through discovery. Name the launchpad, not the AMM.
+        engine::PoolKind::V4 { .. } => "pools.trade",
     }
 }
 

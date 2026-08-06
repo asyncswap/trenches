@@ -11,6 +11,7 @@ mod base_currency;
 mod art;
 mod shortcuts;
 mod launch_stream;
+mod wallet_scan;
 mod net;
 mod contracts;
 mod discover;
@@ -132,18 +133,33 @@ async fn read_held_tokens<P: Provider>(
 ) -> HeldTokens {
     use futures::StreamExt;
     let mut seen = std::collections::HashSet::new();
-    let targets: Vec<SelPool> =
-        pools.iter().filter(|p| seen.insert(p.token)).cloned().collect();
+    let mut targets: Vec<(alloy::primitives::Address, String)> = pools
+        .iter()
+        .filter(|p| seen.insert(p.token))
+        .map(|p| (p.token, p.sym.clone()))
+        .collect();
+    // The registry only knows tokens this app has traded. The wallet scan
+    // knows every token the address has RECEIVED — airdrops, transfers in,
+    // buys made elsewhere — so the union is what "my tokens" actually means.
+    for t in wallet_scan::known_tokens(me) {
+        if seen.insert(t) {
+            let sym = token_metadata_chain_id::get(t)
+                .map(|f| f.sym)
+                .filter(|sy| !sy.is_empty())
+                .unwrap_or_else(|| format!("0x{}", &alloy::hex::encode(t.as_slice())[..6]));
+            targets.push((t, sym));
+        }
+    }
     futures::stream::iter(targets)
-        .map(|p| async move {
-            let erc = contracts::IERC20::new(p.token, provider);
+        .map(|(token, sym)| async move {
+            let erc = contracts::IERC20::new(token, provider);
             // Bound separately: the call builders are temporaries, and joining
             // them inline drops each before its future is polled.
             let (cb, cd) = (erc.balanceOf(me), erc.decimals());
             let (bal, dec) = tokio::join!(cb.call(), cd.call());
             let dec = dec.map(|d| d._0).unwrap_or(18);
             let bal = bal.map(|b| engine::units_to_f64(b._0, dec)).unwrap_or(0.0);
-            (p.token, p.sym.clone(), bal, dec)
+            (token, sym, bal, dec)
         })
         .buffered(16)
         .filter(|(_, _, bal, _)| futures::future::ready(*bal > DUST))
@@ -2760,6 +2776,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // screen — so pressing `f` an hour in opens onto an hour of launches, the
     // way the Solana side has always behaved.
     discover::ensure_discovery(provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone());
+    wallet_scan::ensure_scan(provider, bot.trader);
 
     // Shared state written by the background poll task, read by the UI thread.
     let market = Arc::new(Mutex::new(engine::Market::default()));
@@ -3778,41 +3795,57 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('h') => {
                             // Wallet holdings: leftover tokens you still hold, with live
                             // ETH value — spot forgotten winners/dust. Enter to trade/sell.
-                            bot.status = "reading wallet holdings…".into();
+                            // Balances ride the same cache the move screen uses: warm
+                            // means instant, cold means ONE parallel read, and only the
+                            // handful of tokens actually held pay for a price call. The
+                            // old path re-read every v3 pool the session had ever seen,
+                            // on the drawing thread — v3 ONLY, so a v4 or curve bag
+                            // answered "no leftover tokens" while sitting in the wallet.
                             let trader = bot.trader;
-                            let mut seen = std::collections::HashSet::new();
-                            let cands: Vec<SelPool> = pools
-                                .iter()
-                                .filter(|p| p.kind.is_v3() && seen.insert(p.token))
-                                .cloned()
-                                .collect();
-                            let rows: Vec<(SelPool, f64, f64)> = futures::stream::iter(cands)
-                                .map(|p| async move {
-                                    // Decimals must be read per token: dividing a
-                                    // 6-dec balance (USDG) by 1e18 puts it below the
-                                    // "not held" threshold, so real holdings vanish.
-                                    let erc = contracts::IERC20::new(p.token, provider);
-                                    let dec = erc
-                                        .decimals()
-                                        .call()
-                                        .await
-                                        .map(|d| d._0)
-                                        .ok()
-                                        .filter(|d| (1..=36).contains(d))
-                                        .unwrap_or(18);
-                                    let bal = erc
-                                        .balanceOf(trader)
-                                        .call()
-                                        .await
-                                        .map(|b| {
-                                            b._0.to_string().parse::<f64>().unwrap_or(0.0)
-                                                / 10f64.powi(dec as i32)
-                                        })
-                                        .unwrap_or(0.0);
-                                    if bal <= 1e-9 {
-                                        return (p, 0.0, 0.0); // not held — skip the price call
+                            wallet_scan::ensure_scan(provider, trader);
+                            let cached = held_tokens().lock().ok().and_then(|g| g.clone());
+                            let balances: HeldTokens = match &cached {
+                                Some((at, rows)) if at.elapsed() < HELD_TTL => rows.clone(),
+                                _ => {
+                                    bot.status = "reading wallet holdings…".into();
+                                    let rows = read_held_tokens(provider, trader, &pools).await;
+                                    if let Ok(mut g) = held_tokens().lock() {
+                                        *g = Some((std::time::Instant::now(), rows.clone()));
                                     }
-                                    // Only held tokens pay for a price read (→ ETH value).
+                                    rows
+                                }
+                            };
+                            let by_token: Vec<(SelPool, f64, u8)> = balances
+                                .iter()
+                                .map(|(a, sym, bal, dec)| {
+                                    match pools.iter().find(|p| p.token == *a && !p.kind.is_empty()) {
+                                        Some(p) => (p.clone(), *bal, *dec),
+                                        // In the wallet but not in the pool registry —
+                                        // an airdrop, a transfer in, a buy made
+                                        // elsewhere. Listed with no pool; picking it
+                                        // says how to link one.
+                                        None => (
+                                            SelPool {
+                                                label: format!("{sym} (wallet)"),
+                                                kind: engine::PoolKind::V3 {
+                                                    pool_addr: alloy::primitives::Address::ZERO,
+                                                    weth_is_token0: true,
+                                                },
+                                                token: *a,
+                                                sym: sym.clone(),
+                                                fee: 0,
+                                                owned: false,
+                                                quote: engine::Quote::Eth,
+                                                quote_sym: "ETH".into(),
+                                            },
+                                            *bal,
+                                            *dec,
+                                        ),
+                                    }
+                                })
+                                .collect();
+                            let rows: Vec<(SelPool, f64, f64)> = futures::stream::iter(by_token)
+                                .map(|(p, bal, dec)| async move {
                                     let (sqrt, w0) = match p.kind {
                                         engine::PoolKind::V3 { pool_addr, weth_is_token0 } => {
                                             let s = contracts::IV3Pool::new(pool_addr, provider)
@@ -3823,18 +3856,45 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                 .unwrap_or(0.0);
                                             (s, weth_is_token0)
                                         }
-                                        _ => (0.0, false),
+                                        engine::PoolKind::V4 { pool_id, .. }
+                                        | engine::PoolKind::FlaunchV4 { pool_id, .. }
+                                        | engine::PoolKind::PonsV2Pool { pool_id, .. } => {
+                                            let s = contracts::IStateView::new(contracts::state_view(), provider)
+                                                .getSlot0(pool_id)
+                                                .call()
+                                                .await
+                                                .map(|r| r.sqrtPriceX96.to_string().parse::<f64>().unwrap_or(0.0) / 2f64.powi(96))
+                                                .unwrap_or(0.0);
+                                            let w0 = match p.kind {
+                                                engine::PoolKind::FlaunchV4 { coin_is_0, .. } => !coin_is_0,
+                                                engine::PoolKind::PonsV2Pool { coin_is_0, .. } => !coin_is_0,
+                                                _ => true,
+                                            };
+                                            (s, w0)
+                                        }
+                                        engine::PoolKind::PonsCurve { curve, .. } => {
+                                            let r = contracts::IPonsCurve::new(curve, provider)
+                                                .getReserves()
+                                                .call()
+                                                .await
+                                                .ok();
+                                            let ept = r
+                                                .map(|r| {
+                                                    let q = engine::units_to_f64(r.quoteReserve, 18);
+                                                    let t = engine::units_to_f64(r.tokenReserve, dec);
+                                                    if t > 0.0 { q / t } else { 0.0 }
+                                                })
+                                                .unwrap_or(0.0);
+                                            return (p, bal, bal * ept);
+                                        }
                                     };
                                     let p_raw = sqrt * sqrt;
                                     let tpe = if w0 { p_raw } else if p_raw > 0.0 { 1.0 / p_raw } else { 0.0 };
-                                    // sqrtPriceX96 is a ratio of BASE units, so converting
-                                    // it to ETH-per-whole-token needs the decimal gap
-                                    // between the token (dec) and WETH (18).
                                     let ept_raw = if tpe > 0.0 { 1.0 / tpe } else { 0.0 };
                                     let ept = ept_raw * 10f64.powi(dec as i32 - 18);
                                     (p, bal, bal * ept)
                                 })
-                                .buffered(24)
+                                .buffered(16)
                                 .collect()
                                 .await;
                             let mut held: Vec<(SelPool, f64, f64)> =
@@ -3898,6 +3958,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                 };
                                 if let Some(i) = ui::select(terminal, &title, &labels)? {
                                     let p = held[i].0.clone();
+                                    if p.kind.is_empty() {
+                                        ui::mouse::copy(&format!("{:#x}", p.token));
+                                        bot.note(format!(
+                                            "{} has no pool linked yet — its address is on the clipboard; press [p] then Add token by CA",
+                                            p.sym
+                                        ));
+                                        continue;
+                                    }
                                     bot.pool = to_poolcfg(&p);
                                     trace_pool("switch", &bot.pool);
                                     bot.restore_basis();
