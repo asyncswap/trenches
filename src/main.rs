@@ -3270,6 +3270,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             eth: o.eth,
                             eth_wei: 0,
                             price,
+                            tokens: 0.0,
                             liq_eth: o.pooled,
                             // The block the trade LANDED in, not the one we
                             // happen to be on. Stamping "now" is what made an
@@ -5274,7 +5275,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                         view::Cell::new(age(s.block)),
                         view::Cell::bold(venue, vtone),
                         view::Cell::bold(lbl, atone),
-                        view::Cell::new(format!("{:.6}", s.eth)),
+                        view::Cell::new(if is_lp && s.eth == 0.0 && s.tokens > 0.0 {
+                            format!("{} {}", view::qty_compact(s.tokens), bot.pool.sym)
+                        } else {
+                            format!("{:.6}", s.eth)
+                        }),
                         view::Cell::new(mid),
                         view::Cell::toned(
                             if s.liq_eth > 0.0 { view::sol_compact(s.liq_eth) } else { String::new() },

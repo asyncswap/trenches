@@ -557,6 +557,21 @@ pub fn log_scale(v: f64, min: f64) -> f64 {
 /// Renders in whatever currency the reader chose — the conversion lives here so
 /// that every one of these call sites follows without knowing about it, and so
 /// that nothing on the way to disk is ever converted.
+/// A bare quantity, compact: token amounts on the tape, no currency symbol.
+pub fn qty_compact(x: f64) -> String {
+    if x >= 1e12 {
+        format!("{:.2}T", x / 1e12)
+    } else if x >= 1e9 {
+        format!("{:.2}B", x / 1e9)
+    } else if x >= 1e6 {
+        format!("{:.2}M", x / 1e6)
+    } else if x >= 1e3 {
+        format!("{:.2}k", x / 1e3)
+    } else {
+        format!("{x:.2}")
+    }
+}
+
 pub fn usd_compact(x: f64) -> String {
     let sym = crate::base_currency::symbol();
     let x = crate::base_currency::from_usd(x);

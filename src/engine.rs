@@ -1923,6 +1923,21 @@ fn order_fields(o: &Order) -> Vec<String> {
             || self.routes.iter().any(|r| matches!(r.kind, PoolKind::FlaunchV4 { .. }))
     }
 
+    /// True when any candidate route settles a SELL through the Universal
+    /// Router, which pulls the token via Permit2 — Flaunch, plain v4, and
+    /// graduated pons v2 pools alike. Gating the grant on Flaunch alone left
+    /// every plain-v4 sell reverting with AllowanceExpired(0): the pool was
+    /// fine, the router simply had never been allowed to take the tokens.
+    fn has_ur_route(&self) -> bool {
+        let ur = |k: &PoolKind| {
+            matches!(
+                k,
+                PoolKind::FlaunchV4 { .. } | PoolKind::V4 { .. } | PoolKind::PonsV2Pool { .. }
+            )
+        };
+        ur(&self.pool.kind) || self.routes.iter().any(|r| ur(&r.kind))
+    }
+
     /// Best-execution router: simulate `amount` (ETH for a buy, tokens for a
     /// sell) on EVERY candidate ETH-quoted venue and return the one with the
     /// greatest output, excluding any that would revert. This is what captures
@@ -2140,7 +2155,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         }
         // Flaunch sells settle the coin through Permit2 — grant it before the
         // routing pre-flight, or every simulated sell reverts.
-        if !buying && self.has_flaunch_route() && !self.ur_ready() {
+        if !buying && self.has_ur_route() && !self.ur_ready() {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
@@ -3171,7 +3186,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 }
             }
         }
-        if self.has_flaunch_route() && !self.ur_ready() {
+        if self.has_ur_route() && !self.ur_ready() {
             match self.ensure_ur_allowance(provider, bal_u256).await {
                 Ok(true) => self.ur_permit2_done = true,
                 Ok(false) => { self.note("Approval is still confirming. Try selling everything again shortly".into()); return Ok(()); }
@@ -3621,6 +3636,7 @@ pub struct Swap {
     pub tx: TxHash,     // to mark our own trades
     pub tick_lo: i32,   // LP range low (Add/Remove only)
     pub tick_hi: i32,   // LP range high (Add/Remove only)
+    pub tokens: f64,    // token side of an LP event (a launch seed is all tokens, no ETH)
     pub is_v4: bool,    // which venue (for the merged arb tape)
 }
 
@@ -3806,6 +3822,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
                     price: t / q,
                     trader: topics.get(1).map(|w| Address::from_word(*w)).unwrap_or_default(),
                     liq_eth: 0.0,
+                    tokens: 0.0,
                     block: lg.block_number.unwrap_or(0),
                     tx: lg.transaction_hash.unwrap_or_default(),
                     tick_lo: 0,
@@ -3837,6 +3854,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
     };
     let logs = provider.get_logs(&filter).await?;
     let mut out = Vec::new();
+    let mut last_sqrt = 0.0f64;
     for lg in logs {
         let topics = lg.topics();
         let t0 = if topics.is_empty() { continue } else { topics[0] };
@@ -3860,6 +3878,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             let a0 = iword(b, 0) / 10f64.powi(dec0 as i32);
             let a1 = iword(b, 1) / 10f64.powi(dec1 as i32);
             let sqrt = uword(b, 2) / 2f64.powi(96);
+            last_sqrt = sqrt;
             let p_raw = sqrt * sqrt;
             // `sqrtPriceX96` prices the pair in BASE UNITS, so turning it into
             // tokens-per-ETH needs the decimal gap between the two sides. That
@@ -3899,7 +3918,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             } else {
                 (TapeAction::Sell, -eth_side)
             };
-            out.push(Swap { action, eth, eth_wei, price, liq_eth, block, tx, trader, tick_lo: 0, tick_hi: 0, is_v4: v4 });
+            out.push(Swap { action, eth, eth_wei, price, liq_eth, block, tx, trader, tick_lo: 0, tick_hi: 0, tokens: 0.0, is_v4: v4 });
             continue;
         }
 
@@ -3909,11 +3928,11 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             let off = if t0 == MINT_V3 { 1 } else { 0 };
             let amt0 = uword(b, off + 1) / 1e18;
             let amt1 = uword(b, off + 2) / 1e18;
-            let eth = if weth0 { amt0 } else { amt1 };
+            let (eth, tokens) = if weth0 { (amt0, amt1) } else { (amt1, amt0) };
             let action = if t0 == MINT_V3 { TapeAction::Add } else { TapeAction::Remove };
             let tick_lo = topics.get(2).map(|t| tick_of(*t)).unwrap_or(0);
             let tick_hi = topics.get(3).map(|t| tick_of(*t)).unwrap_or(0);
-            out.push(Swap { action, eth, eth_wei: 0, price: 0.0, liq_eth: 0.0, block, tx, trader: Address::ZERO, tick_lo, tick_hi, is_v4: v4 });
+            out.push(Swap { action, eth, eth_wei: 0, price: 0.0, liq_eth: 0.0, block, tx, trader: Address::ZERO, tick_lo, tick_hi, tokens, is_v4: v4 });
             continue;
         }
 
@@ -3923,7 +3942,25 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             let tick_hi = iword(b, 1) as i32;
             let delta = iword(b, 2); // liquidityDelta (signed)
             let action = if delta >= 0.0 { TapeAction::Add } else { TapeAction::Remove };
-            out.push(Swap { action, eth: 0.0, eth_wei: 0, price: 0.0, liq_eth: 0.0, block, tx, trader: Address::ZERO, tick_lo, tick_hi, is_v4: v4 });
+            // What the event does NOT carry: the amounts. They follow from the
+            // liquidity delta, the range and the pool's current price — the
+            // standard v3/v4 position maths. A launch seed minted entirely
+            // above the price is all tokens and no ETH, and showing 0.000000
+            // for it read as a decoding bug rather than as what it is.
+            let l = delta.abs();
+            let (sa, sb) = (1.0001f64.powi(tick_lo).sqrt(), 1.0001f64.powi(tick_hi).sqrt());
+            let s = if last_sqrt > 0.0 { last_sqrt.clamp(sa, sb) } else { sb };
+            let (amt0, amt1) = if s > 0.0 && sa > 0.0 {
+                (l * (1.0 / s - 1.0 / sb), l * (s - sa))
+            } else {
+                (0.0, 0.0)
+            };
+            let (eth, tokens) = if weth0 {
+                (amt0 / 10f64.powi(quote_dec as i32), amt1 / 10f64.powi(token_dec as i32))
+            } else {
+                (amt1 / 10f64.powi(quote_dec as i32), amt0 / 10f64.powi(token_dec as i32))
+            };
+            out.push(Swap { action, eth: eth.max(0.0), eth_wei: 0, price: 0.0, liq_eth: 0.0, block, tx, trader: Address::ZERO, tick_lo, tick_hi, tokens: tokens.max(0.0), is_v4: v4 });
             continue;
         }
     }
@@ -4052,6 +4089,7 @@ mod basis_recovery_tests {
             tx: TxHash::ZERO,
             tick_lo: 0,
             tick_hi: 0,
+            tokens: 0.0,
             is_v4: false,
         }
     }
