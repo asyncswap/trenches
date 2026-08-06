@@ -347,19 +347,40 @@ pub async fn find_v4_native_pool<P: Provider>(
     provider: &P,
     token: Address,
 ) -> Option<(B256, i32, u32)> {
-    const TIERS: [(u32, i32); 6] = [(2500, 25), (2500, 50), (500, 10), (3000, 60), (10_000, 200), (100, 1)];
+    use futures::StreamExt;
     let sv = IStateView::new(state_view(), provider);
-    for (fee, spacing) in TIERS {
-        let id = native_v4_pool_id(token, fee, spacing);
-        let call = sv.getSlot0(id);
-        if let Ok(Ok(r)) = tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
-            if !r.sqrtPriceX96.is_zero() {
-                crate::trace(&format!("v4 probe: {token} fee {fee} spacing {spacing} is live"));
-                return Some((id, spacing, fee));
+    // The FULL grid, not a list of pairs.
+    //
+    // A pool key's fee and tick spacing are independent, and a launchpad is
+    // free to combine them however it likes: pools.trade opens instant
+    // launches at 2500/25, graduates crowd ones at 2500/50, and its own site
+    // lists 2500/60 launches too. Probing a hand-written list of "known"
+    // pairs missed that third one and reported a live, traded market as
+    // having no pool — so every fee is now tried against every spacing.
+    const FEES: [u32; 6] = [2500, 3000, 500, 10_000, 100, 0];
+    const SPACINGS: [i32; 6] = [60, 25, 50, 10, 200, 1];
+    let cands: Vec<(u32, i32)> =
+        FEES.iter().flat_map(|f| SPACINGS.iter().map(move |s| (*f, *s))).collect();
+    let hits: Vec<Option<(B256, i32, u32)>> = futures::stream::iter(cands)
+        .map(|(fee, spacing)| {
+            let sv = &sv;
+            async move {
+                let id = native_v4_pool_id(token, fee, spacing);
+                let call = sv.getSlot0(id);
+                match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+                    Ok(Ok(r)) if !r.sqrtPriceX96.is_zero() => Some((id, spacing, fee)),
+                    _ => None,
+                }
             }
-        }
+        })
+        .buffered(12)
+        .collect()
+        .await;
+    if let Some((id, spacing, fee)) = hits.into_iter().flatten().next() {
+        crate::trace(&format!("v4 probe: {token} fee {fee} spacing {spacing} is live"));
+        return Some((id, spacing, fee));
     }
-    crate::trace(&format!("v4 probe: {token} has no native-ETH pool at any known tier"));
+    crate::trace(&format!("v4 probe: {token} has no native-ETH pool at any fee/spacing"));
     None
 }
 
@@ -3818,17 +3839,42 @@ mod ca_tests {
         assert_ne!(a, native_v4_pool_id(token, 3000, 25));
     }
 
-    /// Every tier the probe walks must be distinct, or a tier is asked about
-    /// twice and another never.
+    /// Every candidate the probe walks must be distinct, or one is asked
+    /// about twice and another never.
     #[test]
-    fn the_probed_tiers_are_all_distinct() {
+    fn the_probed_candidates_are_all_distinct() {
         let token: Address = "0x1df1f09c4dd65c76746d53467361d536cdfdc719".parse().unwrap();
-        let tiers = [(2500u32, 25i32), (2500, 50), (500, 10), (3000, 60), (10_000, 200), (100, 1)];
-        let mut ids: Vec<B256> = tiers.iter().map(|(f, s)| native_v4_pool_id(token, *f, *s)).collect();
-        ids.sort();
+        let fees = [2500u32, 3000, 500, 10_000, 100, 0];
+        let spacings = [60i32, 25, 50, 10, 200, 1];
+        let mut ids: Vec<B256> = fees
+            .iter()
+            .flat_map(|f| spacings.iter().map(move |s| native_v4_pool_id(token, *f, *s)))
+            .collect();
         let n = ids.len();
+        ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n);
+    }
+
+    /// The miss that made this a grid: UHS trades in a live 2500/60 pool, a
+    /// combination absent from the hand-written pair list — fee 2500 was only
+    /// ever tried with spacing 25 and 50, so a traded market read as "no
+    /// pool". Both vectors are real, and both must be reachable.
+    #[test]
+    fn the_grid_covers_the_combinations_the_chain_actually_uses() {
+        let uhs: Address = "0xdff99908660ac9c68677ed886e39859254dada3a".parse().unwrap();
+        assert_eq!(
+            format!("{:#x}", native_v4_pool_id(uhs, 2500, 60)),
+            "0xe82ce2dd5cf698974b196e06db731fa32798b1df6bf368fe5128e10a2f9b38ba"
+        );
+        let fees = [2500u32, 3000, 500, 10_000, 100, 0];
+        let spacings = [60i32, 25, 50, 10, 200, 1];
+        for (fee, spacing) in [(2500u32, 60i32), (2500, 25), (2500, 50)] {
+            assert!(
+                fees.contains(&fee) && spacings.contains(&spacing),
+                "the probe must reach fee {fee} spacing {spacing}"
+            );
+        }
     }
 
     /// The pools.trade token family, recognised by what its tokenURI serves.
