@@ -1,0 +1,27 @@
+{
+  "language": "Solidity",
+  "settings": {
+    "outputSelection": {
+      "*": {
+        "": [
+          "ast"
+        ],
+        "*": [
+          "devdoc",
+          "userdoc",
+          "evm.methodIdentifiers",
+          "storageLayout",
+          "transientStorageLayout"
+        ]
+      }
+    },
+    "remappings": []
+  },
+  "sources": {
+    "": {
+      "urls": [
+        ""
+      ]
+    }
+  }
+}

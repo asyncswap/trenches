@@ -41,6 +41,11 @@ pub struct Venues {
     pub pons_factory: Address,
     pub pons_v2_factory: Address,
     pub pons_v2_hook: Address,
+    /// pools.trade, Uniswap's own launchpad: the LiquidityLauncher every
+    /// launch goes through. An instant launch initializes an ordinary,
+    /// hookless v4 pool against native ETH in the same transaction; a crowd
+    /// launch runs an auction first and the pool appears at graduation.
+    pub pools_launcher: Address,
 }
 
 /// Official Robinhood Chain deployment.
@@ -85,6 +90,7 @@ static ROBINHOOD: Venues = Venues {
     // the curve used rather than paying a liquidity provider that does not
     // exist.
     pons_v2_hook: address!("E5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"),
+    pools_launcher: address!("0000FffFBE8efE702c8703aE3477FF5dE3d319C0"),
 };
 
 /// Base mainnet.
@@ -117,6 +123,7 @@ static BASE: Venues = Venues {
     pons_factory: Address::ZERO,
     pons_v2_factory: Address::ZERO,
     pons_v2_hook: Address::ZERO,
+    pools_launcher: Address::ZERO,
 };
 
 #[allow(dead_code)] // the pair reads as a pair; only one is matched on
@@ -138,6 +145,7 @@ pub fn universal_router() -> Address { venues().universal_router }
 pub fn v3_factory() -> Address { venues().v3_factory }
 pub fn swap_router_02() -> Address { venues().swap_router_02 }
 pub fn weth() -> Address { venues().weth }
+pub fn pools_launcher() -> Address { venues().pools_launcher }
 pub fn flaunch_pm() -> Address { venues().flaunch_pm }
 pub fn fleth() -> Address { venues().fleth }
 pub fn fleth_hooks() -> Address { venues().fleth_hooks }
@@ -185,7 +193,28 @@ sol! {
 
     #[sol(rpc)]
     interface IPoolManager {
+        event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick);
         function initialize(PoolKey key, uint160 sqrtPriceX96) external returns (int24 tick);
+    }
+
+    // ---- pools.trade (Uniswap's launchpad) ----
+    #[sol(rpc)]
+    interface ILiquidityLauncher {
+        event TokenCreated(address indexed tokenAddress);
+        event TokenDistributed(address indexed tokenAddress, address indexed strategy, uint256 amount);
+    }
+
+    // The uerc20-factory's creation event, emitted in the same transaction as
+    // the launcher's. Nothing is indexed; the metadata rides in the data.
+    struct UERC20Metadata {
+        string description;
+        string website;
+        string image;
+        bytes extraData;
+    }
+
+    interface IUERC20Factory {
+        event TokenCreated(address tokenAddress, UERC20Metadata metadata);
     }
 
     // ---- Pons launchpad ----
@@ -457,6 +486,26 @@ mod venue_tests {
 
     /// A chain's table must be complete for what that chain HAS. A zero where a
     /// contract exists routes a swap at nothing; the whole point of the table
+    /// Pinned to the topics observed in live Robinhood Chain logs, so an ABI
+    /// edit that silently changes a signature fails here instead of making the
+    /// launcher gone quiet.
+    #[test]
+    fn pools_trade_event_topics_match_the_chain() {
+        use alloy::sol_types::SolEvent;
+        assert_eq!(
+            format!("{:#x}", ILiquidityLauncher::TokenCreated::SIGNATURE_HASH),
+            "0x2e2b3f61b70d2d131b2a807371103cc98d51adcaa5e9a8f9c32658ad8426e74e"
+        );
+        assert_eq!(
+            format!("{:#x}", IUERC20Factory::TokenCreated::SIGNATURE_HASH),
+            "0x4ef8284ecf42d4cd19686572ffd87f630858c82398911e776cb831de35eddbf4"
+        );
+        assert_eq!(
+            format!("{:#x}", IPoolManager::Initialize::SIGNATURE_HASH),
+            "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
+        );
+    }
+
     /// is that this is checkable rather than discovered by a failed trade.
     #[test]
     fn every_chain_names_the_venues_it_trades_through() {

@@ -24,11 +24,12 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::{prelude::*, widgets::*};
 
 use crate::contracts::{
-    IERC20, IFlaunchPositionManager, IPonsCurve, IPonsFactory, IPonsV2Factory, IStateView,
-    IV3Factory, IV3Pool,
-    FLAUNCH_FEE_EST, flaunch_pm, pons_factory, pons_v2_factory, pool_manager, state_view,
-    v3_factory, weth,
+    IERC20, IFlaunchPositionManager, ILiquidityLauncher, IPonsCurve, IPonsFactory,
+    IPonsV2Factory, IPoolManager, IStateView, IUERC20Factory, IV3Factory, IV3Pool,
+    FLAUNCH_FEE_EST, flaunch_pm, pons_factory, pons_v2_factory, pool_manager, pools_launcher,
+    state_view, v3_factory, weth,
 };
+use std::sync::OnceLock;
 use crate::engine;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -227,6 +228,134 @@ pub struct PonsV2Cand {
     pub block: u64,
 }
 
+/// A pools.trade launch, from the LiquidityLauncher's TokenCreated. The event
+/// carries only the token; the pool (instant launches initialize a plain v4
+/// pool in the same transaction) and the metadata are read from the receipt.
+#[derive(Clone, Copy)]
+pub struct PoolsCand {
+    pub token: Address,
+    pub block: u64,
+    pub tx: B256,
+    /// Zero until the receipt is read — and stays zero for a crowd launch,
+    /// whose pool only exists if the auction graduates.
+    pub pool_id: B256,
+    pub tick_spacing: i32,
+    pub fee: u32,
+}
+
+fn decode_pools_log(lg: &alloy::rpc::types::Log) -> Option<PoolsCand> {
+    let t = lg.topics();
+    if t.len() < 2 || t[0] != ILiquidityLauncher::TokenCreated::SIGNATURE_HASH {
+        return None;
+    }
+    Some(PoolsCand {
+        token: Address::from_word(t[1]),
+        block: lg.block_number.unwrap_or(0),
+        tx: lg.transaction_hash.unwrap_or_default(),
+        pool_id: B256::ZERO,
+        tick_spacing: 0,
+        fee: 0,
+    })
+}
+
+type PtResolved = std::collections::HashMap<Address, (B256, i32, u32)>;
+
+/// Receipt-derived facts per pools.trade token: the v4 pool (id, tick spacing,
+/// fee), plus which tokens are being asked about right now. Shared because the
+/// resolution runs in its own task while the candidate list lives on the
+/// discovery loop.
+fn pt_state() -> &'static Mutex<(PtResolved, std::collections::HashSet<Address>)> {
+    static S: OnceLock<Mutex<(PtResolved, std::collections::HashSet<Address>)>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Default::default()))
+}
+
+fn note_pools_launch<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PoolsCand) {
+    if c.tx.is_zero() {
+        return;
+    }
+    {
+        let Ok(mut g) = pt_state().lock() else { return };
+        if g.0.contains_key(&c.token) || !g.1.insert(c.token) {
+            return;
+        }
+    }
+    let (p, token, tx) = (provider.clone(), c.token, c.tx);
+    tokio::spawn(async move {
+        use alloy::sol_types::SolEvent as _;
+        let mut found = None;
+        for attempt in 0..4u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1500 << attempt)).await;
+            }
+            if let Ok(Ok(Some(r))) = tokio::time::timeout(RPC_TIMEOUT, p.get_transaction_receipt(tx)).await {
+                found = Some(r);
+                break;
+            }
+        }
+        let Some(r) = found else {
+            crate::trace(&format!("pools identity: receipt {tx} unavailable for {token}, will retry"));
+            if let Ok(mut g) = pt_state().lock() {
+                g.1.remove(&token);
+            }
+            return;
+        };
+        let mut pool: Option<(B256, i32, u32)> = None;
+        for lg in r.inner.logs() {
+            let tp = lg.topics();
+            if lg.address() == pool_manager()
+                && tp.first() == Some(&IPoolManager::Initialize::SIGNATURE_HASH)
+                && tp.get(3) == Some(&token.into_word())
+                && tp.get(2) == Some(&B256::ZERO)
+            {
+                if let Ok(ev) = IPoolManager::Initialize::decode_raw_log(tp.iter().copied(), lg.data().data.as_ref(), true) {
+                    pool = Some((
+                        ev.id,
+                        ev.tickSpacing.as_i32(),
+                        ev.fee.to::<u32>(),
+                    ));
+                }
+            }
+            if tp.first() == Some(&IUERC20Factory::TokenCreated::SIGNATURE_HASH) {
+                if let Ok(ev) = IUERC20Factory::TokenCreated::decode_raw_log(tp.iter().copied(), lg.data().data.as_ref(), true) {
+                    if ev.tokenAddress == token {
+                        let (web, img) = (ev.metadata.website.clone(), ev.metadata.image.clone());
+                        crate::token_metadata_chain_id::merge(token, move |f| {
+                            if f.socials.website.is_empty() {
+                                f.socials.website = web;
+                            }
+                            if f.socials.logo.is_empty() {
+                                f.socials.logo = img;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if let Ok(mut g) = pt_state().lock() {
+            if let Some(pl) = pool {
+                g.0.insert(token, pl);
+            } else {
+                // A crowd launch: no pool yet. Resolved as "auction" so the
+                // receipt is not re-read every round; the pool is looked up
+                // again if the row is ever opened after graduation.
+                g.0.insert(token, (B256::ZERO, 0, 0));
+            }
+            g.1.remove(&token);
+        }
+        match pool {
+            Some((id, ts, fee)) => crate::trace(&format!(
+                "pools launch: {token} pool {id} spacing {ts} fee {fee}"
+            )),
+            None => crate::trace(&format!("pools launch: {token} is an auction, no pool yet")),
+        }
+        let facts = crate::token_metadata_chain_id::ensure(&p, token, None).await;
+        crate::trace(&format!("pools identity: {token} ({})", facts.sym));
+        if !facts.socials.logo.is_empty() {
+            crate::art::request(&facts.socials.logo);
+        }
+    });
+}
+
 fn decode_pons_v2_log(lg: &alloy::rpc::types::Log) -> Option<PonsV2Cand> {
     let t = lg.topics();
     if t.len() < 4 || t[0] != IPonsV2Factory::TokenLaunched::SIGNATURE_HASH {
@@ -300,6 +429,7 @@ fn seed_rows(
     shared: &Arc<Mutex<Vec<Row>>>,
     known: &[(Address, Address, u64)],
     known_fl: &[FlCand],
+    known_pt: &[PoolsCand],
     head: u64,
 ) -> usize {
     let mut cur = shared.lock().unwrap();
@@ -319,6 +449,13 @@ fn seed_rows(
         cur.push(build_fl_row(c, 0.0, 0.0, 0.0, 0, head));
         added += 1;
     }
+    for c in known_pt {
+        if cur.iter().any(|r| r.grad.token == c.token) {
+            continue;
+        }
+        cur.push(build_pt_row(c, 0.0, 0.0, 0.0, 0, head));
+        added += 1;
+    }
     if added > 0 {
         // In canonical order immediately. A streamed row that appears at the
         // bottom and jumps to the top a round later reads as two events.
@@ -335,9 +472,9 @@ fn seed_rows(
 /// and they would drift the first time an ABI changed.
 pub fn sort_launch_logs(
     logs: &[alloy::rpc::types::Log],
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<(Address, u64)>) {
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<(Address, u64)>, Vec<PoolsCand>) {
     let mut seen = std::collections::HashSet::new();
-    let (mut pons, mut fl, mut v2) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut pons, mut fl, mut v2, mut pt) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut deployed: Vec<(Address, u64)> = Vec::new();
     for lg in logs {
         if lg.address() == pons_v2_factory() {
@@ -361,13 +498,19 @@ pub fn sort_launch_logs(
                     pons.push(c);
                 }
             }
+        } else if lg.address() == pools_launcher() {
+            if let Some(c) = decode_pools_log(lg) {
+                if seen.insert(c.token.into_word()) {
+                    pt.push(c);
+                }
+            }
         } else if let Some(c) = decode_flaunch_log(lg) {
             if seen.insert(c.pool_id) {
                 fl.push(c);
             }
         }
     }
-    (pons, fl, v2, deployed)
+    (pons, fl, v2, deployed, pt)
 }
 
 /// One chunked getLogs covers EVERY launchpad: both factory addresses, both
@@ -581,7 +724,7 @@ fn note_v2_supply<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: 
 }
 
 fn launch_addresses() -> Vec<Address> {
-    [pons_factory(), flaunch_pm(), pons_v2_factory()]
+    [pons_factory(), flaunch_pm(), pons_v2_factory(), pools_launcher()]
         .into_iter()
         .filter(|a| !a.is_zero())
         .collect()
@@ -593,6 +736,7 @@ fn launch_topics() -> Vec<B256> {
         IPonsFactory::TokenLaunched::SIGNATURE_HASH,
         IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
         IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
+        ILiquidityLauncher::TokenCreated::SIGNATURE_HASH,
     ]
 }
 
@@ -600,7 +744,7 @@ async fn scan_launchpads<P: Provider>(
     provider: &P,
     from: u64,
     to: u64,
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Option<u64>) {
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<PoolsCand>, Option<u64>) {
     let mut logs = Vec::new();
     let (from, chunk) = clamp_scan("launch scan", from, to, LOG_CHUNK);
     let mut start = from;
@@ -616,7 +760,7 @@ async fn scan_launchpads<P: Provider>(
         // on every round, on a metered endpoint.
         let pads = launch_addresses();
         if pads.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new(), Some(to));
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(to));
         }
         let filter = Filter::new()
             .address(pads)
@@ -657,7 +801,7 @@ async fn scan_launchpads<P: Provider>(
         }
         start = end + 1;
     }
-    let (mut pons, mut fl, v2, deployed) = sort_launch_logs(&logs);
+    let (mut pons, mut fl, v2, deployed, pt) = sort_launch_logs(&logs);
     // A creation names no pool, so ask the factory for it. One call per NEW
     // coin, and only for coins this scan has not already seen graduate.
     for (token, block) in deployed {
@@ -683,7 +827,7 @@ async fn scan_launchpads<P: Provider>(
     pons.truncate(MAX_SCAN);
     fl.sort_by(|a, b| b.block.cmp(&a.block));
     fl.truncate(MAX_SCAN);
-    (pons, fl, v2, covered)
+    (pons, fl, v2, pt, covered)
 }
 
 /// One row from cached on-chain metadata + batch-read metrics. No RPC of its own: the
@@ -990,6 +1134,43 @@ fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: u
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
 
     Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, grad_pct: None, graduated: false, head_block: head, verified: false }
+}
+
+fn build_pt_row(c: &PoolsCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: usize, head: u64) -> Row {
+    let facts = crate::token_metadata_chain_id::get(c.token);
+    let sym = facts
+        .as_ref()
+        .map(|f| f.sym.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("0x{}", &alloy::hex::encode(c.token.as_slice())[..6]));
+    let supply = facts.as_ref().map(|f| f.supply).unwrap_or(0.0);
+    let grad = Grad {
+        token: c.token,
+        kind: engine::PoolKind::V4 { pool_id: c.pool_id, tick_spacing: c.tick_spacing },
+        quote: engine::Quote::Eth,
+        sym,
+        fee: c.fee,
+        launch_block: c.block,
+        socials: facts.as_ref().map(|f| f.socials.clone()).unwrap_or_default(),
+    };
+    // Native ETH is currency0 (the zero address sorts first), so the pool's
+    // price is token per ETH and the ETH-side virtual reserve is L/sqrtP.
+    let pooled_eth = if sqrt > 0.0 { liq / sqrt / 1e18 } else { 0.0 };
+    let tokens_per_eth = sqrt * sqrt;
+    let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
+    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
+    Row {
+        grad,
+        pooled_eth,
+        mkt_cap_eth: supply * eth_per_token,
+        tx_per_sec,
+        my_bal,
+        grad_pct: None,
+        graduated: false,
+        head_block: head,
+        verified: false,
+    }
 }
 
 /// A token's Flaunch pool, if the token was launched there — the Flaunch
@@ -1498,6 +1679,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
     known: &mut Vec<(Address, Address, u64)>,
     known_fl: &mut Vec<FlCand>,
     known_v2: &mut Vec<PonsV2Cand>,
+    known_pt: &mut Vec<PoolsCand>,
     shared: &Arc<Mutex<Vec<Row>>>,
     head: u64,
 ) {
@@ -1527,7 +1709,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
     if live.is_empty() {
         return;
     }
-    let (mut pons, fl, v2, deployed) = sort_launch_logs(&live);
+    let (mut pons, fl, v2, deployed, pt) = sort_launch_logs(&live);
     // A creation pushed over the socket is the earliest anything can know
     // about a coin. Its pool is one call away, and the whole point of the
     // socket is not waiting for the next scan.
@@ -1543,7 +1725,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
             }
         }
     }
-    let (mut n_pons, mut n_fl, mut n_v2) = (0usize, 0usize, 0usize);
+    let (mut n_pons, mut n_fl, mut n_v2, mut n_pt) = (0usize, 0usize, 0usize, 0usize);
     for c in pons {
         crate::token_metadata_chain_id::record_launch(c.0, c.2);
         if !known.iter().any(|(t, _, _)| *t == c.0) {
@@ -1568,12 +1750,20 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
             n_v2 += 1;
         }
     }
-    if n_pons + n_fl + n_v2 > 0 {
+    for c in pt {
+        if !known_pt.iter().any(|k| k.token == c.token) {
+            crate::trace(&format!("launch: pools {} block {} via ws", c.token, c.block));
+            note_pools_launch(provider, &c);
+            known_pt.push(c);
+            n_pt += 1;
+        }
+    }
+    if n_pons + n_fl + n_v2 + n_pt > 0 {
         crate::trace(&format!(
-            "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2, live"
+            "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2 + {n_pt} pools, live"
         ));
         // On the list before this function returns, not at the next round.
-        let seeded = seed_rows(shared, known, known_fl, head);
+        let seeded = seed_rows(shared, known, known_fl, known_pt, head);
         if seeded > 0 {
             crate::trace(&format!("discovery: {seeded} streamed row(s) on the list"));
         }
@@ -1626,6 +1816,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // TRANSIENT state — it graduates into a pool and the entry stops being
     // true — so a saved one would come back as a venue that no longer exists.
     let mut known_v2: Vec<PonsV2Cand> = Vec::new();
+    let mut known_pt: Vec<PoolsCand> = Vec::new();
     // The rolling swap tape: (block, pool key) per swap, across every
     // candidate pool at once, trimmed to the activity window. Feeds tx/sec.
     // Keyed by B256 so v3 pools (address, widened) and Flaunch pools (pool
@@ -1716,7 +1907,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // when the wide-logs endpoint is resting, and narrowed when it is rate
         // limited, and neither of those touches the stream. A launch that
         // arrives during a deferred scan is on screen anyway.
-        ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &shared, head)
+        ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &mut known_pt, &shared, head)
             .await;
         // Nobody is looking: keep collecting launches, stop paying for the
         // rest.
@@ -1736,7 +1927,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         let visible = !stop.load(Ordering::Relaxed);
         let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
         if from <= head && wide_ok {
-            let (pons, fl, v2, covered) = scan_launchpads(&provider, from, head).await;
+            let (pons, fl, v2, pt, covered) = scan_launchpads(&provider, from, head).await;
             for c in pons {
                 crate::token_metadata_chain_id::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
@@ -1756,6 +1947,13 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                     note_v2_supply(&provider, &c);
                     note_v2_identity(&provider, &c);
                     known_v2.push(c);
+                }
+            }
+            for c in pt {
+                if !known_pt.iter().any(|k| k.token == c.token) {
+                    crate::trace(&format!("launch: pools {} block {} via scan", c.token, c.block));
+                    note_pools_launch(&provider, &c);
+                    known_pt.push(c);
                 }
             }
             // Only as far as the scan actually READ.
@@ -1802,6 +2000,19 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known_fl.truncate(ROW_MAX);
         known_v2.sort_by(|a, b| b.block.cmp(&a.block));
         known_v2.truncate(ROW_MAX);
+        known_pt.sort_by(|a, b| b.block.cmp(&a.block));
+        known_pt.truncate(ROW_MAX);
+        if let Ok(g) = pt_state().lock() {
+            for c in known_pt.iter_mut() {
+                if c.pool_id.is_zero() {
+                    if let Some((id, ts, fee)) = g.0.get(&c.token) {
+                        c.pool_id = *id;
+                        c.tick_spacing = *ts;
+                        c.fee = *fee;
+                    }
+                }
+            }
+        }
 
         // NOT a `continue` any more.
         //
@@ -1820,7 +2031,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // pool id. This replaces a per-pool history scan that asked the same
         // blocks about the same pools every round.
         let pools: Vec<Address> = known.iter().map(|(_, p, _)| *p).collect();
-        let fl_ids: Vec<B256> = known_fl.iter().map(|c| c.pool_id).collect();
+        let mut fl_ids: Vec<B256> = known_fl.iter().map(|c| c.pool_id).collect();
+        fl_ids.extend(known_pt.iter().filter(|c| !c.pool_id.is_zero()).map(|c| c.pool_id));
         let cutoff = head.saturating_sub(ACTIVITY_WINDOW);
         let sfrom = match swaps_to {
             None => cutoff,
@@ -1922,7 +2134,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         }
 
         // Every launch on the list, immediately. Measurement follows.
-        let seeded = seed_rows(&shared, &known, &known_fl, head);
+        let seeded = seed_rows(&shared, &known, &known_fl, &known_pt, head);
         if seeded > 0 {
             crate::trace(&format!("discovery: {seeded} new row(s) on the list"));
         }
@@ -1940,6 +2152,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             /// A pons v2 launch on its curve. Refreshed by reading the curve
             /// itself — there is no pool to read.
             V2(PonsV2Cand),
+            /// A pools.trade launch whose v4 pool exists. Auction launches
+            /// have no pool yet and are not refreshed at all.
+            Pt(PoolsCand),
         }
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1951,6 +2166,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             known.iter().take(MAX_SCAN).map(|(t, p, b)| Due::Pons(*t, *p, *b)).collect();
         due.extend(fl_live.iter().take(MAX_SCAN).cloned().map(Due::Fl));
         due.extend(known_v2.iter().take(MAX_SCAN).copied().map(Due::V2));
+        due.extend(
+            known_pt.iter().filter(|c| !c.pool_id.is_zero()).take(MAX_SCAN).copied().map(Due::Pt),
+        );
         let tail: Vec<Due> = known
             .iter()
             .skip(MAX_SCAN)
@@ -2007,6 +2225,13 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 Due::V2(c) => {
                     calls.push((c.curve, IPonsCurve::getReservesCall {}.abi_encode()));
                     calls.push((c.curve, IPonsCurve::realQuoteReserveCall {}.abi_encode()));
+                    if with_bal {
+                        calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
+                    }
+                }
+                Due::Pt(c) => {
+                    calls.push((state_view(), IStateView::getSlot0Call { poolId: c.pool_id }.abi_encode()));
+                    calls.push((state_view(), IStateView::getLiquidityCall { poolId: c.pool_id }.abi_encode()));
                     if with_bal {
                         calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
                     }
@@ -2103,6 +2328,10 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                     let n = swap_count.get(&c.pool_id).copied().unwrap_or(0);
                     build_fl_row(c, sqrt, liq, my_bal, n, head)
                 }
+                Due::Pt(c) => {
+                    let n = swap_count.get(&c.pool_id).copied().unwrap_or(0);
+                    build_pt_row(c, sqrt, liq, my_bal, n, head)
+                }
                 // The generic slots hold single numbers; a curve's first read
                 // returns TWO, so it is decoded from the raw response here
                 // rather than through the pool-shaped path above.
@@ -2197,7 +2426,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = stream.wait() => {
-                    ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &shared, head)
+                    ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &mut known_pt, &shared, head)
                         .await;
                 }
             }
