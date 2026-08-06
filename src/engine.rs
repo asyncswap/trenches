@@ -2120,10 +2120,20 @@ fn order_fields(o: &Order) -> Vec<String> {
         // check" reads as a bug rather than as the auction it is.
         if self.pool.kind.is_empty() {
             self.skips += 1;
-            self.note(format!(
-                "{} has no pool yet — a crowd launch trades only after its auction graduates",
-                self.pool.sym
-            ));
+            let auction = crate::token_metadata_chain_id::get(self.pool.token)
+                .and_then(|f| f.launchpad)
+                .is_some();
+            self.note(match (auction, side) {
+                (true, Side::Buy) => format!(
+                    "{} is mid-auction: a buy here is a CCA BID, which this app cannot place yet — the pool opens at graduation",
+                    self.pool.sym
+                ),
+                (true, Side::Sell) => format!(
+                    "{} is mid-auction: tokens are only distributed at graduation, so there is nothing to sell until then",
+                    self.pool.sym
+                ),
+                (false, _) => format!("{} has no pool yet", self.pool.sym),
+            });
             return Ok(());
         }
         // Dedup guard: never stack a trade while one is already in flight for the
