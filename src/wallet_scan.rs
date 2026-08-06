@@ -24,7 +24,9 @@ use alloy::rpc::types::Filter;
 
 const TRANSFER: B256 = b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 const LOOKBACK: u64 = 2_000_000;
-const CHUNK: u64 = 40_000;
+/// The widest range the strictest upstream allows. Anything larger 413s with
+/// "eth_getLogs is limited to a 10,000 range" and the scan starves.
+const CHUNK: u64 = 10_000;
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 struct SavedTokens {
@@ -96,8 +98,9 @@ async fn scan<P: Provider>(provider: &P, trader: Address) -> Option<usize> {
     if total > CHUNK {
         crate::trace(&format!("wallet scan: {total} blocks to cover, chunked"));
     }
+    let mut chunk = CHUNK;
     while from <= head {
-        let to = (from + CHUNK - 1).min(head);
+        let to = (from + chunk - 1).min(head);
         let filter = Filter::new()
             .event_signature(TRANSFER)
             .topic2(trader.into_word())
@@ -121,11 +124,23 @@ async fn scan<P: Provider>(provider: &P, trader: Address) -> Option<usize> {
                 if fresh > 0 {
                     crate::trace(&format!("wallet scan: {from}..{to}: {fresh} new token(s)"));
                 }
+                from = to + 1;
+                // Room for the rest of the app: this is background work on a
+                // metered pipe, not a race.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             }
-            // Stop rather than skip: the cursor stays where the last success
-            // left it, and the next call resumes there. A skipped range is a
-            // token that never appears, silently.
             Ok(Err(e)) => {
+                let msg = e.to_string().to_lowercase();
+                // A range cap is a fact about the endpoint, not this range:
+                // shrink and retry the same blocks rather than giving up.
+                if (msg.contains("range") || msg.contains("limited")) && chunk > 1_000 {
+                    chunk /= 2;
+                    crate::trace(&format!("wallet scan: range capped, chunk now {chunk}"));
+                    continue;
+                }
+                // Stop rather than skip: the cursor stays where the last
+                // success left it, and the next call resumes there. A skipped
+                // range is a token that never appears, silently.
                 crate::trace(&format!("wallet scan: {from}..{to} failed: {e}"));
                 return None;
             }
@@ -134,7 +149,6 @@ async fn scan<P: Provider>(provider: &P, trader: Address) -> Option<usize> {
                 return None;
             }
         }
-        from = to + 1;
     }
     Some(saved.tokens.len())
 }
