@@ -360,6 +360,19 @@ pub async fn find_v4_native_pool<P: Provider>(
     None
 }
 
+/// Is this token a UERC20 — the pools.trade token contract? Answered by the
+/// token itself: only that family serves its metadata as inline base64 JSON
+/// from tokenURI(). One eth_call, no logs, so it works mid-auction when the
+/// pool that would prove the launch does not exist yet.
+pub async fn is_uerc20<P: Provider>(provider: &P, token: Address) -> bool {
+    let c = crate::contracts::IUERC20::new(token, provider);
+    let call = c.tokenURI();
+    match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+        Ok(Ok(r)) => r._0.starts_with("data:application/json"),
+        _ => false,
+    }
+}
+
 /// A pools.trade launch looked up by its token address — for coins that
 /// arrive by CA rather than through discovery. One indexed log query answers
 /// whether the launcher ever created it; the launch receipt then yields the

@@ -4336,6 +4336,22 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             token, sym, fee, owned: false,
                                                             quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                         })
+                                                    } else if discover::is_uerc20(provider, token).await {
+                                                        // A pools.trade crowd launch mid-auction: the token is
+                                                        // real, the pool is not, and the upgrade probe lights
+                                                        // the screen up the moment it graduates.
+                                                        token_metadata_chain_id::merge(token, |f| {
+                                                            if f.launchpad.is_none() {
+                                                                f.launchpad = Some("pools.trade".into());
+                                                            }
+                                                        });
+                                                        bot.status = format!("{sym} is a pools.trade crowd launch — auction running, pool at graduation");
+                                                        Some(SelPool {
+                                                            label: pool_label(false, "v4", "ETH", &sym, 0, ""),
+                                                            kind: engine::PoolKind::V4 { pool_id: B256::ZERO, tick_spacing: 0 },
+                                                            token, sym, fee: 0, owned: false,
+                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                        })
                                                     } else {
                                                         bot.status = format!("No liquid Uniswap V3 pool for {sym}. Try selecting assets to use V4");
                                                         None
