@@ -3058,6 +3058,11 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     let mut last_status = String::new();
     let mut status_since = std::time::Instant::now();
     let mut view = Panel::Tape; // default to the live tape
+    // When a pool was adopted. Keys pressed while adoption was resolving
+    // queue up and replay against the NEW screen — two buffered arrow
+    // presses walked the panel from Tape to Logs on every open that took a
+    // second. Panel switches inside this window are stale input, not intent.
+    let mut adopted_at: Option<std::time::Instant> = None;
     let mut show_help = false;
     let mut orders_scroll: usize = 0;
     // Whether the orders panel shows every order or only the open token's.
@@ -3621,11 +3626,35 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             view = Panel::Orders;
                             orders_scroll = 0;
                         }
-                        KeyCode::Char('l') => { crate::trace("panel: logs (l)"); view = Panel::Logs; orders_scroll = 0; }
+                        KeyCode::Char('l') => {
+                            if adopted_at.is_some_and(|t| t.elapsed().as_millis() < 800) {
+                                crate::trace("panel: swallowed queued l after adoption");
+                            } else {
+                                crate::trace("panel: logs (l)");
+                                view = Panel::Logs;
+                                orders_scroll = 0;
+                            }
+                        }
                         // Capital O spins the carousel for one-handed browsing;
                         // the lowercase keys stay the fast direct jumps.
-                        KeyCode::Char('O') | KeyCode::Right => { view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders }; crate::trace("panel: cycled right"); orders_scroll = 0; }
-                        KeyCode::Left => { view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders }; crate::trace("panel: cycled left"); orders_scroll = 0; }
+                        KeyCode::Char('O') | KeyCode::Right => {
+                            if adopted_at.is_some_and(|t| t.elapsed().as_millis() < 800) {
+                                crate::trace("panel: swallowed queued cycle after adoption");
+                            } else {
+                                view = match view { Panel::Orders => Panel::Tape, Panel::Tape => Panel::Chart, Panel::Chart => Panel::Logs, Panel::Logs => Panel::Orders };
+                                crate::trace("panel: cycled right");
+                                orders_scroll = 0;
+                            }
+                        }
+                        KeyCode::Left => {
+                            if adopted_at.is_some_and(|t| t.elapsed().as_millis() < 800) {
+                                crate::trace("panel: swallowed queued cycle after adoption");
+                            } else {
+                                view = match view { Panel::Orders => Panel::Logs, Panel::Logs => Panel::Chart, Panel::Chart => Panel::Tape, Panel::Tape => Panel::Orders };
+                                crate::trace("panel: cycled left");
+                                orders_scroll = 0;
+                            }
+                        }
                         // Straight to the chart; , . walk the candle interval.
                         KeyCode::Char('c') | KeyCode::Char('v') => { view = Panel::Chart; orders_scroll = 0; }
                         // Price or market cap — one series, two units.
@@ -4112,6 +4141,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     // Land on the Tape — the new pool's live flow.
                                     view = Panel::Tape;
                                     orders_scroll = 0;
+                                    adopted_at = Some(std::time::Instant::now());
                                 }
                                 None => bot.status = "discovery cancelled".into(),
                             }
@@ -4378,6 +4408,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     refresh_venue_meta(provider, bot).await;
                                     view = Panel::Tape;
                                     orders_scroll = 0;
+                                    adopted_at = Some(std::time::Instant::now());
                                 }
                             }
                         }
