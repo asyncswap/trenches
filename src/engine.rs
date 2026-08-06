@@ -2111,6 +2111,81 @@ fn order_fields(o: &Order) -> Vec<String> {
         best
     }
 
+    /// Bid into a crowd launch's continuous clearing auction.
+    ///
+    /// Not a swap: the auction sells on a schedule and clears continuously, so
+    /// a bid names the most you will pay per token and how much currency you
+    /// commit. Two rules the contract enforces and this must satisfy first —
+    /// the price sits on a tick boundary above the floor, and it is strictly
+    /// above the live clearing price. Both are read fresh here, because both
+    /// move with every block of demand.
+    async fn place_cca_bid<P: Provider>(&mut self, provider: &P, auction: Address) -> eyre::Result<()> {
+        use crate::contracts::ICCA;
+        let c = ICCA::new(auction, provider);
+        let (cb_floor, cb_space, cb_clear) = (c.floorPrice(), c.tickSpacing(), c.clearingPrice());
+        let (floor, spacing, clearing) =
+            tokio::join!(cb_floor.call(), cb_space.call(), cb_clear.call());
+        let (Ok(floor), Ok(spacing), Ok(clearing)) = (floor, spacing, clearing) else {
+            self.skips += 1;
+            self.note(format!("Could not read {}'s auction, so no bid was placed", self.pool.sym));
+            return Ok(());
+        };
+        let (floor, spacing, clearing) = (floor._0, spacing._0, clearing._0);
+        if spacing.is_zero() {
+            self.skips += 1;
+            self.note("That auction reports no tick spacing, so a bid cannot be priced".into());
+            return Ok(());
+        }
+        // The first boundary STRICTLY above clearing. Equal is refused, so the
+        // step is taken after the division rather than before it.
+        let steps = (clearing.saturating_sub(floor)) / spacing + U256::from(1);
+        let max_price = floor + steps * spacing;
+        let eth_in = (self.eth * self.buy_frac).max(0.0);
+        if eth_in <= 0.0 {
+            self.skips += 1;
+            self.note("No ETH available to bid".into());
+            return Ok(());
+        }
+        let wei = Wei::rounded(eth_in);
+        let amount: u128 = wei.raw();
+        let call = c
+            .submitBid(max_price, amount, self.trader, floor, alloy::primitives::Bytes::new())
+            .value(U256::from(wei.raw()));
+        let tx = call.into_transaction_request();
+        if let Err(e) = provider.call(&tx).await {
+            self.skips += 1;
+            self.note(format!("The bid would revert. {}", short_err(&e.to_string())));
+            return Ok(());
+        }
+        let label = format!("BID ~{:.6} ETH on {} [cca]", eth_in, self.pool.sym);
+        let nonce = self.take_nonce(provider).await?;
+        let sent = provider.send_transaction(tx.with_nonce(nonce)).await;
+        match self.spent_nonce(sent) {
+            Ok(p) => {
+                let hash = *p.tx_hash();
+                self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
+                self.pending.push(Pending {
+                    hash,
+                    label,
+                    side: None,
+                    eth_amt: eth_in,
+                    tok_amt: 0.0,
+                    position_id: None,
+                });
+                self.note(format!(
+                    "Bid {eth_in:.6} ETH into {}'s auction. Tokens are claimable if it graduates; the bid refunds if it does not",
+                    self.pool.sym
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                self.fails += 1;
+                self.note(format!("The bid failed to send. {}", short_err(&e.to_string())));
+                Ok(())
+            }
+        }
+    }
+
     /// Place one order: size to pool depth, quote exact output, pre-flight with
     /// a free eth_call (skip if it would revert — no gas wasted), then send.
     pub async fn place<P: Provider>(&mut self, provider: &P, side: Side) -> eyre::Result<()> {
@@ -2119,13 +2194,23 @@ fn order_fields(o: &Order) -> Vec<String> {
         // does not until graduation, and "no pool passes the pre flight
         // check" reads as a bug rather than as the auction it is.
         if self.pool.kind.is_empty() {
+            // A crowd launch mid-auction: a BUY is a bid into its CCA, which
+            // is a different transaction to a swap and the only way in before
+            // the pool exists.
+            if side == Side::Buy {
+                if let Some(auction) =
+                    crate::token_metadata_chain_id::get(self.pool.token).and_then(|f| f.cca_auction)
+                {
+                    return self.place_cca_bid(provider, auction).await;
+                }
+            }
             self.skips += 1;
             let auction = crate::token_metadata_chain_id::get(self.pool.token)
                 .and_then(|f| f.launchpad)
                 .is_some();
             self.note(match (auction, side) {
                 (true, Side::Buy) => format!(
-                    "{} is mid-auction: a buy here is a CCA BID, which this app cannot place yet — the pool opens at graduation",
+                    "{} is mid-auction and its auction address is not known yet — try again in a moment",
                     self.pool.sym
                 ),
                 (true, Side::Sell) => format!(

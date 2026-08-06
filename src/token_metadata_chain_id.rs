@@ -70,6 +70,9 @@ pub struct TokenMetadata {
     /// The creator's verified primary ENS name, resolved once from mainnet.
     #[serde(default)]
     pub creator_ens: Option<String>,
+    /// The CCA a crowd launch bids into, before it has a pool.
+    #[serde(default)]
+    pub cca_auction: Option<Address>,
 }
 
 impl TokenMetadata {
@@ -166,6 +169,20 @@ pub fn get(token: Address) -> Option<TokenMetadata> {
 fn put(token: Address, facts: TokenMetadata) {
     lock(store()).insert(token, facts);
     save();
+}
+
+/// The pools.trade contracts that appear in every launch receipt, so the one
+/// emitter that is NOT one of them can be recognised as the auction.
+pub fn is_known_pools_contract(a: Address) -> bool {
+    const UERC20_FACTORY: Address =
+        alloy::primitives::address!("000000e200088D55C39a11F609E5F667729ad49b");
+    const LIQUIDITY_STRATEGY: Address =
+        alloy::primitives::address!("23f8209572b4a1C2AD88A42749E830791Fb027f1");
+    const CROWD_STRATEGY: Address =
+        alloy::primitives::address!("05d552391067389EE44fec3924157ed33F976000");
+    const LOCKER: Address =
+        alloy::primitives::address!("EfF166aAf189323C58dc27eD1206Eb2c37fAacdF");
+    [UERC20_FACTORY, LIQUIDITY_STRATEGY, CROWD_STRATEGY, LOCKER].contains(&a)
 }
 
 /// The facts for `token`, fetching whatever is missing — ONCE, ever.

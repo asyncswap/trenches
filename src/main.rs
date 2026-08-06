@@ -4344,6 +4344,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                         })
                                                     } else if discover::is_uerc20(provider, token).await {
+                                                        // The auction it bids into, resolved now so
+                                                        // pressing b works the moment it opens.
+                                                        let _ = discover::fetch_cca_auction(provider, token).await;
                                                         // A pools.trade crowd launch mid-auction: the token is
                                                         // real, the pool is not, and the upgrade probe lights
                                                         // the screen up the moment it graduates.

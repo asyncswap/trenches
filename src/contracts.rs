@@ -222,6 +222,21 @@ sol! {
         function tokenURI() external view returns (string memory);
     }
 
+    // The continuous clearing auction a crowd launch runs before it has a
+    // pool. One contract per launch; bids go straight to it.
+    #[sol(rpc)]
+    interface ICCA {
+        event BidSubmitted(uint256 indexed bidId, address indexed owner, uint256 maxPrice, uint128 amount);
+        function submitBid(uint256 maxPrice, uint128 amount, address owner, uint256 prevTickPrice, bytes hookData) external payable returns (uint256 bidId);
+        function exitBid(uint256 bidId) external;
+        function claimTokensBatch(address owner, uint256[] bidIds) external;
+        function floorPrice() external view returns (uint256);
+        function tickSpacing() external view returns (uint256);
+        function clearingPrice() external view returns (uint256);
+        function isGraduated() external view returns (bool);
+        function endBlock() external view returns (uint256);
+    }
+
     // ---- Pons launchpad ----
     #[sol(rpc)]
     interface IPonsFactory {

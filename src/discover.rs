@@ -343,10 +343,57 @@ pub fn native_v4_pool_id(token: Address, fee: u32, spacing: i32) -> B256 {
     alloy::primitives::keccak256((Address::ZERO, token, f, sp, Address::ZERO).abi_encode())
 }
 
+/// The native-ETH pool for `token`, read from the initialization event.
+///
+/// `Initialize` indexes both currencies, so this is a point lookup rather
+/// than a scan: the node answers from its log index no matter how old the
+/// pool is.
+pub async fn initialized_native_pool<P: Provider>(
+    provider: &P,
+    token: Address,
+) -> Option<(B256, i32, u32)> {
+    use alloy::sol_types::SolEvent as _;
+    let filter = Filter::new()
+        .address(pool_manager())
+        .event_signature(IPoolManager::Initialize::SIGNATURE_HASH)
+        .topic2(Address::ZERO.into_word())
+        .topic3(token.into_word())
+        .from_block(0);
+    let logs = match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            crate::trace(&format!("v4 index: {token} lookup failed ({e}), sweeping instead"));
+            return None;
+        }
+        Err(_) => {
+            crate::trace(&format!("v4 index: {token} lookup timed out, sweeping instead"));
+            return None;
+        }
+    };
+    let lg = logs.first()?;
+    let ev = IPoolManager::Initialize::decode_raw_log(
+        lg.topics().iter().copied(),
+        lg.data().data.as_ref(),
+        true,
+    )
+    .ok()?;
+    let (fee, spacing) = (ev.fee.to::<u32>(), ev.tickSpacing.as_i32());
+    crate::trace(&format!("v4 index: {token} pool {} fee {fee} spacing {spacing}", ev.id));
+    Some((ev.id, spacing, fee))
+}
+
 pub async fn find_v4_native_pool<P: Provider>(
     provider: &P,
     token: Address,
 ) -> Option<(B256, i32, u32)> {
+    // Ask the INDEX first. A pool announces itself once, in PoolManager's
+    // `Initialize`, with its currencies indexed — so one filtered query names
+    // the pool exactly, whatever fee and spacing it chose. The sweep below is
+    // only the fallback for when that query cannot run (a node that refuses
+    // the range), and it can only find keys someone thought to list.
+    if let Some(found) = initialized_native_pool(provider, token).await {
+        return Some(found);
+    }
     use futures::StreamExt;
     let sv = IStateView::new(state_view(), provider);
     // The FULL grid, not a list of pairs.
@@ -382,6 +429,46 @@ pub async fn find_v4_native_pool<P: Provider>(
     }
     crate::trace(&format!("v4 probe: {token} has no native-ETH pool at any fee/spacing"));
     None
+}
+
+/// The auction a crowd launch runs, from its launch receipt.
+///
+/// No registry maps token to auction, so it is read the way the chain
+/// records it: the launch transaction's logs carry exactly one emitter that
+/// is neither the launcher, the factory, the token, nor the strategy — the
+/// auction deployed for this launch.
+pub async fn fetch_cca_auction<P: Provider>(provider: &P, token: Address) -> Option<Address> {
+    use alloy::sol_types::SolEvent as _;
+    if let Some(a) = crate::token_metadata_chain_id::get(token).and_then(|f| f.cca_auction) {
+        return Some(a);
+    }
+    if pools_launcher().is_zero() {
+        return None;
+    }
+    let filter = Filter::new()
+        .address(pools_launcher())
+        .event_signature(ILiquidityLauncher::TokenCreated::SIGNATURE_HASH)
+        .topic1(token.into_word())
+        .from_block(0);
+    let logs = tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await.ok()?.ok()?;
+    let tx = logs.first()?.transaction_hash?;
+    let r = tokio::time::timeout(RPC_TIMEOUT, provider.get_transaction_receipt(tx))
+        .await
+        .ok()?
+        .ok()??;
+    let known = [pools_launcher(), token];
+    let auction = r.inner.logs().iter().map(|l| l.address()).find(|a| {
+        !known.contains(a)
+            && *a != pool_manager()
+            && !crate::token_metadata_chain_id::is_known_pools_contract(*a)
+    })?;
+    crate::trace(&format!("cca: {token} bids into {auction}"));
+    crate::token_metadata_chain_id::merge(token, move |f| {
+        if f.cca_auction.is_none() {
+            f.cca_auction = Some(auction);
+        }
+    });
+    Some(auction)
 }
 
 /// Is this token a UERC20 — the pools.trade token contract? Answered by the
