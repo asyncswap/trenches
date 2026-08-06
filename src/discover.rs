@@ -3375,8 +3375,12 @@ fn venue_tag(g: &Grad) -> &'static str {
         engine::PoolKind::PonsV2Pool { .. } => "Pons v2",
         // In this list, a plain v4 row can only have come from the
         // pools.trade launcher — generic v4 pools arrive by CA or the pool
-        // menu, never through discovery. Name the launchpad, not the AMM.
-        engine::PoolKind::V4 { .. } => "pools.trade",
+        // menu, never through discovery. Name the launchpad, not the AMM —
+        // and a row with no pool yet is a crowd launch mid-auction, which is
+        // a different thing to walk into than a live pool.
+        engine::PoolKind::V4 { pool_id, .. } => {
+            if pool_id.is_zero() { "pools CCA" } else { "pools.trade" }
+        }
     }
 }
 

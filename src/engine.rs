@@ -2114,6 +2114,18 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// Place one order: size to pool depth, quote exact output, pre-flight with
     /// a free eth_call (skip if it would revert — no gas wasted), then send.
     pub async fn place<P: Provider>(&mut self, provider: &P, side: Side) -> eyre::Result<()> {
+        // No pool is a fact worth naming, not a pre-flight to fail. A crowd
+        // launch mid-auction sits exactly here: the token exists, the pool
+        // does not until graduation, and "no pool passes the pre flight
+        // check" reads as a bug rather than as the auction it is.
+        if self.pool.kind.is_empty() {
+            self.skips += 1;
+            self.note(format!(
+                "{} has no pool yet — a crowd launch trades only after its auction graduates",
+                self.pool.sym
+            ));
+            return Ok(());
+        }
         // Dedup guard: never stack a trade while one is already in flight for the
         // token — stops the double/triple-buy race (and duplicate sells).
         if self.guard_dup && self.pending.iter().any(|p| p.side.is_some()) {

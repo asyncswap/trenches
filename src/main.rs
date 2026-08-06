@@ -192,6 +192,60 @@ fn pons_grad_cache() -> &'static std::sync::Mutex<Option<PonsGrad>> {
     C.get_or_init(Default::default)
 }
 
+fn cca_found() -> &'static std::sync::Mutex<Option<(alloy::primitives::Address, B256, i32, u32)>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Option<(alloy::primitives::Address, B256, i32, u32)>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cca_probe_at() -> &'static std::sync::Mutex<Option<(alloy::primitives::Address, std::time::Instant)>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Option<(alloy::primitives::Address, std::time::Instant)>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// A crowd launch adopted mid-auction has no pool; the pool appears at
+/// graduation and nothing else would ever notice. Probe the deterministic
+/// pool ids every few seconds and, the moment one is initialized, upgrade the
+/// live pool in place. Returns true when the pool changed so the caller can
+/// republish it to the market reader.
+fn cca_upgrade<P: Provider + Clone + Send + Sync + 'static>(provider: &P, bot: &mut engine::Bot) -> bool {
+    let engine::PoolKind::V4 { pool_id, .. } = bot.pool.kind else { return false };
+    if !pool_id.is_zero()
+        || token_metadata_chain_id::get(bot.pool.token).and_then(|f| f.launchpad).is_none()
+    {
+        return false;
+    }
+    if let Some((t, id, sp, fee)) = cca_found().lock().ok().and_then(|g| *g) {
+        if t == bot.pool.token {
+            bot.pool.kind = engine::PoolKind::V4 { pool_id: id, tick_spacing: sp };
+            bot.pool.fee = fee;
+            bot.note(format!("{} graduated — its pool is live", bot.pool.sym));
+            if let Ok(mut g) = cca_found().lock() {
+                *g = None;
+            }
+            return true;
+        }
+    }
+    let due = cca_probe_at()
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .is_none_or(|(t, at)| t != bot.pool.token || at.elapsed() > std::time::Duration::from_secs(10));
+    if due {
+        if let Ok(mut g) = cca_probe_at().lock() {
+            *g = Some((bot.pool.token, std::time::Instant::now()));
+        }
+        let (p, tok) = (provider.clone(), bot.pool.token);
+        tokio::spawn(async move {
+            if let Some((id, sp, fee)) = discover::find_v4_native_pool(&p, tok).await {
+                if let Ok(mut g) = cca_found().lock() {
+                    *g = Some((tok, id, sp, fee));
+                }
+            }
+        });
+    }
+    false
+}
+
 fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, bot: &mut engine::Bot) {
     if bot.socials.is_empty() && matches!(bot.pool.kind, engine::PoolKind::PonsCurve { .. }) {
         if let Some(f) = token_metadata_chain_id::get(bot.pool.token) {
@@ -3165,6 +3219,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 // Named so a freeze here is attributable: a draw blocks when
                 // the TERMINAL stops consuming output — scrollback, a dragged
                 // window, a busy tab — not because of anything in the app.
+                if cca_upgrade(provider, bot) {
+                    *pool_cell.lock().unwrap() = bot.pool.as_ref();
+                }
                 refresh_pons_grad(provider, bot);
                 phase!("drawing (a stalled draw usually means the terminal itself was busy)");
                 terminal.draw(|f| {
@@ -4744,10 +4801,12 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             Span::styled(
                 {
                     let venue = bot.pool.kind.venue_label();
-                    let named = token_metadata_chain_id::get(bot.pool.token)
-                        .and_then(|f| f.launchpad)
-                        .map(|lp| format!("{lp} · {venue}"))
-                        .unwrap_or_else(|| venue.to_string());
+                    let lp = token_metadata_chain_id::get(bot.pool.token).and_then(|f| f.launchpad);
+                    let named = match (&lp, bot.pool.kind.is_empty()) {
+                        (Some(lp), true) => format!("{lp} · CCA auction, no pool yet"),
+                        (Some(lp), false) => format!("{lp} · {venue}"),
+                        (None, _) => venue.to_string(),
+                    };
                     format!("{named} ETH/{} {}", bot.pool.sym, fee_label(bot.pool.fee))
                 },
                 Style::default().add_modifier(Modifier::BOLD),
