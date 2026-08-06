@@ -2186,7 +2186,7 @@ async fn app(
                     Some(i) => {
                         save_last_chain(&reg.networks[i].name);
                         events::action("Resumed last chain", &[("chain", reg.networks[i].name.clone())]);
-                        chain_session_on(terminal, reg, &reg.networks[i], i, false, None).await?
+                        chain_session_on(terminal, reg, &reg.networks[i], i, false, None, None).await?
                     }
                     None => chain_session(terminal, reg, None).await?,
                 };
@@ -2284,7 +2284,7 @@ async fn app(
             // and it asks first.
             None => return Ok(Exit::Docs),
         };
-        chain_session_on(terminal, reg, net, net_idx, false, None).await
+        chain_session_on(terminal, reg, net, net_idx, false, None, None).await
     }
 
     /// The session for one already-chosen network.
@@ -2299,6 +2299,11 @@ async fn app(
         ask_account: bool,
         // The pool that was on screen before an account change, if this is one.
         // None on a fresh session.
+        // The signer that WAS unlocked when `W` sent us back round, so a
+        // cancelled picker returns to it instead of silently locking the
+        // session into watch-only — changing your mind must not cost your
+        // wallet context.
+        prev_signer: Option<(String, alloy::signers::local::PrivateKeySigner)>,
         resume_pool: Option<SelPool>,
     ) -> eyre::Result<Exit> {
 
@@ -2331,9 +2336,10 @@ async fn app(
         // must come up even with nothing to unlock, because the screen offers
         // create/import; gating it on existing keystores made `W` a silent no-op
         // on a machine with no ~/.foundry/keystores and no config keystores.
-        let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = None;
+        let mut unlocked: Option<(String, alloy::signers::local::PrivateKeySigner)> = prev_signer;
         // As on the Solana side: whether to ask is decided once, then the loop
-        // runs until an unlock lands or the user steps back.
+        // runs until an unlock lands or the user steps back — back onto the
+        // wallet they came in with, when there was one.
         if ask_account {
             loop {
             let Some(ks) = wallet_screen(terminal, config::ChainKind::Evm)? else {
@@ -2356,6 +2362,8 @@ async fn app(
                     unlocked = Some((ks, sg));
                     break;
                 }
+                // (a cancelled password prompt keeps looping; Esc on the list
+                // above is the way out, and it keeps the previous signer.)
                 Err(_) => {
                     ui::select(terminal, "Wrong password for that wallet", &["Back".into()])?;
                 }
@@ -2398,6 +2406,7 @@ async fn app(
     // rather than a second generic instantiation of the whole dashboard that
     // differs only in whether it can sign.
     let no_account = unlocked.is_none();
+    let keep_signer = unlocked.clone();
     let (account, signer) = match unlocked {
         Some((ks, sg)) => (ks, sg),
         None => ("(no account)".to_string(), alloy::signers::local::LocalSigner::random()),
@@ -2605,7 +2614,7 @@ async fn app(
         // Straight back to the account list on this same chain. Recursing
         // rebuilds the provider around the new signer, which is the whole
         // reason this cannot be swapped in place.
-        return Box::pin(chain_session_on(terminal, reg, net, _net_idx, true, carry)).await;
+        return Box::pin(chain_session_on(terminal, reg, net, _net_idx, true, keep_signer, carry)).await;
     }
     Ok(exit)
 }
