@@ -4249,6 +4249,22 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             token, sym, fee: contracts::FLAUNCH_FEE_EST, owned: false,
                                                             quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                         })
+                                                    } else if let Some((_, pool)) = discover::fetch_pools_trade(provider, token).await {
+                                                        match pool {
+                                                            Some((pool_id, tick_spacing, fee)) => {
+                                                                bot.status = format!("found pools.trade pool for {sym}");
+                                                                Some(SelPool {
+                                                                    label: pool_label(false, "v4", "ETH", &sym, fee, ""),
+                                                                    kind: engine::PoolKind::V4 { pool_id, tick_spacing },
+                                                                    token, sym, fee, owned: false,
+                                                                    quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                                })
+                                                            }
+                                                            None => {
+                                                                bot.status = format!("{sym} is a pools.trade auction still running — no pool until it graduates");
+                                                                None
+                                                            }
+                                                        }
                                                     } else {
                                                         bot.status = format!("No liquid Uniswap V3 pool for {sym}. Try selecting assets to use V4");
                                                         None

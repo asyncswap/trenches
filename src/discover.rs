@@ -269,6 +269,60 @@ fn pt_state() -> &'static Mutex<(PtResolved, std::collections::HashSet<Address>)
     S.get_or_init(|| Mutex::new(Default::default()))
 }
 
+fn pt_pool_from_receipt(
+    r: &alloy::rpc::types::TransactionReceipt,
+    token: Address,
+) -> Option<(B256, i32, u32)> {
+    use alloy::sol_types::SolEvent as _;
+    for lg in r.inner.logs() {
+        let tp = lg.topics();
+        if lg.address() == pool_manager()
+            && tp.first() == Some(&IPoolManager::Initialize::SIGNATURE_HASH)
+            && tp.get(3) == Some(&token.into_word())
+            && tp.get(2) == Some(&B256::ZERO)
+        {
+            if let Ok(ev) = IPoolManager::Initialize::decode_raw_log(tp.iter().copied(), lg.data().data.as_ref(), true) {
+                return Some((ev.id, ev.tickSpacing.as_i32(), ev.fee.to::<u32>()));
+            }
+        }
+    }
+    None
+}
+
+/// A pools.trade launch looked up by its token address — for coins that
+/// arrive by CA rather than through discovery. One indexed log query answers
+/// whether the launcher ever created it; the launch receipt then yields the
+/// pool for an instant launch, or nothing yet for a running auction.
+pub async fn fetch_pools_trade<P: Provider>(
+    provider: &P,
+    token: Address,
+) -> Option<(u64, Option<(B256, i32, u32)>)> {
+    use alloy::sol_types::SolEvent as _;
+    if pools_launcher().is_zero() {
+        return None;
+    }
+    let filter = Filter::new()
+        .address(pools_launcher())
+        .event_signature(ILiquidityLauncher::TokenCreated::SIGNATURE_HASH)
+        .topic1(token.into_word())
+        .from_block(0);
+    let logs = tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await.ok()?.ok()?;
+    let lg = logs.first()?;
+    let block = lg.block_number.unwrap_or(0);
+    crate::token_metadata_chain_id::merge(token, |f| {
+        if f.launchpad.is_none() {
+            f.launchpad = Some("pools.trade".into());
+        }
+    });
+    crate::token_metadata_chain_id::record_launch(token, block);
+    let tx = lg.transaction_hash?;
+    let r = tokio::time::timeout(RPC_TIMEOUT, provider.get_transaction_receipt(tx))
+        .await
+        .ok()?
+        .ok()??;
+    Some((block, pt_pool_from_receipt(&r, token)))
+}
+
 fn note_pools_launch<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: &PoolsCand) {
     if c.tx.is_zero() {
         return;
@@ -299,22 +353,9 @@ fn note_pools_launch<P: Provider + Clone + Send + Sync + 'static>(provider: &P, 
             }
             return;
         };
-        let mut pool: Option<(B256, i32, u32)> = None;
+        let pool: Option<(B256, i32, u32)> = pt_pool_from_receipt(&r, token);
         for lg in r.inner.logs() {
             let tp = lg.topics();
-            if lg.address() == pool_manager()
-                && tp.first() == Some(&IPoolManager::Initialize::SIGNATURE_HASH)
-                && tp.get(3) == Some(&token.into_word())
-                && tp.get(2) == Some(&B256::ZERO)
-            {
-                if let Ok(ev) = IPoolManager::Initialize::decode_raw_log(tp.iter().copied(), lg.data().data.as_ref(), true) {
-                    pool = Some((
-                        ev.id,
-                        ev.tickSpacing.as_i32(),
-                        ev.fee.to::<u32>(),
-                    ));
-                }
-            }
             if tp.first() == Some(&IUERC20Factory::TokenCreated::SIGNATURE_HASH) {
                 if let Ok(ev) = IUERC20Factory::TokenCreated::decode_raw_log(tp.iter().copied(), lg.data().data.as_ref(), true) {
                     if ev.tokenAddress == token {
