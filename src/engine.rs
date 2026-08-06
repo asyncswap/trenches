@@ -1167,8 +1167,14 @@ impl Bot {
             // failure.
             self.ur_permit2_until = expiration48.to::<u64>();
             let nonce = self.take_nonce(provider).await?;
+            // Unlimited within the expiry by default: the grant's bound is
+            // TIME, and an exact amount is consumed by the sell that uses it,
+            // which put an extra approval in front of every exit.
+            // `permit2_exact: true` in the config restores amount-bounded
+            // grants for anyone who wants them.
+            let amount = if crate::config::permit2_exact() { need160 } else { U160::MAX };
             let sent = p2
-                .approve(self.pool.token, universal_router(), need160, expiration48)
+                .approve(self.pool.token, universal_router(), amount, expiration48)
                 .gas(120_000)
                 .nonce(nonce)
                 .send()
@@ -1250,7 +1256,7 @@ impl Bot {
     }
 
     async fn pre_approve_exit<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
-        if !self.has_v3_route() && !self.has_flaunch_route() {
+        if !self.has_v3_route() && !self.has_ur_route() {
             return Ok(());
         }
         let bal = IERC20::new(self.pool.token, provider)
@@ -1268,7 +1274,7 @@ impl Bot {
                 self.note(format!("Pre approved {} so an exit can go out immediately", self.pool.sym));
             }
         }
-        if self.has_flaunch_route() {
+        if self.has_ur_route() {
             let covered = self.ensure_ur_allowance(provider, bal).await?;
             self.ur_permit2_done = covered;
             if covered {
@@ -1918,11 +1924,6 @@ fn order_fields(o: &Order) -> Vec<String> {
 
     /// True if any candidate route (or the active pool) is a Flaunch pool,
     /// whose sells settle the coin through Permit2 and need `ensure_ur_allowance`.
-    fn has_flaunch_route(&self) -> bool {
-        matches!(self.pool.kind, PoolKind::FlaunchV4 { .. })
-            || self.routes.iter().any(|r| matches!(r.kind, PoolKind::FlaunchV4 { .. }))
-    }
-
     /// True when any candidate route settles a SELL through the Universal
     /// Router, which pulls the token via Permit2 — Flaunch, plain v4, and
     /// graduated pons v2 pools alike. Gating the grant on Flaunch alone left

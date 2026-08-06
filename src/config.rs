@@ -265,6 +265,14 @@ pub struct Registry {
     /// zero or a century are both answers this should not simply obey.
     #[serde(default)]
     pub permit2_expiry: Option<u64>,
+    /// Exact-amount Permit2 grants instead of unlimited-until-expiry ones.
+    ///
+    /// Off by default: the expiry is the protection, and an exact grant is
+    /// consumed by the sell that uses it, so strict mode pays one extra
+    /// approval before every sell. For someone who wants amount-bounded
+    /// grants anyway, this is the switch.
+    #[serde(default)]
+    pub permit2_exact: Option<bool>,
     /// Whether to open on the docs.
     ///
     /// Absent means "until you have been through them once" — the docs are
@@ -318,6 +326,18 @@ pub fn permit2_ttl_secs() -> u64 {
             .and_then(|r| r.permit2_expiry)
             .unwrap_or(DEFAULT_PERMIT2_EXPIRY);
         clamp_permit2_expiry(hours) * 3_600
+    })
+}
+
+/// Whether Permit2 grants are exact-amount (strict mode) or unlimited within
+/// their expiry (the default).
+pub fn permit2_exact() -> bool {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXACT.get_or_init(|| {
+        Registry::load(&config_path().to_string_lossy())
+            .ok()
+            .and_then(|r| r.permit2_exact)
+            .unwrap_or(false)
     })
 }
 

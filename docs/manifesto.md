@@ -13,8 +13,11 @@ Every approval is the exact amount the trade needs. One is not.
 `0x000000000022D473030F116dDEE9F6B43aC78BA3`. That one is `U256::MAX`.
 
 Permit2 cannot move tokens with it alone. It needs a grant naming the spender,
-the amount, and an expiry. Ours are exact, and expire in 24 hours. Set
-`permit2_expiry` in the config — hours, 1 to 8760.
+the amount, and an expiry. Ours are unlimited in amount and bounded by TIME:
+they expire in 24 hours. Set `permit2_expiry` in the config — hours, 1 to
+8760. Set `permit2_exact: true` for exact-amount grants instead; that pays one
+extra approval before every sell, because an exact grant is consumed by the
+sell that uses it.
 
 An expired grant is renewed by the next trade, so an exit is never blocked.
 
