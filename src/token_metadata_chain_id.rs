@@ -64,6 +64,12 @@ pub struct TokenMetadata {
     /// AMM the pool happens to live on.
     #[serde(default)]
     pub launchpad: Option<String>,
+    /// Who sent the launch transaction, from its receipt.
+    #[serde(default)]
+    pub launch_creator: Option<Address>,
+    /// The creator's verified primary ENS name, resolved once from mainnet.
+    #[serde(default)]
+    pub creator_ens: Option<String>,
 }
 
 impl TokenMetadata {

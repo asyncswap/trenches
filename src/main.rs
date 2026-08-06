@@ -16,6 +16,7 @@ mod net;
 mod contracts;
 mod discover;
 mod engine;
+mod ens;
 mod events;
 mod token_metadata_chain_id;
 mod ledger;
@@ -4838,6 +4839,15 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // "1/7 filled" with nothing under it was the common case, because the one
     // filled field was a logo or a description and neither was rendered — a
     // row spent saying that something existed somewhere off screen.
+    if let Some(fx) = token_metadata_chain_id::get(bot.pool.token) {
+        if let Some(c) = fx.launch_creator {
+            let who = match fx.creator_ens {
+                Some(name) => format!("{name}  {c:#x}"),
+                None => format!("{c:#x}"),
+            };
+            mkt.push(Line::from(vec![mlbl("Creator"), Span::raw(who)]));
+        }
+    }
     if !bot.socials.is_empty() {
         let m = &bot.socials;
         let mut any = false;

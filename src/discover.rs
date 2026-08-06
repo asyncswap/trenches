@@ -402,9 +402,22 @@ fn note_pools_launch<P: Provider + Clone + Send + Sync + 'static>(provider: &P, 
                 }
             }
         }
-        crate::token_metadata_chain_id::merge(token, |f| {
+        let creator = r.from;
+        crate::token_metadata_chain_id::merge(token, move |f| {
             if f.launchpad.is_none() {
                 f.launchpad = Some("pools.trade".into());
+            }
+            if f.launch_creator.is_none() {
+                f.launch_creator = Some(creator);
+            }
+        });
+        tokio::spawn(async move {
+            if let Some(name) = crate::ens::reverse(creator).await {
+                crate::token_metadata_chain_id::merge(token, move |f| {
+                    if f.creator_ens.is_none() {
+                        f.creator_ens = Some(name);
+                    }
+                });
             }
         });
         if let Ok(mut g) = pt_state().lock() {
