@@ -2013,6 +2013,21 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 }
             }
         }
+        for c in known_pt
+            .iter()
+            .filter(|c| {
+                crate::token_metadata_chain_id::get(c.token)
+                    .map(|f| f.sym)
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .take(8)
+        {
+            let (p2, t2) = (provider.clone(), c.token);
+            tokio::spawn(async move {
+                let _ = crate::token_metadata_chain_id::ensure(&p2, t2, None).await;
+            });
+        }
 
         // NOT a `continue` any more.
         //
