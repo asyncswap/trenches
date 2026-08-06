@@ -3232,7 +3232,7 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
 /// grad in this feed is a Pons graduation; FlaunchV4 is Flaunch by identity.
 fn venue_tag(g: &Grad) -> &'static str {
     match g.kind {
-        engine::PoolKind::V3 { .. } => "Pons",
+        engine::PoolKind::V3 { .. } => "Pons v1",
         // Spelled out. "flnch" saves one column and costs the reader a
         // guess at which launchpad they are looking at, which is the only
         // thing this column is for.
