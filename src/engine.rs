@@ -576,7 +576,57 @@ pub async fn fetch_token_meta<P: Provider>(provider: &P, token: Address) -> Toke
         .await
         .map(|s| (s.twitter, s.telegram, s.discord, s.website, s.farcaster))
         .unwrap_or_default();
-    TokenSocials { logo, description, twitter, telegram, website, discord, farcaster }
+    let out = TokenSocials { logo, description, twitter, telegram, website, discord, farcaster };
+    if !out.is_empty() {
+        return out;
+    }
+    // Not a pons token. A UERC20 (pools.trade) carries its metadata in
+    // tokenURI() as inline base64 JSON — no gateway, no fetch, the chain IS
+    // the document.
+    let uri = crate::contracts::IUERC20::new(token, provider)
+        .tokenURI()
+        .call()
+        .await
+        .map(|s| s._0)
+        .unwrap_or_default();
+    if let Some(b64) = uri.strip_prefix("data:application/json;base64,") {
+        if let Some(bytes) = base64_loose(b64) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                let img = s("image");
+                return TokenSocials {
+                    logo: crate::net::metadata_url(&img).unwrap_or(img),
+                    description: s("description"),
+                    website: s("website"),
+                    ..Default::default()
+                };
+            }
+        }
+    } else if uri.starts_with("ipfs://") || uri.starts_with("https://") {
+        return fetch_flaunch_meta(&uri).await;
+    }
+    TokenSocials::default()
+}
+
+/// Base64, permissive about padding and whitespace — this decodes a string a
+/// token contract built for itself, not an arbitrary file.
+fn base64_loose(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = T.iter().position(|&t| t == c)? as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Fetch a Flaunch coin's metadata JSON from its launch tokenUri (ipfs://…).

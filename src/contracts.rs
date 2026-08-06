@@ -217,6 +217,11 @@ sol! {
         event TokenCreated(address tokenAddress, UERC20Metadata metadata);
     }
 
+    #[sol(rpc)]
+    interface IUERC20 {
+        function tokenURI() external view returns (string memory);
+    }
+
     // ---- Pons launchpad ----
     #[sol(rpc)]
     interface IPonsFactory {
