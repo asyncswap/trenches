@@ -289,6 +289,36 @@ fn pt_pool_from_receipt(
     None
 }
 
+/// A native-ETH v4 pool for `token`, found by ASKING THE CHAIN FOR STATE
+/// rather than scanning logs. The pool id is the keccak of its key, and a
+/// plain pool's key has only two unknowns — fee and tick spacing — so a
+/// handful of candidate reads answers what no bounded log query can: the
+/// pools.trade tiers first (2500/25 instant, 2500/50 graduated crowd), then
+/// the standard Uniswap tiers. Range caps cannot touch an eth_call.
+pub async fn find_v4_native_pool<P: Provider>(
+    provider: &P,
+    token: Address,
+) -> Option<(B256, i32, u32)> {
+    use alloy::sol_types::SolValue;
+    const TIERS: [(u32, i32); 6] = [(2500, 25), (2500, 50), (500, 10), (3000, 60), (10_000, 200), (100, 1)];
+    let sv = IStateView::new(state_view(), provider);
+    for (fee, spacing) in TIERS {
+        let sp: alloy::primitives::aliases::I24 = spacing.try_into().ok()?;
+        let f24: alloy::primitives::aliases::U24 = fee.try_into().ok()?;
+        let id: B256 = alloy::primitives::keccak256(
+            (Address::ZERO, token, f24, sp, Address::ZERO).abi_encode(),
+        );
+        let call = sv.getSlot0(id);
+        if let Ok(Ok(r)) = tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+            if !r.sqrtPriceX96.is_zero() {
+                crate::trace(&format!("v4 probe: {token} fee {fee} spacing {spacing} is live"));
+                return Some((id, spacing, fee));
+            }
+        }
+    }
+    None
+}
+
 /// A pools.trade launch looked up by its token address — for coins that
 /// arrive by CA rather than through discovery. One indexed log query answers
 /// whether the launcher ever created it; the launch receipt then yields the
