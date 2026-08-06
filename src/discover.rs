@@ -336,19 +336,21 @@ pub fn note_pools_creator<P: Provider + Clone + Send + Sync + 'static>(provider:
 /// handful of candidate reads answers what no bounded log query can: the
 /// pools.trade tiers first (2500/25 instant, 2500/50 graduated crowd), then
 /// the standard Uniswap tiers. Range caps cannot touch an eth_call.
+pub fn native_v4_pool_id(token: Address, fee: u32, spacing: i32) -> B256 {
+    use alloy::sol_types::SolValue;
+    let f: alloy::primitives::aliases::U24 = fee.try_into().unwrap_or_default();
+    let sp: alloy::primitives::aliases::I24 = spacing.try_into().unwrap_or_default();
+    alloy::primitives::keccak256((Address::ZERO, token, f, sp, Address::ZERO).abi_encode())
+}
+
 pub async fn find_v4_native_pool<P: Provider>(
     provider: &P,
     token: Address,
 ) -> Option<(B256, i32, u32)> {
-    use alloy::sol_types::SolValue;
     const TIERS: [(u32, i32); 6] = [(2500, 25), (2500, 50), (500, 10), (3000, 60), (10_000, 200), (100, 1)];
     let sv = IStateView::new(state_view(), provider);
     for (fee, spacing) in TIERS {
-        let sp: alloy::primitives::aliases::I24 = spacing.try_into().ok()?;
-        let f24: alloy::primitives::aliases::U24 = fee.try_into().ok()?;
-        let id: B256 = alloy::primitives::keccak256(
-            (Address::ZERO, token, f24, sp, Address::ZERO).abi_encode(),
-        );
+        let id = native_v4_pool_id(token, fee, spacing);
         let call = sv.getSlot0(id);
         if let Ok(Ok(r)) = tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
             if !r.sqrtPriceX96.is_zero() {
@@ -357,6 +359,7 @@ pub async fn find_v4_native_pool<P: Provider>(
             }
         }
     }
+    crate::trace(&format!("v4 probe: {token} has no native-ETH pool at any known tier"));
     None
 }
 
@@ -368,10 +371,37 @@ pub async fn is_uerc20<P: Provider>(provider: &P, token: Address) -> bool {
     let c = crate::contracts::IUERC20::new(token, provider);
     let call = c.tokenURI();
     match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
-        Ok(Ok(r)) => r._0.starts_with("data:application/json"),
-        _ => false,
+        Ok(Ok(r)) => {
+            let yes = is_inline_metadata(&r._0);
+            crate::trace(&format!(
+                "ca: {token} tokenURI {} inline metadata",
+                if yes { "is" } else { "is not" }
+            ));
+            yes
+        }
+        Ok(Err(e)) => {
+            crate::trace(&format!("ca: {token} has no tokenURI ({})", crate::net::redact(&e.to_string())));
+            false
+        }
+        Err(_) => {
+            crate::trace(&format!("ca: {token} tokenURI timed out"));
+            false
+        }
     }
 }
+
+/// A UERC20 serves its metadata from `tokenURI()` as a base64 data URI. That
+/// is what identifies the family — a pools.trade token mid-auction has no pool
+/// to be proven by, so the token contract is the only witness.
+pub fn is_inline_metadata(uri: &str) -> bool {
+    uri.starts_with("data:application/json")
+}
+
+/// The v4 pool id for a hookless native-ETH pair at `fee`/`spacing`.
+///
+/// Separate from the probe so the derivation can be checked against pool ids
+/// read off the chain: a wrong key silently reads an empty pool, which looks
+/// exactly like a token that has none.
 
 /// A pools.trade launch looked up by its token address — for coins that
 /// arrive by CA rather than through discovery. One indexed log query answers
@@ -3759,4 +3789,57 @@ mod pons_v2_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod ca_tests {
+    use super::*;
+
+    /// A pool id computed from a key must match what the chain published for
+    /// that pool. Vector: the Initialize event of a real pools.trade instant
+    /// launch (FOMOMALS), native ETH / token, fee 2500, spacing 25, no hook.
+    #[test]
+    fn a_native_pool_id_matches_the_chain() {
+        let token: Address = "0xd6e6998d0b84debf81d244f1b203408c46a4623e".parse().unwrap();
+        assert_eq!(
+            format!("{:#x}", native_v4_pool_id(token, 2500, 25)),
+            "0xe51001efba5c2fe71d9445ab98c7ea648f4607740fe7b84916a36a3ad3dd89f3"
+        );
+    }
+
+    /// Fee and spacing are BOTH part of the key: a crowd launch graduates at
+    /// spacing 50 and an instant one opens at 25, so getting it wrong reads a
+    /// pool that does not exist and reports "no pool" for a live market.
+    #[test]
+    fn spacing_and_fee_change_the_pool_id() {
+        let token: Address = "0xd6e6998d0b84debf81d244f1b203408c46a4623e".parse().unwrap();
+        let a = native_v4_pool_id(token, 2500, 25);
+        assert_ne!(a, native_v4_pool_id(token, 2500, 50));
+        assert_ne!(a, native_v4_pool_id(token, 3000, 25));
+    }
+
+    /// Every tier the probe walks must be distinct, or a tier is asked about
+    /// twice and another never.
+    #[test]
+    fn the_probed_tiers_are_all_distinct() {
+        let token: Address = "0x1df1f09c4dd65c76746d53467361d536cdfdc719".parse().unwrap();
+        let tiers = [(2500u32, 25i32), (2500, 50), (500, 10), (3000, 60), (10_000, 200), (100, 1)];
+        let mut ids: Vec<B256> = tiers.iter().map(|(f, s)| native_v4_pool_id(token, *f, *s)).collect();
+        ids.sort();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n);
+    }
+
+    /// The pools.trade token family, recognised by what its tokenURI serves.
+    /// Real values: UHS (empty JSON) and FROGE (a full document) are both
+    /// UERC20; an ipfs URI is Flaunch's shape and a bare failure is neither.
+    #[test]
+    fn inline_metadata_identifies_a_uerc20() {
+        assert!(is_inline_metadata("data:application/json;base64,e30="));
+        assert!(is_inline_metadata("data:application/json;base64,eyJkZXNjcmlwdGlvbiI6IlRoZSBHcm"));
+        assert!(!is_inline_metadata("ipfs://bafkreifu2vv6ig3pp2zk2jwxk76bhehuvclc7oi63o63bl7k5e6m2b5rpa"));
+        assert!(!is_inline_metadata("https://example.com/meta.json"));
+        assert!(!is_inline_metadata(""));
+    }
 }

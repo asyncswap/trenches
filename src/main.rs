@@ -4310,7 +4310,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                             Some(s) => match s.trim().parse::<alloy::primitives::Address>() {
                                                 Ok(token) => {
                                                     let sym = read_symbol(provider, token).await;
+                                                    // Every outcome of this walk lands in the log.
+                                                    // It used to speak only through the status
+                                                    // line, so a token that would not load left
+                                                    // nothing to read afterwards.
+                                                    crate::trace(&format!("ca: resolving {token} ({sym})"));
                                                     if let Some((addr, fee, w0)) = find_v3_pool(provider, token).await {
+                                                        crate::trace(&format!("ca: {token} resolved to v3 {addr:#x} fee {fee}"));
                                                         bot.status = format!("found v3 {} pool for {sym}", fee_label(fee));
                                                         Some(SelPool {
                                                             label: pool_label(false, "v3", "ETH", &sym, fee, ""),
@@ -4329,6 +4335,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                         })
                                                     } else if let Some((pool_id, tick_spacing, fee)) = discover::find_v4_native_pool(provider, token).await {
+                                                        crate::trace(&format!("ca: {token} resolved to v4 {pool_id} fee {fee} spacing {tick_spacing}"));
                                                         bot.status = format!("found v4 {} pool for {sym}", fee_label(fee));
                                                         Some(SelPool {
                                                             label: pool_label(false, "v4", "ETH", &sym, fee, ""),
@@ -4345,6 +4352,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                                 f.launchpad = Some("pools.trade".into());
                                                             }
                                                         });
+                                                        crate::trace(&format!("ca: {token} is a pools.trade auction, adopted without a pool"));
                                                         bot.status = format!("{sym} is a pools.trade crowd launch — auction running, pool at graduation");
                                                         Some(SelPool {
                                                             label: pool_label(false, "v4", "ETH", &sym, 0, ""),
@@ -4353,7 +4361,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
                                                         })
                                                     } else {
-                                                        bot.status = format!("No liquid Uniswap V3 pool for {sym}. Try selecting assets to use V4");
+                                                        crate::trace(&format!("ca: {token} matched nothing — no v3, no Flaunch, no native v4, not a UERC20"));
+                                                        bot.note(format!(
+                                                            "Could not place {sym}: no Uniswap v3 or v4 pool against ETH, and it is not a pools.trade launch"
+                                                        ));
                                                         None
                                                     }
                                                 }
@@ -4380,7 +4391,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             None
                                                         }
                                                     }
-                                                    Err(_) => { bot.status = "invalid address".into(); None }
+                                                    Err(_) => {
+                                                        bot.note(format!(
+                                                            "That is not an address or a pool id: {}",
+                                                            s.trim().chars().take(24).collect::<String>()
+                                                        ));
+                                                        None
+                                                    }
                                                 },
                                             },
                                             None => None,
