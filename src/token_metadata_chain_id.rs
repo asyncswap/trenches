@@ -73,6 +73,11 @@ pub struct TokenMetadata {
     /// The CCA a crowd launch bids into, before it has a pool.
     #[serde(default)]
     pub cca_auction: Option<Address>,
+    /// Bids we placed into that auction. Ids are sequential counters, and
+    /// they are what claiming and exiting are keyed on — lose them and the
+    /// position is only recoverable by reading the chain back.
+    #[serde(default)]
+    pub cca_bids: Vec<u64>,
 }
 
 impl TokenMetadata {

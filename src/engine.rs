@@ -2111,6 +2111,80 @@ fn order_fields(o: &Order) -> Vec<String> {
         best
     }
 
+    /// Settle our bids in a crowd launch that has ended.
+    ///
+    /// One shape covers both endings, because the contract does: a bid is
+    /// EXITED first — which refunds unspent currency, and is the whole of it
+    /// when the launch missed its target — and then, if the auction
+    /// graduated, the tokens it won are claimed. Doing them in that order is
+    /// not a preference: a claim before the exit reverts.
+    async fn settle_cca<P: Provider>(&mut self, provider: &P, auction: Address) -> eyre::Result<()> {
+        use crate::contracts::ICCA;
+        let bids = crate::token_metadata_chain_id::get(self.pool.token)
+            .map(|f| f.cca_bids)
+            .unwrap_or_default();
+        if bids.is_empty() {
+            self.skips += 1;
+            self.note(format!("No bids of ours in {}'s auction to settle", self.pool.sym));
+            return Ok(());
+        }
+        let c = ICCA::new(auction, provider);
+        let (cb_end, cb_grad) = (c.endBlock(), c.isGraduated());
+        let (end, grad) = tokio::join!(cb_end.call(), cb_grad.call());
+        let head = provider.get_block_number().await.unwrap_or(0);
+        let end = end.map(|e| e._0.to::<u64>()).unwrap_or(0);
+        if end > 0 && head < end {
+            self.skips += 1;
+            self.note(format!(
+                "{}'s auction is still running — bids settle after block {end} (about {} blocks away)",
+                self.pool.sym,
+                end - head
+            ));
+            return Ok(());
+        }
+        let graduated = grad.map(|g| g._0).unwrap_or(false);
+        let mut sent = 0usize;
+        for id in &bids {
+            let nonce = self.take_nonce(provider).await?;
+            let call = c.exitBid(U256::from(*id)).gas(300_000).nonce(nonce);
+            match self.spent_nonce(call.send().await) {
+                Ok(p) => {
+                    let hash = *p.tx_hash();
+                    let _ = provider.get_transaction_receipt(hash).await;
+                    sent += 1;
+                }
+                Err(e) => {
+                    self.note(format!("Could not exit bid {id}. {}", short_err(&e.to_string())));
+                }
+            }
+        }
+        if !graduated {
+            self.note(format!(
+                "{}'s auction did not graduate, so {sent} bid(s) were refunded in full",
+                self.pool.sym
+            ));
+            return Ok(());
+        }
+        let ids: Vec<U256> = bids.iter().map(|b| U256::from(*b)).collect();
+        let nonce = self.take_nonce(provider).await?;
+        let call = c.claimTokensBatch(self.trader, ids).gas(600_000).nonce(nonce);
+        match self.spent_nonce(call.send().await) {
+            Ok(p) => {
+                let hash = *p.tx_hash();
+                self.push_order(format!("CLAIM {} [cca]", self.pool.sym), OrderStatus::Pending, Some(hash));
+                self.note(format!(
+                    "Claimed {} from its graduated auction. It trades in the pool from here",
+                    self.pool.sym
+                ));
+            }
+            Err(e) => {
+                self.fails += 1;
+                self.note(format!("The claim failed. {}", short_err(&e.to_string())));
+            }
+        }
+        Ok(())
+    }
+
     /// Bid into a crowd launch's continuous clearing auction.
     ///
     /// Not a swap: the auction sells on a schedule and clears continuously, so
@@ -2176,6 +2250,27 @@ fn order_fields(o: &Order) -> Vec<String> {
                     "Bid {eth_in:.6} ETH into {}'s auction. Tokens are claimable if it graduates; the bid refunds if it does not",
                     self.pool.sym
                 ));
+                // The id is how this bid is exited and claimed later, and it
+                // is only ever announced here — so it is written down before
+                // anything else can go wrong.
+                if let Ok(Some(rc)) = provider.get_transaction_receipt(hash).await {
+                    use alloy::sol_types::SolEvent as _;
+                    for lg in rc.inner.logs() {
+                        let tp = lg.topics();
+                        if tp.first() == Some(&ICCA::BidSubmitted::SIGNATURE_HASH) {
+                            if let Some(idw) = tp.get(1) {
+                                let id = U256::from_be_slice(idw.as_slice()).to::<u64>();
+                                crate::trace(&format!("cca: bid {id} recorded on {auction}"));
+                                let token = self.pool.token;
+                                crate::token_metadata_chain_id::merge(token, move |f| {
+                                    if !f.cca_bids.contains(&id) {
+                                        f.cca_bids.push(id);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -2194,9 +2289,16 @@ fn order_fields(o: &Order) -> Vec<String> {
         // does not until graduation, and "no pool passes the pre flight
         // check" reads as a bug rather than as the auction it is.
         if self.pool.kind.is_empty() {
-            // A crowd launch mid-auction: a BUY is a bid into its CCA, which
-            // is a different transaction to a swap and the only way in before
-            // the pool exists.
+            // A crowd launch: a BUY bids into its CCA, and a SELL settles
+            // what those bids became — a refund if it never graduated, the
+            // tokens if it did.
+            if side == Side::Sell {
+                if let Some(auction) =
+                    crate::token_metadata_chain_id::get(self.pool.token).and_then(|f| f.cca_auction)
+                {
+                    return self.settle_cca(provider, auction).await;
+                }
+            }
             if side == Side::Buy {
                 if let Some(auction) =
                     crate::token_metadata_chain_id::get(self.pool.token).and_then(|f| f.cca_auction)
