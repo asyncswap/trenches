@@ -334,6 +334,9 @@ pub fn for_venue(venue: crate::ui::image::Venue, network: &str) -> Option<&'stat
         Venue::PumpFun => Some(&PUMP_FUN),
         Venue::Pons => Some(&PONS),
         Venue::Flaunch => Some(&FLAUNCH),
+        // No pixel-art mark yet; the PNG placement carries the brand and the
+        // banner carries the name.
+        Venue::PoolsTrade => None,
         Venue::Uniswap => Some(&UNISWAP),
         Venue::Chain => for_network(network),
     }

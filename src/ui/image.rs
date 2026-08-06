@@ -213,6 +213,7 @@ pub const PUMP_PNG: &[u8] = include_bytes!("../../assets/pump.png");
 pub const PONS_PNG: &[u8] = include_bytes!("../../assets/pons.png");
 pub const UNISWAP_PNG: &[u8] = include_bytes!("../../assets/uniswap.png");
 pub const FLAUNCH_PNG: &[u8] = include_bytes!("../../assets/flaunch.png");
+pub const POOLS_TRADE_PNG: &[u8] = include_bytes!("../../assets/pools-trade.png");
 pub const BASE_PNG: &[u8] = include_bytes!("../../assets/base.png");
 
 impl Venue {
@@ -222,6 +223,7 @@ impl Venue {
             Venue::PumpFun => "PUMP.FUN".to_string(),
             Venue::Pons => "PONS".to_string(),
             Venue::Flaunch => "FLAUNCH".to_string(),
+            Venue::PoolsTrade => "POOLS.TRADE".to_string(),
             Venue::Uniswap => "UNISWAP".to_string(),
             Venue::Chain => {
                 let n = network.to_lowercase();
@@ -243,6 +245,7 @@ pub fn for_venue(venue: Venue, network: &str) -> Option<&'static [u8]> {
         Venue::PumpFun => Some(PUMP_PNG),
         Venue::Pons => Some(PONS_PNG),
         Venue::Flaunch => Some(FLAUNCH_PNG),
+        Venue::PoolsTrade => Some(POOLS_TRADE_PNG),
         Venue::Uniswap => Some(UNISWAP_PNG),
         Venue::Chain => for_network(network),
     }
@@ -269,6 +272,9 @@ pub enum Venue {
     /// Flaunch. Detected from the pool kind itself (`PoolKind::FlaunchV4`) —
     /// a Flaunch coin never stops being one, so no side-channel is needed.
     Flaunch,
+    /// pools.trade, Uniswap's launchpad. Detected from the facts file's
+    /// launchpad tag, which discovery writes when it sees the launch.
+    PoolsTrade,
     /// A plain AMM trade.
     Uniswap,
     /// Nothing more specific known — fall back to the chain's own mark.

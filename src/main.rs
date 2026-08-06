@@ -1335,6 +1335,11 @@ fn header_venue(bot: &Bot) -> ui::image::Venue {
         // The kind IS the signal — checked before pons_launch so a launch
         // block set for the Age row can never relabel a Flaunch coin.
         ui::image::Venue::Flaunch
+    } else if token_metadata_chain_id::get(bot.pool.token)
+        .and_then(|f| f.launchpad)
+        .is_some()
+    {
+        ui::image::Venue::PoolsTrade
     } else if bot.pons_launch().is_some() {
         ui::image::Venue::Pons
     } else {
@@ -4452,6 +4457,9 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // the chain is the one thing still true.
     let name = match venue {
         ui::image::Venue::Chain => venue.display_name(&bot.net),
+        // The launchpad outranks the AMM it launched onto — same order the
+        // logo resolves in.
+        ui::image::Venue::PoolsTrade => "POOLS.TRADE".to_string(),
         _ => bot.pool.kind.banner_name().to_string(),
     };
 
