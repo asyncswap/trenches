@@ -386,6 +386,13 @@ pub struct Bot {
     pub eth: f64,
     pub token_bal: f64,
     pub ready: bool,
+    /// Spot price straight from slot0 (token per quote) — what `price()` falls
+    /// back to when the reserves are zero. See `Market::spot`.
+    pub spot: f64,
+    /// The pool is initialized but ALL its liquidity sits on the coin side
+    /// (fresh launch, tick parked at the range edge). Buys fill — the first one
+    /// pushes the tick into the seeded range — but there is no quote depth yet.
+    pub one_sided: bool,
 
     // accounting
     pub baseline_eth: Option<f64>,       // ETH at session start (session PnL)
@@ -694,7 +701,11 @@ impl Bot {
         if self.r0 > 0.0 {
             self.r1 / self.r0
         } else {
-            0.0
+            // No quote-side depth — a one-sided launch, or a curve nothing has
+            // bought from. The pool still HAS a price (slot0 / the phantom
+            // reserve); returning 0 here is what made every fresh launch read
+            // as "no market yet" and blocked the first buy.
+            self.spot
         }
     }
 
@@ -1945,6 +1956,8 @@ fn order_fields(o: &Order) -> Vec<String> {
         // actually asked about liquidity gets to say whether there is any.
         if m.full || m.sqrt_price > 0.0 {
             self.ready = m.ready;
+            self.spot = m.spot;
+            self.one_sided = m.one_sided;
         }
         if m.gas_price > 0.0 {
             self.gas_price = m.gas_price;
@@ -3642,6 +3655,15 @@ pub struct Market {
     /// Balances, or None on a light read that did not ask for them.
     pub token_bal: Option<f64>,
     pub ready: bool,
+    /// Price implied by slot0's sqrtPrice alone (token per quote, human units).
+    /// The reserve-ratio price is zero whenever ACTIVE liquidity is zero — but
+    /// an initialized pool always has a price, and a one-sided launch needs it
+    /// to trade before the first buy exists to create reserves.
+    pub spot: f64,
+    /// Zero active liquidity, but the pool holds the coin: a fresh single-sided
+    /// launch (e.g. a Flaunch fair-launch position parked just under the tick).
+    /// Tradeable — the first buy crosses into the seeded range.
+    pub one_sided: bool,
     pub read_ms: f64,
     pub gas_price: f64, // wei, for the profitability filter
     pub supply: f64,    // token totalSupply (human units), for market cap
@@ -3746,6 +3768,10 @@ async fn read_market_inner<P: Provider>(
             eth: eth.map(wei_to_f64),
             token_bal: bal.ok().map(|b| units_to_f64(b._0, pref.token_decimals)),
             ready: q > 0.0 && t > 0.0,
+            // Phantom reserve included: the opening price a fresh curve quotes
+            // the first buyer, where the REAL reserve (r0) is still zero.
+            spot: if q > 0.0 { t / q } else { 0.0 },
+            one_sided: false,
             read_ms: t0.elapsed().as_secs_f64() * 1000.0,
             gas_price: provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0),
             supply: 0.0,
@@ -3805,12 +3831,9 @@ async fn read_market_inner<P: Provider>(
     // scale each by 10^decimals (NOT a blanket 1e18 — USDG is 6-dec, so 1e18 read
     // its reserve as ~0). Tracked tokens are 18-dec; the quote may be ETH (18) or
     // a stablecoin (e.g. USDG 6).
-    let a_raw = if sqrt_p > 0.0 { l / sqrt_p } else { 0.0 }; // token0 raw reserve
-
-    let b_raw = l * sqrt_p; // token1 raw reserve
     let qd = pref.quote.decimals() as i32;
     let tdi = pref.token_decimals as i32; // tracked-token decimals — read on-chain, NOT assumed
-    let (r0, r1) = match pref.kind {
+    let orient = |a_raw: f64, b_raw: f64| match pref.kind {
         // Curves returned above; this arm exists only so the match is total.
         PoolKind::PonsCurve { .. } => (0.0, 0.0),
         // token0 = min(token, quote). If the tracked token sorts below the quote
@@ -3853,6 +3876,30 @@ async fn read_market_inner<P: Provider>(
             }
         }
     };
+    let (r0, r1) = orient(if sqrt_p > 0.0 { l / sqrt_p } else { 0.0 }, l * sqrt_p);
+    // The same orientation with UNIT liquidity: the reserve ratio with L
+    // cancelled out, i.e. the spot price slot0 implies even when L is zero.
+    let (u0, u1) = orient(if sqrt_p > 0.0 { 1.0 / sqrt_p } else { 0.0 }, sqrt_p);
+    let spot = if u0 > 0.0 { u1 / u0 } else { 0.0 };
+    // Zero ACTIVE liquidity is not the same as an empty pool. A fresh launch
+    // seeds one single-sided position with the tick parked at its edge (a
+    // Flaunch fair launch is 100% coin in [-887220, upper] with the tick just
+    // ABOVE upper), so getLiquidity answers 0 until the first buy crosses into
+    // the range — and gating trades on it refused the exact buy that would
+    // bring the pool to life. If the pool itself holds the coin, buys fill:
+    // the market is live, one-sided. One extra read, only on illiquid pools.
+    let one_sided = if l <= 0.0 && sqrt_p > 0.0 {
+        let holder = match pref.kind {
+            PoolKind::V3 { pool_addr, .. } => pool_addr,
+            _ => pool_manager(), // v4 family: the singleton custodies every pool
+        };
+        crate::rpcstats::timed("balanceOf", erc.balanceOf(holder).call())
+            .await
+            .map(|b| !b._0.is_zero())
+            .unwrap_or(false)
+    } else {
+        false
+    };
     Ok(Market {
         sqrt_price: sqrt_p,
         tick,
@@ -3860,7 +3907,9 @@ async fn read_market_inner<P: Provider>(
         r1,
         eth: eth_bal.map(wei_to_f64), // native ETH is always 18-dec
         token_bal: tok_bal.map(|t| units_to_f64(t, pref.token_decimals)),
-        ready: r0 > 0.0 && r1 > 0.0,
+        ready: (r0 > 0.0 && r1 > 0.0) || one_sided,
+        spot,
+        one_sided,
         read_ms: t0.elapsed().as_secs_f64() * 1000.0,
         gas_price,
         supply,

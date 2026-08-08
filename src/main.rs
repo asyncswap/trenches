@@ -1559,6 +1559,9 @@ const STATUS_TTL: Duration = Duration::from_secs(10);
 /// The two states the status line falls back to once its news has gone stale.
 const ILLIQUID: &str = "This pool has no active liquidity. Press a to add liquidity.";
 const HEALTHY: &str = "Healthy — pool is live.";
+/// A fresh single-sided launch: tradeable, but "healthy" would oversell it and
+/// ILLIQUID's "press a" advice is refused on Flaunch pools — its own sentence.
+const ONE_SIDED: &str = "Fresh launch — all liquidity is coin-side until the first buy. Trading is open.";
 
 /// The identifying facts of a pool, for an event line.
 ///
@@ -2583,6 +2586,8 @@ async fn app(
         eth: 0.0,
         token_bal: 0.0,
         ready: false,
+        spot: 0.0,
+        one_sided: false,
         baseline_eth: None,
         daily_baseline: None,
         day_realized: 0.0,
@@ -3282,8 +3287,8 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     // pool that filled up seconds later still read as empty —
                     // under a tape of live trades, which is worse than saying
                     // nothing at all.
-                    if bot.status == ILLIQUID {
-                        bot.status = HEALTHY.into();
+                    if bot.status == ILLIQUID || (bot.status == ONE_SIDED && !bot.one_sided) {
+                        bot.status = if bot.one_sided { ONE_SIDED.into() } else { HEALTHY.into() };
                     }
                     prices.push_back(bot.price());
                     if prices.len() > 60 { prices.pop_front(); }
@@ -3305,11 +3310,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 } else if status_since.elapsed() > STATUS_TTL
                     && !bot.status.is_empty()
                     && bot.status != HEALTHY
+                    && bot.status != ONE_SIDED
                 {
                     bot.status = if !rpc_ok.load(Ordering::Relaxed) {
                         "Waiting on the RPC.".into()
                     } else if bot.pool.kind.is_empty() {
                         String::new()
+                    } else if bot.ready && bot.one_sided {
+                        ONE_SIDED.into()
                     } else if bot.ready {
                         HEALTHY.into()
                     } else {
