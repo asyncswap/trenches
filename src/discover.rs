@@ -3535,11 +3535,25 @@ fn venue_tag(g: &Grad) -> &'static str {
     }
 }
 
+/// The unit a row's numbers are denominated in — the pool's quote asset.
+/// A pons v2 curve can be priced in a stablecoin, and its `pooled_eth` /
+/// `mkt_cap_eth` fields then carry QUOTE units, not ether. Writing "ETH"
+/// after such a figure overstates it by the ETH price — the unit has to
+/// ride each row, because this table mixes quotes.
+fn quote_sym(g: &Grad) -> String {
+    match g.quote {
+        engine::Quote::Eth => "ETH".to_string(),
+        engine::Quote::Stable { token, .. } => crate::stable_symbol(token),
+    }
+}
+
 fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState) {
     // Split: table on top, a details box (socials for the selected row) below.
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(f.area());
     let header = ratatui::widgets::Row::new([
-        "", "source", "symbol", "pooled ETH", "mkt cap", "grad", "tx/sec", "age", "mine", "token",
+        // "pooled", not "pooled ETH": the unit rides the value, because a
+        // stable-quoted row's depth under a header saying ETH is a unit error.
+        "", "source", "symbol", "pooled", "mkt cap", "grad", "tx/sec", "age", "mine", "token",
     ])
     .style(Style::default().fg(crate::ui::widgets::tone_color(crate::view::Tone::Info)).add_modifier(Modifier::BOLD));
 
@@ -3580,8 +3594,8 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
                     };
                     Cell::from(r.grad.sym.clone()).style(style)
                 },
-                Cell::from(format!("{:.4}", r.pooled_eth)),
-                Cell::from(format!("{:.3} ETH", r.mkt_cap_eth)),
+                Cell::from(format!("{:.4} {}", r.pooled_eth, quote_sym(&r.grad))),
+                Cell::from(format!("{:.3} {}", r.mkt_cap_eth, quote_sym(&r.grad))),
                 // Graduation: latched "grad", a live percentage, or nothing
                 // where the venue has no such concept.
                 match (r.graduated, r.grad_pct) {
@@ -3604,8 +3618,9 @@ fn render_table(f: &mut Frame, rows: &[Row], sel: usize, state: &mut TableState)
         // Wide enough for "pools.trade" spelled out — see `venue_tag`.
         Constraint::Length(11),
         Constraint::Length(12),
-        Constraint::Length(11),
-        Constraint::Length(11),
+        // Room for the unit beside the number ("28.8800 USDG").
+        Constraint::Length(12),
+        Constraint::Length(12),
         Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(6),
