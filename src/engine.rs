@@ -4177,6 +4177,11 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
     const SWAP_V3: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
     const MINT_V3: B256 = alloy::primitives::b256!("7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde");
     const BURN_V3: B256 = alloy::primitives::b256!("0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c");
+    // Collect(owner, recipient, tickLower, tickUpper, amount0, amount1). This is
+    // where a v3 position's ETH actually leaves the pool: removing liquidity —
+    // and collecting fees — settles through `burn` then `collect`, and the burn
+    // routinely carries zero while the collect carries the money.
+    const COLLECT_V3: B256 = alloy::primitives::b256!("70935338e69775456a85ddef226c395fb668b63fa0115f5f20610b388e6ca9c0");
     const MODLIQ_V4: B256 = alloy::primitives::b256!("f208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec");
 
     // One filter per protocol (no topic0 filter — decode by topic0 below). v4:
@@ -4330,11 +4335,22 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
 
         // v3 Mint (Add) / Burn (Remove): tickLower/Upper are indexed (topics 2,3);
         // data = [amount, amount0, amount1] (Mint prepends `sender`, +1 word).
-        if !v4 && (t0 == MINT_V3 || t0 == BURN_V3) {
+        if !v4 && (t0 == MINT_V3 || t0 == BURN_V3 || t0 == COLLECT_V3) {
             let off = if t0 == MINT_V3 { 1 } else { 0 };
             let amt0 = uword(b, off + 1) / 1e18;
             let amt1 = uword(b, off + 2) / 1e18;
             let (eth, tokens) = if weth0 { (amt0, amt1) } else { (amt1, amt0) };
+            // Show the row only when ETH actually moved.
+            //
+            // Removing liquidity settles as `burn` then `collect`, and the burn
+            // routinely carries zero — a bare `burn(0)` is also how fees get
+            // poked before collecting. So a burn's zero says nothing, and the
+            // collect alongside it holds the ETH. Taking the ETH from whichever
+            // event carried it, and dropping the ones that carried none, is why
+            // the column stops reading 0.000000 on a real withdrawal.
+            if t0 != MINT_V3 && eth == 0.0 {
+                continue;
+            }
             let action = if t0 == MINT_V3 { TapeAction::Add } else { TapeAction::Remove };
             let tick_lo = topics.get(2).map(|t| tick_of(*t)).unwrap_or(0);
             let tick_hi = topics.get(3).map(|t| tick_of(*t)).unwrap_or(0);
