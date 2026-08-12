@@ -6,6 +6,13 @@
 //! file. What reaches the event log is a **rollup**, once every 30 seconds:
 //! rate, successes, failures, rate limits, and how long calls are taking.
 //!
+//! The recorder is the TRANSPORT (`src/rpc.rs`), so what is counted is what
+//! actually went out on the wire — including the attempts that failed over to
+//! a second endpoint. It used to be a handful of hand-wrapped call sites
+//! instead, which counted about a dozen places and missed everything else:
+//! the numbers looked like a tenth of the real traffic, so an endpoint being
+//! hammered read as an endpoint with an absurdly low limit.
+//!
 //! That split is deliberate, and it is the same lesson as the poll stream. A
 //! line per call means ten lines a second from market reads alone — which is
 //! precisely the flood that made the log screen useless, and writing it as
@@ -17,7 +24,9 @@
 //! answered, so a silent screen and a working endpoint are told apart without
 //! having to infer it from the absence of errors.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 static OK: AtomicU64 = AtomicU64::new(0);
 static FAILED: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +41,19 @@ static SINCE: AtomicU64 = AtomicU64::new(0);
 /// how many clean answers followed.
 static LAST_OK: AtomicU64 = AtomicU64::new(0);
 static LAST_FAIL: AtomicU64 = AtomicU64::new(0);
+/// Per-method tallies for the window: method -> (ok, failed). Which method is
+/// spending the budget is the one thing that says what to cut, and a single
+/// total cannot answer it — one wide `eth_getLogs` can cost a provider more
+/// than a hundred `eth_call`s.
+static METHODS: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// These counters are process-global, so tests that assert an exact delta on
+/// them have to run one at a time. Serialising is the honest fix: the
+/// alternative is loosening the assertions to ">= before", which would stop
+/// them catching a double count — exactly the bug that made the transport's
+/// numbers wrong in the first place.
+#[cfg(test)]
+static TEST_GATE: Mutex<()> = Mutex::new(());
 
 /// How often the rollup is written.
 const WINDOW_SECS: u64 = 30;
@@ -52,6 +74,11 @@ pub fn record(label: &str, ok: bool, elapsed: std::time::Duration, err: Option<&
     MICROS.fetch_add(micros, Ordering::Relaxed);
     SLOWEST.fetch_max(micros, Ordering::Relaxed);
     SINCE.compare_exchange(0, now(), Ordering::Relaxed, Ordering::Relaxed).ok();
+
+    if let Ok(mut m) = METHODS.lock() {
+        let e = m.entry(label.to_string()).or_insert((0, 0));
+        if ok { e.0 += 1 } else { e.1 += 1 }
+    }
 
     if ok {
         OK.fetch_add(1, Ordering::Relaxed);
@@ -102,6 +129,23 @@ pub fn maybe_report() {
     if total == 0 {
         return;
     }
+    // The busiest methods, worst-offending first: what is actually being spent
+    // on, and how much of it is being refused.
+    let busiest = METHODS
+        .lock()
+        .map(|mut m| {
+            let mut v: Vec<(String, (u64, u64))> = std::mem::take(&mut *m).into_iter().collect();
+            v.sort_by_key(|(_, (ok, bad))| std::cmp::Reverse(ok + bad));
+            v.into_iter()
+                .take(3)
+                .map(|(name, (ok, bad))| {
+                    if bad > 0 { format!("{name} {}/{}", ok + bad, bad) } else { format!("{name} {}", ok + bad) }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
     let details = vec![
         ("rate", format!("{:.1}/s", total as f64 / elapsed.max(1) as f64)),
         ("ok", ok.to_string()),
@@ -110,6 +154,8 @@ pub fn maybe_report() {
         ("avg", format!("{:.0}ms", micros as f64 / total as f64 / 1000.0)),
         ("slowest", format!("{:.0}ms", slowest as f64 / 1000.0)),
         ("over", format!("{elapsed}s")),
+        // "method calls/refused" — the refused count is only shown when nonzero.
+        ("busiest", busiest),
     ];
     // Levelled by what the numbers mean, so the reader does not have to do the
     // arithmetic: a rate limit is the one that explains an empty screen.
@@ -167,9 +213,13 @@ where
 {
     let t0 = std::time::Instant::now();
     let out = fut.await;
+    // Traced with the caller's own name for the work — "balanceOf" reads better
+    // in a trace than "eth_call". NOT counted: the transport counts every
+    // request, and counting again here would double every call that reaches it.
+    let ms = t0.elapsed().as_micros() as f64 / 1000.0;
     match &out {
-        Ok(_) => record(label, true, t0.elapsed(), None),
-        Err(e) => record(label, false, t0.elapsed(), Some(&e.to_string())),
+        Ok(_) => crate::trace(&format!("call: {label} ok in {ms:.1}ms")),
+        Err(e) => crate::trace(&format!("call: {label} FAILED in {ms:.1}ms: {e}")),
     }
     out
 }
@@ -180,6 +230,7 @@ mod tests {
 
     #[test]
     fn a_rate_limit_is_counted_apart_from_a_plain_failure() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let before = LIMITED.load(Ordering::Relaxed);
         record("x", false, std::time::Duration::from_millis(1), Some("HTTP 429 Rate Limit Hit"));
         assert_eq!(LIMITED.load(Ordering::Relaxed), before + 1);
@@ -191,8 +242,43 @@ mod tests {
 
     #[test]
     fn a_success_is_counted_so_a_working_endpoint_is_visible() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let before = OK.load(Ordering::Relaxed);
         record("x", true, std::time::Duration::from_millis(5), None);
         assert_eq!(OK.load(Ordering::Relaxed), before + 1);
     }
 }
+
+#[cfg(test)]
+mod method_tally_tests {
+    use super::*;
+
+    /// The rollup has to say WHICH method is spending the budget, and how much
+    /// of that spend is being refused — a single total cannot tell you what to
+    /// cut. Uniquely named so parallel tests cannot disturb the count.
+    #[test]
+    fn per_method_tallies_separate_answered_from_refused() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let m = "eth_methodTallyFixture";
+        record(m, true, std::time::Duration::from_millis(1), None);
+        record(m, true, std::time::Duration::from_millis(1), None);
+        record(m, false, std::time::Duration::from_millis(1), Some("HTTP 429 Rate Limit Hit"));
+
+        let g = METHODS.lock().expect("tally lock");
+        assert_eq!(g.get(m), Some(&(2, 1)), "two answered, one refused");
+    }
+
+    /// A refusal must land in BOTH the global rate-limit counter and the
+    /// method's own tally, or the rollup would name a busy method while the
+    /// headline said nothing was being limited.
+    #[test]
+    fn a_refusal_counts_in_both_places() {
+        let _gate = TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let before = LIMITED.load(Ordering::Relaxed);
+        record("eth_refusalFixture", false, std::time::Duration::from_millis(1), Some("rate limit"));
+        assert!(LIMITED.load(Ordering::Relaxed) > before, "global rate-limit counter moved");
+        let g = METHODS.lock().expect("tally lock");
+        assert_eq!(g.get("eth_refusalFixture").map(|t| t.1), Some(1));
+    }
+}
+

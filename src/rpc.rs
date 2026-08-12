@@ -371,6 +371,7 @@ impl Inner {
             let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
+                    crate::rpcstats::record(&method, false, t0.elapsed(), Some("unreachable"));
                     ep.bench(COOLDOWN_BROKEN, "unreachable");
                     last_err = Some(TransportErrorKind::custom(e));
                     continue;
@@ -389,6 +390,7 @@ impl Inner {
             // streamed read is capped too.
             const MAX_BODY: usize = 64 * 1024 * 1024;
             if resp.content_length().is_some_and(|n| n > MAX_BODY as u64) {
+                crate::rpcstats::record(&method, false, t0.elapsed(), Some("response too large"));
                 ep.bench(COOLDOWN_BROKEN, "response too large");
                 last_err = Some(TransportErrorKind::custom_str("response body over cap"));
                 continue;
@@ -396,6 +398,7 @@ impl Inner {
             let bytes = match read_capped(resp, MAX_BODY).await {
                 Ok(b) => b,
                 Err(e) => {
+                    crate::rpcstats::record(&method, false, t0.elapsed(), Some("body read failed"));
                     ep.bench(COOLDOWN_BROKEN, "body read failed");
                     last_err = Some(TransportErrorKind::custom_str(&e));
                     continue;
@@ -404,12 +407,14 @@ impl Inner {
 
             if status.as_u16() == 429 {
                 let text = String::from_utf8_lossy(&bytes);
+                crate::rpcstats::record(&method, false, t0.elapsed(), Some("429 rate limit"));
                 ep.bench(limited_cooldown(&text, retry_after), "429");
                 last_err =
                     Some(TransportErrorKind::http_error(429, text.into_owned()));
                 continue;
             }
             if status.is_server_error() {
+                crate::rpcstats::record(&method, false, t0.elapsed(), Some("5xx"));
                 ep.bench(COOLDOWN_BROKEN, "5xx");
                 last_err = Some(TransportErrorKind::http_error(
                     status.as_u16(),
@@ -458,6 +463,7 @@ impl Inner {
                     .as_error()
                     .map(|e| e.message.to_string())
                     .unwrap_or_else(|| "rate limited".into());
+                crate::rpcstats::record(&method, false, t0.elapsed(), Some("429 rate limit in body"));
                 ep.bench(limited_cooldown(&msg, retry_after), "429 in body");
                 last_err = Some(TransportErrorKind::http_error(429, msg));
                 continue;
@@ -507,6 +513,7 @@ impl Inner {
                 }
             }
 
+            crate::rpcstats::record(&method, true, t0.elapsed(), None);
             ep.observe(t0.elapsed());
             if attempt > 0 {
                 crate::trace(&format!("rpc: {} answered {method} after failover", ep.host));
