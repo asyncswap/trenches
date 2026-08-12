@@ -221,6 +221,7 @@ pub const PONS_PNG: &[u8] = include_bytes!("../../assets/pons.png");
 pub const UNISWAP_PNG: &[u8] = include_bytes!("../../assets/uniswap.png");
 pub const FLAUNCH_PNG: &[u8] = include_bytes!("../../assets/flaunch.png");
 pub const POOLS_TRADE_PNG: &[u8] = include_bytes!("../../assets/pools-trade.png");
+pub const POOLS_FUN_PNG: &[u8] = include_bytes!("../../assets/pools-fun.png");
 pub const BASE_PNG: &[u8] = include_bytes!("../../assets/base.png");
 
 impl Venue {
@@ -231,6 +232,7 @@ impl Venue {
             Venue::Pons => "PONS".to_string(),
             Venue::Flaunch => "FLAUNCH".to_string(),
             Venue::PoolsTrade => "POOLS.TRADE".to_string(),
+            Venue::PoolsFun => "POOLS.FUN".to_string(),
             Venue::Uniswap => "UNISWAP".to_string(),
             Venue::Chain => {
                 let n = network.to_lowercase();
@@ -253,6 +255,7 @@ pub fn for_venue(venue: Venue, network: &str) -> Option<&'static [u8]> {
         Venue::Pons => Some(PONS_PNG),
         Venue::Flaunch => Some(FLAUNCH_PNG),
         Venue::PoolsTrade => Some(POOLS_TRADE_PNG),
+        Venue::PoolsFun => Some(POOLS_FUN_PNG),
         Venue::Uniswap => Some(UNISWAP_PNG),
         Venue::Chain => for_network(network),
     }
@@ -272,6 +275,9 @@ pub enum Venue {
     /// EVM-only build never constructs it.
     #[cfg_attr(not(feature = "solana"), allow(dead_code))]
     PumpFun,
+    /// pools.fun. Recognised from the POOL KIND rather than from metadata:
+    /// a Sushi v3 pool on this chain only exists because a launchpad made it.
+    PoolsFun,
     /// Pons. Detected from the pool having a Pons `TokenLaunched` block: only
     /// graduation discovery sets one, so its presence IS the signal that this
     /// token came off Pons rather than being a plain Uniswap pair.
