@@ -5310,6 +5310,29 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             Span::raw(format!("{:.2} {} (bought)", bot.bought_qty, bot.pool.sym)),
         ]),
         pnl_row("Realized", bot.realized_pnl, real_color),
+        // What the bag you are still holding is worth against what it cost.
+        // Realized only moves when you SELL, so a position sitting at a loss
+        // showed nothing anywhere on this panel — every PnL row read zero
+        // while the money was down. This is the open half.
+        {
+            let cost = bot.token_bal * bot.avg_basis();
+            let px = bot.price();
+            let value = if px > 0.0 { bot.token_bal / px } else { 0.0 };
+            if bot.token_bal > 0.0 && cost > 0.0 && px > 0.0 {
+                let open = value - cost;
+                pnl_row("Unrealized", open, ui::widgets::tone_color(pnl_tone(open, 6)))
+            } else {
+                // No bag, or no price to mark it against — a dash, never a zero
+                // that would read as "flat".
+                Line::from(vec![
+                    lbl("Unrealized"),
+                    Span::styled(
+                        "—".to_string(),
+                        Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
+                    ),
+                ])
+            }
+        },
         match bot.last_fill_pnl {
             Some(v) => pnl_row("Last Fill", v, ui::widgets::tone_color(pnl_tone(v, 6))),
             None => Line::from(vec![
