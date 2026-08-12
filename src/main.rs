@@ -5282,7 +5282,21 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             }
             spans
         }),
-        Line::from(vec![lbl(&bot.pool.sym), Span::raw(format!("{:.4}", bot.token_bal))]),
+        Line::from({
+            // The bag, and beside it what it is actually worth. A six-figure
+            // token count says nothing on its own — the whole question is
+            // whether those tokens are worth anything, and the answer was one
+            // panel away. Dimmed, approximate, and absent when the price is.
+            let mut spans = vec![lbl(&bot.pool.sym), Span::raw(format!("{:.4}", bot.token_bal))];
+            let px = bot.price();
+            if px > 0.0 && bot.pool.quote_usd > 0.0 && bot.token_bal > 0.0 {
+                spans.push(Span::styled(
+                    format!("  ({})", view::usd_compact(bot.token_bal / px * bot.pool.quote_usd)),
+                    Style::default().fg(ui::widgets::tone_color(view::Tone::Dim)),
+                ));
+            }
+            spans
+        }),
         Line::from(vec![
             lbl("Our Liq"),
             Span::raw(format!("{} {} ({} pos)", view::eth(bot.our_liq_eth()), bot.pool.quote_sym, bot.positions.len())),
