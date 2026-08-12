@@ -13,6 +13,7 @@ A terminal trading bot.
 - Uniswap V4
 - pons.family
 - Flaunch
+- pools.fun — SushiSwap V3
 - pump.fun
 - PumpSwap AMM
 
