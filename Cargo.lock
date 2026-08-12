@@ -4881,7 +4881,7 @@ dependencies = [
 
 [[package]]
 name = "trenches"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "alloy",
  "bincode",
