@@ -19,7 +19,7 @@ A terminal bot for trading memecoins.
   launches, [Flaunch](https://flaunch.gg) launches, and
   [pools.fun](https://pools.fun) launches trading on SushiSwap V3
 - **Solana** — pump.fun bonding curves and PumpSwap AMM
-- **Base, BNB Chain, Hyperliquid** — next
+- **Base, BNB Chain** — next
 - Keys stay on your machine, in a password-encrypted keystore
 - One set of shortcuts, from one file — the app, the docs and the website
   cannot disagree about them
