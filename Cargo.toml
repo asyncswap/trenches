@@ -12,10 +12,6 @@ authors = ["AsyncSwap Labs, Inc."]
 # Testnets and local nodes. Off in a release: without this they are not
 # compiled in at all, so a production binary cannot offer a chain nobody trades.
 testnet = []
-# The in-app copilot (A key): spawns the user's own `claude` CLI with live
-# market context. EXPERIMENTAL — off in default and release builds while it
-# bakes; build with `--features agent` to play.
-agent = []
 # Providing liquidity: the `a` and `r` keys, and the position-closing half of
 # the sweep. OFF for the first release.
 #

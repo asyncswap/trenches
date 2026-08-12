@@ -1224,60 +1224,6 @@ impl SolBot {
         net.max(0.0)
     }
 
-    /// The room, written down for the copilot: what coin, what price, what
-    /// we hold, and the recent tape. Plain text — a prompt, not an API.
-    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
-    pub fn agent_context(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&format!("Network: {}\n", self.net));
-        match (&self.meta, &self.coin) {
-            (Some(m), Some(c)) => {
-                s.push_str(&format!("Coin: {} ({}) mint {}\n", m.name, m.symbol, c.mint));
-            }
-            (None, Some(c)) => s.push_str(&format!("Coin mint: {}\n", c.mint)),
-            _ => s.push_str("No coin selected.\n"),
-        }
-        if self.sol_usd > 0.0 {
-            s.push_str(&format!("SOL/USD: {:.2}\n", self.sol_usd));
-        }
-        s.push_str(&format!(
-            "My SOL balance: {:.4}. My token balance: {:.2}.\n",
-            self.sol, self.token_bal
-        ));
-        if self.bought_qty > 0.0 {
-            s.push_str(&format!(
-                "Open position: {:.2} tokens costing {:.4} SOL total.\n",
-                self.bought_qty, self.bought_cost
-            ));
-        }
-        s.push_str(&format!(
-            "Realized PnL this session: {:+.6} SOL. Trades {} Fails {}.\n",
-            self.realized_pnl, self.trades, self.fails
-        ));
-        if let Some(last) = self.tape.first().and_then(|r| r.block_time) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(last);
-            s.push_str(&format!(
-                "Recent tape, newest first (last row {}s ago), SOL amounts; MINE marks my fills:\n",
-                (now - last).max(0)
-            ));
-        } else {
-            s.push_str("Recent tape, newest first:\n");
-        }
-        for r in self.tape.iter().take(40) {
-            s.push_str(&format!(
-                "  {} {:.4} SOL cap {:.0} SOL{}\n",
-                r.kind.label(),
-                r.sol,
-                r.mkt_cap_sol,
-                if r.mine { "  MINE" } else { "" }
-            ));
-        }
-        s.push_str(&format!("Status line: {}\n", self.status));
-        s
-    }
 }
 
 /// The steps `;` and `'` move between, coarsest last. The EVM ladder, because
@@ -2999,10 +2945,6 @@ pub async fn run(
 
     let mut msel = ui::mouse::Selection::default();
     let mut copy_armed = false;
-    // The copilot's thread: survives panel flips and coin changes, dies with
-    // the dashboard — a conversation about this sitting, not a diary.
-    #[cfg(feature = "agent")]
-    let mut chat = crate::agent::Chat::default();
     loop {
         let mut logo_box = None;
         let mut coin_box = None;
@@ -3139,15 +3081,6 @@ pub async fn run(
                     KeyCode::Char('D') => {
                         crate::events::action("Opened docs", &[("chain", "solana".to_string())]);
                         ui::docs(term)?
-                    }
-                    // Ask the copilot about the room. v1: the user's own
-                    // `claude` binary, fed the live state as context. It can
-                    // read everything and trade nothing.
-                    #[cfg(feature = "agent")]
-                    KeyCode::Char('A') => {
-                        // Full-screen copilot: streaming answers, one thread
-                        // for the whole sitting, the market running behind it.
-                        ui::chat_screen(term, &mut chat, &|| bot.agent_context())?;
                     }
                     // Back to the wallet list on this same chain, as on EVM.
                     // `w` is an unlisted alias for `W`, as on the EVM side.

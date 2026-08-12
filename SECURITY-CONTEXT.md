@@ -56,8 +56,7 @@ anything, and trade against a pool the user is watching.
   and truncation are expected. `src/sol/{pumpfun,pumpswap,discover,engine}.rs`,
   `src/engine.rs`, `src/discover.rs`.
 - **The tape**: other people's trades, including their addresses, flow into
-  the UI, into persisted files, and (behind a feature flag) into an AI
-  prompt. See "AI copilot" below.
+  the UI and into persisted files.
 - **RPC responses**: the app trusts its configured endpoints for pricing and
   balances. A malicious/compromised RPC is in scope — what can it make the
   app do? (Relevant: users paste provider URLs into config.)
@@ -105,7 +104,7 @@ Ranked by our own unease, not by what's easy to scan for:
 3. **Untrusted text into a terminal.** ANSI/control filtering happens in
    `clean_text`. We just fixed bidi/zero-width passthrough (see Fixed below).
    Look for other paths that print chain-derived strings without it — logs,
-   session files, the copilot prompt, panel labels, error messages.
+   session files, panel labels, error messages.
 4. **The Worker's authorization checks.** Every `/portal/*` route re-loads
    the account and must verify ownership (`acct.keys.includes(key)`) before
    acting. We have edited these routes rapidly; assume one is wrong.
@@ -120,21 +119,6 @@ Ranked by our own unease, not by what's easy to scan for:
 8. **The updater** (`src/update.rs`): downloads a release, verifies
    SHA256SUMS with a pinned minisign key. Anything that lets an unsigned or
    substituted binary land is critical.
-
-## AI copilot (feature-flagged OFF in every released binary)
-
-`src/agent.rs` + `chat_screen` in `src/ui.rs`, built only with
-`--features agent`; **not present in release builds** (the release workflow
-builds `--features solana` only). It spawns the user's own `claude` CLI and
-feeds it live market state as a prompt. Two things we already consider real
-risks and would like judged:
-
-- **Prompt injection via market data.** Token names and trader addresses on
-  the tape land inside the prompt. Today the spawned agent has no tools
-  wired, but the shape is: hostile on-chain text → an agent running on the
-  user's machine.
-- **Data exfiltration surface.** The prompt contains balances, positions and
-  addresses; it leaves the process via a child process.
 
 ## Recently fixed (don't re-report; useful as a fingerprint of our blind spots)
 
@@ -163,7 +147,6 @@ risks and would like judged:
 ```
 cargo build --release --features solana      # what ships
 cargo test  --release --features solana      # 240 tests
-cargo build --release --features solana,agent  # + the copilot (not shipped)
 ```
 
 Worker: `bunx tsc --noEmit`, `bunx wrangler deploy`. Secrets are never in the
