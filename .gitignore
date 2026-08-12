@@ -33,3 +33,6 @@ hero-*.png
 # Vendor documentation kept locally for reference, not redistributed.
 pons-v2.txt
 /pools.trade/
+
+# Solidity language server scratch — solc input dumps, not source.
+.solidity-language-server/
