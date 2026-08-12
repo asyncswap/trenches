@@ -46,6 +46,26 @@ pub struct Venues {
     /// hookless v4 pool against native ETH in the same transaction; a crowd
     /// launch runs an auction first and the pool appears at graduation.
     pub pools_launcher: Address,
+    /// pools.fun, the launchpad that deploys straight into a SushiSwap V3 pool.
+    /// The launched token is always token0 and the pool is always 1% fee /
+    /// 200 spacing. ZERO where it is not deployed.
+    pub pools_fun: Address,
+    /// Sushi's OWN launchpad, a different contract with a different
+    /// `TokenLaunched` — both are live and both feed Sushi V3 pools, so
+    /// discovery watches each by address rather than by event signature.
+    pub sushi_launchpad: Address,
+    /// Sushi's V3 factory. A v3 router is bound to its factory, so a pool
+    /// registered here CANNOT be traded through Uniswap's SwapRouter02 — this
+    /// is what separates a Sushi pool from a Uniswap one.
+    pub sushi_v3_factory: Address,
+    /// Sushi's swap path: RedSnwapper is the entry point (and the approval
+    /// target for sells); it executes a route against the RouteProcessor.
+    pub sushi_red_snwapper: Address,
+    pub sushi_route_processor: Address,
+    /// The second quote asset pools.fun launches against. Most launches pair
+    /// WETH, but a real minority pair USDG, and pricing one as the other is
+    /// off by orders of magnitude.
+    pub usdg: Address,
 }
 
 /// Official Robinhood Chain deployment.
@@ -91,6 +111,17 @@ static ROBINHOOD: Venues = Venues {
     // exist.
     pons_v2_hook: address!("E5e702641Ea86F4ae6cC3cDaeD2B886f976Be044"),
     pools_launcher: address!("0000FffFBE8efE702c8703aE3477FF5dE3d319C0"),
+    // pools.fun. Verified live: ~15.6KB of bytecode and hundreds of launches,
+    // every one of them creating a 1% / 200-spacing Sushi V3 pool.
+    pools_fun: address!("626C3d09B65bF5d1D40E0D5F25e19fa49783B3D4"),
+    // Sushi's own launchpad, from sushi-labs/sushiswap's LAUNCHPAD_ADDRESS.
+    // Also live, also launching into Sushi V3 — a different contract from
+    // pools.fun, not a second name for it.
+    sushi_launchpad: address!("104F1Ab42674565EC3DF0BFEbCcC4186f72fA7ED"),
+    sushi_v3_factory: address!("E51960f1B45f1C9FB6D166E6a884F866fC70433B"),
+    sushi_red_snwapper: address!("8E6fD69A77e88ee20Ba4B4fBd59DfCDA3EC0E98A"),
+    sushi_route_processor: address!("0e867974275Cd31C25015C2753C9d75F9f355379"),
+    usdg: address!("5fc5360D0400a0Fd4f2af552ADD042D716F1d168"),
 };
 
 /// Base mainnet.
@@ -124,6 +155,15 @@ static BASE: Venues = Venues {
     pons_v2_factory: Address::ZERO,
     pons_v2_hook: Address::ZERO,
     pools_launcher: Address::ZERO,
+    // pools.fun and Sushi's launchpad are Robinhood Chain only. Sushi V3 does
+    // exist on Base, but nothing here routes through it yet, so zero rather
+    // than an address no code path reads.
+    pools_fun: Address::ZERO,
+    sushi_launchpad: Address::ZERO,
+    sushi_v3_factory: Address::ZERO,
+    sushi_red_snwapper: Address::ZERO,
+    sushi_route_processor: Address::ZERO,
+    usdg: Address::ZERO,
 };
 
 #[allow(dead_code)] // the pair reads as a pair; only one is matched on
@@ -146,6 +186,12 @@ pub fn v3_factory() -> Address { venues().v3_factory }
 pub fn swap_router_02() -> Address { venues().swap_router_02 }
 pub fn weth() -> Address { venues().weth }
 pub fn pools_launcher() -> Address { venues().pools_launcher }
+pub fn pools_fun() -> Address { venues().pools_fun }
+pub fn sushi_launchpad() -> Address { venues().sushi_launchpad }
+pub fn sushi_v3_factory() -> Address { venues().sushi_v3_factory }
+pub fn sushi_red_snwapper() -> Address { venues().sushi_red_snwapper }
+pub fn sushi_route_processor() -> Address { venues().sushi_route_processor }
+pub fn usdg() -> Address { venues().usdg }
 pub fn flaunch_pm() -> Address { venues().flaunch_pm }
 pub fn fleth() -> Address { venues().fleth }
 pub fn fleth_hooks() -> Address { venues().fleth_hooks }
@@ -202,6 +248,85 @@ sol! {
     interface ILiquidityLauncher {
         event TokenCreated(address indexed tokenAddress);
         event TokenDistributed(address indexed tokenAddress, address indexed strategy, uint256 amount);
+    }
+
+    // ---- pools.fun (PartyFactory) ----
+    //
+    // Declared in the SAME order as the Solidity source, because that order is
+    // what decides both which fields are topics and how the data words are
+    // laid out. `creator` is the THIRD indexed field even though it is the
+    // fourth parameter, so topic3 is the creator and `deployer` rides in the
+    // data — reading topic3 as the deployer happens to work only because the
+    // contract requires `creator == msg.sender`.
+    #[sol(rpc)]
+    interface IPartyFactory {
+        event TokenLaunched(
+            address indexed token,
+            address indexed pool,
+            address pairedAsset,
+            address indexed creator,
+            address deployer,
+            address feeRecipient,
+            int24 startTick,
+            string metadataUri,
+            uint256 devBuyAmountOut
+        );
+        function allowedPairedAsset(address asset) external view returns (bool);
+    }
+
+    // ---- Sushi's own launchpad ----
+    //
+    // A different contract from pools.fun with a different TokenLaunched, both
+    // live and both landing in Sushi V3 pools. Kept apart so a row can say
+    // which launchpad it came from.
+    #[sol(rpc)]
+    interface ISushiLaunchpad {
+        event TokenLaunched(
+            address indexed creator,
+            address indexed token,
+            address indexed pool,
+            address quoteToken,
+            int24 startTick,
+            string name,
+            string symbol,
+            uint16 reserveBps,
+            uint256 reserveAmount,
+            uint64 reserveUnlockAt,
+            uint16 initialSushiFeeBps
+        );
+    }
+
+    // ---- Sushi V3 ----
+    #[sol(rpc)]
+    interface ISushiV3Factory {
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface ISushiV3Pool {
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
+        function liquidity() external view returns (uint128);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function fee() external view returns (uint24);
+    }
+
+    // Sushi's swap entry point. RedSnwapper pulls the input, hands a route to
+    // the RouteProcessor, and enforces `amountOutMin` on what actually lands
+    // with the recipient — so it, not the RouteProcessor, is the approval
+    // target for a sell.
+    #[sol(rpc)]
+    interface IRedSnwapper {
+        function snwap(address tokenIn, uint256 amountIn, address recipient, address tokenOut, uint256 amountOutMin, address executor, bytes executorData) external payable returns (uint256 amountOut);
+    }
+
+    // The executor RedSnwapper calls. `takeSurplus` MUST be false: with it set
+    // the processor forwards only `amountOutMin` to the recipient and keeps
+    // the remainder, which silently donates the whole difference between the
+    // quote and the fill.
+    #[sol(rpc)]
+    interface ISushiRouteProcessor {
+        function processRoute(address tokenIn, uint256 amountIn, address tokenOut, uint256 amountOutMin, address to, bytes route, bool takeSurplus, uint32 referralCode) external payable returns (uint256 amountOut);
     }
 
     // The uerc20-factory's creation event, emitted in the same transaction as

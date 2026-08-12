@@ -4,7 +4,6 @@
 //! built speed-first: concurrent reads, pre-flight gas protection, and ready
 //! for a local Nitro node over ws:// or IPC (remote ~380ms -> local ~1ms).
 
-mod agent;
 mod verification;
 mod config;
 mod base_currency;
@@ -28,6 +27,7 @@ mod rpcstats;
 #[cfg(feature = "solana")]
 mod sol;
 mod ui;
+mod sushi;
 mod update;
 mod v3;
 mod v4;
@@ -1284,6 +1284,61 @@ async fn read_symbol<P: Provider>(provider: &P, token: alloy::primitives::Addres
         .unwrap_or_else(|_| "TOK".to_string())
 }
 
+/// Pick the concentrated-liquidity venue for a pasted CA.
+///
+/// Sushi is asked FIRST, and that ordering is the fix for a real bug: a
+/// launched token can also sit in a pool somebody else created, and sushicat's
+/// pools.fun pool held 52 WETH while a Uniswap pool for the same token held 1.
+/// Taking whichever venue answered first picked the 48x thinner market and
+/// labelled it as a different protocol.
+///
+/// Returns Err when a lookup could not be COMPLETED. That is not the same as
+/// "no pool", and conflating them told the user their token had no market when
+/// the truth was that the node was rate limiting us.
+async fn resolve_cl_pool<P: Provider>(
+    provider: &P,
+    token: alloy::primitives::Address,
+    sym: &str,
+) -> Result<Option<SelPool>, String> {
+    match discover::resolve_sushi_grad(provider, token, sym).await {
+        Ok(Some(g)) => {
+            let quote_addr = match g.kind {
+                engine::PoolKind::SushiV3 { quote, .. } => quote,
+                _ => contracts::weth(),
+            };
+            let (quote, quote_sym) = quote_from(&format!("{quote_addr:#x}"));
+            crate::trace(&format!("ca: {token} resolved to the sushi pool, quoted in {quote_sym}"));
+            return Ok(Some(SelPool {
+                label: pool_label(false, "sushi", &quote_sym, sym, g.fee, ""),
+                kind: g.kind,
+                token,
+                sym: sym.to_string(),
+                fee: g.fee,
+                owned: false,
+                quote,
+                quote_sym,
+            }));
+        }
+        Ok(None) => {}
+        Err(why) => return Err(why),
+    }
+
+    if let Some((addr, fee, w0)) = find_v3_pool(provider, token).await {
+        crate::trace(&format!("ca: {token} resolved to uniswap v3 {addr:#x} fee {fee}"));
+        return Ok(Some(SelPool {
+            label: pool_label(false, "v3", "ETH", sym, fee, ""),
+            kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: w0 },
+            token,
+            sym: sym.to_string(),
+            fee,
+            owned: false,
+            quote: engine::Quote::Eth,
+            quote_sym: "ETH".to_string(),
+        }));
+    }
+    Ok(None)
+}
+
 /// Auto-find a token's WETH v3 pool: scan the fee tiers and return the first with
 /// live liquidity as (pool_addr, fee, weth_is_token0). None if the token has no
 /// liquid v3 pool.
@@ -1391,6 +1446,10 @@ fn header_venue(bot: &Bot) -> ui::image::Venue {
         // The kind IS the signal — checked before pons_launch so a launch
         // block set for the Age row can never relabel a Flaunch coin.
         ui::image::Venue::Flaunch
+    } else if matches!(bot.pool.kind, engine::PoolKind::SushiV3 { .. }) {
+        // Also decided by the kind, and checked before the metadata branch so a
+        // launchpad tag left by another venue cannot relabel it.
+        ui::image::Venue::PoolsFun
     } else if token_metadata_chain_id::get(bot.pool.token)
         .and_then(|f| f.launchpad)
         .is_some()
@@ -1570,7 +1629,8 @@ const ONE_SIDED: &str = "Fresh launch — all liquidity is coin-side until the f
 /// what you paste into an explorer, match against a fill, or send to us.
 fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
     let (key, val) = match p.kind {
-        engine::PoolKind::V3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
+        engine::PoolKind::V3 { pool_addr, .. }
+        | engine::PoolKind::SushiV3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
         // Name it for what it is: there is no pool yet, and calling a curve
         // "pool" in a bug report sends whoever reads it to the wrong contract.
         engine::PoolKind::PonsCurve { curve, .. } => ("curve", format!("{curve:#x}")),
@@ -1646,6 +1706,19 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                 match p.address.parse::<alloy::primitives::Address>() {
                     Ok(a) if a != alloy::primitives::Address::ZERO => {
                         engine::PoolKind::V3 { pool_addr: a, weth_is_token0: weth_is_token0(tok) }
+                    }
+                    _ => continue,
+                }
+            } else if p.kind.eq_ignore_ascii_case("sushi_v3") {
+                // Saved with the pool in `address` and the quote in
+                // `currency0`, because WETH- and USDG-quoted Sushi pools are
+                // otherwise indistinguishable on reload.
+                match (
+                    p.address.parse::<alloy::primitives::Address>(),
+                    p.currency0.parse::<alloy::primitives::Address>(),
+                ) {
+                    (Ok(a), Ok(q)) if a != alloy::primitives::Address::ZERO => {
+                        engine::PoolKind::SushiV3 { pool_addr: a, quote: q }
                     }
                     _ => continue,
                 }
@@ -1925,6 +1998,10 @@ async fn main() -> eyre::Result<()> {
     // terminal's own selection stops working under capture, so the app
     // provides the same gesture itself.
     let _ = std::io::stdout().execute(crossterm::event::EnableMouseCapture);
+    // Bracketed paste: without it a pasted private key or seed phrase arrives
+    // as individual key events, indistinguishable from typing, and the
+    // ghost-key filter eats every repeated character.
+    let _ = std::io::stdout().execute(crossterm::event::EnableBracketedPaste);
     // Raw mode + alternate screen are global terminal state. A panic unwinds
     // past the teardown below and would leave the user with a shell that shows
     // no typing and no prompt, so restore it first and let the panic through.
@@ -1932,6 +2009,7 @@ async fn main() -> eyre::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
+        let _ = std::io::stdout().execute(crossterm::event::DisableBracketedPaste);
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
         default_hook(info);
     }));
@@ -1939,6 +2017,7 @@ async fn main() -> eyre::Result<()> {
     let res = app(&mut terminal, &reg).await;
     disable_raw_mode()?;
     let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
+    let _ = std::io::stdout().execute(crossterm::event::DisableBracketedPaste);
     std::io::stdout().execute(LeaveAlternateScreen)?;
     // Last thing, after the terminal is back. The next run starts on what is
     // launching then, not on what launched now.
@@ -2726,6 +2805,13 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
         engine::PoolKind::PonsV2Pool { pool_id, quote, tick_spacing, .. } => (
             "pons_v2", pool_id.to_string(), String::new(), tick_spacing,
             quote.to_string(), contracts::state_view().to_string(),
+        ),
+        // Identified by ADDRESS like a v3 pool, but the quote is not implied —
+        // WETH and USDG pools look identical otherwise — so it is recorded in
+        // `currency0` and the variant rebuilds from the file without a read.
+        engine::PoolKind::SushiV3 { pool_addr, quote } => (
+            "sushi_v3", String::new(), pool_addr.to_string(), 0,
+            quote.to_string(), String::new(),
         ),
     };
     let pool_obj = json!({
@@ -3568,66 +3654,6 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             events::action("Opened docs", &[]);
                             ui::docs(terminal)?
                         }
-                        // Ask the copilot about the room — same v1 as the
-                        // Solana side: the user's own claude binary, fed the
-                        // live state. Reads everything, trades nothing.
-                        #[cfg(feature = "agent")]
-                        KeyCode::Char('A') => {
-                            if let Some(q) =
-                                ui::input(terminal, "Ask the copilot", "e.g. what does this tape say?")?
-                            {
-                                if !q.trim().is_empty() {
-                                    let mut ctx = String::new();
-                                    ctx.push_str(&format!(
-                                        "Network: {} (EVM)\nPool: {} / {} \n",
-                                        bot.net, bot.pool.sym, bot.pool.quote_sym
-                                    ));
-                                    if bot.eth_usd > 0.0 {
-                                        ctx.push_str(&format!("ETH/USD: {:.2}\n", bot.eth_usd));
-                                    }
-                                    ctx.push_str(&format!(
-                                        "My ETH: {:.6}. My {}: {:.4}. Basis {:.6} {}/{}.\n",
-                                        bot.eth,
-                                        bot.pool.sym,
-                                        bot.token_bal,
-                                        bot.avg_basis(),
-                                        bot.pool.quote_sym,
-                                        bot.pool.sym
-                                    ));
-                                    ctx.push_str(&format!(
-                                        "Realized PnL: {:+.6} {}. Open liquidity {:.4} ETH across {} positions.\n",
-                                        bot.realized_pnl,
-                                        bot.pool.quote_sym,
-                                        bot.our_liq_eth(),
-                                        bot.positions.len()
-                                    ));
-                                    {
-                                        let t = tape.lock().unwrap();
-                                        ctx.push_str("Recent tape, newest first (ETH amounts; MINE marks my fills):\n");
-                                        for s in t.iter().rev().take(40) {
-                                            let kind = match s.action {
-                                                engine::TapeAction::Buy => "BUY",
-                                                engine::TapeAction::Sell => "SELL",
-                                                engine::TapeAction::Add => "ADD-LP",
-                                                engine::TapeAction::Remove => "REMOVE-LP",
-                                            };
-                                            let mine = bot.is_mine(s);
-                                            ctx.push_str(&format!(
-                                                "  {kind} {:.4} ETH pooled {:.2} ETH{}\n",
-                                                s.eth,
-                                                s.liq_eth,
-                                                if mine { "  MINE" } else { "" }
-                                            ));
-                                        }
-                                    }
-                                    ctx.push_str(&format!("Status line: {}\n", bot.status));
-                                    let rx = agent::spawn_ask(ctx, q.clone());
-                                    if let Some(ans) = ui::wait_for_answer(terminal, &q, &rx)? {
-                                        ui::text_view(terminal, " Copilot ", &ans)?;
-                                    }
-                                }
-                            }
-                        }
                         // Back to the account list on this same chain.
                         // `w` is an unlisted alias for `W`. Not in
                         // shortcuts.json on purpose: the help names one key per
@@ -3683,7 +3709,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('?') => { show_help = true; }
                         // Theme picker with live preview (persists the choice).
                         KeyCode::Char('T') => {
-                            match ui::widgets::theme_picker(terminal)? {
+                            let picked = ui::widgets::theme_picker(terminal)?;
+                            ui::drain_input();
+                            match picked {
                                 Some(name) => {
                                     events::action("Changed theme", &[("theme", name.clone())]);
                                     bot.status = format!("Changed theme to {name}");
@@ -3967,6 +3995,15 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                 .unwrap_or(0.0);
                                             (s, weth_is_token0)
                                         }
+                                        engine::PoolKind::SushiV3 { pool_addr, quote } => {
+                                            let s = contracts::IV3Pool::new(pool_addr, provider)
+                                                .slot0()
+                                                .call()
+                                                .await
+                                                .map(|r| r.sqrtPriceX96.to_string().parse::<f64>().unwrap_or(0.0) / 2f64.powi(96))
+                                                .unwrap_or(0.0);
+                                            (s, quote < p.token)
+                                        }
                                         engine::PoolKind::V4 { pool_id, .. }
                                         | engine::PoolKind::FlaunchV4 { pool_id, .. }
                                         | engine::PoolKind::PonsV2Pool { pool_id, .. } => {
@@ -4150,17 +4187,37 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             // screen — its numbers are invisible, and discovery
                             // needs the requests more.
                             poll_paused.store(true, Ordering::Relaxed);
+                            // Paint the waiting message BEFORE awaiting. Setting
+                            // `bot.status` alone changes nothing on screen: the
+                            // dashboard does not repaint until this handler
+                            // returns, so a screen that takes seconds to load
+                            // left the old frame sitting there, frozen, and the
+                            // stall watchdog rightly called it out.
                             let grad = if k.code == KeyCode::Char('F') {
                                 bot.status = "Loading verified tokens".into();
+                                discover::draw_status(terminal, "\nLoading verified tokens…")?;
                                 discover::screen_verified(terminal, verified.clone()).await?
                             } else if k.code == KeyCode::Char('k') {
                                 bot.status = "loading top tokens…".into();
+                                discover::draw_status(terminal, "\nLoading top tokens…")?;
                                 discover::screen_top_tokens(terminal, provider, discovery_rpc.clone(), bot.eth_usd).await?
                             } else {
                                 bot.status = "discovering token launches…".into();
+                                discover::draw_status(terminal, "\nDiscovering token launches…")?;
                                 discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?
                             };
                             poll_paused.store(false, Ordering::Relaxed);
+                            // Whatever was typed at the modal while it was busy
+                            // is not a command for the dashboard.
+                            ui::drain_input();
+                            // Come back to the trades panel, always. Which panel
+                            // you were on before opening a full-screen picker is
+                            // not a thing to preserve, and the panel must only
+                            // ever move because someone asked it to — it used to
+                            // arrive somewhere else entirely, which read as the
+                            // view cycling on its own.
+                            view = Panel::Tape;
+                            orders_scroll = 0;
                             match grad {
                                 Some(g) => {
                                     let quote_sym = match &g.quote {
@@ -4323,16 +4380,21 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                     // line, so a token that would not load left
                                                     // nothing to read afterwards.
                                                     crate::trace(&format!("ca: resolving {token} ({sym})"));
-                                                    if let Some((addr, fee, w0)) = find_v3_pool(provider, token).await {
-                                                        crate::trace(&format!("ca: {token} resolved to v3 {addr:#x} fee {fee}"));
-                                                        bot.status = format!("found v3 {} pool for {sym}", fee_label(fee));
-                                                        Some(SelPool {
-                                                            label: pool_label(false, "v3", "ETH", &sym, fee, ""),
-                                                            kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: w0 },
-                                                            token, sym, fee, owned: false,
-                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
-                                                        })
-                                                    } else if let Some(fl) = discover::fetch_flaunch_pool(provider, token).await {
+                                                    match resolve_cl_pool(provider, token, &sym).await {
+                                                        Ok(Some(p)) => {
+                                                            bot.status = format!("{} for {sym}", p.label);
+                                                            Some(p)
+                                                        }
+                                                        // A lookup that never completed says NOTHING
+                                                        // about whether a pool exists. Saying "no pool"
+                                                        // here sent the user hunting for a market that
+                                                        // was there the whole time.
+                                                        Err(why) => {
+                                                            crate::trace(&format!("ca: {token} could not be checked: {why}"));
+                                                            bot.note(format!("Could not check {sym}: {why}. The node did not answer — try again"));
+                                                            None
+                                                        }
+                                                        Ok(None) =>                                                     if let Some(fl) = discover::fetch_flaunch_pool(provider, token).await {
                                                         // No v3 pool, but Flaunch launched it — trade the
                                                         // flETH-paired hook pool instead.
                                                         bot.status = format!("found Flaunch pool for {sym}");
@@ -4374,9 +4436,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                     } else {
                                                         crate::trace(&format!("ca: {token} matched nothing — no v3, no Flaunch, no native v4, not a UERC20"));
                                                         bot.note(format!(
-                                                            "Could not place {sym}: no Uniswap v3 or v4 pool against ETH, and it is not a pools.trade launch"
+                                                            "Could not place {sym}: no Uniswap v3 or v4 pool, no SushiSwap pool against ETH or USDG, and it is not a pools.trade launch"
                                                         ));
                                                         None
+                                                    }
                                                     }
                                                 }
                                                 // Not a 20-byte address. Flaunch listings show the
@@ -4633,6 +4696,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // The launchpad outranks the AMM it launched onto — same order the
         // logo resolves in.
         ui::image::Venue::PoolsTrade => "POOLS.TRADE".to_string(),
+        ui::image::Venue::PoolsFun => "POOLS.FUN".to_string(),
         _ => bot.pool.kind.banner_name().to_string(),
     };
 
@@ -4827,7 +4891,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // Addresses first — always FULL so they can be copy-pasted into an explorer.
     mkt.push(Line::from(vec![mlbl("Token"), Span::raw(bot.pool.token.to_string())]));
     match bot.pool.kind {
-        engine::PoolKind::V3 { pool_addr, .. } =>
+        engine::PoolKind::V3 { pool_addr, .. }
+        | engine::PoolKind::SushiV3 { pool_addr, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
         engine::PoolKind::PonsCurve { curve, .. } =>
             mkt.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
@@ -5049,7 +5114,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let mut mb: Vec<Line> = Vec::new();
             mb.push(Line::from(Span::styled(format!("{:<9}{}", "Token", pb.token), Style::default().fg(ui::widgets::tone_color(view::Tone::Normal)))));
             match pb.kind {
-                engine::PoolKind::V3 { pool_addr, .. } =>
+                engine::PoolKind::V3 { pool_addr, .. }
+                | engine::PoolKind::SushiV3 { pool_addr, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
                 engine::PoolKind::PonsCurve { curve, .. } =>
                     mb.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),

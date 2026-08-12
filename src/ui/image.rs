@@ -73,7 +73,11 @@ pub fn clear() {
         return;
     }
     let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b_Ga=d\x1b\\");
+    // q=2: suppress the terminal's reply. Without it kitty answers every
+    // graphics command with `\x1b_Gi=<id>;OK\x1b\\`, which lands on stdin and is
+    // parsed as keystrokes — the "O" of "OK" is the dashboard's Orders key, so
+    // drawing coin art walked the panel through the views by itself.
+    let _ = write!(out, "\x1b_Ga=d,q=2\x1b\\");
     let _ = out.flush();
 }
 
@@ -87,6 +91,9 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16, img: u32) {
     // Terminal cursor addressing is 1-indexed.
     let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
 
+    // q=2: no reply. The terminal otherwise ACKs every chunk on stdin and the
+    // event loop reads those bytes as key presses.
+    //
     // f=100: PNG payload. a=T: transmit and display. C=1: leave the cursor put,
     // so the placement can't scroll the view. m=1 marks "more chunks follow" —
     // the protocol caps each escape at 4096 base64 bytes.
@@ -101,7 +108,7 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16, img: u32) {
         if first {
             let _ = write!(
                 out,
-                "\x1b_Ga=T,f=100,C=1,i={img},c={cols},r={rows},m={more};{}\x1b\\",
+                "\x1b_Ga=T,f=100,C=1,q=2,i={img},c={cols},r={rows},m={more};{}\x1b\\",
                 std::str::from_utf8(chunk).unwrap_or("")
             );
             first = false;
@@ -119,7 +126,7 @@ fn delete_image(img: u32) {
     }
     let mut out = std::io::stdout();
     // d=I: delete the image and free its data, rather than only its placements.
-    let _ = write!(out, "\x1b_Ga=d,d=I,i={img}\x1b\\");
+    let _ = write!(out, "\x1b_Ga=d,d=I,q=2,i={img}\x1b\\");
     let _ = out.flush();
 }
 
@@ -214,6 +221,7 @@ pub const PONS_PNG: &[u8] = include_bytes!("../../assets/pons.png");
 pub const UNISWAP_PNG: &[u8] = include_bytes!("../../assets/uniswap.png");
 pub const FLAUNCH_PNG: &[u8] = include_bytes!("../../assets/flaunch.png");
 pub const POOLS_TRADE_PNG: &[u8] = include_bytes!("../../assets/pools-trade.png");
+pub const POOLS_FUN_PNG: &[u8] = include_bytes!("../../assets/pools-fun.png");
 pub const BASE_PNG: &[u8] = include_bytes!("../../assets/base.png");
 
 impl Venue {
@@ -224,6 +232,7 @@ impl Venue {
             Venue::Pons => "PONS".to_string(),
             Venue::Flaunch => "FLAUNCH".to_string(),
             Venue::PoolsTrade => "POOLS.TRADE".to_string(),
+            Venue::PoolsFun => "POOLS.FUN".to_string(),
             Venue::Uniswap => "UNISWAP".to_string(),
             Venue::Chain => {
                 let n = network.to_lowercase();
@@ -246,6 +255,7 @@ pub fn for_venue(venue: Venue, network: &str) -> Option<&'static [u8]> {
         Venue::Pons => Some(PONS_PNG),
         Venue::Flaunch => Some(FLAUNCH_PNG),
         Venue::PoolsTrade => Some(POOLS_TRADE_PNG),
+        Venue::PoolsFun => Some(POOLS_FUN_PNG),
         Venue::Uniswap => Some(UNISWAP_PNG),
         Venue::Chain => for_network(network),
     }
@@ -265,6 +275,9 @@ pub enum Venue {
     /// EVM-only build never constructs it.
     #[cfg_attr(not(feature = "solana"), allow(dead_code))]
     PumpFun,
+    /// pools.fun. Recognised from the POOL KIND rather than from metadata:
+    /// a Sushi v3 pool on this chain only exists because a launchpad made it.
+    PoolsFun,
     /// Pons. Detected from the pool having a Pons `TokenLaunched` block: only
     /// graduation discovery sets one, so its presence IS the signal that this
     /// token came off Pons rather than being a plain Uniswap pair.

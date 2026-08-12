@@ -9,6 +9,10 @@ What each venue actually lets you do, since it is not the same everywhere:
 - **pons.family** — launch discovery, and graduations into Uniswap
 - **Flaunch** — launch discovery, and trading via Uniswap V4 (fees charged by
   the Flaunch hook)
+- **pools.fun** — launch discovery, and trading on SushiSwap V3. Every launch
+  opens a 1% pool paired against WETH or USDG, and the launched token is
+  always token0. These pools are NOT reachable through Uniswap's router — a v3
+  router is bound to one factory — so trades route through Sushi's own path
 - **pump.fun** — bonding curves, live launches
 - **PumpSwap AMM** — graduated coins
 

@@ -16,7 +16,7 @@ pub mod widgets;
 use std::io::Stdout;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{prelude::*, widgets::*};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -42,6 +42,30 @@ pub fn fresh_key(code: KeyCode) -> bool {
     }
     *g = Some((code, std::time::Instant::now()));
     true
+}
+
+/// Throw away input that queued up while a modal screen owned the terminal.
+///
+/// A screen that blocks on the network is not reading the keyboard, so the
+/// terminal buffers everything typed at it and hands the backlog to whatever
+/// reads next — the dashboard. The arrows that were scrolling a token list are
+/// the dashboard's panel-cycle keys, so pressing f, arrowing around and
+/// pressing q made the view walk t/c/o/l by itself afterwards.
+///
+/// Anything typed at a screen that has since closed was meant for that screen,
+/// not for this one, so it is stale by definition and dropped.
+pub fn drain_input() {
+    // Bounded: a terminal that always reports ready must not spin here forever.
+    for _ in 0..512 {
+        match event::poll(Duration::from_millis(0)) {
+            Ok(true) => {
+                if event::read().is_err() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
 }
 
 /// Arrow-key list selection. Returns the chosen index, or None if cancelled.
@@ -888,17 +912,38 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                match k.code {
-                    KeyCode::Enter => return Ok(Some(buf.trim().to_string())),
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Backspace => {
-                        buf.pop();
+            match event::read()? {
+                // A paste arrives as ONE event carrying the whole string, so it
+                // never passes through `fresh_key`. That matters: the ghost-key
+                // filter cannot tell a duplicate keypress from the second '0' of
+                // a pasted "00", and a 64-character private key almost always
+                // contains a repeated character. Without this, pasting a key
+                // silently lost bytes and the import failed as "not a valid
+                // private key".
+                Event::Paste(s) => buf.push_str(s.trim()),
+                Event::Key(k) => {
+                    // A physical press reported twice is the whole reason
+                    // `fresh_key` exists. Where the terminal tells us the event
+                    // KIND, the duplicate is identifiable outright and there is
+                    // no need to guess from timing.
+                    if k.kind == KeyEventKind::Release { continue; }
+                    // Text characters must NOT go through the ghost filter: it
+                    // drops a repeat inside 25ms, which is indistinguishable
+                    // from the second '0' of a key or the 'll' of a seed word.
+                    // The filter still guards the control keys, where a stray
+                    // repeat would submit or cancel the screen twice.
+                    if !matches!(k.code, KeyCode::Char(_)) && !fresh_key(k.code) { continue; }
+                    match k.code {
+                        KeyCode::Enter => return Ok(Some(buf.trim().to_string())),
+                        KeyCode::Esc => return Ok(None),
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
                     }
-                    KeyCode::Char(c) => buf.push(c),
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -930,17 +975,38 @@ pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                match k.code {
-                    KeyCode::Enter => return Ok(Some(buf)),
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Backspace => {
-                        buf.pop();
+            match event::read()? {
+                // A paste arrives as ONE event carrying the whole string, so it
+                // never passes through `fresh_key`. That matters: the ghost-key
+                // filter cannot tell a duplicate keypress from the second '0' of
+                // a pasted "00", and a 64-character private key almost always
+                // contains a repeated character. Without this, pasting a key
+                // silently lost bytes and the import failed as "not a valid
+                // private key".
+                Event::Paste(s) => buf.push_str(s.trim()),
+                Event::Key(k) => {
+                    // A physical press reported twice is the whole reason
+                    // `fresh_key` exists. Where the terminal tells us the event
+                    // KIND, the duplicate is identifiable outright and there is
+                    // no need to guess from timing.
+                    if k.kind == KeyEventKind::Release { continue; }
+                    // Text characters must NOT go through the ghost filter: it
+                    // drops a repeat inside 25ms, which is indistinguishable
+                    // from the second '0' of a key or the 'll' of a seed word.
+                    // The filter still guards the control keys, where a stray
+                    // repeat would submit or cancel the screen twice.
+                    if !matches!(k.code, KeyCode::Char(_)) && !fresh_key(k.code) { continue; }
+                    match k.code {
+                        KeyCode::Enter => return Ok(Some(buf)),
+                        KeyCode::Esc => return Ok(None),
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
                     }
-                    KeyCode::Char(c) => buf.push(c),
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -959,274 +1025,33 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 
-#[cfg(feature = "agent")]
-/// A modal wait on the copilot: spinner, the question, Esc to cancel. The
-/// render loop is never blocked by a language model — this loop polls the
-/// answer channel and the keyboard at 50ms.
-pub fn wait_for_answer<T: Send + 'static>(
-    term: &mut Term,
-    question: &str,
-    rx: &std::sync::mpsc::Receiver<T>,
-) -> eyre::Result<Option<T>> {
-    use crossterm::event::{self, Event, KeyCode};
-    let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut i = 0usize;
-    loop {
-        if let Ok(ans) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            return Ok(Some(ans));
-        }
-        i = (i + 1) % spin.len();
-        let q = question.to_string();
-        term.draw(|f| {
-            let area = f.area();
-            let block = widgets::themed_block(" Copilot ");
-            let inner = ratatui::layout::Rect {
-                x: area.width / 8,
-                y: area.height / 3,
-                width: area.width * 3 / 4,
-                height: 5,
-            };
-            let text = ratatui::widgets::Paragraph::new(vec![
-                ratatui::text::Line::from(format!("{} thinking about: {q}", spin[i])),
-                ratatui::text::Line::from(""),
-                ratatui::text::Line::from("esc cancels — the market keeps running behind this"),
-            ])
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .block(block);
-            f.render_widget(ratatui::widgets::Clear, inner);
-            f.render_widget(text, inner);
-        })?;
-        if event::poll(std::time::Duration::from_millis(30))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                if k.code == KeyCode::Esc {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "agent")]
-/// A full-screen scrollable text view — the copilot's answer, readable at
-/// length. ↑/↓ and PgUp/PgDn scroll, anything else closes.
-pub fn text_view(term: &mut Term, title: &str, text: &str) -> eyre::Result<()> {
-    use crossterm::event::{self, Event, KeyCode};
-    let mut scroll: u16 = 0;
-    loop {
-        term.draw(|f| {
-            let area = f.area();
-            let para = ratatui::widgets::Paragraph::new(text.to_string())
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .scroll((scroll, 0))
-                .block(widgets::themed_block(title));
-            f.render_widget(ratatui::widgets::Clear, area);
-            f.render_widget(para, area);
-        })?;
-        if event::poll(std::time::Duration::from_millis(120))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                if widgets::theme_key(term, k.code)? { continue; }
-                match k.code {
-                    KeyCode::Up => scroll = scroll.saturating_sub(1),
-                    KeyCode::Down => scroll = scroll.saturating_add(1),
-                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
-                    KeyCode::Char('j') => scroll = scroll.saturating_add(1),
-                    KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-                    _ => return Ok(()),
-                }
-            }
-        }
-    }
-}
 
 
-#[cfg(feature = "agent")]
-/// The copilot, full screen: the conversation above, a live input below with
-/// a blinking cursor, answers streaming in as claude writes them. Enter asks;
-/// Esc cancels a stream in flight, and closes the screen when idle. The
-/// market keeps trading behind this — the poller never stops.
-pub fn chat_screen(
-    term: &mut Term,
-    chat: &mut crate::agent::Chat,
-    context: &dyn Fn() -> String,
-) -> eyre::Result<()> {
-    use crate::agent::StreamEvent;
-    use crossterm::event::{self, Event, KeyCode};
 
-    // This screen owns the terminal now: take down any image the dashboard
-    // left (the coin logo is a graphics PLACEMENT, not cells — it floats over
-    // whatever is drawn under it until explicitly cleared). Clearing also
-    // marks placements stale, so the dashboard redraws its logo on return.
-    image::clear();
 
-    fn wrap_into<'a>(
-        lines: &mut Vec<ratatui::text::Line<'a>>,
-        head: &str,
-        text: &str,
-        width: usize,
-        style: ratatui::style::Style,
-    ) {
-        let mut first = true;
-        for para in text.split('\n') {
-            let mut line = String::new();
-            for word in para.split_whitespace() {
-                let lead = if first { head.len() } else { 2 };
-                if !line.is_empty() && lead + line.len() + 1 + word.len() > width {
-                    let prefix = if first { head.to_string() } else { "  ".to_string() };
-                    lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
-                    first = false;
-                    line.clear();
-                }
-                if !line.is_empty() {
-                    line.push(' ');
-                }
-                line.push_str(word);
-            }
-            let prefix = if first { head.to_string() } else { "  ".to_string() };
-            lines.push(ratatui::text::Line::styled(format!("{prefix}{line}"), style));
-            first = false;
-        }
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    /// The ghost-key filter cannot tell a duplicated keypress from a genuine
+    /// repeated character, and a private key is 64 hex digits that very often
+    /// contains one. This is why pasted text must arrive as `Event::Paste` and
+    /// bypass the filter entirely — routing it through here dropped a character
+    /// per repeat and the import failed as "not a valid private key".
+    #[test]
+    fn the_ghost_filter_swallows_genuine_repeats() {
+        assert!(fresh_key(KeyCode::Char('7')), "the first press is kept");
+        assert!(
+            !fresh_key(KeyCode::Char('7')),
+            "an immediate repeat is dropped — correct for a ghost, wrong for a pasted \"77\""
+        );
     }
 
-    let mut input = String::new();
-    let mut streaming: Option<std::sync::mpsc::Receiver<StreamEvent>> = None;
-    let mut partial = String::new();
-    let mut from_bottom: u16 = 0; // 0 = pinned to the newest line
-    let t0 = std::time::Instant::now();
-
-    loop {
-        // Drain whatever claude has written since the last frame.
-        let mut finished = false;
-        if let Some(rx) = &streaming {
-            loop {
-                match rx.try_recv() {
-                    Ok(StreamEvent::Delta(d)) => {
-                        partial.push_str(&d);
-                        from_bottom = 0;
-                    }
-                    Ok(StreamEvent::Done { session_id }) => {
-                        if session_id.is_some() {
-                            chat.session_id = session_id;
-                        }
-                        if !partial.is_empty() {
-                            chat.transcript.push((false, std::mem::take(&mut partial)));
-                        }
-                        finished = true;
-                        break;
-                    }
-                    Ok(StreamEvent::Fail(e)) => {
-                        chat.transcript.push((false, format!("({e})")));
-                        partial.clear();
-                        finished = true;
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        if !partial.is_empty() {
-                            chat.transcript.push((false, std::mem::take(&mut partial)));
-                        }
-                        finished = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if finished {
-            streaming = None;
-        }
-
-        let busy = streaming.is_some();
-        let blink = (t0.elapsed().as_millis() / 500).is_multiple_of(2);
-        term.draw(|f| {
-            let area = f.area();
-            let chunks = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Min(3),
-                    ratatui::layout::Constraint::Length(3),
-                ])
-                .split(area);
-
-            let width = chunks[0].width.saturating_sub(2).max(10) as usize;
-            let bold = ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD);
-            let plain = ratatui::style::Style::default();
-            let mut lines: Vec<ratatui::text::Line> = Vec::new();
-            for (who, text) in chat.transcript.iter() {
-                wrap_into(&mut lines, if *who { "you ▸ " } else { "claude ▸ " }, text, width, if *who { bold } else { plain });
-                lines.push(ratatui::text::Line::from(""));
-            }
-            if busy {
-                let live = format!("{partial}{}", if blink { "▌" } else { " " });
-                wrap_into(&mut lines, "claude ▸ ", &live, width, plain);
-            }
-            let total = lines.len() as u16;
-            let view_h = chunks[0].height.saturating_sub(2);
-            let max_scroll = total.saturating_sub(view_h);
-            let s = max_scroll.saturating_sub(from_bottom.min(max_scroll));
-            let para = ratatui::widgets::Paragraph::new(lines)
-                .scroll((s, 0))
-                .block(widgets::themed_block(" Copilot — the market keeps running behind this "));
-            f.render_widget(ratatui::widgets::Clear, area);
-            f.render_widget(para, chunks[0]);
-
-            let cursor = if busy { "" } else if blink { "▌" } else { " " };
-            let hint = if busy { "esc stops the answer" } else { "enter asks · esc closes · ↑/↓ scroll" };
-            let input_line = ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled("❯ ", bold),
-                ratatui::text::Span::raw(format!("{input}{cursor}")),
-                ratatui::text::Span::styled(
-                    format!("   {hint}"),
-                    ratatui::style::Style::default().fg(widgets::tone_color(crate::view::Tone::Dim)),
-                ),
-            ]);
-            let inp = ratatui::widgets::Paragraph::new(input_line).block(widgets::themed_block(" Ask "));
-            f.render_widget(inp, chunks[1]);
-        })?;
-
-        if event::poll(std::time::Duration::from_millis(33))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                if k.kind == crossterm::event::KeyEventKind::Release {
-                    continue;
-                }
-                match k.code {
-                    KeyCode::Esc => {
-                        if busy {
-                            streaming = None;
-                            if !partial.is_empty() {
-                                let cut = format!("{} (stopped)", std::mem::take(&mut partial));
-                                chat.transcript.push((false, cut));
-                            }
-                        } else {
-                            return Ok(());
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if !busy && !input.trim().is_empty() {
-                            let q = std::mem::take(&mut input);
-                            chat.transcript.push((true, q.clone()));
-                            partial.clear();
-                            from_bottom = 0;
-                            streaming = Some(crate::agent::spawn_stream(
-                                chat.session_id.clone(),
-                                context(),
-                                q,
-                            ));
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        input.pop();
-                    }
-                    KeyCode::Up => from_bottom = from_bottom.saturating_add(1),
-                    KeyCode::Down => from_bottom = from_bottom.saturating_sub(1),
-                    KeyCode::PageUp => from_bottom = from_bottom.saturating_add(10),
-                    KeyCode::PageDown => from_bottom = from_bottom.saturating_sub(10),
-                    KeyCode::Char(c) => input.push(c),
-                    _ => {}
-                }
-            }
-        }
+    /// Distinct characters are unaffected, which is why the bug only showed up
+    /// on keys and phrases that happened to contain a doubled character.
+    #[test]
+    fn distinct_characters_pass_through() {
+        assert!(fresh_key(KeyCode::Char('a')));
+        assert!(fresh_key(KeyCode::Char('b')));
     }
 }

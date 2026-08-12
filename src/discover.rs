@@ -26,8 +26,9 @@ use ratatui::{prelude::*, widgets::*};
 use crate::contracts::{
     IERC20, IFlaunchPositionManager, ILiquidityLauncher, IPonsCurve, IPonsFactory,
     IPonsV2Factory, IPoolManager, IStateView, IUERC20Factory, IV3Factory, IV3Pool,
+    IPartyFactory, ISushiLaunchpad, ISushiV3Factory, ISushiV3Pool,
     FLAUNCH_FEE_EST, flaunch_pm, pons_factory, pons_v2_factory, pool_manager, pools_launcher,
-    state_view, v3_factory, weth,
+    pools_fun, state_view, sushi_launchpad, sushi_v3_factory, usdg, v3_factory, weth,
 };
 use std::sync::OnceLock;
 use crate::engine;
@@ -83,7 +84,8 @@ impl Grad {
     /// A stable identity for dedup ONLY (v3 address padded into a B256).
     pub fn pool_key(&self) -> B256 {
         match self.kind {
-            engine::PoolKind::V3 { pool_addr, .. } => pool_addr.into_word(),
+            engine::PoolKind::V3 { pool_addr, .. }
+            | engine::PoolKind::SushiV3 { pool_addr, .. } => pool_addr.into_word(),
             // A curve has no pool; its own address is the stable identity, and
             // it is unique per launch.
             engine::PoolKind::PonsCurve { curve, .. } => curve.into_word(),
@@ -96,7 +98,8 @@ impl Grad {
     /// 32-byte pool_id for v4. Never the zero-padded form.
     pub fn pool_display(&self) -> String {
         match self.kind {
-            engine::PoolKind::V3 { pool_addr, .. } => format!("{pool_addr:#x}"),
+            engine::PoolKind::V3 { pool_addr, .. }
+            | engine::PoolKind::SushiV3 { pool_addr, .. } => format!("{pool_addr:#x}"),
             engine::PoolKind::PonsCurve { curve, .. } => format!("{curve:#x}"),
             engine::PoolKind::V4 { pool_id, .. }
             | engine::PoolKind::FlaunchV4 { pool_id, .. }
@@ -241,6 +244,62 @@ pub struct PoolsCand {
     pub pool_id: B256,
     pub tick_spacing: i32,
     pub fee: u32,
+}
+
+/// Pools that came out of a Sushi launchpad, mapped to the asset they are
+/// quoted in.
+///
+/// Discovery decodes a launch long before it builds a row, and the row has to
+/// know it is looking at a SUSHI pool: from the address alone a Sushi pool and
+/// a Uniswap one are indistinguishable, and routing the former through
+/// Uniswap's router does not misprice it — the router cannot find the pool at
+/// all. The quote rides along because it is not always WETH.
+fn sushi_pool_registry() -> &'static std::sync::Mutex<std::collections::HashMap<Address, Address>> {
+    static R: OnceLock<std::sync::Mutex<std::collections::HashMap<Address, Address>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Record a pool as Sushi-launched, with the asset it trades against.
+pub fn note_sushi_pool(pool: Address, quote: Address) {
+    if let Ok(mut m) = sushi_pool_registry().lock() {
+        m.insert(pool, quote);
+    }
+}
+
+/// The quote asset of a known Sushi pool, or None if this is not one.
+pub fn sushi_pool_quote(pool: Address) -> Option<Address> {
+    sushi_pool_registry().lock().ok().and_then(|m| m.get(&pool).copied())
+}
+
+/// A launch from pools.fun or from Sushi's own launchpad.
+///
+/// Both name the token, the pool and the quote asset in the event itself, so
+/// unlike a pools.trade launch there is no receipt to fetch — the row can be
+/// built from the log alone.
+///
+/// The two events are NOT the same shape. pools.fun indexes (token, pool,
+/// creator); Sushi's indexes (creator, token, pool). Only the quote asset sits
+/// in the same place in both — the first data word — which is why the topics
+/// are read per-signature rather than by position.
+fn decode_sushi_launch(lg: &alloy::rpc::types::Log) -> Option<(Address, Address, u64)> {
+    let t = lg.topics();
+    if t.len() < 4 {
+        return None;
+    }
+    let (token, pool) = if t[0] == IPartyFactory::TokenLaunched::SIGNATURE_HASH {
+        (Address::from_word(t[1]), Address::from_word(t[2]))
+    } else if t[0] == ISushiLaunchpad::TokenLaunched::SIGNATURE_HASH {
+        (Address::from_word(t[2]), Address::from_word(t[3]))
+    } else {
+        return None;
+    };
+    let data = lg.data().data.as_ref();
+    if data.len() < 32 {
+        return None;
+    }
+    let quote = Address::from_slice(&data[12..32]);
+    note_sushi_pool(pool, quote);
+    Some((token, pool, lg.block_number.unwrap_or(0)))
 }
 
 fn decode_pools_log(lg: &alloy::rpc::types::Log) -> Option<PoolsCand> {
@@ -779,6 +838,15 @@ pub fn sort_launch_logs(
                     pons.push(c);
                 }
             }
+        } else if lg.address() == pools_fun() || lg.address() == sushi_launchpad() {
+            // The event carries the pool, so this needs no follow-up lookup —
+            // it joins the same (token, pool, block) list a pons graduation
+            // uses, and `build_row` reads the registry to get the venue right.
+            if let Some((token, pool, block)) = decode_sushi_launch(lg) {
+                if seen.insert(token.into_word()) {
+                    pons.push((token, pool, block));
+                }
+            }
         } else if lg.address() == pools_launcher() {
             if let Some(c) = decode_pools_log(lg) {
                 if seen.insert(c.token.into_word()) {
@@ -1005,7 +1073,7 @@ fn note_v2_supply<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: 
 }
 
 fn launch_addresses() -> Vec<Address> {
-    [pons_factory(), flaunch_pm(), pons_v2_factory(), pools_launcher()]
+    [pons_factory(), flaunch_pm(), pons_v2_factory(), pools_launcher(), pools_fun(), sushi_launchpad()]
         .into_iter()
         .filter(|a| !a.is_zero())
         .collect()
@@ -1018,6 +1086,10 @@ fn launch_topics() -> Vec<B256> {
         IFlaunchPositionManager::PoolCreated::SIGNATURE_HASH,
         IPonsV2Factory::TokenLaunched::SIGNATURE_HASH,
         ILiquidityLauncher::TokenCreated::SIGNATURE_HASH,
+        // pools.fun and Sushi's launchpad each emit their own TokenLaunched;
+        // the signatures differ, so both are needed to see both feeds.
+        IPartyFactory::TokenLaunched::SIGNATURE_HASH,
+        ISushiLaunchpad::TokenLaunched::SIGNATURE_HASH,
     ]
 }
 
@@ -1126,10 +1198,25 @@ fn build_row(
     swaps_in_window: usize,
     head: u64,
 ) -> Row {
+    // A pool from a Sushi launchpad trades somewhere Uniswap's router cannot
+    // reach, so the venue has to be right here or every trade on the row fails.
+    let (kind, quote) = match sushi_pool_quote(pool_addr) {
+        Some(q) if q == weth() => (engine::PoolKind::SushiV3 { pool_addr, quote: q }, engine::Quote::Eth),
+        // USDG is 6-decimal, and its USD value is fetched rather than assumed
+        // to be a dollar — stables drift and depeg.
+        Some(q) => (
+            engine::PoolKind::SushiV3 { pool_addr, quote: q },
+            engine::Quote::Stable { token: q, decimals: 6 },
+        ),
+        None => (
+            engine::PoolKind::V3 { pool_addr, weth_is_token0: weth() < token },
+            engine::Quote::Eth,
+        ),
+    };
     let grad = Grad {
         token,
-        kind: engine::PoolKind::V3 { pool_addr, weth_is_token0: weth() < token },
-        quote: engine::Quote::Eth,
+        kind,
+        quote,
         sym: f.sym.clone(),
         fee: if f.fee > 0 { f.fee } else { 10_000 },
         launch_block: block,
@@ -2991,7 +3078,7 @@ fn draw_scan_status(term: &mut Term, msg: &str, foot: &str, frame: usize) -> eyr
     Ok(())
 }
 
-fn draw_status(term: &mut Term, msg: &str) -> eyre::Result<()> {
+pub fn draw_status(term: &mut Term, msg: &str) -> eyre::Result<()> {
     term.draw(|f| {
         crate::ui::image::clear();
         let block = crate::ui::widgets::themed_block_line(trenches_title(0));
@@ -3361,6 +3448,102 @@ async fn enrich_pooled(
 
 /// Resolve a bare token address to a tradable v3 WETH-pool Grad (the most-liquid
 /// fee tier). None if the token has no live WETH pool.
+/// Resolve a token to its SushiSwap V3 pool — where every pools.fun launch
+/// trades, and somewhere Uniswap's router cannot reach.
+///
+/// Both quote assets are tried. Most launches pair WETH, but a real minority
+/// pair USDG, and the two are indistinguishable from the token alone: the pool
+/// address is a point lookup per quote, so asking costs one call each rather
+/// than a scan. The 1% tier comes first because the launchpad hardcodes it.
+pub async fn resolve_sushi_grad<P: Provider>(
+    provider: &P,
+    token: Address,
+    sym: &str,
+) -> Result<Option<Grad>, String> {
+    // Not deployed on this chain — say nothing rather than probe address zero.
+    if sushi_v3_factory().is_zero() {
+        return Ok(None);
+    }
+    let factory = ISushiV3Factory::new(sushi_v3_factory(), provider);
+    let mut errors = 0usize;
+    let mut last = String::new();
+
+    for quote in [weth(), usdg()] {
+        if quote.is_zero() {
+            continue;
+        }
+        // Only the 1% tier: it is what both launchpads hardcode, and every
+        // extra tier is another call to burn against a rate limit before the
+        // caller can fall through to Uniswap.
+        for fee in [10000u32] {
+            let addr = match factory.getPool(token, quote, fee.try_into().unwrap()).call().await {
+                Ok(a) => a._0,
+                Err(e) => {
+                    // A failed lookup is not the same as "no pool"; count it so
+                    // the caller can say "could not check" instead of "none".
+                    errors += 1;
+                    last = e.to_string();
+                    continue;
+                }
+            };
+            if addr.is_zero() {
+                continue;
+            }
+            let pool = ISushiV3Pool::new(addr, provider);
+            let liq = match pool.liquidity().call().await {
+                Ok(l) => l._0,
+                Err(e) => {
+                    errors += 1;
+                    last = e.to_string();
+                    continue;
+                }
+            };
+            // A brand-new launch is one-sided: the whole supply sits above spot
+            // and there is no quote asset in the pool yet. That is a live
+            // market you can buy into, so liquidity == 0 is not a rejection.
+            let one_sided = liq == 0
+                && IERC20::new(token, provider)
+                    .balanceOf(addr)
+                    .call()
+                    .await
+                    .map(|b| !b._0.is_zero())
+                    .unwrap_or(false);
+            if liq == 0 && !one_sided {
+                continue;
+            }
+            let q = if quote == weth() {
+                engine::Quote::Eth
+            } else {
+                let decimals = IERC20::new(quote, provider)
+                    .decimals()
+                    .call()
+                    .await
+                    .map(|d| d._0)
+                    .unwrap_or(18);
+                engine::Quote::Stable { token: quote, decimals }
+            };
+            // Register it too: a token that arrives by CA never passes through
+            // the launch decoder, and without this a later row would rebuild it
+            // as a Uniswap pool and route it to a router that cannot reach it.
+            note_sushi_pool(addr, quote);
+            return Ok(Some(Grad {
+                token,
+                kind: engine::PoolKind::SushiV3 { pool_addr: addr, quote },
+                quote: q,
+                sym: sym.to_string(),
+                fee,
+                launch_block: 0,
+                socials: engine::TokenSocials::default(),
+            }));
+        }
+    }
+    if errors > 0 {
+        return Err(format!("could not check sushi ({errors} lookups failed: {last})"));
+    }
+    crate::trace(&format!("resolve {sym}: no sushi pool with a market"));
+    Ok(None)
+}
+
 async fn resolve_v3_grad<P: Provider>(
     provider: &P,
     token: Address,
@@ -3495,9 +3678,13 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
                             draw_status(term, "\nResolving pool…")?;
                             match resolve_v3_grad(provider, r.token, &r.sym).await {
                                 Ok(Some(g)) => return Ok(Some(g)),
-                                Ok(None) => {
-                                    note = format!("  · {}: no live weth() pool", r.sym)
-                                }
+                                // No Uniswap pool is not the end of it: a
+                                // pools.fun token only ever has a Sushi one.
+                                Ok(None) => match resolve_sushi_grad(provider, r.token, &r.sym).await {
+                                    Ok(Some(g)) => return Ok(Some(g)),
+                                    Ok(None) => note = format!("  · {}: no live weth() pool", r.sym),
+                                    Err(why) => note = format!("  · {}: {why}", r.sym),
+                                },
                                 Err(why) => note = format!("  · {}: {why}", r.sym),
                             }
                         }
@@ -3515,6 +3702,9 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
 fn venue_tag(g: &Grad) -> &'static str {
     match g.kind {
         engine::PoolKind::V3 { .. } => "Pons v1",
+        // Sushi V3 pools reach this feed only through a launchpad, and
+        // pools.fun is the one that fills it.
+        engine::PoolKind::SushiV3 { .. } => "pools.fun",
         // Spelled out. "flnch" saves one column and costs the reader a
         // guess at which launchpad they are looking at, which is the only
         // thing this column is for.
@@ -3989,5 +4179,103 @@ mod ca_tests {
         assert!(!is_inline_metadata("ipfs://bafkreifu2vv6ig3pp2zk2jwxk76bhehuvclc7oi63o63bl7k5e6m2b5rpa"));
         assert!(!is_inline_metadata("https://example.com/meta.json"));
         assert!(!is_inline_metadata(""));
+    }
+}
+
+#[cfg(test)]
+mod sushi_launch_tests {
+    use super::*;
+    use alloy::primitives::{address, LogData};
+
+    fn mk(addr: Address, topics: Vec<B256>, data: Vec<u8>) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: addr,
+                data: LogData::new_unchecked(topics, data.into()),
+            },
+            block_number: Some(33_997_417),
+            ..Default::default()
+        }
+    }
+
+    fn word(a: Address) -> B256 {
+        a.into_word()
+    }
+
+    /// Straight from the real MERLIN launch at block 33,997,417. The third
+    /// indexed field is the CREATOR, not the pool and not the deployer —
+    /// reading it positionally is the mistake this test exists to catch.
+    #[test]
+    fn pools_fun_launch_decodes_token_pool_and_quote() {
+        let token = address!("08381AB31D2B3E70D47F8256d71C56a9e14A13d1");
+        let pool = address!("619aa83b66Bd9738eB665FFc993B64048837F9FF");
+        let creator = address!("8e056cb829788507641ffbc066246fd6b1d08b04");
+
+        let mut data = vec![0u8; 32];
+        data[12..32].copy_from_slice(weth().as_slice());
+
+        let lg = mk(
+            pools_fun(),
+            vec![
+                IPartyFactory::TokenLaunched::SIGNATURE_HASH,
+                word(token),
+                word(pool),
+                word(creator),
+            ],
+            data,
+        );
+
+        let (t, p, b) = decode_sushi_launch(&lg).expect("should decode");
+        assert_eq!(t, token, "topic1 is the token");
+        assert_eq!(p, pool, "topic2 is the pool");
+        assert_eq!(b, 33_997_417);
+        assert_eq!(sushi_pool_quote(pool), Some(weth()), "quote registered from the first data word");
+    }
+
+    /// Sushi's own launchpad indexes (creator, token, pool) — a different order
+    /// from pools.fun. Decoding both by position would silently swap them.
+    #[test]
+    fn sushi_launchpad_uses_a_different_topic_order() {
+        let token = address!("00000000000000000000000000000000DeaDBeef");
+        let pool = address!("000000000000000000000000000000000000BEEF");
+        let creator = address!("000000000000000000000000000000000000C0DE");
+
+        let mut data = vec![0u8; 32];
+        data[12..32].copy_from_slice(usdg().as_slice());
+
+        let lg = mk(
+            sushi_launchpad(),
+            vec![
+                ISushiLaunchpad::TokenLaunched::SIGNATURE_HASH,
+                word(creator),
+                word(token),
+                word(pool),
+            ],
+            data,
+        );
+
+        let (t, p, _) = decode_sushi_launch(&lg).expect("should decode");
+        assert_eq!(t, token, "topic2 is the token here, not topic1");
+        assert_eq!(p, pool, "topic3 is the pool here");
+        assert_eq!(sushi_pool_quote(pool), Some(usdg()), "a USDG-quoted launch keeps its quote");
+    }
+
+    /// The two launchpads share an event NAME but not a signature, so anything
+    /// else on those addresses must be ignored rather than half-decoded.
+    #[test]
+    fn an_unrelated_event_is_not_a_launch() {
+        let lg = mk(
+            pools_fun(),
+            vec![B256::ZERO, B256::ZERO, B256::ZERO, B256::ZERO],
+            vec![0u8; 32],
+        );
+        assert!(decode_sushi_launch(&lg).is_none());
+    }
+
+    /// A pool nobody launched must not be claimed as Sushi's, or an ordinary
+    /// Uniswap v3 pool would be routed to a router that cannot reach it.
+    #[test]
+    fn unknown_pools_are_not_sushi() {
+        assert_eq!(sushi_pool_quote(address!("000000000000000000000000000000000000dEaD")), None);
     }
 }
