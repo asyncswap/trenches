@@ -1410,12 +1410,31 @@ impl Bot {
     }
 
     fn push_order(&mut self, label: String, status: OrderStatus, hash: Option<TxHash>) {
+        self.push_order_valued(label, status, hash, None)
+    }
+
+    /// `push_order`, with the ETH value stated instead of inferred.
+    ///
+    /// The inference below reads the amount out of the LABEL, which works only
+    /// because buys and adds happen to spell it there. A burn's label is
+    /// `REMOVE LP #7` — no number — so it fell through to the sell fallback and
+    /// reported the trader's ENTIRE token bag valued in ETH, which has nothing
+    /// to do with what the position returned. Callers that know the real figure
+    /// pass it.
+    fn push_order_valued(
+        &mut self,
+        label: String,
+        status: OrderStatus,
+        hash: Option<TxHash>,
+        eth_override: Option<f64>,
+    ) {
         let price = self.price();
         let mc = if price > 0.0 { self.token_supply / price } else { 0.0 };
         // Amount ALWAYS in ETH numeraire (cost in ether). Buys/LP encode the ETH in
         // the label; sells are token-denominated, so value them at price (ETH = tok
         // / price, since price is tokens-per-ETH).
-        let eth = eth_of_label(&label)
+        let eth = eth_override
+            .or_else(|| eth_of_label(&label))
             .unwrap_or_else(|| if price > 0.0 { self.token_bal / price } else { 0.0 });
         let is_v4 = matches!(self.pool.kind, PoolKind::V4 { .. } | PoolKind::FlaunchV4 { .. });
         if let Some(h) = hash {
@@ -3328,10 +3347,25 @@ fn order_fields(o: &Order) -> Vec<String> {
         let cb_liq = pm.getPositionLiquidity(token_id);
         let (info, liq) = tokio::join!(cb_info.call(), cb_liq.call());
         let (mut amount0_min, mut amount1_min) = (0u128, 0u128);
+        // What the position is expected to hand back on the QUOTE side, so the
+        // order row can state it. Already computed for the slippage minimums —
+        // it was simply never carried anywhere the reader could see it.
+        let mut expected_quote: Option<f64> = None;
         match (info, liq) {
             (Ok(i), Ok(l)) => {
                 let (lo, hi) = position_ticks(i.info);
                 let (a0, a1) = burn_amounts(u128_to_f64(l.liquidity), self.sqrt_price, lo, hi);
+                // Which side is the quote depends on the venue: a plain v4 pool
+                // pairs native ETH, which is currency0 because the zero address
+                // sorts first; Flaunch and pons record the coin's side instead.
+                let quote_units = match self.pool.kind {
+                    PoolKind::FlaunchV4 { coin_is_0, .. } | PoolKind::PonsV2Pool { coin_is_0, .. } => {
+                        if coin_is_0 { a1 } else { a0 }
+                    }
+                    _ => a0,
+                };
+                expected_quote =
+                    Some(quote_units / 10f64.powi(self.pool.quote.decimals() as i32));
                 let floor = self.slip_floor();
                 amount0_min = (a0 * floor).max(0.0) as u128;
                 amount1_min = (a1 * floor).max(0.0) as u128;
@@ -3359,7 +3393,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         if let Err(e) = provider.call(&tx).await {
             self.skips += 1;
             self.positions.push(token_id); // undo the optimistic removal above
-            self.push_order(label, OrderStatus::Skipped, None);
+            self.push_order_valued(label, OrderStatus::Skipped, None, expected_quote);
             self.note(format!("Closing the position would revert. {}", short_err(&e.to_string())));
             return Ok(());
         }
@@ -3368,14 +3402,14 @@ fn order_fields(o: &Order) -> Vec<String> {
         match provider.send_transaction(tx).await {
             Ok(p) => {
                 let hash = *p.tx_hash();
-                self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
+                self.push_order_valued(label.clone(), OrderStatus::Pending, Some(hash), expected_quote);
                 self.note(format!("PLACED {}  tx {}", label, hash));
                 self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
             }
             Err(e) => {
                 self.fails += 1;
                 self.nonce = None;
-                self.push_order(label, OrderStatus::Failed, None);
+                self.push_order_valued(label, OrderStatus::Failed, None, expected_quote);
                 self.note(format!("Closing the position failed. {}", short_err(&e.to_string())));
             }
         }
