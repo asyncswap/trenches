@@ -116,12 +116,28 @@ pub fn import_private_key(
     private_key: &str,
     password: &str,
 ) -> eyre::Result<alloy::primitives::Address> {
-    let signer: PrivateKeySigner = private_key
-        .trim()
-        .trim_start_matches("0x")
+    let signer: PrivateKeySigner = normalize_private_key(private_key)
         .parse()
-        .map_err(|_| eyre::eyre!("that is not a valid private key"))?;
+        .map_err(|_| {
+            eyre::eyre!("that is not a valid private key (expected 64 hex characters, with or without a 0x prefix)")
+        })?;
     store_signer(name, signer, password)
+}
+
+/// Normalize a pasted private key to bare hex.
+///
+/// Accepted with or without the `0x` prefix, in either case. Whitespace is
+/// stripped throughout rather than just at the ends: a key copied out of a
+/// wrapped file or a terminal arrives with newlines inside it, and a key that
+/// is right except for an invisible character is the most frustrating possible
+/// rejection. What is NOT normalized away is a wrong length or a non-hex
+/// character — those are real errors and the parse should say so.
+fn normalize_private_key(input: &str) -> String {
+    let compact: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    match compact.strip_prefix("0x").or_else(|| compact.strip_prefix("0X")) {
+        Some(rest) => rest.to_string(),
+        None => compact,
+    }
 }
 
 /// Import an account derived from a seed phrase into an encrypted keystore.
@@ -211,5 +227,64 @@ mod keystore_tests {
     fn a_missing_keystore_directory_lists_as_empty() {
         // A first run has no keystores; that is not an error state.
         let _ = list_keystores();
+    }
+}
+
+#[cfg(test)]
+mod private_key_form_tests {
+    use super::*;
+    use alloy::signers::local::PrivateKeySigner;
+
+    // A published test vector, not anyone's key.
+    const KEY: &str = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+
+    fn address_of(input: &str) -> String {
+        normalize_private_key(input)
+            .parse::<PrivateKeySigner>()
+            .expect("should parse")
+            .address()
+            .to_string()
+    }
+
+    /// With or without `0x`, and in either case, must reach the SAME account —
+    /// a key that imported to a different address than the user expected would
+    /// be worse than one that refused outright.
+    #[test]
+    fn every_accepted_form_is_the_same_account() {
+        let expected = address_of(KEY);
+        for form in [
+            format!("0x{KEY}"),
+            format!("0X{KEY}"),
+            KEY.to_uppercase(),
+            format!("0x{}", KEY.to_uppercase()),
+        ] {
+            assert_eq!(address_of(&form), expected, "form {form:?} changed the account");
+        }
+    }
+
+    /// Paste drags whitespace along — a trailing newline from a terminal, or a
+    /// line break from a wrapped file straight through the middle of the key.
+    #[test]
+    fn whitespace_from_a_paste_is_tolerated() {
+        let expected = address_of(KEY);
+        let (a, b) = KEY.split_at(32);
+        for form in [
+            format!("{KEY}\n"),
+            format!("  0x{KEY}  "),
+            format!("{a}\n{b}"),
+            format!("0x{a} {b}"),
+        ] {
+            assert_eq!(address_of(&form), expected, "whitespace changed the account");
+        }
+    }
+
+    /// Normalizing must not paper over a genuinely broken key. This is exactly
+    /// what a paste looked like when the ghost-key filter ate a repeated
+    /// character: one hex digit short, and it must be rejected, not padded.
+    #[test]
+    fn a_short_or_non_hex_key_is_still_rejected() {
+        assert!(normalize_private_key(&KEY[..63]).parse::<PrivateKeySigner>().is_err());
+        assert!(normalize_private_key("0xnothex").parse::<PrivateKeySigner>().is_err());
+        assert!(normalize_private_key("").parse::<PrivateKeySigner>().is_err());
     }
 }

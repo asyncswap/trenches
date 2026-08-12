@@ -1995,6 +1995,10 @@ async fn main() -> eyre::Result<()> {
     // terminal's own selection stops working under capture, so the app
     // provides the same gesture itself.
     let _ = std::io::stdout().execute(crossterm::event::EnableMouseCapture);
+    // Bracketed paste: without it a pasted private key or seed phrase arrives
+    // as individual key events, indistinguishable from typing, and the
+    // ghost-key filter eats every repeated character.
+    let _ = std::io::stdout().execute(crossterm::event::EnableBracketedPaste);
     // Raw mode + alternate screen are global terminal state. A panic unwinds
     // past the teardown below and would leave the user with a shell that shows
     // no typing and no prompt, so restore it first and let the panic through.
@@ -2002,6 +2006,7 @@ async fn main() -> eyre::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
+        let _ = std::io::stdout().execute(crossterm::event::DisableBracketedPaste);
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
         default_hook(info);
     }));
@@ -2009,6 +2014,7 @@ async fn main() -> eyre::Result<()> {
     let res = app(&mut terminal, &reg).await;
     disable_raw_mode()?;
     let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
+    let _ = std::io::stdout().execute(crossterm::event::DisableBracketedPaste);
     std::io::stdout().execute(LeaveAlternateScreen)?;
     // Last thing, after the terminal is back. The next run starts on what is
     // launching then, not on what launched now.

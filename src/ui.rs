@@ -16,7 +16,7 @@ pub mod widgets;
 use std::io::Stdout;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{prelude::*, widgets::*};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -888,17 +888,38 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                match k.code {
-                    KeyCode::Enter => return Ok(Some(buf.trim().to_string())),
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Backspace => {
-                        buf.pop();
+            match event::read()? {
+                // A paste arrives as ONE event carrying the whole string, so it
+                // never passes through `fresh_key`. That matters: the ghost-key
+                // filter cannot tell a duplicate keypress from the second '0' of
+                // a pasted "00", and a 64-character private key almost always
+                // contains a repeated character. Without this, pasting a key
+                // silently lost bytes and the import failed as "not a valid
+                // private key".
+                Event::Paste(s) => buf.push_str(s.trim()),
+                Event::Key(k) => {
+                    // A physical press reported twice is the whole reason
+                    // `fresh_key` exists. Where the terminal tells us the event
+                    // KIND, the duplicate is identifiable outright and there is
+                    // no need to guess from timing.
+                    if k.kind == KeyEventKind::Release { continue; }
+                    // Text characters must NOT go through the ghost filter: it
+                    // drops a repeat inside 25ms, which is indistinguishable
+                    // from the second '0' of a key or the 'll' of a seed word.
+                    // The filter still guards the control keys, where a stray
+                    // repeat would submit or cancel the screen twice.
+                    if !matches!(k.code, KeyCode::Char(_)) && !fresh_key(k.code) { continue; }
+                    match k.code {
+                        KeyCode::Enter => return Ok(Some(buf.trim().to_string())),
+                        KeyCode::Esc => return Ok(None),
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
                     }
-                    KeyCode::Char(c) => buf.push(c),
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -930,17 +951,38 @@ pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
         crate::ui_alive();
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if !fresh_key(k.code) { continue; }
-                match k.code {
-                    KeyCode::Enter => return Ok(Some(buf)),
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Backspace => {
-                        buf.pop();
+            match event::read()? {
+                // A paste arrives as ONE event carrying the whole string, so it
+                // never passes through `fresh_key`. That matters: the ghost-key
+                // filter cannot tell a duplicate keypress from the second '0' of
+                // a pasted "00", and a 64-character private key almost always
+                // contains a repeated character. Without this, pasting a key
+                // silently lost bytes and the import failed as "not a valid
+                // private key".
+                Event::Paste(s) => buf.push_str(s.trim()),
+                Event::Key(k) => {
+                    // A physical press reported twice is the whole reason
+                    // `fresh_key` exists. Where the terminal tells us the event
+                    // KIND, the duplicate is identifiable outright and there is
+                    // no need to guess from timing.
+                    if k.kind == KeyEventKind::Release { continue; }
+                    // Text characters must NOT go through the ghost filter: it
+                    // drops a repeat inside 25ms, which is indistinguishable
+                    // from the second '0' of a key or the 'll' of a seed word.
+                    // The filter still guards the control keys, where a stray
+                    // repeat would submit or cancel the screen twice.
+                    if !matches!(k.code, KeyCode::Char(_)) && !fresh_key(k.code) { continue; }
+                    match k.code {
+                        KeyCode::Enter => return Ok(Some(buf)),
+                        KeyCode::Esc => return Ok(None),
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
                     }
-                    KeyCode::Char(c) => buf.push(c),
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
