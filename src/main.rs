@@ -3766,7 +3766,9 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         KeyCode::Char('?') => { show_help = true; }
                         // Theme picker with live preview (persists the choice).
                         KeyCode::Char('T') => {
-                            match ui::widgets::theme_picker(terminal)? {
+                            let picked = ui::widgets::theme_picker(terminal)?;
+                            ui::drain_input();
+                            match picked {
                                 Some(name) => {
                                     events::action("Changed theme", &[("theme", name.clone())]);
                                     bot.status = format!("Changed theme to {name}");
@@ -4242,17 +4244,37 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             // screen — its numbers are invisible, and discovery
                             // needs the requests more.
                             poll_paused.store(true, Ordering::Relaxed);
+                            // Paint the waiting message BEFORE awaiting. Setting
+                            // `bot.status` alone changes nothing on screen: the
+                            // dashboard does not repaint until this handler
+                            // returns, so a screen that takes seconds to load
+                            // left the old frame sitting there, frozen, and the
+                            // stall watchdog rightly called it out.
                             let grad = if k.code == KeyCode::Char('F') {
                                 bot.status = "Loading verified tokens".into();
+                                discover::draw_status(terminal, "\nLoading verified tokens…")?;
                                 discover::screen_verified(terminal, verified.clone()).await?
                             } else if k.code == KeyCode::Char('k') {
                                 bot.status = "loading top tokens…".into();
+                                discover::draw_status(terminal, "\nLoading top tokens…")?;
                                 discover::screen_top_tokens(terminal, provider, discovery_rpc.clone(), bot.eth_usd).await?
                             } else {
                                 bot.status = "discovering token launches…".into();
+                                discover::draw_status(terminal, "\nDiscovering token launches…")?;
                                 discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?
                             };
                             poll_paused.store(false, Ordering::Relaxed);
+                            // Whatever was typed at the modal while it was busy
+                            // is not a command for the dashboard.
+                            ui::drain_input();
+                            // Come back to the trades panel, always. Which panel
+                            // you were on before opening a full-screen picker is
+                            // not a thing to preserve, and the panel must only
+                            // ever move because someone asked it to — it used to
+                            // arrive somewhere else entirely, which read as the
+                            // view cycling on its own.
+                            view = Panel::Tape;
+                            orders_scroll = 0;
                             match grad {
                                 Some(g) => {
                                     let quote_sym = match &g.quote {

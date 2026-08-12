@@ -73,7 +73,11 @@ pub fn clear() {
         return;
     }
     let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b_Ga=d\x1b\\");
+    // q=2: suppress the terminal's reply. Without it kitty answers every
+    // graphics command with `\x1b_Gi=<id>;OK\x1b\\`, which lands on stdin and is
+    // parsed as keystrokes — the "O" of "OK" is the dashboard's Orders key, so
+    // drawing coin art walked the panel through the views by itself.
+    let _ = write!(out, "\x1b_Ga=d,q=2\x1b\\");
     let _ = out.flush();
 }
 
@@ -87,6 +91,9 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16, img: u32) {
     // Terminal cursor addressing is 1-indexed.
     let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
 
+    // q=2: no reply. The terminal otherwise ACKs every chunk on stdin and the
+    // event loop reads those bytes as key presses.
+    //
     // f=100: PNG payload. a=T: transmit and display. C=1: leave the cursor put,
     // so the placement can't scroll the view. m=1 marks "more chunks follow" —
     // the protocol caps each escape at 4096 base64 bytes.
@@ -101,7 +108,7 @@ pub fn place(png: &[u8], col: u16, row: u16, cols: u16, rows: u16, img: u32) {
         if first {
             let _ = write!(
                 out,
-                "\x1b_Ga=T,f=100,C=1,i={img},c={cols},r={rows},m={more};{}\x1b\\",
+                "\x1b_Ga=T,f=100,C=1,q=2,i={img},c={cols},r={rows},m={more};{}\x1b\\",
                 std::str::from_utf8(chunk).unwrap_or("")
             );
             first = false;
@@ -119,7 +126,7 @@ fn delete_image(img: u32) {
     }
     let mut out = std::io::stdout();
     // d=I: delete the image and free its data, rather than only its placements.
-    let _ = write!(out, "\x1b_Ga=d,d=I,i={img}\x1b\\");
+    let _ = write!(out, "\x1b_Ga=d,d=I,q=2,i={img}\x1b\\");
     let _ = out.flush();
 }
 

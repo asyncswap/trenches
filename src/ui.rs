@@ -44,6 +44,30 @@ pub fn fresh_key(code: KeyCode) -> bool {
     true
 }
 
+/// Throw away input that queued up while a modal screen owned the terminal.
+///
+/// A screen that blocks on the network is not reading the keyboard, so the
+/// terminal buffers everything typed at it and hands the backlog to whatever
+/// reads next — the dashboard. The arrows that were scrolling a token list are
+/// the dashboard's panel-cycle keys, so pressing f, arrowing around and
+/// pressing q made the view walk t/c/o/l by itself afterwards.
+///
+/// Anything typed at a screen that has since closed was meant for that screen,
+/// not for this one, so it is stale by definition and dropped.
+pub fn drain_input() {
+    // Bounded: a terminal that always reports ready must not spin here forever.
+    for _ in 0..512 {
+        match event::poll(Duration::from_millis(0)) {
+            Ok(true) => {
+                if event::read().is_err() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
 /// Arrow-key list selection. Returns the chosen index, or None if cancelled.
 pub fn select(term: &mut Term, title: &str, items: &[String]) -> eyre::Result<Option<usize>> {
     // This screen owns the terminal now: take down any image the previous one
