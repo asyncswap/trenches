@@ -28,6 +28,7 @@ mod rpcstats;
 #[cfg(feature = "solana")]
 mod sol;
 mod ui;
+mod sushi;
 mod update;
 mod v3;
 mod v4;
@@ -1284,6 +1285,61 @@ async fn read_symbol<P: Provider>(provider: &P, token: alloy::primitives::Addres
         .unwrap_or_else(|_| "TOK".to_string())
 }
 
+/// Pick the concentrated-liquidity venue for a pasted CA.
+///
+/// Sushi is asked FIRST, and that ordering is the fix for a real bug: a
+/// launched token can also sit in a pool somebody else created, and sushicat's
+/// pools.fun pool held 52 WETH while a Uniswap pool for the same token held 1.
+/// Taking whichever venue answered first picked the 48x thinner market and
+/// labelled it as a different protocol.
+///
+/// Returns Err when a lookup could not be COMPLETED. That is not the same as
+/// "no pool", and conflating them told the user their token had no market when
+/// the truth was that the node was rate limiting us.
+async fn resolve_cl_pool<P: Provider>(
+    provider: &P,
+    token: alloy::primitives::Address,
+    sym: &str,
+) -> Result<Option<SelPool>, String> {
+    match discover::resolve_sushi_grad(provider, token, sym).await {
+        Ok(Some(g)) => {
+            let quote_addr = match g.kind {
+                engine::PoolKind::SushiV3 { quote, .. } => quote,
+                _ => contracts::weth(),
+            };
+            let (quote, quote_sym) = quote_from(&format!("{quote_addr:#x}"));
+            crate::trace(&format!("ca: {token} resolved to the sushi pool, quoted in {quote_sym}"));
+            return Ok(Some(SelPool {
+                label: pool_label(false, "sushi", &quote_sym, sym, g.fee, ""),
+                kind: g.kind,
+                token,
+                sym: sym.to_string(),
+                fee: g.fee,
+                owned: false,
+                quote,
+                quote_sym,
+            }));
+        }
+        Ok(None) => {}
+        Err(why) => return Err(why),
+    }
+
+    if let Some((addr, fee, w0)) = find_v3_pool(provider, token).await {
+        crate::trace(&format!("ca: {token} resolved to uniswap v3 {addr:#x} fee {fee}"));
+        return Ok(Some(SelPool {
+            label: pool_label(false, "v3", "ETH", sym, fee, ""),
+            kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: w0 },
+            token,
+            sym: sym.to_string(),
+            fee,
+            owned: false,
+            quote: engine::Quote::Eth,
+            quote_sym: "ETH".to_string(),
+        }));
+    }
+    Ok(None)
+}
+
 /// Auto-find a token's WETH v3 pool: scan the fee tiers and return the first with
 /// live liquidity as (pool_addr, fee, weth_is_token0). None if the token has no
 /// liquid v3 pool.
@@ -1570,7 +1626,8 @@ const ONE_SIDED: &str = "Fresh launch — all liquidity is coin-side until the f
 /// what you paste into an explorer, match against a fill, or send to us.
 fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
     let (key, val) = match p.kind {
-        engine::PoolKind::V3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
+        engine::PoolKind::V3 { pool_addr, .. }
+        | engine::PoolKind::SushiV3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
         // Name it for what it is: there is no pool yet, and calling a curve
         // "pool" in a bug report sends whoever reads it to the wrong contract.
         engine::PoolKind::PonsCurve { curve, .. } => ("curve", format!("{curve:#x}")),
@@ -1646,6 +1703,19 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                 match p.address.parse::<alloy::primitives::Address>() {
                     Ok(a) if a != alloy::primitives::Address::ZERO => {
                         engine::PoolKind::V3 { pool_addr: a, weth_is_token0: weth_is_token0(tok) }
+                    }
+                    _ => continue,
+                }
+            } else if p.kind.eq_ignore_ascii_case("sushi_v3") {
+                // Saved with the pool in `address` and the quote in
+                // `currency0`, because WETH- and USDG-quoted Sushi pools are
+                // otherwise indistinguishable on reload.
+                match (
+                    p.address.parse::<alloy::primitives::Address>(),
+                    p.currency0.parse::<alloy::primitives::Address>(),
+                ) {
+                    (Ok(a), Ok(q)) if a != alloy::primitives::Address::ZERO => {
+                        engine::PoolKind::SushiV3 { pool_addr: a, quote: q }
                     }
                     _ => continue,
                 }
@@ -2726,6 +2796,13 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
         engine::PoolKind::PonsV2Pool { pool_id, quote, tick_spacing, .. } => (
             "pons_v2", pool_id.to_string(), String::new(), tick_spacing,
             quote.to_string(), contracts::state_view().to_string(),
+        ),
+        // Identified by ADDRESS like a v3 pool, but the quote is not implied —
+        // WETH and USDG pools look identical otherwise — so it is recorded in
+        // `currency0` and the variant rebuilds from the file without a read.
+        engine::PoolKind::SushiV3 { pool_addr, quote } => (
+            "sushi_v3", String::new(), pool_addr.to_string(), 0,
+            quote.to_string(), String::new(),
         ),
     };
     let pool_obj = json!({
@@ -3967,6 +4044,15 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                 .unwrap_or(0.0);
                                             (s, weth_is_token0)
                                         }
+                                        engine::PoolKind::SushiV3 { pool_addr, quote } => {
+                                            let s = contracts::IV3Pool::new(pool_addr, provider)
+                                                .slot0()
+                                                .call()
+                                                .await
+                                                .map(|r| r.sqrtPriceX96.to_string().parse::<f64>().unwrap_or(0.0) / 2f64.powi(96))
+                                                .unwrap_or(0.0);
+                                            (s, quote < p.token)
+                                        }
                                         engine::PoolKind::V4 { pool_id, .. }
                                         | engine::PoolKind::FlaunchV4 { pool_id, .. }
                                         | engine::PoolKind::PonsV2Pool { pool_id, .. } => {
@@ -4323,16 +4409,21 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                     // line, so a token that would not load left
                                                     // nothing to read afterwards.
                                                     crate::trace(&format!("ca: resolving {token} ({sym})"));
-                                                    if let Some((addr, fee, w0)) = find_v3_pool(provider, token).await {
-                                                        crate::trace(&format!("ca: {token} resolved to v3 {addr:#x} fee {fee}"));
-                                                        bot.status = format!("found v3 {} pool for {sym}", fee_label(fee));
-                                                        Some(SelPool {
-                                                            label: pool_label(false, "v3", "ETH", &sym, fee, ""),
-                                                            kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: w0 },
-                                                            token, sym, fee, owned: false,
-                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
-                                                        })
-                                                    } else if let Some(fl) = discover::fetch_flaunch_pool(provider, token).await {
+                                                    match resolve_cl_pool(provider, token, &sym).await {
+                                                        Ok(Some(p)) => {
+                                                            bot.status = format!("{} for {sym}", p.label);
+                                                            Some(p)
+                                                        }
+                                                        // A lookup that never completed says NOTHING
+                                                        // about whether a pool exists. Saying "no pool"
+                                                        // here sent the user hunting for a market that
+                                                        // was there the whole time.
+                                                        Err(why) => {
+                                                            crate::trace(&format!("ca: {token} could not be checked: {why}"));
+                                                            bot.note(format!("Could not check {sym}: {why}. The node did not answer — try again"));
+                                                            None
+                                                        }
+                                                        Ok(None) =>                                                     if let Some(fl) = discover::fetch_flaunch_pool(provider, token).await {
                                                         // No v3 pool, but Flaunch launched it — trade the
                                                         // flETH-paired hook pool instead.
                                                         bot.status = format!("found Flaunch pool for {sym}");
@@ -4374,9 +4465,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                     } else {
                                                         crate::trace(&format!("ca: {token} matched nothing — no v3, no Flaunch, no native v4, not a UERC20"));
                                                         bot.note(format!(
-                                                            "Could not place {sym}: no Uniswap v3 or v4 pool against ETH, and it is not a pools.trade launch"
+                                                            "Could not place {sym}: no Uniswap v3 or v4 pool, no SushiSwap pool against ETH or USDG, and it is not a pools.trade launch"
                                                         ));
                                                         None
+                                                    }
                                                     }
                                                 }
                                                 // Not a 20-byte address. Flaunch listings show the
@@ -4827,7 +4919,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     // Addresses first — always FULL so they can be copy-pasted into an explorer.
     mkt.push(Line::from(vec![mlbl("Token"), Span::raw(bot.pool.token.to_string())]));
     match bot.pool.kind {
-        engine::PoolKind::V3 { pool_addr, .. } =>
+        engine::PoolKind::V3 { pool_addr, .. }
+        | engine::PoolKind::SushiV3 { pool_addr, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
         engine::PoolKind::PonsCurve { curve, .. } =>
             mkt.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
@@ -5049,7 +5142,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let mut mb: Vec<Line> = Vec::new();
             mb.push(Line::from(Span::styled(format!("{:<9}{}", "Token", pb.token), Style::default().fg(ui::widgets::tone_color(view::Tone::Normal)))));
             match pb.kind {
-                engine::PoolKind::V3 { pool_addr, .. } =>
+                engine::PoolKind::V3 { pool_addr, .. }
+                | engine::PoolKind::SushiV3 { pool_addr, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
                 engine::PoolKind::PonsCurve { curve, .. } =>
                     mb.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),

@@ -186,6 +186,18 @@ pub enum PoolKind {
     // hook and both currencies form the pool key, and unlike Flaunch the quote
     // is not a fixed asset — each launch chooses its own.
     PonsV2Pool { pool_id: B256, coin_is_0: bool, quote: Address, tick_spacing: i32 },
+    // A pools.fun (or Sushi launchpad) token: an ordinary concentrated-liquidity
+    // pool, but registered on SUSHI's v3 factory rather than Uniswap's.
+    //
+    // Not `V3`, even though the pool maths are identical. A v3 router is bound
+    // to one factory, so routing this through SwapRouter02 does not mispriceit
+    // — it fails to find the pool at all. These trade through Sushi's
+    // RedSnwapper instead, which is also the approval target for a sell.
+    //
+    // `quote` rides along because it is not always WETH: a real minority of
+    // pools.fun launches pair USDG, and those are an ERC-20 trade with no
+    // wrapping rather than a native-ETH one.
+    SushiV3 { pool_addr: Address, quote: Address },
 }
 
 /// The v4 pool id a pons v2 launch graduates into.
@@ -210,6 +222,7 @@ impl PoolKind {
             PoolKind::FlaunchV4 { .. } => "flaunch",
             PoolKind::PonsCurve { .. } => "curve",
             PoolKind::PonsV2Pool { .. } => "pons2",
+            PoolKind::SushiV3 { .. } => "sushi",
         }
     }
 
@@ -223,22 +236,25 @@ impl PoolKind {
             PoolKind::FlaunchV4 { .. } => "Flaunch",
             PoolKind::PonsCurve { .. } => "Pons v2 curve",
             PoolKind::PonsV2Pool { .. } => "Pons v2",
+            PoolKind::SushiV3 { .. } => "SushiSwap V3",
         }
     }
 
     /// The venue's name for the banner, in the pixel font's alphabet.
     ///
-    /// Every v3 pool reachable here arrived through a Pons v1 graduation, so
-    /// that is what a v3 pool is — "UNISWAP V3" would name the AMM it settled
-    /// into rather than the launchpad it came from, and the launchpad is what
-    /// decides how it behaves.
+    /// This used to call every v3 pool "PONS V1", on the reasoning that every
+    /// v3 pool on this chain arrived through a Pons graduation. That stopped
+    /// being true — v3 pools get created by anyone, and a plain Uniswap pool
+    /// was being announced as a launchpad it had nothing to do with. A pool
+    /// whose provenance is not recorded is named for the AMM it actually is.
     pub fn banner_name(&self) -> &'static str {
         match self {
-            PoolKind::V3 { .. } => "PONS V1",
+            PoolKind::V3 { .. } => "UNISWAP V3",
             PoolKind::PonsCurve { .. } => "PONS V2",
             PoolKind::PonsV2Pool { .. } => "PONS V2",
             PoolKind::FlaunchV4 { .. } => "FLAUNCH",
             PoolKind::V4 { .. } => "UNISWAP V4",
+            PoolKind::SushiV3 { .. } => "POOLS.FUN",
         }
     }
 
@@ -256,10 +272,28 @@ impl PoolKind {
             PoolKind::FlaunchV4 { .. } => "Flaunch",
             PoolKind::PonsCurve { .. } => "Pons v2",
             PoolKind::PonsV2Pool { .. } => "Pons v2",
+            PoolKind::SushiV3 { .. } => "pools.fun",
         }
     }
     pub fn is_v3(&self) -> bool {
         matches!(self, PoolKind::V3 { .. })
+    }
+    /// True for pools whose SELLS need a plain ERC-20 allowance to a router
+    /// before they can settle — as opposed to the v4 family, which grants
+    /// through Permit2 instead.
+    pub fn needs_router_approval(&self) -> bool {
+        matches!(self, PoolKind::V3 { .. } | PoolKind::SushiV3 { .. })
+    }
+    /// The contract that allowance must name. Uniswap v3 settles through
+    /// SwapRouter02; Sushi settles through RedSnwapper, which is both the entry
+    /// point and the spender. Approving the RouteProcessor instead — the
+    /// obvious guess, since it is what executes the route — leaves every sell
+    /// reverting inside transferFrom.
+    pub fn sell_spender(&self) -> Address {
+        match self {
+            PoolKind::SushiV3 { .. } => sushi_red_snwapper(),
+            _ => swap_router_02(),
+        }
     }
     /// True when no real pool is selected (placeholder / empty network).
     pub fn is_empty(&self) -> bool {
@@ -269,6 +303,7 @@ impl PoolKind {
             | PoolKind::PonsV2Pool { pool_id, .. } => *pool_id == B256::ZERO,
             PoolKind::V3 { pool_addr, .. } => *pool_addr == Address::ZERO,
             PoolKind::PonsCurve { curve, .. } => *curve == Address::ZERO,
+            PoolKind::SushiV3 { pool_addr, .. } => *pool_addr == Address::ZERO,
         }
     }
 
@@ -1135,14 +1170,19 @@ impl Bot {
     /// poll so it never hangs.
     async fn ensure_v3_allowance<P: Provider>(&mut self, provider: &P, need: U256) -> eyre::Result<bool> {
         let erc = IERC20::new(self.pool.token, provider);
-        if let Ok(a) = erc.allowance(self.trader, swap_router_02()).call().await {
+        // NOTE: one `v3_covered` flag covers one spender. That is exact while a
+        // token trades on a single venue, which is the case for a pools.fun
+        // launch; a token routed across BOTH a Uniswap and a Sushi pool would
+        // need a grant per spender.
+        let spender = self.pool.kind.sell_spender();
+        if let Ok(a) = erc.allowance(self.trader, spender).call().await {
             if a._0 >= need {
                 return Ok(true);
             }
         }
         self.note(format!("Approving {} for the router", self.pool.sym));
         let nonce = self.take_nonce(provider).await?;
-        let sent = erc.approve(swap_router_02(), need).gas(120_000).nonce(nonce).send().await;
+        let sent = erc.approve(spender, need).gas(120_000).nonce(nonce).send().await;
         let hash = *self.spent_nonce(sent)?.tx_hash();
         for _ in 0..6u32 {
             if provider.get_transaction_receipt(hash).await.ok().flatten().is_some() {
@@ -1328,7 +1368,7 @@ impl Bot {
         if bal.is_zero() {
             return Ok(());
         }
-        if self.has_v3_route() {
+        if self.has_v3_route() || self.pool.kind.needs_router_approval() {
             let covered = self.ensure_v3_allowance(provider, bal).await?;
             self.v3_covered = covered;
             if covered {
@@ -1982,7 +2022,7 @@ fn order_fields(o: &Order) -> Vec<String> {
     /// True if any candidate route is a v3 pool (which needs a token approval to
     /// sell). Used to grant the approval before simulating sells across venues.
     fn has_v3_route(&self) -> bool {
-        self.routes.iter().any(|r| r.kind.is_v3())
+        self.routes.iter().any(|r| r.kind.needs_router_approval())
     }
 
     /// True if any candidate route (or the active pool) is a Flaunch pool,
@@ -2415,7 +2455,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         // already pre-approved the exact balance (v3_covered) → zero-RPC fast
         // path. Fallback: approve the exact balance for a holding that wasn't
         // pre-approved, deferring the sell one round if it hasn't mined.
-        if !buying && self.has_v3_route() && !self.v3_covered {
+        if !buying && (self.has_v3_route() || self.pool.kind.needs_router_approval()) && !self.v3_covered {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
@@ -2838,7 +2878,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         }
         // v3 sells need the token approved to SwapRouter02 first (same token);
         // Flaunch sells need the Permit2 + router grants.
-        if sk.is_v3() && !self.v3_covered {
+        if sk.needs_router_approval() && !self.v3_covered {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
@@ -3047,7 +3087,10 @@ fn order_fields(o: &Order) -> Vec<String> {
     pub async fn add_liquidity<P: Provider>(&mut self, provider: &P, eth_wei: u128) -> eyre::Result<()> {
         let spacing = match self.pool.kind {
             PoolKind::V4 { tick_spacing, .. } => tick_spacing,
-            PoolKind::V3 { .. } | PoolKind::PonsCurve { .. } | PoolKind::PonsV2Pool { .. } => {
+            PoolKind::V3 { .. }
+            | PoolKind::SushiV3 { .. }
+            | PoolKind::PonsCurve { .. }
+            | PoolKind::PonsV2Pool { .. } => {
                 self.skips += 1;
                 self.push_order("ADD LP".into(), OrderStatus::Skipped, None);
                 // A curve holds the whole supply and IS the liquidity; there is
@@ -3448,7 +3491,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         }
         // Approve v3 venues up front, then route the dump to the venue that
         // returns the most ETH (best fee tier / depth / least hook take).
-        if (self.has_v3_route() || self.pool.kind.is_v3()) && !self.v3_covered {
+        if (self.has_v3_route() || self.pool.kind.needs_router_approval()) && !self.v3_covered {
             let need = IERC20::new(self.pool.token, provider)
                 .balanceOf(self.trader).call().await.map(|b| b._0).unwrap_or(U256::ZERO);
             if !need.is_zero() {
@@ -3791,7 +3834,10 @@ async fn read_market_inner<P: Provider>(
             let s0 = s0?;
             (u160_to_f64(s0.sqrtPriceX96) / 2f64.powi(96), s0.tick.as_i32(), u128_to_f64(lq?.liquidity))
         }
-        PoolKind::V3 { pool_addr, .. } => {
+        // Sushi pools answer the same slot0/liquidity ABI as Uniswap v3 —
+        // only the factory that minted them differs, and that matters for
+        // routing, not for reading state.
+        PoolKind::V3 { pool_addr, .. } | PoolKind::SushiV3 { pool_addr, .. } => {
             let pool = IV3Pool::new(pool_addr, provider);
             let cb0 = pool.slot0();
             let cbl = pool.liquidity();
@@ -3855,6 +3901,17 @@ async fn read_market_inner<P: Provider>(
                 (b_raw / 1e18, a_raw / 10f64.powi(tdi))
             }
         }
+        // Sushi: a v3 pool, but the quote is NOT always WETH — a USDG pair is
+        // not 18-decimal, so scale the quote side by its own decimals rather
+        // than a blanket 1e18. pools.fun mines the salt so the launch token
+        // sorts below its quote, which makes the quote token1 in practice.
+        PoolKind::SushiV3 { quote, .. } => {
+            if quote < pref.token {
+                (a_raw / 10f64.powi(qd), b_raw / 10f64.powi(tdi))
+            } else {
+                (b_raw / 10f64.powi(qd), a_raw / 10f64.powi(tdi))
+            }
+        }
         // Flaunch: the quote side is flETH (18-dec, 1:1 with ETH), so the
         // flETH reserve is r0 in ETH terms. The launch's _currencyFlipped bool
         // decides the orientation, not the ETH-vs-token address ordering.
@@ -3890,7 +3947,7 @@ async fn read_market_inner<P: Provider>(
     // the market is live, one-sided. One extra read, only on illiquid pools.
     let one_sided = if l <= 0.0 && sqrt_p > 0.0 {
         let holder = match pref.kind {
-            PoolKind::V3 { pool_addr, .. } => pool_addr,
+            PoolKind::V3 { pool_addr, .. } | PoolKind::SushiV3 { pool_addr, .. } => pool_addr,
             _ => pool_manager(), // v4 family: the singleton custodies every pool
         };
         crate::rpcstats::timed("balanceOf", erc.balanceOf(holder).call())
@@ -4158,6 +4215,12 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         ),
         PoolKind::V3 { pool_addr, weth_is_token0 } => (
             weth_is_token0, false,
+            Filter::new().address(pool_addr).from_block(from_block).to_block(to_block),
+        ),
+        // Same Swap event, same decoding; the quote's side of the pool is
+        // whichever address sorts lower.
+        PoolKind::SushiV3 { pool_addr, quote } => (
+            quote < pref.token, false,
             Filter::new().address(pool_addr).from_block(from_block).to_block(to_block),
         ),
     };
@@ -4684,6 +4747,21 @@ fn build_swap(
                 v3::v3_sell_calldata(token, fee, wi, wm, trader)
             };
             (swap_router_02(), d, value)
+        }
+        // Sushi's own pools. RedSnwapper is both the entry point and the
+        // spender a sell must be approved to — SwapRouter02 cannot reach these
+        // pools at all, so there is no shared path with the arm above.
+        //
+        // A WETH-quoted pool trades in native ETH and the route wraps it; a
+        // USDG-quoted one is a straight ERC-20 swap that must send NO value.
+        PoolKind::SushiV3 { pool_addr, quote } => {
+            let d = if buying {
+                crate::sushi::sushi_buy_calldata(token, pool_addr, quote, wi, wm, trader)
+            } else {
+                crate::sushi::sushi_sell_calldata(token, pool_addr, quote, wi, wm, trader)
+            };
+            let v = if buying { crate::sushi::buy_value(quote, wi) } else { U256::ZERO };
+            (sushi_red_snwapper(), d, v)
         }
     }
 }
