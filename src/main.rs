@@ -333,6 +333,16 @@ fn block_secs(block: u64) -> i64 {
     (block as f64 * contracts::secs_per_block()) as i64
 }
 
+/// Action ticks (500ms each) between USD price fetches — ~15 minutes, matching
+/// `pricing::TTL`. It was one minute, which spent sixty requests an hour of a
+/// shared per-IP budget watching a number that does not move that fast.
+const PRICE_REFRESH_TICKS: u32 = 1800;
+
+/// Action ticks between display-currency FX fetches — ~10 minutes. Its own
+/// number rather than a share of the price interval, so changing one does not
+/// quietly change the other.
+const FX_REFRESH_TICKS: u32 = 1200;
+
 /// Below this, a balance is a leftover rather than a holding.
 ///
 /// One wei of an 18-decimal token is `1e-18` — greater than zero, indisputably
@@ -1677,8 +1687,9 @@ fn blank_pool(net_label: &str) -> SelPool {
     }
 }
 
-/// Build the engine PoolCfg from a selectable pool. quote_usd starts at a safe
-/// fallback and is overwritten by the live CoinGecko fetch before first render.
+/// Build the engine PoolCfg from a selectable pool. `quote_usd` starts at the
+/// last cached rate and is overwritten by the live CoinGecko fetch before first
+/// render.
 fn to_poolcfg(p: &SelPool) -> engine::PoolCfg {
     engine::PoolCfg {
         kind: p.kind,
@@ -1691,8 +1702,12 @@ fn to_poolcfg(p: &SelPool) -> engine::PoolCfg {
         token_decimals: 18,
         quote: p.quote,
         quote_sym: p.quote_sym.clone(),
-        // A placeholder until the price feed lands: roughly ETH, roughly BNB.
-        quote_usd: if p.quote.is_eth() { if contracts::native_sym() == "BNB" { 800.0 } else { 1851.0 } } else { 1.0 },
+        // The cached rate until the feed lands, and 0.0 if there is none. It
+        // was a hardcoded "roughly ETH, roughly BNB" — 1851 and 800 — which is
+        // a made-up price wearing the same clothes as a real one. A stable
+        // still starts at $1: that is a prior about a peg, not a guess at a
+        // market, and the feed corrects it either way.
+        quote_usd: if p.quote.is_eth() { pricing::native_usd() } else { 1.0 },
     }
 }
 
@@ -2945,7 +2960,13 @@ async fn app(
         lp_frac: 0.05,        // add 5% of ETH balance as LP
         nonce: None,
         token_supply: 0.0,
-        eth_usd: 1871.0,    // ETH price estimate for USD market cap (adjust as needed)
+        // The last fetched price, or 0.0 — never a guess. This was a hardcoded
+        // 1871.0, and a feed that never landed left it on screen as though it
+        // were a quote: a wallet read $2.1k for months because nothing
+        // distinguished "the price is 1871" from "the price was never
+        // fetched". Every consumer treats 0.0 as "no feed" and prints no
+        // dollar figure at all, which is the honest answer.
+        eth_usd: pricing::native_usd(),
         profit_guard: false, // OFF by default — don't gate on positive EV; toggle with 'g'
         guard_dup: true,     // ON by default — stop double buys; toggle with 'n'
         min_edge_eth: 0.0,
@@ -3191,10 +3212,15 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
         });
     }
 
+    // Price the pools from the cached feed before anything renders. The
+    // dashboard's own fetch is still a screen away, and until it lands every
+    // rate on the bot is whatever `to_poolcfg` seeded — which is the cache, or
+    // nothing.
+    apply_prices(bot, &pricing::last_known());
     // Discovery runs from HERE, not from the first visit to the trenches
     // screen — so pressing `f` an hour in opens onto an hour of launches, the
     // way the Solana side has always behaved.
-    discover::ensure_discovery(provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone());
+    discover::ensure_discovery(provider, bot.trader, discovery_rpc.clone());
     wallet_scan::ensure_scan(provider, bot.trader);
 
     // Shared state written by the background poll task, read by the UI thread.
@@ -3499,8 +3525,13 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
     // 1.5s the fetch moves to the background and lands via `feed_cell`.
     let feed_ids = price_ids(&pools);
     let feed_cell: Arc<Mutex<Option<std::collections::HashMap<String, f64>>>> = Default::default();
-    let mut feed = match tokio::time::timeout(Duration::from_millis(1500), pricing::fetch_usd(&feed_ids)).await {
-        Ok(f) => f,
+    // The last session's prices, off disk, before anything touches the network.
+    // Whatever happens next, the first frame is drawn against a number that
+    // was measured rather than the hardcoded one the bot was built with.
+    let mut feed = pricing::last_known();
+    match tokio::time::timeout(Duration::from_millis(1500), pricing::fetch_usd(&feed_ids)).await {
+        Ok(f) if !f.is_empty() => feed = f,
+        Ok(_) => {}
         Err(_) => {
             let (ids, cell) = (feed_ids.clone(), feed_cell.clone());
             tokio::spawn(async move {
@@ -3509,11 +3540,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                     *cell.lock().unwrap() = Some(f);
                 }
             });
-            Default::default()
         }
     };
     apply_prices(bot, &feed);
-    let mut price_refresh: u32 = 0; // action-tick counter; refetch every ~60s
+    // Two clocks, deliberately separate. They were one: the display currency's
+    // FX rate rode the USD price refresh, so stretching the price interval to
+    // fifteen minutes silently stretched the FX one too. A crypto quote and a
+    // fiat conversion do not move at the same speed and should not be governed
+    // by the same number.
+    let mut price_refresh: u32 = 0; // action ticks (500ms) until the next USD fetch
+    let mut fx_refresh: u32 = 0;    // and until the next FX fetch
 
     // The freeze detector. The render arm beats this heart every 100ms; a
     // watcher task reports any gap — because EVERY await in the select arms
@@ -3748,13 +3784,18 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                 phase!("telemetry");
                 tele_ctr += 1;
                 if tele_ctr.is_multiple_of(4) { bot.telemetry(block.load(Ordering::Relaxed), bot.last_read_ms); }
-                // Refresh the USD feed every ~60s (120 * 500ms) so quote values
-                // track — in the BACKGROUND. This await used to sit on the UI
-                // thread, and a slow CoinGecko froze the whole screen for up to
-                // its 6s timeout, once a minute: exactly the "it freezes and
-                // then comes back" that was impossible to attribute.
+                // Refresh the USD feed every ~15min (1800 * 500ms) so quote
+                // values track — in the BACKGROUND. This await used to sit on
+                // the UI thread, and a slow CoinGecko froze the whole screen
+                // for up to its 6s timeout, once a minute: exactly the "it
+                // freezes and then comes back" that was impossible to
+                // attribute.
+                //
+                // The interval matches `pricing::TTL`. It was a minute, which
+                // spent sixty requests an hour of a shared per-IP budget to
+                // watch a number that does not move that fast.
                 price_refresh += 1;
-                if price_refresh >= 120 {
+                if price_refresh >= PRICE_REFRESH_TICKS {
                     price_refresh = 0;
                     let (ids, cell) = (feed_ids.clone(), feed_cell.clone());
                     tokio::spawn(async move {
@@ -3762,13 +3803,18 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                         if !f.is_empty() {
                             *cell.lock().unwrap() = Some(f);
                         }
-                        // The display currency's rate rides the same interval.
-                        // A session left open overnight would otherwise still
-                        // be converting at yesterday's number.
-                        if !crate::base_currency::is_usd() {
-                            crate::base_currency::refresh().await;
-                        }
                     });
+                }
+                // The display currency's rate, on its own clock. A session left
+                // open overnight would otherwise still be converting at
+                // yesterday's number. Skipped entirely in USD, where there is
+                // nothing to convert.
+                fx_refresh += 1;
+                if fx_refresh >= FX_REFRESH_TICKS {
+                    fx_refresh = 0;
+                    if !crate::base_currency::is_usd() {
+                        tokio::spawn(crate::base_currency::refresh());
+                    }
                 }
                 if let Some(f) = feed_cell.lock().unwrap().take() {
                     feed = f;
@@ -4059,7 +4105,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             tape_relive.store(true, Ordering::Relaxed);
                             let (ids, cell) = (feed_ids.clone(), feed_cell.clone());
                             tokio::spawn(async move {
-                                let f = pricing::fetch_usd(&ids).await;
+                                // Forced: the point of the press is that the
+                                // reader does not trust what is on screen, so
+                                // the cache does not get to answer for it.
+                                let f = pricing::refresh_usd(&ids).await;
                                 if !f.is_empty() {
                                     *cell.lock().unwrap() = Some(f);
                                 }
@@ -4479,7 +4528,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             } else {
                                 bot.status = "discovering token launches…".into();
                                 discover::draw_status(terminal, "\nDiscovering token launches…")?;
-                                discover::screen(terminal, provider, bot.trader, discovery_rpc.clone(), bot.eth_usd, verified.clone()).await?
+                                discover::screen(terminal, provider, bot.trader, discovery_rpc.clone()).await?
                             };
                             poll_paused.store(false, Ordering::Relaxed);
                             // Whatever was typed at the modal while it was busy

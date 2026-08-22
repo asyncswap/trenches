@@ -9,6 +9,15 @@
 //! NOTE: this module also holds the DORMANT v4/USDG + Verified-pool discovery
 //! (big-fish sweep, `scan_v4_inits`, `verified_rows`, tab/venue consts, etc.),
 //! parked for an off-trade-loop redesign — hence the module-wide dead_code allow.
+//!
+//! That allow has a cost, and it has been paid twice. It silences "never
+//! called" for the parked code AND for anything that stops being called by
+//! accident: `merge_publish` was written, documented and never invoked (see the
+//! note in `run_discovery`), and `run_discovery` itself took an ETH rate and a
+//! verified-pool list it ignored, which live callers kept computing and cloning
+//! for it. Roughly 30 items in here are dead on purpose. Before believing a
+//! function in this module runs, check that something calls it — the compiler
+//! will not say.
 #![allow(dead_code)]
 
 use std::io::Stdout;
@@ -2405,14 +2414,24 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
 /// (so six of a hundred launches appeared), age out at two hours (so a list of
 /// seven became three while being watched), and stop being built entirely when
 /// the screen closed (so leaving and returning showed the list you left).
+///
+/// It took an `eth_usd: f64` and a `Vec<VerifiedPool>` and used neither — the
+/// dormant v4/verified discovery below is what wanted them. Live callers were
+/// still computing the rate and cloning the pool list on every screen open to
+/// feed parameters that went nowhere, and a signature that accepts a price is
+/// read as a signature that uses one: it is why the ETH rate captured HERE was
+/// blamed for pricing the whole trenches screen.
+///
+/// When that work is revived it should read the rate live, from
+/// `crate::pricing::native_usd()`, rather than take a snapshot argument. A
+/// snapshot is what this task would have held for the life of the process,
+/// which is a stale price by construction.
 async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     provider: P,
     trader: Address,
     shared: Arc<Mutex<Vec<Row>>>,
     stop: Arc<AtomicBool>,
     disc_url: Option<String>,
-    _eth_usd: f64,
-    _verified: Vec<VerifiedPool>,
 ) {
     let client = reqwest::Client::new();
     // How far the launch log has been read. Everything below hangs off this:
@@ -3210,22 +3229,12 @@ pub fn ensure_discovery<P: Provider + Clone + Send + Sync + 'static>(
     provider: &P,
     trader: Address,
     disc_url: Option<String>,
-    eth_usd: f64,
-    verified: Vec<VerifiedPool>,
 ) {
     let (stop, fresh) = discovery_task();
     if fresh {
         // Background budgets until a screen opens and clears the flag.
         stop.store(true, Ordering::Relaxed);
-        tokio::spawn(run_discovery(
-            provider.clone(),
-            trader,
-            rows_cache(),
-            stop,
-            disc_url,
-            eth_usd,
-            verified,
-        ));
+        tokio::spawn(run_discovery(provider.clone(), trader, rows_cache(), stop, disc_url));
     }
 }
 
@@ -3252,8 +3261,6 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     provider: &P,
     trader: Address,
     disc_url: Option<String>,
-    eth_usd: f64,
-    verified: Vec<VerifiedPool>,
 ) -> eyre::Result<Option<Grad>> {
     // This screen owns the terminal now: take down any image the last one left.
     // Clearing also marks every placement stale, so the dashboard redraws its
@@ -3271,7 +3278,7 @@ pub async fn screen<P: Provider + Clone + Send + Sync + 'static>(
     // longer dies on the way out that would stack one per visit. The flag is
     // shared instead: opening clears it, leaving sets it, and the running task
     // reads it as "is anyone looking".
-    ensure_discovery(provider, trader, disc_url, eth_usd, verified);
+    ensure_discovery(provider, trader, disc_url);
     let (stop, _) = discovery_task();
     stop.store(false, Ordering::Relaxed);
 
