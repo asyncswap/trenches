@@ -88,9 +88,34 @@ pub fn ipfs_path(uri: &str) -> Option<String> {
 /// Every URL worth racing for one document, best-effort first.
 pub fn fetch_urls(uri: &str) -> Vec<String> {
     if let Some(path) = ipfs_path(uri) {
-        return IPFS_GATEWAYS.iter().map(|g| format!("{g}/ipfs/{path}")).collect();
+        let mut urls: Vec<String> = IPFS_GATEWAYS.iter().map(|g| format!("{g}/ipfs/{path}")).collect();
+        // A document that arrived as a gateway URL names the gateway that
+        // pinned it, and that one answers first — Flap's, for instance, is
+        // where every Flap CID lives. Race it with the public ones rather
+        // than throw the hint away; a private gateway that refuses a foreign
+        // CID just loses the race.
+        if uri.starts_with("https://") && !urls.iter().any(|u| u == uri) && public_host(uri) {
+            urls.insert(0, uri.to_string());
+        }
+        urls
+    } else {
+        metadata_url(uri).into_iter().collect()
     }
-    metadata_url(uri).into_iter().collect()
+}
+
+/// A bare IPFS CID — a `Qm…` v0 or a `baf…` v1 — as an `ipfs://` URI, so
+/// the fetch path recognises it. Flap's launch event carries the CID alone.
+/// Anything already a URI passes through untouched.
+pub fn ipfs_uri(s: &str) -> String {
+    let s = s.trim();
+    let bare = !s.contains("://")
+        && !s.contains('/')
+        && ((s.starts_with("Qm") && s.len() == 46) || (s.starts_with("baf") && s.len() >= 50));
+    if bare {
+        format!("ipfs://{s}")
+    } else {
+        s.to_string()
+    }
 }
 
 /// Strip secrets out of any string that might quote a URL.

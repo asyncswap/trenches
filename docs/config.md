@@ -106,8 +106,26 @@ fields:
 }
 ```
 
-The name drives the label — `robinhood-mainnet` shows as **Robinhood Chain**.
-To hide a chain, delete its entry.
+The name drives the label — `robinhood-mainnet` shows as **Robinhood Chain**,
+`bnb-mainnet` as **BNB Chain**. To hide a chain, delete its entry.
+
+BNB Chain is offered even to a config written before it existed: an entry
+with `"chain_id": 56` is added in memory at startup when the file has none, so
+the picker shows it without an edit. To point it at your own endpoint, or to
+hide it, write the entry down:
+
+```json
+{
+  "name": "bnb-mainnet",
+  "kind": "evm",
+  "chain_id": 56,
+  "rpc": ["https://bsc-rpc.publicnode.com"],
+  "hidden": false
+}
+```
+
+`"hidden": true` keeps a chain out of the picker. The public BNB endpoint
+rate-limits log scans; a keyed one from any provider goes in the same list.
 
 ## No seed phrases
 

@@ -339,6 +339,8 @@ pub fn for_venue(venue: crate::ui::image::Venue, network: &str) -> Option<&'stat
         Venue::PoolsTrade => None,
         // Same: the PNG carries the mark, the banner carries the name.
         Venue::PoolsFun => None,
+        Venue::Flap => None,
+        Venue::Pancake => None,
         Venue::Uniswap => Some(&UNISWAP),
         Venue::Chain => for_network(network),
     }

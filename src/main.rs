@@ -272,9 +272,11 @@ fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, 
     enum Kind {
         V1,
         Curve(alloy::primitives::Address),
+        Flap(alloy::primitives::Address),
     }
     let kind = match bot.pool.kind {
         engine::PoolKind::PonsCurve { curve, .. } => Kind::Curve(curve),
+        engine::PoolKind::Flap { portal, .. } => Kind::Flap(portal),
         engine::PoolKind::V3 { .. } if bot.pons_launch().is_some() => Kind::V1,
         _ => return,
     };
@@ -293,6 +295,14 @@ fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, 
                     _ => None,
                 }
             }
+            // The Portal's own progress figure, a wad; DEX status is done.
+            Kind::Flap(portal) => match engine::flap_state(&p, portal, token).await {
+                Ok(st) => Some((
+                    engine::units_to_f64(st.progress, 18),
+                    st.status == engine::FLAP_STATUS_DEX,
+                )),
+                Err(_) => None,
+            },
             Kind::Curve(curve) => {
                 let c = contracts::IPonsCurve::new(curve, &p);
                 let (a, b, d) = (c.realQuoteReserve(), c.graduationThreshold(), c.graduated());
@@ -315,6 +325,12 @@ fn refresh_pons_grad<P: Provider + Clone + Send + Sync + 'static>(provider: &P, 
             }
         }
     });
+}
+
+/// A block number as seconds on the chart's clock — the chain's block time,
+/// not a fixed ten-per-second, which was Robinhood Chain's and nobody else's.
+fn block_secs(block: u64) -> i64 {
+    (block as f64 * contracts::secs_per_block()) as i64
 }
 
 /// Below this, a balance is a leftover rather than a holding.
@@ -345,7 +361,7 @@ async fn move_flow<P: Provider + Clone + Send + Sync + 'static>(
     // on the thread that draws. The screen froze for as long as that took and
     // there was nothing to look at while it did.
     let mut assets: Vec<(Option<Address>, String, f64, u8)> =
-        vec![(None, "ETH".into(), bot.eth, 18)];
+        vec![(None, contracts::native_sym().into(), bot.eth, 18)];
     let cached = held_tokens().lock().ok().and_then(|g| g.clone());
     let fresh_enough = cached.as_ref().is_some_and(|(at, _)| at.elapsed() < HELD_TTL);
     match &cached {
@@ -523,6 +539,9 @@ fn stable_symbol(addr: alloy::primitives::Address) -> String {
     }
     match format!("{addr:#x}").as_str() {
         "0x5fc5360d0400a0fd4f2af552add042d716f1d168" => "USDG".to_string(),
+        // The quotes Flap offers on BNB Chain besides BNB.
+        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d" => "USD1".to_string(),
+        "0x0782b6d8c4551b9760e74c0545a9bcd90bdc41e5" => "lisUSD".to_string(),
         _ => "USD".to_string(),
     }
 }
@@ -531,6 +550,8 @@ fn stable_symbol(addr: alloy::primitives::Address) -> String {
 fn stable_cg_id(addr: alloy::primitives::Address) -> Option<&'static str> {
     match format!("{addr:#x}").as_str() {
         "0x5fc5360d0400a0fd4f2af552add042d716f1d168" => Some("global-dollar"),
+        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d" => Some("usd1-wlfi"),
+        "0x0782b6d8c4551b9760e74c0545a9bcd90bdc41e5" => Some("lista-usd"),
         _ => None,
     }
 }
@@ -538,8 +559,14 @@ fn stable_cg_id(addr: alloy::primitives::Address) -> Option<&'static str> {
 /// ERC-20 decimals for a known stablecoin quote (USDG is 6-dec, not 18).
 /// Fallback 18. TODO: read on-chain for arbitrary stables.
 fn stable_decimals(addr: alloy::primitives::Address) -> u8 {
+    // The chain's answer first, when something has asked it — a quote asset
+    // seen through discovery or a Flap launch has its decimals cached.
+    if let Some(d) = crate::token_metadata_chain_id::get(addr).and_then(|f| f.decimals) {
+        return d;
+    }
     match format!("{addr:#x}").as_str() {
         "0x5fc5360d0400a0fd4f2af552add042d716f1d168" => 6, // USDG
+        // USD1 and lisUSD are 18-dec, which is also the fallback.
         _ => 18,
     }
 }
@@ -557,7 +584,7 @@ fn quote_usd_of(quote: engine::Quote, eth_usd: f64, prices: &std::collections::H
 
 /// Push freshly-fetched USD prices into the bot: ETH and each pool's quote.
 fn apply_prices(bot: &mut Bot, prices: &std::collections::HashMap<String, f64>) {
-    if let Some(&e) = prices.get("ethereum") {
+    if let Some(&e) = prices.get(contracts::native_cg_id()) {
         if e > 0.0 {
             bot.eth_usd = e;
         }
@@ -571,7 +598,7 @@ fn apply_prices(bot: &mut Bot, prices: &std::collections::HashMap<String, f64>) 
 
 /// CoinGecko ids to fetch for a set of pools: ETH plus every stable quote.
 fn price_ids(pools: &[SelPool]) -> Vec<&'static str> {
-    let mut ids = vec!["ethereum"];
+    let mut ids = vec![contracts::native_cg_id()];
     for p in pools {
         if let engine::Quote::Stable { token, .. } = p.quote {
             if let Some(id) = stable_cg_id(token) {
@@ -1300,6 +1327,28 @@ async fn resolve_cl_pool<P: Provider>(
     token: alloy::primitives::Address,
     sym: &str,
 ) -> Result<Option<SelPool>, String> {
+    // Flap first, where it is deployed: a launch on its curve has NO pool
+    // anywhere, and a graduated one is best read from the Portal's own record
+    // — which names the pool it moved to — rather than guessed at by fee tier.
+    if let Some(p) = resolve_flap(provider, token, sym).await? {
+        return Ok(Some(p));
+    }
+    // PancakeSwap next, where it is deployed: on BNB Chain that is where a
+    // pasted token most likely trades, and the fee tiers are Pancake's own.
+    if let Some((addr, fee, quote)) = find_pancake_pool(provider, token).await {
+        let (q, quote_sym) = quote_from(&format!("{quote:#x}"));
+        crate::trace(&format!("ca: {token} resolved to pancake v3 {addr:#x} fee {fee}, quoted in {quote_sym}"));
+        return Ok(Some(SelPool {
+            label: pool_label(false, "pancake", &quote_sym, sym, fee, ""),
+            kind: engine::PoolKind::PancakeV3 { pool_addr: addr, quote },
+            token,
+            sym: sym.to_string(),
+            fee,
+            owned: false,
+            quote: q,
+            quote_sym,
+        }));
+    }
     match discover::resolve_sushi_grad(provider, token, sym).await {
         Ok(Some(g)) => {
             let quote_addr = match g.kind {
@@ -1326,17 +1375,159 @@ async fn resolve_cl_pool<P: Provider>(
     if let Some((addr, fee, w0)) = find_v3_pool(provider, token).await {
         crate::trace(&format!("ca: {token} resolved to uniswap v3 {addr:#x} fee {fee}"));
         return Ok(Some(SelPool {
-            label: pool_label(false, "v3", "ETH", sym, fee, ""),
+            label: pool_label(false, "v3", contracts::native_sym(), sym, fee, ""),
             kind: engine::PoolKind::V3 { pool_addr: addr, weth_is_token0: w0 },
             token,
             sym: sym.to_string(),
             fee,
             owned: false,
             quote: engine::Quote::Eth,
-            quote_sym: "ETH".to_string(),
+            quote_sym: contracts::native_sym().to_string(),
         }));
     }
     Ok(None)
+}
+
+/// A pasted token, if Flap launched it.
+///
+/// `getTokenV7` REVERTS for a token the Portal never launched, so a revert is
+/// "not Flap" and the walk moves on. A transport failure is not — that is an
+/// Err, and the caller says the node did not answer rather than "no pool".
+///
+/// On its curve: `Flap`. Graduated into a Pancake V3 pool: `PancakeV3`, the
+/// pool's own venue. Graduated anywhere else (a V2 pair): `Flap` still, and
+/// the Portal routes it.
+async fn resolve_flap<P: Provider>(
+    provider: &P,
+    token: alloy::primitives::Address,
+    sym: &str,
+) -> Result<Option<SelPool>, String> {
+    let portal = contracts::flap_portal();
+    if portal.is_zero() {
+        return Ok(None);
+    }
+    let st = match tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        engine::flap_state(provider, portal, token),
+    )
+    .await
+    {
+        Ok(Ok(st)) => st,
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            // A revert is the Portal answering "not mine". Anything else is
+            // the node not answering, which must not be read as "no pool".
+            if msg.contains("revert") || msg.contains("execution reverted") || msg.contains("0xde6137d1") {
+                crate::trace(&format!("ca: {token} is not a Flap launch"));
+                return Ok(None);
+            }
+            return Err(format!("the Flap Portal did not answer: {}", msg.chars().take(80).collect::<String>()));
+        }
+        Err(_) => return Err("the Flap Portal did not answer in time".into()),
+    };
+    if st.status != engine::FLAP_STATUS_TRADABLE && st.status != engine::FLAP_STATUS_DEX {
+        // Invalid, staged but not yet created, or one of the obsolete states.
+        return Ok(None);
+    }
+    let mut quote_addr = st.quoteTokenAddress;
+    if !quote_addr.is_zero() {
+        // The quote's symbol and decimals, from the chain: Flap quotes include
+        // tokenized equities, and `quote_from` reads the cache this fills.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            token_metadata_chain_id::ensure(provider, quote_addr, None),
+        )
+        .await;
+        // A launch quoted in something else that the Portal will still sell
+        // for the gas token is traded in the gas token — that is what the
+        // trader holds. Proven by a quote, not assumed from the flag.
+        if st.nativeToQuoteSwapEnabled {
+            let probe = engine::flap_quote(provider, portal, token, alloy::primitives::Address::ZERO, true, 0.01, alloy::primitives::Address::ZERO, 18, 18).await;
+            if probe.is_some_and(|o| o > 0.0) {
+                crate::trace(&format!("ca: {token} is quoted in {quote_addr:#x} but trades in the gas token"));
+                quote_addr = alloy::primitives::Address::ZERO;
+            }
+        }
+    }
+    let (quote, quote_sym) = quote_from(&format!("{quote_addr:#x}"));
+    token_metadata_chain_id::merge(token, |f| {
+        if f.launchpad.is_none() {
+            f.launchpad = Some("flap".into());
+        }
+        if f.supply <= 0.0 {
+            f.supply = 1_000_000_000.0;
+        }
+    });
+    // A graduate in a Pancake V3 pool is that pool's venue — unless we trade
+    // it in the gas token while its pool pairs the launch's own quote asset,
+    // where only the Portal bridges the two.
+    let cross = quote_addr.is_zero() && !st.quoteTokenAddress.is_zero();
+    if st.status == engine::FLAP_STATUS_DEX && !cross && !st.pool.is_zero() && !contracts::pancake_v3_factory().is_zero() {
+        // A Pancake V3 pool answers fee(); a V2 pair does not.
+        let pool = contracts::IPancakeV3Pool::new(st.pool, provider);
+        if let Ok(fee) = pool.fee().call().await {
+            let fee = fee._0.to::<u32>();
+            let wq = if quote_addr.is_zero() { contracts::weth() } else { quote_addr };
+            crate::trace(&format!("ca: {token} is a Flap graduate in pancake v3 {:#x} fee {fee}", st.pool));
+            return Ok(Some(SelPool {
+                label: pool_label(false, "pancake", &quote_sym, sym, fee, ""),
+                kind: engine::PoolKind::PancakeV3 { pool_addr: st.pool, quote: wq },
+                token,
+                sym: sym.to_string(),
+                fee,
+                owned: false,
+                quote,
+                quote_sym,
+            }));
+        }
+    }
+    let on_dex = st.status == engine::FLAP_STATUS_DEX;
+    crate::trace(&format!("ca: {token} is a Flap launch, status {} (on_dex {on_dex})", st.status));
+    Ok(Some(SelPool {
+        label: pool_label(false, "flap", &quote_sym, sym, contracts::FLAP_FEE_BPS * 100, ""),
+        kind: engine::PoolKind::Flap { portal, quote: quote_addr, on_dex },
+        token,
+        sym: sym.to_string(),
+        fee: contracts::FLAP_FEE_BPS * 100,
+        owned: false,
+        quote,
+        quote_sym,
+    }))
+}
+
+/// Auto-find a token's PancakeSwap V3 pool against WBNB — Pancake's fee tiers,
+/// Pancake's factory — as (pool, fee, quote). None where Pancake is not
+/// deployed or no tier has live liquidity.
+async fn find_pancake_pool<P: Provider>(
+    provider: &P,
+    token: alloy::primitives::Address,
+) -> Option<(alloy::primitives::Address, u32, alloy::primitives::Address)> {
+    let fac = contracts::pancake_v3_factory();
+    if fac.is_zero() {
+        return None;
+    }
+    let factory = contracts::IV3Factory::new(fac, provider);
+    let quote = contracts::weth();
+    // The DEEPEST tier, not the first with anything in it: CAKE/WBNB has a
+    // 1% pool holding a few BNB and a 0.05% pool holding the market, and
+    // active liquidity at the same price compares across tiers.
+    let mut best: Option<(alloy::primitives::Address, u32, u128)> = None;
+    for fee in contracts::PANCAKE_V3_FEES {
+        let Ok(p) = factory.getPool(token, quote, fee.try_into().unwrap()).call().await else { continue };
+        if p.pool.is_zero() {
+            continue;
+        }
+        let liq = contracts::IPancakeV3Pool::new(p.pool, provider)
+            .liquidity()
+            .call()
+            .await
+            .map(|l| l._0)
+            .unwrap_or(0);
+        if liq > 0 && best.is_none_or(|(_, _, l)| liq > l) {
+            best = Some((p.pool, fee, liq));
+        }
+    }
+    best.map(|(pool, fee, _)| (pool, fee, quote))
 }
 
 /// Auto-find a token's WETH v3 pool: scan the fee tiers and return the first with
@@ -1383,7 +1574,7 @@ fn quote_from(currency0: &str) -> (engine::Quote, String) {
     // flETH counts as ETH: it is redeemable 1:1, so a Flaunch pool is
     // ETH-quoted even though its currency0 is the wrapper.
     if addr == alloy::primitives::Address::ZERO || addr == contracts::weth() || addr == contracts::fleth() {
-        (engine::Quote::Eth, "ETH".to_string())
+        (engine::Quote::Eth, contracts::native_sym().to_string())
     } else {
         (engine::Quote::Stable { token: addr, decimals: stable_decimals(addr) }, stable_symbol(addr))
     }
@@ -1450,11 +1641,18 @@ fn header_venue(bot: &Bot) -> ui::image::Venue {
         // Also decided by the kind, and checked before the metadata branch so a
         // launchpad tag left by another venue cannot relabel it.
         ui::image::Venue::PoolsFun
-    } else if token_metadata_chain_id::get(bot.pool.token)
-        .and_then(|f| f.launchpad)
-        .is_some()
-    {
-        ui::image::Venue::PoolsTrade
+    } else if matches!(bot.pool.kind, engine::PoolKind::Flap { .. }) {
+        ui::image::Venue::Flap
+    } else if let Some(pad) = token_metadata_chain_id::get(bot.pool.token).and_then(|f| f.launchpad) {
+        // The launchpad outranks the AMM it graduated into: a Flap graduate
+        // in its Pancake pool is still a Flap coin.
+        if pad == "flap" {
+            ui::image::Venue::Flap
+        } else {
+            ui::image::Venue::PoolsTrade
+        }
+    } else if matches!(bot.pool.kind, engine::PoolKind::PancakeV3 { .. }) {
+        ui::image::Venue::Pancake
     } else if bot.pons_launch().is_some() {
         ui::image::Venue::Pons
     } else {
@@ -1475,7 +1673,7 @@ fn blank_pool(net_label: &str) -> SelPool {
         fee: 0,
         owned: false,
         quote: engine::Quote::Eth,
-        quote_sym: "ETH".to_string(),
+        quote_sym: contracts::native_sym().to_string(),
     }
 }
 
@@ -1493,7 +1691,8 @@ fn to_poolcfg(p: &SelPool) -> engine::PoolCfg {
         token_decimals: 18,
         quote: p.quote,
         quote_sym: p.quote_sym.clone(),
-        quote_usd: if p.quote.is_eth() { 1851.0 } else { 1.0 },
+        // A placeholder until the price feed lands: roughly ETH, roughly BNB.
+        quote_usd: if p.quote.is_eth() { if contracts::native_sym() == "BNB" { 800.0 } else { 1851.0 } } else { 1.0 },
     }
 }
 
@@ -1543,7 +1742,7 @@ fn pool_label(owned: bool, proto: &str, quote_sym: &str, sym: &str, fee: u32, no
         fee_label(fee),
         // The quote only when it is NOT the obvious one. An ETH pair is the
         // default and saying so on every row costs more than it tells.
-        if quote_sym.eq_ignore_ascii_case("ETH") {
+        if quote_sym.eq_ignore_ascii_case(contracts::native_sym()) {
             note.to_string()
         } else {
             format!("  ({quote_sym}-quoted){note}")
@@ -1630,10 +1829,13 @@ const ONE_SIDED: &str = "Fresh launch — all liquidity is coin-side until the f
 fn pool_facts(p: &engine::PoolCfg) -> Vec<(&'static str, String)> {
     let (key, val) = match p.kind {
         engine::PoolKind::V3 { pool_addr, .. }
-        | engine::PoolKind::SushiV3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
+        | engine::PoolKind::SushiV3 { pool_addr, .. }
+        | engine::PoolKind::PancakeV3 { pool_addr, .. } => ("pool", format!("{pool_addr:#x}")),
         // Name it for what it is: there is no pool yet, and calling a curve
         // "pool" in a bug report sends whoever reads it to the wrong contract.
         engine::PoolKind::PonsCurve { curve, .. } => ("curve", format!("{curve:#x}")),
+        // The Portal is the venue for the life of a Flap launch.
+        engine::PoolKind::Flap { portal, .. } => ("portal", format!("{portal:#x}")),
         engine::PoolKind::V4 { pool_id, .. }
         | engine::PoolKind::FlaunchV4 { pool_id, .. }
         | engine::PoolKind::PonsV2Pool { pool_id, .. } => ("pool_id", format!("{pool_id:#x}")),
@@ -1722,6 +1924,28 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                     }
                     _ => continue,
                 }
+            } else if p.kind.eq_ignore_ascii_case("pancake_v3") {
+                match (
+                    p.address.parse::<alloy::primitives::Address>(),
+                    p.currency0.parse::<alloy::primitives::Address>(),
+                ) {
+                    (Ok(a), Ok(q)) if a != alloy::primitives::Address::ZERO => {
+                        engine::PoolKind::PancakeV3 { pool_addr: a, quote: q }
+                    }
+                    _ => continue,
+                }
+            } else if p.kind.eq_ignore_ascii_case("flap") {
+                // Reloaded as "on its curve"; the first graduation check
+                // re-reads the Portal and corrects that if it has moved on.
+                match (
+                    p.address.parse::<alloy::primitives::Address>(),
+                    p.currency0.parse::<alloy::primitives::Address>(),
+                ) {
+                    (Ok(a), Ok(q)) if a != alloy::primitives::Address::ZERO => {
+                        engine::PoolKind::Flap { portal: a, quote: q, on_dex: false }
+                    }
+                    _ => continue,
+                }
             } else if p.kind.eq_ignore_ascii_case("flaunch") {
                 match p.pool_id.parse::<B256>() {
                     // Currency ordering is address ordering, so the coin's side
@@ -1767,7 +1991,7 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
         if let Ok(tok) = pp.token.parse::<alloy::primitives::Address>() {
             let sym = if pp.sym.is_empty() { symbol_for(net, &pp.token) } else { pp.sym.clone() };
             v.push(SelPool {
-                label: pool_label(false, "v4", "ETH", &sym, pp.fee, ""),
+                label: pool_label(false, "v4", contracts::native_sym(), &sym, pp.fee, ""),
                 kind: engine::PoolKind::V4 {
                     pool_id: compute_pool_id(tok, pp.fee, pp.tick_spacing as i32),
                     tick_spacing: pp.tick_spacing as i32,
@@ -1777,7 +2001,7 @@ fn collect_pools(net: &config::Network) -> Vec<SelPool> {
                 fee: pp.fee,
                 owned: false,
                 quote: engine::Quote::Eth,
-                quote_sym: "ETH".to_string(),
+                quote_sym: contracts::native_sym().to_string(),
             });
         }
     }
@@ -1921,7 +2145,7 @@ async fn main() -> eyre::Result<()> {
             "--help" | "-h" => {
                 println!("trenches {}", update::full());
                 println!();
-                println!("A terminal for trading memecoins on Robinhood Chain and Solana.");
+                println!("A terminal for trading memecoins on Robinhood Chain, BNB Chain, Base and Solana.");
                 println!();
                 println!("USAGE:");
                 println!("    trenches            start the app");
@@ -1967,6 +2191,24 @@ async fn main() -> eyre::Result<()> {
     // invites a first trade that goes nowhere, and an anvil node nobody is
     // running is a dead row. Never written to the config either way.
     reg.networks.extend(config::dev_networks());
+    // Chains added since this config was written. Missing from the file is
+    // not the same as removed by hand: a user who deletes an entry to hide a
+    // chain would see it come back — so only chains the file has NEVER named
+    // are added, judged by chain id, and only when the config predates them
+    // (it has no entry for that id at all).
+    for n in config::starter_networks() {
+        let known = reg.networks.iter().any(|x| {
+            if n.kind.is_solana() { x.kind.is_solana() } else { x.chain_id == n.chain_id }
+        });
+        if !known && !n.kind.is_solana() && n.chain_id == contracts::BNB_MAINNET {
+            trace(&format!("registry: adding {} from the starter config", n.name));
+            reg.networks.push(n);
+        }
+    }
+    // An entry marked hidden is the way to decline a chain that the app adds
+    // by default — the entry stays, so it is not re-added, and the picker
+    // does not show it.
+    reg.networks.retain(|n| !n.hidden);
 
     // A build without the solana feature cannot trade Solana, so it does not
     // offer it. The dispatch below still refuses politely if one slips through,
@@ -2290,7 +2532,7 @@ async fn app(
         // with nothing on screen to explain why.
         let mut make_wallet = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>| -> eyre::Result<()> {
             let opts = vec![
-                "Robinhood Chain / EVM".to_string(),
+                "EVM (Robinhood Chain, BNB Chain, Base)".to_string(),
                 "Solana".to_string(),
             ];
             let Some(i) = ui::select(t, "An account for which chain?", &opts)? else {
@@ -2360,6 +2602,8 @@ async fn app(
                 // a chain, so only the one that needs it gets the suffix.
                 let base = if base.eq_ignore_ascii_case("robinhood") {
                     "Robinhood Chain".to_string()
+                } else if base.eq_ignore_ascii_case("bnb") || base.eq_ignore_ascii_case("bsc") {
+                    "BNB Chain".to_string()
                 } else {
                     base
                 };
@@ -2529,7 +2773,7 @@ async fn app(
     // Wallet-selectable assets: ETH (currency0) + every known token on this
     // network. Used by the pair picker so the user selects assets, not addresses.
     let mut assets: Vec<(alloy::primitives::Address, String)> =
-        vec![(alloy::primitives::Address::ZERO, "ETH".to_string())];
+        vec![(alloy::primitives::Address::ZERO, contracts::native_sym().to_string())];
     for t in &net.tokens {
         if let Ok(a) = t.address.parse::<alloy::primitives::Address>() {
             if !assets.iter().any(|(x, _)| *x == a) {
@@ -2662,6 +2906,7 @@ async fn app(
         tick: 0,
         r0: 0.0,
         r1: 0.0,
+        virt: (0.0, 0.0),
         eth: 0.0,
         token_bal: 0.0,
         ready: false,
@@ -2813,9 +3058,22 @@ fn persist_pool(network: &str, p: &SelPool) -> eyre::Result<()> {
             "sushi_v3", String::new(), pool_addr.to_string(), 0,
             quote.to_string(), String::new(),
         ),
+        // Same shape as Sushi: the pool in `address`, the quote in `currency0`.
+        engine::PoolKind::PancakeV3 { pool_addr, quote } => (
+            "pancake_v3", String::new(), pool_addr.to_string(), 0,
+            quote.to_string(), String::new(),
+        ),
+        // The Portal in `address`, the quote in `currency0`. Whether it has
+        // graduated is NOT saved: the reload re-reads the Portal's record,
+        // since graduation happens without us and a saved "on curve" would
+        // be a stale claim the moment it did.
+        engine::PoolKind::Flap { portal, quote, .. } => (
+            "flap", String::new(), portal.to_string(), 0,
+            quote.to_string(), String::new(),
+        ),
     };
     let pool_obj = json!({
-        "label": format!("ETH/{} {}", p.sym, fee_label(p.fee)),
+        "label": format!("{}/{} {}", p.quote_sym, p.sym, fee_label(p.fee)),
         "kind": kind,
         "pool_id": pool_id,
         "address": addr,
@@ -3975,7 +4233,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                 fee: 0,
                                                 owned: false,
                                                 quote: engine::Quote::Eth,
-                                                quote_sym: "ETH".into(),
+                                                quote_sym: contracts::native_sym().into(),
                                             },
                                             *bal,
                                             *dec,
@@ -4034,6 +4292,23 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                 })
                                                 .unwrap_or(0.0);
                                             return (p, bal, bal * ept);
+                                        }
+                                        // The Portal's marginal price, quote per token as a wad.
+                                        engine::PoolKind::Flap { portal, .. } => {
+                                            let ept = engine::flap_state(provider, portal, p.token)
+                                                .await
+                                                .map(|st| engine::units_to_f64(st.price, 18))
+                                                .unwrap_or(0.0);
+                                            return (p, bal, bal * ept);
+                                        }
+                                        engine::PoolKind::PancakeV3 { pool_addr, quote } => {
+                                            let s = contracts::IPancakeV3Pool::new(pool_addr, provider)
+                                                .slot0()
+                                                .call()
+                                                .await
+                                                .map(|r| r.sqrtPriceX96.to_string().parse::<f64>().unwrap_or(0.0) / 2f64.powi(96))
+                                                .unwrap_or(0.0);
+                                            (s, quote < p.token)
                                         }
                                     };
                                     let p_raw = sqrt * sqrt;
@@ -4221,7 +4496,7 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                             match grad {
                                 Some(g) => {
                                     let quote_sym = match &g.quote {
-                                        engine::Quote::Eth => "ETH".to_string(),
+                                        engine::Quote::Eth => contracts::native_sym().to_string(),
                                         engine::Quote::Stable { token, .. } => stable_symbol(*token),
                                     };
                                     let p = SelPool {
@@ -4399,19 +4674,19 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                         // flETH-paired hook pool instead.
                                                         bot.status = format!("found Flaunch pool for {sym}");
                                                         Some(SelPool {
-                                                            label: pool_label(false, "flaunch", "ETH", &sym, contracts::FLAUNCH_FEE_EST, ""),
+                                                            label: pool_label(false, "flaunch", contracts::native_sym(), &sym, contracts::FLAUNCH_FEE_EST, ""),
                                                             kind: engine::PoolKind::FlaunchV4 { pool_id: fl.pool_id, coin_is_0: fl.coin_is_0 },
                                                             token, sym, fee: contracts::FLAUNCH_FEE_EST, owned: false,
-                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                            quote: engine::Quote::Eth, quote_sym: contracts::native_sym().to_string(),
                                                         })
                                                     } else if let Some((pool_id, tick_spacing, fee)) = discover::find_v4_native_pool(provider, token).await {
                                                         crate::trace(&format!("ca: {token} resolved to v4 {pool_id} fee {fee} spacing {tick_spacing}"));
                                                         bot.status = format!("found v4 {} pool for {sym}", fee_label(fee));
                                                         Some(SelPool {
-                                                            label: pool_label(false, "v4", "ETH", &sym, fee, ""),
+                                                            label: pool_label(false, "v4", contracts::native_sym(), &sym, fee, ""),
                                                             kind: engine::PoolKind::V4 { pool_id, tick_spacing },
                                                             token, sym, fee, owned: false,
-                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                            quote: engine::Quote::Eth, quote_sym: contracts::native_sym().to_string(),
                                                         })
                                                     } else if discover::is_uerc20(provider, token).await {
                                                         // The auction it bids into, resolved now so
@@ -4428,10 +4703,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                         crate::trace(&format!("ca: {token} is a pools.trade auction, adopted without a pool"));
                                                         bot.status = format!("{sym} is a pools.trade crowd launch — auction running, pool at graduation");
                                                         Some(SelPool {
-                                                            label: pool_label(false, "v4", "ETH", &sym, 0, ""),
+                                                            label: pool_label(false, "v4", contracts::native_sym(), &sym, 0, ""),
                                                             kind: engine::PoolKind::V4 { pool_id: B256::ZERO, tick_spacing: 0 },
                                                             token, sym, fee: 0, owned: false,
-                                                            quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                            quote: engine::Quote::Eth, quote_sym: contracts::native_sym().to_string(),
                                                         })
                                                     } else {
                                                         crate::trace(&format!("ca: {token} matched nothing — no v3, no Flaunch, no native v4, not a UERC20"));
@@ -4452,10 +4727,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                             let sym = read_symbol(provider, token).await;
                                                             bot.status = format!("found Flaunch pool for {sym}");
                                                             Some(SelPool {
-                                                                label: pool_label(false, "flaunch", "ETH", &sym, contracts::FLAUNCH_FEE_EST, ""),
+                                                                label: pool_label(false, "flaunch", contracts::native_sym(), &sym, contracts::FLAUNCH_FEE_EST, ""),
                                                                 kind: engine::PoolKind::FlaunchV4 { pool_id: fl.pool_id, coin_is_0: fl.coin_is_0 },
                                                                 token, sym, fee: contracts::FLAUNCH_FEE_EST, owned: false,
-                                                                quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                                quote: engine::Quote::Eth, quote_sym: contracts::native_sym().to_string(),
                                                             })
                                                         } else {
                                                             // A plain v4 pool id has no launch log to
@@ -4519,14 +4794,14 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                                     let sym = read_symbol(provider, token).await;
                                                                     bot.status = format!("resolved {sym} from that pool");
                                                                     Some(SelPool {
-                                                                        label: pool_label(false, "v3", "ETH", &sym, fee, ""),
+                                                                        label: pool_label(false, "v3", contracts::native_sym(), &sym, fee, ""),
                                                                         kind: engine::PoolKind::V3 {
                                                                             pool_addr: addr,
                                                                             weth_is_token0: t0 == contracts::weth(),
                                                                         },
                                                                         token, sym, fee, owned: false,
                                                                         quote: engine::Quote::Eth,
-                                                                        quote_sym: "ETH".to_string(),
+                                                                        quote_sym: contracts::native_sym().to_string(),
                                                                     })
                                                                 }
                                                                 None => {
@@ -4560,10 +4835,10 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                                     let sp96 = price_to_sqrtx96(price);
                                                     let _ = bot.initialize_pool(provider, token, fee, spacing, sp96).await;
                                                     Some(SelPool {
-                                                        label: pool_label(true, "v4", "ETH", &sym, fee, ""),
+                                                        label: pool_label(true, "v4", contracts::native_sym(), &sym, fee, ""),
                                                         kind: engine::PoolKind::V4 { pool_id: compute_pool_id(token, fee, spacing), tick_spacing: spacing },
                                                         token, sym, fee, owned: true,
-                                                        quote: engine::Quote::Eth, quote_sym: "ETH".to_string(),
+                                                        quote: engine::Quote::Eth, quote_sym: contracts::native_sym().to_string(),
                                                     })
                                                 }
                                                 None => None,
@@ -4697,6 +4972,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         // logo resolves in.
         ui::image::Venue::PoolsTrade => "POOLS.TRADE".to_string(),
         ui::image::Venue::PoolsFun => "POOLS.FUN".to_string(),
+        ui::image::Venue::Flap => "FLAP".to_string(),
         _ => bot.pool.kind.banner_name().to_string(),
     };
 
@@ -4892,10 +5168,13 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
     mkt.push(Line::from(vec![mlbl("Token"), Span::raw(bot.pool.token.to_string())]));
     match bot.pool.kind {
         engine::PoolKind::V3 { pool_addr, .. }
-        | engine::PoolKind::SushiV3 { pool_addr, .. } =>
+        | engine::PoolKind::SushiV3 { pool_addr, .. }
+        | engine::PoolKind::PancakeV3 { pool_addr, .. } =>
             mkt.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
         engine::PoolKind::PonsCurve { curve, .. } =>
             mkt.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
+        engine::PoolKind::Flap { portal, .. } =>
+            mkt.push(Line::from(vec![mlbl("Portal"), Span::raw(format!("{portal}"))])),
         engine::PoolKind::V4 { pool_id, .. }
         | engine::PoolKind::FlaunchV4 { pool_id, .. }
         | engine::PoolKind::PonsV2Pool { pool_id, .. } =>
@@ -4916,7 +5195,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                         (Some(lp), false) => format!("{lp} · {venue}"),
                         (None, _) => venue.to_string(),
                     };
-                    format!("{named} ETH/{} {}", bot.pool.sym, fee_label(bot.pool.fee))
+                    format!("{named} {}/{} {}", bot.pool.quote_sym, bot.pool.sym, fee_label(bot.pool.fee))
                 },
                 Style::default().add_modifier(Modifier::BOLD),
             ),
@@ -4959,7 +5238,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         }
     }
     if let Some(lb) = bot.pons_launch() {
-        let s = block.saturating_sub(lb) / 10; // blocks -> seconds at ~10/s
+        let s = (block.saturating_sub(lb) as f64 * contracts::secs_per_block()) as u64; // blocks -> seconds
         let a = view::age_compact(s as f64);
         // "since launch", because that is what the recorded block now is: pons
         // coins are seen at TokenDeployed, before graduation, so "since
@@ -5115,10 +5394,13 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             mb.push(Line::from(Span::styled(format!("{:<9}{}", "Token", pb.token), Style::default().fg(ui::widgets::tone_color(view::Tone::Normal)))));
             match pb.kind {
                 engine::PoolKind::V3 { pool_addr, .. }
-                | engine::PoolKind::SushiV3 { pool_addr, .. } =>
+                | engine::PoolKind::SushiV3 { pool_addr, .. }
+                | engine::PoolKind::PancakeV3 { pool_addr, .. } =>
                     mb.push(Line::from(vec![mlbl("Pool"), Span::raw(format!("{pool_addr}"))])),
                 engine::PoolKind::PonsCurve { curve, .. } =>
                     mb.push(Line::from(vec![mlbl("Curve"), Span::raw(format!("{curve}"))])),
+                engine::PoolKind::Flap { portal, .. } =>
+                    mb.push(Line::from(vec![mlbl("Portal"), Span::raw(format!("{portal}"))])),
                 engine::PoolKind::V4 { pool_id, .. }
                 | engine::PoolKind::FlaunchV4 { pool_id, .. }
                 | engine::PoolKind::PonsV2Pool { pool_id, .. } =>
@@ -5273,7 +5555,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
         Line::from({
             // The balance in the unit you spend, and beside it the unit you
             // think in — dimmed, approximate, absent when the price is.
-            let mut spans = vec![lbl("ETH"), Span::raw(view::eth(bot.eth))];
+            let mut spans = vec![lbl(contracts::native_sym()), Span::raw(view::eth(bot.eth))];
             if bot.eth_usd > 0.0 && bot.eth > 0.0 {
                 spans.push(Span::styled(
                     format!("  ({})", view::usd_compact(bot.eth * bot.eth_usd)),
@@ -5373,11 +5655,11 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
             let points: Vec<(i64, f64, f64)> = tape
                 .iter()
                 .filter(|s| (bot.arb_mode || s.is_v4 == pool_is_v4) && s.price > 0.0)
-                .map(|s| ((s.block / 10) as i64, 1.0 / s.price, s.eth))
+                .map(|s| (block_secs(s.block), 1.0 / s.price, s.eth))
                 .collect();
             // "Now" on the same block/10 clock as the points, so five quiet
             // minutes read as a flat line up to the live head, not a freeze.
-            let candles = view::candles_of(&points, bot.chart_iv, 240, Some((block / 10) as i64));
+            let candles = view::candles_of(&points, bot.chart_iv, 240, Some(block_secs(block)));
             // Our own fills: any tape row whose tx is in the persisted
             // own-transaction set, on the same block/10 clock as the points.
             // One entry line per FILL, not per tape row. A duplicated row drew a
@@ -5389,7 +5671,7 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 .filter(|s| bot.is_mine(s) && s.price > 0.0)
                 .filter(|s| matches!(s.action, engine::TapeAction::Buy | engine::TapeAction::Sell))
                 .filter(|s| seen_fill.insert(s.tx))
-                .map(|s| ((s.block / 10) as i64, 1.0 / s.price, matches!(s.action, engine::TapeAction::Buy)))
+                .map(|s| (block_secs(s.block), 1.0 / s.price, matches!(s.action, engine::TapeAction::Buy)))
                 .collect();
             // Market cap is price times supply — a LINEAR rescale, so the
             // candles keep their exact shape and only the axis changes. That
@@ -5428,10 +5710,10 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 unit: if bot.chart_mcap && !money {
                     bot.pool.quote_sym.clone()
                 } else {
-                    "ETH".to_string()
+                    contracts::native_sym().to_string()
                 },
                 money,
-                now_t: (block / 10) as i64,
+                now_t: block_secs(block),
                 active_key: Some('c'),
                 trades,
             };
@@ -5502,8 +5784,8 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 if blk == 0 || blk > block {
                     return "—".to_string();
                 }
-                let secs = block.saturating_sub(blk) / 10;
-                view::age_compact(secs as f64)
+                let secs = block.saturating_sub(blk) as f64 * contracts::secs_per_block();
+                view::age_compact(secs)
             };
             // Single-market mode shows only the active venue's swaps; arb mode
             // keeps the merged v3+v4 tape.
@@ -5635,7 +5917,28 @@ fn draw(f: &mut Frame, bot: &Bot, block: u64, round_ms: f64, view: Panel, orders
                 } else {
                     "—".into()
                 };
-                let (venue, vtone) = if s.is_v4 { ("v4", view::Tone::Info) } else { ("v3", view::Tone::Accent) };
+                // The tape decodes two event shapes, v4's and v3's, and that
+                // is what `is_v4` records. A venue that is neither — a curve,
+                // Pancake — is named for what it is when it is the only venue
+                // on the tape (single-market mode); in arb mode the two pools
+                // are told apart by the shape.
+                let (venue, vtone) = if s.is_v4 {
+                    ("v4", view::Tone::Info)
+                } else if !bot.arb_mode
+                    && matches!(bot.pool.kind, engine::PoolKind::Flap { .. } | engine::PoolKind::PonsCurve { .. } | engine::PoolKind::PancakeV3 { .. })
+                {
+                    // Four columns wide, like "v3" and "v4".
+                    (
+                        match bot.pool.kind {
+                            engine::PoolKind::Flap { .. } => "flap",
+                            engine::PoolKind::PancakeV3 { .. } => "pcs",
+                            _ => "crv",
+                        },
+                        view::Tone::Accent,
+                    )
+                } else {
+                    ("v3", view::Tone::Accent)
+                };
                 // The whole row carries the trade's colour, so a buy reads as
                 // one green unit and a sell as one red one. Age stays neutral:
                 // it says when, not what.

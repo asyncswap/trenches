@@ -66,6 +66,22 @@ pub struct Venues {
     /// WETH, but a real minority pair USDG, and pricing one as the other is
     /// off by orders of magnitude.
     pub usdg: Address,
+    /// Flap (flap.sh): a launchpad whose Portal is factory, bonding curve and
+    /// router in one contract. Every launch trades against the Portal while it
+    /// is on its curve, and the Portal keeps routing it after graduation, so
+    /// one address is the whole venue. ZERO where Flap is not deployed.
+    pub flap_portal: Address,
+    /// PancakeSwap V3 — the DEX a non-tax Flap launch graduates into on BNB
+    /// Chain. Read-only here: the pool's `slot0` and Swap logs are what the
+    /// tape and price use once a launch has left its curve. Trades still go
+    /// through the Portal, which routes to the pool itself. ZERO elsewhere.
+    pub pancake_v3_factory: Address,
+    /// PancakeSwap's SmartRouter: a fork of Uniswap's swap-router-contracts,
+    /// so it takes SwapRouter02's exact-input params (no deadline) and the
+    /// same multicall + unwrapWETH9 sell shape. Verified live: its `factory()`
+    /// is the V3 factory above and its `WETH9()` is WBNB. The approval target
+    /// for a PancakeSwap sell.
+    pub pancake_router: Address,
 }
 
 /// Official Robinhood Chain deployment.
@@ -122,6 +138,11 @@ static ROBINHOOD: Venues = Venues {
     sushi_red_snwapper: address!("8E6fD69A77e88ee20Ba4B4fBd59DfCDA3EC0E98A"),
     sushi_route_processor: address!("0e867974275Cd31C25015C2753C9d75F9f355379"),
     usdg: address!("5fc5360D0400a0Fd4f2af552ADD042D716F1d168"),
+    // Flap's Portal on Robinhood Chain (v5.14.16), from docs.flap.sh's deployed
+    // addresses. Launches here graduate to a Uniswap V2 pair.
+    flap_portal: address!("26605f322f7fF986f381bB9A6e3f5DAb0bEaEb09"),
+    pancake_v3_factory: Address::ZERO,
+    pancake_router: Address::ZERO,
 };
 
 /// Base mainnet.
@@ -164,17 +185,102 @@ static BASE: Venues = Venues {
     sushi_red_snwapper: Address::ZERO,
     sushi_route_processor: Address::ZERO,
     usdg: Address::ZERO,
+    flap_portal: Address::ZERO,
+    pancake_v3_factory: Address::ZERO,
+    pancake_router: Address::ZERO,
 };
 
-#[allow(dead_code)] // the pair reads as a pair; only one is matched on
+/// BNB Chain (BSC) mainnet.
+///
+/// Uniswap addresses from the same Uniswap/contracts registry (commit
+/// 3793618) that supplied Base — the "BNB Chain" rows, `labs-supported`
+/// tier. The UniversalRouter is the registry's primary BNB entry, the same
+/// v2.x line Base trades through, so the v4 command encoding is unchanged.
+///
+/// WBNB is the canonical wrapped-native token, and it plays the WETH role
+/// everywhere: the quote side of every v3 pool and the wrap step of a v3 buy.
+///
+/// Flap is the launchpad this chain is here for. Its Portal (v5.14.16) is from
+/// docs.flap.sh's deployed addresses and cross-checked against the FlapBSCFixture
+/// in flap-sh's own vault example repo. Non-tax launches graduate into
+/// PancakeSwap V3 (address from pancake-v3-contracts' bscMainnet deployment);
+/// tax launches into PancakeSwap V2. Neither pool is traded directly — the
+/// Portal keeps routing a graduated token — but the V3 factory is recorded so
+/// a graduated pool's Swap tape can be read by address.
+///
+/// pons, pools.trade, pools.fun, Sushi's launchpad and Flaunch are not deployed
+/// here: zero, so discovery does not scan for events that cannot be emitted.
+static BNB: Venues = Venues {
+    pool_manager: address!("28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF"),
+    position_manager: address!("7A4a5c919aE2541AeD11041A1AEeE68f1287f95b"),
+    state_view: address!("d13Dd3D6E93f276FAfc9Db9E6BB47C1180aeE0c4"),
+    universal_router: address!("91BF3bfAEf8D771A74E1A8fE460b3EE646b2e588"),
+    v3_factory: address!("dB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7"),
+    swap_router_02: address!("B971eF87ede563556b2ED4b1C0b0019111Dd85d2"),
+    weth: address!("bb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
+    flaunch_pm: Address::ZERO,
+    fleth: Address::ZERO,
+    fleth_hooks: Address::ZERO,
+    pons_factory: Address::ZERO,
+    pons_v2_factory: Address::ZERO,
+    pons_v2_hook: Address::ZERO,
+    pools_launcher: Address::ZERO,
+    pools_fun: Address::ZERO,
+    sushi_launchpad: Address::ZERO,
+    sushi_v3_factory: Address::ZERO,
+    sushi_red_snwapper: Address::ZERO,
+    sushi_route_processor: Address::ZERO,
+    usdg: Address::ZERO,
+    flap_portal: address!("e2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0"),
+    pancake_v3_factory: address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
+    pancake_router: address!("13f4EA83D0bd40E75C8222255bc855a974568Dd4"),
+};
+
+#[allow(dead_code)] // the set reads as a set; not every id is matched on
 pub const ROBINHOOD_MAINNET: u64 = 4663;
 pub const BASE_MAINNET: u64 = 8453;
+pub const BNB_MAINNET: u64 = 56;
 
 /// The addresses for the chain currently selected.
 pub fn venues() -> &'static Venues {
     match crate::chain_id() {
         BASE_MAINNET => &BASE,
+        BNB_MAINNET => &BNB,
         _ => &ROBINHOOD,
+    }
+}
+
+/// The native gas token's ticker on the selected chain.
+///
+/// Every EVM chain here prices launches in its gas token, and the code calls
+/// that side "ETH" throughout — `Quote::Eth`, `bot.eth`, `pooled_eth`. On BNB
+/// Chain the same slot holds BNB, and the maths are identical: 18 decimals,
+/// wrapped by `weth()`, sent as `value`. Only the label differs, so only the
+/// label is chain-aware. Anything a person reads goes through this; the
+/// internal names stay as they are.
+pub fn native_sym() -> &'static str {
+    match crate::chain_id() {
+        BNB_MAINNET => "BNB",
+        _ => "ETH",
+    }
+}
+
+/// CoinGecko id of the native gas token — what the USD feed is asked for.
+pub fn native_cg_id() -> &'static str {
+    match crate::chain_id() {
+        BNB_MAINNET => "binancecoin",
+        _ => "ethereum",
+    }
+}
+
+/// Seconds per block on the selected chain, for turning a block window into
+/// a rate and a block age into a time. Robinhood Chain runs ~10 blocks a
+/// second; Base ships one every 2s; BNB Chain every 0.75s since Maxwell.
+pub fn secs_per_block() -> f64 {
+    match crate::chain_id() {
+        BASE_MAINNET => 2.0,
+        BNB_MAINNET => 0.75,
+        _ => 0.1,
     }
 }
 
@@ -198,6 +304,19 @@ pub fn fleth_hooks() -> Address { venues().fleth_hooks }
 pub fn pons_factory() -> Address { venues().pons_factory }
 pub fn pons_v2_factory() -> Address { venues().pons_v2_factory }
 pub fn pons_v2_hook() -> Address { venues().pons_v2_hook }
+pub fn flap_portal() -> Address { venues().flap_portal }
+pub fn pancake_v3_factory() -> Address { venues().pancake_v3_factory }
+pub fn pancake_router() -> Address { venues().pancake_router }
+
+/// PancakeSwap V3's fee tiers (hundredths of a bip) and their tick spacings.
+/// Not Uniswap's: 2500 (0.25%) replaces 3000, and its spacing is 50.
+pub const PANCAKE_V3_FEES: [u32; 4] = [10_000, 2_500, 500, 100];
+
+/// Flap's protocol rate on every bonding-curve buy and sell, in basis points:
+/// 1% on BNB Chain and Robinhood. Display and off-chain estimates only — the
+/// Portal's own `quoteExactInput` is what a trade is sized from, and it
+/// already includes this and any per-token tax.
+pub const FLAP_FEE_BPS: u32 = 100;
 
 // Existing tokens placed straight into a v2-style pool, skipping the curve.
 // Nothing reads these yet; they are recorded so the addresses are not looked up
@@ -518,6 +637,107 @@ sol! {
         function fee() external view returns (uint24);
     }
 
+    /// PancakeSwap V3 pool. The same slot0/liquidity shape as Uniswap v3 —
+    /// with ONE difference that matters to a decoder: `feeProtocol` is a
+    /// uint32 (two packed uint16s), not a uint8, and a Pancake pool's word
+    /// there routinely exceeds 255. Decoding it as Uniswap's uint8 fails
+    /// validation, which read as "this pool has no price".
+    #[sol(rpc)]
+    interface IPancakeV3Pool {
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint32 feeProtocol, bool unlocked);
+        function liquidity() external view returns (uint128);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function fee() external view returns (uint24);
+        // Two protocol-fee words after Uniswap's five, so a different topic0;
+        // the first five data words decode exactly as a Uniswap v3 Swap.
+        event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint128 protocolFeesToken0, uint128 protocolFeesToken1);
+    }
+
+    /// Uniswap V2 pair (and its forks — PancakeSwap V2 on BNB Chain, the
+    /// native V2 fork on Robinhood Chain). Read-only: a tax-token Flap launch
+    /// graduates here, and its trades still route through the Portal, but the
+    /// tape needs the pair's Swap and its reserves for a price.
+    #[sol(rpc)]
+    interface IV2Pair {
+        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to);
+    }
+
+    // ---- Flap (flap.sh) Portal ----
+    //
+    // One contract is the launchpad, the bonding curve for every launch and
+    // the router: `newToken*` creates, `swapExactInput` trades (on the curve
+    // and, after graduation, through the DEX pool the Portal migrated to), and
+    // `getTokenV7` reads state. From flap-sh's published IPortal.sol
+    // (v5.14.16); the enum-typed fields are declared as uint8 here, which is
+    // ABI-identical and — like the Portal's own `getTokenV8Safe` — does not
+    // break decoding when a future upgrade adds an enum value.
+    //
+    // NOTE the trade events index NOTHING: `token` rides in the data. A tape
+    // for one launch has to read every trade on the Portal in the window and
+    // filter, and a per-token log filter is not possible.
+    #[sol(rpc)]
+    interface IFlapPortal {
+        event TokenCreated(uint256 ts, address creator, uint256 nonce, address token, string name, string symbol, string meta);
+        event TokenBought(uint256 ts, address token, address buyer, uint256 amount, uint256 eth, uint256 fee, uint256 postPrice);
+        event TokenSold(uint256 ts, address token, address seller, uint256 amount, uint256 eth, uint256 fee, uint256 postPrice);
+        // `pool` is the real pool for V2/V3 migrators; for the CL migrators it
+        // is the vault/PoolManager and FlapTokenCLPoolCreated carries the id.
+        event LaunchedToDEX(address token, address pool, uint256 amount, uint256 eth);
+        event FlapTokenCLPoolCreated(address token, bytes32 poolId, uint160 sqrtPriceX96);
+        event FlapTokenCirculatingSupplyChanged(address token, uint256 newSupply);
+        event FlapTokenProgressChanged(address token, uint256 newProgress);
+        event TokenQuoteSet(address token, address quoteToken);
+        event FlapTokenTaxSet(address token, uint256 tax);
+
+        struct FlapTokenStateV7 {
+            uint8 status;            // TokenStatus: 0 Invalid, 1 Tradable, 2/3 obsolete, 4 DEX, 5 Staged
+            uint256 reserve;         // quote held by the curve
+            uint256 circulatingSupply;
+            uint256 price;           // quote per token, wad
+            uint8 tokenVersion;      // TokenVersion: 4/5/6 are the tax tokens
+            uint256 r;
+            uint256 h;
+            uint256 k;
+            uint256 dexSupplyThresh; // circulating supply at which it graduates
+            address quoteTokenAddress; // zero = native gas token
+            bool nativeToQuoteSwapEnabled;
+            bytes32 extensionID;
+            uint256 taxRate;         // bps; 0 = not a tax token
+            address pool;            // the DEX pool once graduated, else zero
+            uint256 progress;        // wad, 1e18 = 100%
+            uint8 lpFeeProfile;
+            uint8 dexId;
+        }
+        // Reverts (custom error) for a token the Portal never launched.
+        function getTokenV7(address token) external view returns (FlapTokenStateV7 state);
+
+        struct FlapQuoteExactInputParams {
+            address inputToken;  // zero = native
+            address outputToken; // zero = native
+            uint256 inputAmount;
+        }
+        // Not a view; call it with eth_call and `from` set to the buyer —
+        // a per-origin buy quota, where a launch has one, is priced in.
+        function quoteExactInput(FlapQuoteExactInputParams params) external returns (uint256 outputAmount);
+
+        struct FlapExactInputParams {
+            address inputToken;
+            address outputToken;
+            uint256 inputAmount;
+            uint256 minOutputAmount;
+            bytes permitData; // empty: sells use a plain approval to the Portal
+        }
+        function swapExactInput(FlapExactInputParams params) external payable returns (uint256 outputAmount);
+
+        // Per-tx.origin cumulative buy cap on the curve; both zero = no cap.
+        function maxBuyPerOrigin(address token) external view returns (uint16 bps, uint256 maxBuyAmount);
+        function buyQuotaOf(address token, address origin) external view returns (uint256 bought, uint256 remaining);
+    }
+
     struct V3ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
@@ -654,7 +874,8 @@ mod venue_tests {
     /// is that this is checkable rather than discovered by a failed trade.
     #[test]
     fn every_chain_names_the_venues_it_trades_through() {
-        for (name, v) in [("robinhood", &ROBINHOOD), ("base", &BASE)] {
+        // The Uniswap stack every chain trades through.
+        for (name, v) in [("robinhood", &ROBINHOOD), ("base", &BASE), ("bnb", &BNB)] {
             for (what, a) in [
                 ("pool_manager", v.pool_manager),
                 ("position_manager", v.position_manager),
@@ -663,33 +884,77 @@ mod venue_tests {
                 ("v3_factory", v.v3_factory),
                 ("swap_router_02", v.swap_router_02),
                 ("weth", v.weth),
-                ("flaunch_pm", v.flaunch_pm),
-                ("fleth", v.fleth),
-                ("fleth_hooks", v.fleth_hooks),
             ] {
                 assert!(!a.is_zero(), "{name} has no {what}");
             }
         }
+        // Flaunch lives on Robinhood and Base, not BNB.
+        for (name, v) in [("robinhood", &ROBINHOOD), ("base", &BASE)] {
+            for (what, a) in [("flaunch_pm", v.flaunch_pm), ("fleth", v.fleth), ("fleth_hooks", v.fleth_hooks)] {
+                assert!(!a.is_zero(), "{name} has no {what}");
+            }
+        }
+        assert!(BNB.flaunch_pm.is_zero(), "flaunch is not on bnb; a nonzero address would be scanned");
+        // Flap on Robinhood and BNB; PancakeSwap on BNB only, and it comes as
+        // a set — a factory without a router finds pools it cannot trade.
+        assert!(!ROBINHOOD.flap_portal.is_zero());
+        assert!(!BNB.flap_portal.is_zero());
+        assert!(BASE.flap_portal.is_zero());
+        assert!(!BNB.pancake_v3_factory.is_zero() && !BNB.pancake_router.is_zero());
+        assert!(ROBINHOOD.pancake_v3_factory.is_zero() && ROBINHOOD.pancake_router.is_zero());
     }
 
-    /// Two chains must not share an address by accident — a copy-paste from one
-    /// table into the other is the likeliest way this file goes wrong, and it
-    /// would send Base trades at Robinhood contracts.
+    /// Chains must not share an address by accident — a copy-paste from one
+    /// table into another is the likeliest way this file goes wrong, and it
+    /// would send one chain's trades at another chain's contracts.
     #[test]
-    fn the_two_chains_do_not_share_addresses() {
-        let r = [
-            ROBINHOOD.pool_manager, ROBINHOOD.position_manager, ROBINHOOD.state_view,
-            ROBINHOOD.universal_router, ROBINHOOD.v3_factory, ROBINHOOD.swap_router_02,
-            ROBINHOOD.weth, ROBINHOOD.flaunch_pm, ROBINHOOD.fleth, ROBINHOOD.fleth_hooks,
+    fn the_chains_do_not_share_addresses() {
+        let of = |v: &Venues| [
+            v.pool_manager, v.position_manager, v.state_view, v.universal_router,
+            v.v3_factory, v.swap_router_02, v.weth, v.flaunch_pm, v.fleth, v.fleth_hooks,
+            v.flap_portal, v.pancake_v3_factory, v.pancake_router,
         ];
-        let b = [
-            BASE.pool_manager, BASE.position_manager, BASE.state_view,
-            BASE.universal_router, BASE.v3_factory, BASE.swap_router_02,
-            BASE.weth, BASE.flaunch_pm, BASE.fleth, BASE.fleth_hooks,
-        ];
-        for (i, x) in b.iter().enumerate() {
+        let (r, b, n) = (of(&ROBINHOOD), of(&BASE), of(&BNB));
+        for (i, x) in b.iter().enumerate().filter(|(_, x)| !x.is_zero()) {
             assert!(!r.contains(x), "base slot {i} carries a Robinhood address: {x}");
         }
+        for (i, x) in n.iter().enumerate().filter(|(_, x)| !x.is_zero()) {
+            assert!(!r.contains(x), "bnb slot {i} carries a Robinhood address: {x}");
+            assert!(!b.contains(x), "bnb slot {i} carries a Base address: {x}");
+        }
+    }
+
+    /// The Flap event topics, pinned. `token` is NOT indexed in any of them,
+    /// which is why the tape filters by topic0 and reads the address from the
+    /// data — a filter by topic1 would silently match nothing.
+    #[test]
+    fn flap_topics_are_pinned() {
+        use alloy::sol_types::SolEvent;
+        assert_eq!(
+            format!("{:#x}", IFlapPortal::TokenCreated::SIGNATURE_HASH),
+            "0x504e7f360b2e5fe33cbaaae4c593bc55305328341bf79009e43e0e3b7f699603"
+        );
+        assert_eq!(
+            format!("{:#x}", IFlapPortal::TokenBought::SIGNATURE_HASH),
+            "0xa800a2038683844fac66747f771bfdfae862eb28b16bcfa387afa9fbacce8ff7"
+        );
+        assert_eq!(
+            format!("{:#x}", IFlapPortal::TokenSold::SIGNATURE_HASH),
+            "0x03a4693e592f5e75dc7c136acb39b146d2b4966c0e509c34f362dee02b3b861a"
+        );
+        assert_eq!(
+            format!("{:#x}", IFlapPortal::LaunchedToDEX::SIGNATURE_HASH),
+            "0x6e4f47630b8745b8cacbd44f42a8a33e7eea7cc08ef22fc7630f4f385784ff7d"
+        );
+        // Pancake's Swap is not Uniswap's: two more words, another topic.
+        assert_eq!(
+            format!("{:#x}", IPancakeV3Pool::Swap::SIGNATURE_HASH),
+            "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83"
+        );
+        assert_eq!(
+            format!("{:#x}", IV2Pair::Swap::SIGNATURE_HASH),
+            "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+        );
     }
 
     /// pons is Robinhood's launchpad. Base must say so with a zero rather than

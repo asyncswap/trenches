@@ -16,10 +16,12 @@ A terminal bot for trading memecoins.
 ![Trenches trading on Robinhood Chain: wallet and pool state above a live trade tape, with your own fills starred](./screenshot.png)
 
 - **Robinhood Chain** — Uniswap V3 and V4, [pons.family](https://pons.family)
-  launches, [Flaunch](https://flaunch.gg) launches, and
-  [pools.fun](https://pools.fun) launches trading on SushiSwap V3
+  launches, [Flaunch](https://flaunch.gg) launches, [Flap](https://flap.sh)
+  launches, and [pools.fun](https://pools.fun) launches trading on SushiSwap V3
+- **BNB Chain** — [Flap](https://flap.sh) bonding curves and their graduation
+  into PancakeSwap V3, plus Uniswap V3 and V4
+- **Base** — Flaunch launches, Uniswap V3 and V4
 - **Solana** — pump.fun bonding curves and PumpSwap AMM
-- **Base, BNB Chain** — next
 - Keys stay on your machine, in a password-encrypted keystore
 - One set of shortcuts, from one file — the app, the docs and the website
   cannot disagree about them

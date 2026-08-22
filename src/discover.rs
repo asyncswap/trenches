@@ -24,10 +24,10 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::{prelude::*, widgets::*};
 
 use crate::contracts::{
-    IERC20, IFlaunchPositionManager, ILiquidityLauncher, IPonsCurve, IPonsFactory,
+    IERC20, IFlapPortal, IFlaunchPositionManager, ILiquidityLauncher, IPonsCurve, IPonsFactory,
     IPonsV2Factory, IPoolManager, IStateView, IUERC20Factory, IV3Factory, IV3Pool,
     IPartyFactory, ISushiLaunchpad, ISushiV3Factory, ISushiV3Pool,
-    FLAUNCH_FEE_EST, flaunch_pm, pons_factory, pons_v2_factory, pool_manager, pools_launcher,
+    FLAP_FEE_BPS, FLAUNCH_FEE_EST, flap_portal, flaunch_pm, pons_factory, pons_v2_factory, pool_manager, pools_launcher,
     pools_fun, state_view, sushi_launchpad, sushi_v3_factory, usdg, v3_factory, weth,
 };
 use std::sync::OnceLock;
@@ -38,7 +38,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 const SWAP_V3: B256 =
     alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
-const SECS_PER_BLOCK: f64 = 0.1; // ~10 blocks/sec on Robinhood Chain
+// Seconds per block is chain-dependent — see `contracts::secs_per_block`.
 const ACTIVITY_WINDOW: u64 = 200; // ~20 s sample for tx/sec
 const MAX_SCAN: usize = 48; // newest launches to track (bounds RPC)
 const CONCURRENCY: usize = 12; // in-flight RPC cap
@@ -85,10 +85,13 @@ impl Grad {
     pub fn pool_key(&self) -> B256 {
         match self.kind {
             engine::PoolKind::V3 { pool_addr, .. }
-            | engine::PoolKind::SushiV3 { pool_addr, .. } => pool_addr.into_word(),
+            | engine::PoolKind::SushiV3 { pool_addr, .. }
+            | engine::PoolKind::PancakeV3 { pool_addr, .. } => pool_addr.into_word(),
             // A curve has no pool; its own address is the stable identity, and
             // it is unique per launch.
             engine::PoolKind::PonsCurve { curve, .. } => curve.into_word(),
+            // Every Flap launch shares the Portal, so the token is the identity.
+            engine::PoolKind::Flap { .. } => self.token.into_word(),
             engine::PoolKind::V4 { pool_id, .. }
             | engine::PoolKind::FlaunchV4 { pool_id, .. }
             | engine::PoolKind::PonsV2Pool { pool_id, .. } => pool_id,
@@ -99,8 +102,10 @@ impl Grad {
     pub fn pool_display(&self) -> String {
         match self.kind {
             engine::PoolKind::V3 { pool_addr, .. }
-            | engine::PoolKind::SushiV3 { pool_addr, .. } => format!("{pool_addr:#x}"),
+            | engine::PoolKind::SushiV3 { pool_addr, .. }
+            | engine::PoolKind::PancakeV3 { pool_addr, .. } => format!("{pool_addr:#x}"),
             engine::PoolKind::PonsCurve { curve, .. } => format!("{curve:#x}"),
+            engine::PoolKind::Flap { portal, .. } => format!("{portal:#x}"),
             engine::PoolKind::V4 { pool_id, .. }
             | engine::PoolKind::FlaunchV4 { pool_id, .. }
             | engine::PoolKind::PonsV2Pool { pool_id, .. } => format!("{pool_id:#x}"),
@@ -171,6 +176,16 @@ fn sort_rows(rows: &mut [Row]) {
 /// caps at 10 blocks — now flows through `src/rpc.rs`, which steers each
 /// request to an endpoint that can answer it.
 const PUBLIC_RPC: &str = "https://rpc.mainnet.chain.robinhood.com/rpc";
+
+/// The public endpoint to fall back to when the config names none that is
+/// usable — the selected chain's, not Robinhood's regardless.
+fn public_rpc() -> &'static str {
+    match crate::chain_id() {
+        crate::contracts::BASE_MAINNET => "https://mainnet.base.org",
+        crate::contracts::BNB_MAINNET => "https://bsc-rpc.publicnode.com",
+        _ => PUBLIC_RPC,
+    }
+}
 
 /// Fast first pass: just the (token, pool, block) list from TokenLaunched —
 /// one getLogs, no per-token reads, so it returns immediately.
@@ -244,6 +259,24 @@ pub struct PoolsCand {
     pub pool_id: B256,
     pub tick_spacing: i32,
     pub fee: u32,
+}
+
+/// A Flap launch, from the Portal's TokenCreated. The event carries the name,
+/// the symbol and the metadata CID inline, so — like Flaunch — a launch needs
+/// no per-token read to become a row. The quote asset comes from the
+/// TokenQuoteSet the same transaction emits when it is not the native gas
+/// token; absent that, native.
+#[derive(Clone)]
+pub struct FlapCand {
+    pub token: Address,
+    pub block: u64,
+    pub sym: String,
+    pub name: String,
+    /// The metadata CID (bare, as the event carries it).
+    pub meta: String,
+    pub creator: Address,
+    /// Zero = native gas token; else the ERC-20 the launch is priced in.
+    pub quote: Address,
 }
 
 /// Pools that came out of a Sushi launchpad, mapped to the asset they are
@@ -770,6 +803,7 @@ fn seed_rows(
     known: &[(Address, Address, u64)],
     known_fl: &[FlCand],
     known_pt: &[PoolsCand],
+    known_flap: &[FlapCand],
     head: u64,
 ) -> usize {
     let mut cur = shared.lock().unwrap();
@@ -796,6 +830,13 @@ fn seed_rows(
         cur.push(build_pt_row(c, 0.0, 0.0, 0.0, 0, head));
         added += 1;
     }
+    for c in known_flap {
+        if cur.iter().any(|r| r.grad.token == c.token) {
+            continue;
+        }
+        cur.push(build_flap_row(c, FlapRead::default(), 0.0, 0, head));
+        added += 1;
+    }
     if added > 0 {
         // In canonical order immediately. A streamed row that appears at the
         // bottom and jumps to the top a round later reads as two events.
@@ -810,14 +851,40 @@ fn seed_rows(
 /// Split out so the polled scan and the live subscription decode identically.
 /// Two decoders for one event shape is two places for a launch to be missed,
 /// and they would drift the first time an ABI changed.
-pub fn sort_launch_logs(
-    logs: &[alloy::rpc::types::Log],
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<(Address, u64)>, Vec<PoolsCand>) {
+/// One batch of launch logs, sorted by launchpad: pons graduations (token,
+/// pool, block), Flaunch, pons v2, pons creations awaiting a pool (token,
+/// block), pools.trade, Flap.
+pub type LaunchBatch =
+    (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<(Address, u64)>, Vec<PoolsCand>, Vec<FlapCand>);
+
+pub fn sort_launch_logs(logs: &[alloy::rpc::types::Log]) -> LaunchBatch {
     let mut seen = std::collections::HashSet::new();
     let (mut pons, mut fl, mut v2, mut pt) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut deployed: Vec<(Address, u64)> = Vec::new();
+    let mut flap: Vec<FlapCand> = Vec::new();
+    // Flap's quote is a SEPARATE event in the creation transaction, and only
+    // when it is not native. Collected first so a launch decoded before its
+    // TokenQuoteSet in the same batch still gets it.
+    let mut flap_quotes: std::collections::HashMap<Address, Address> = Default::default();
+    if !flap_portal().is_zero() {
+        use alloy::sol_types::SolEvent as _;
+        for lg in logs.iter().filter(|l| l.address() == flap_portal()) {
+            if let Ok(ev) = IFlapPortal::TokenQuoteSet::decode_log(&lg.inner, true) {
+                flap_quotes.insert(ev.data.token, ev.data.quoteToken);
+            }
+        }
+    }
     for lg in logs {
-        if lg.address() == pons_v2_factory() {
+        if !flap_portal().is_zero() && lg.address() == flap_portal() {
+            if let Some(mut c) = decode_flap_log(lg) {
+                if let Some(q) = flap_quotes.get(&c.token) {
+                    c.quote = *q;
+                }
+                if seen.insert(c.token.into_word()) {
+                    flap.push(c);
+                }
+            }
+        } else if lg.address() == pons_v2_factory() {
             if let Some(c) = decode_pons_v2_log(lg) {
                 if seen.insert(c.token.into_word()) {
                     v2.push(c);
@@ -859,7 +926,76 @@ pub fn sort_launch_logs(
             }
         }
     }
-    (pons, fl, v2, deployed, pt)
+    (pons, fl, v2, deployed, pt, flap)
+}
+
+/// One Flap launch from the Portal's TokenCreated. Nothing in it is indexed,
+/// so alloy decodes the whole data tuple; the strings are attacker-written and
+/// length-capped like every other on-chain name here.
+fn decode_flap_log(lg: &alloy::rpc::types::Log) -> Option<FlapCand> {
+    use alloy::sol_types::SolEvent as _;
+    if lg.topics().first() != Some(&IFlapPortal::TokenCreated::SIGNATURE_HASH) {
+        return None;
+    }
+    let ev = IFlapPortal::TokenCreated::decode_log(&lg.inner, true).ok()?;
+    Some(FlapCand {
+        token: ev.data.token,
+        block: lg.block_number.unwrap_or(0),
+        sym: ev.data.symbol.chars().take(12).collect(),
+        name: ev.data.name.chars().take(40).collect(),
+        meta: ev.data.meta.chars().take(120).collect(),
+        creator: ev.data.creator,
+        quote: Address::ZERO,
+    })
+}
+
+/// What a Flap launch is known to be, before any read: symbol, name, creator,
+/// the launchpad, and the supply — every Flap token is 1e9 with 18 decimals,
+/// minted whole at creation, so that is a fact and not a call. Metadata is
+/// asked of IPFS off-loop, once, through the same cache Flaunch uses.
+fn note_flap_launch(c: &FlapCand) {
+    let (sym, creator, block) = (c.sym.clone(), c.creator, c.block);
+    crate::token_metadata_chain_id::merge(c.token, move |f| {
+        if f.sym.is_empty() {
+            f.sym = sym;
+        }
+        if f.supply <= 0.0 {
+            f.supply = 1_000_000_000.0;
+        }
+        if f.decimals.is_none() {
+            f.decimals = Some(18);
+        }
+        if f.launchpad.is_none() {
+            f.launchpad = Some("flap".into());
+        }
+        if f.launch_creator.is_none() && !creator.is_zero() {
+            f.launch_creator = Some(creator);
+        }
+        if f.launch_block.is_none() && block > 0 {
+            f.launch_block = Some(block);
+        }
+    });
+    crate::token_metadata_chain_id::record_launch(c.token, c.block);
+    let _ = fl_meta(c.token, &crate::net::ipfs_uri(&c.meta));
+}
+
+/// The quote asset's own facts — symbol and decimals — when a launch is not
+/// priced in the gas token. Flap quotes include tokenized equities (QQQB,
+/// GMEB) as well as USD1, and neither the symbol nor the decimals can be
+/// assumed. Once per quote asset, off-loop, through the persistent cache.
+fn note_flap_quote<P: Provider + Clone + Send + Sync + 'static>(provider: &P, quote: Address) {
+    if quote.is_zero() {
+        return;
+    }
+    let known = crate::token_metadata_chain_id::get(quote)
+        .is_some_and(|f| !f.sym.is_empty() && f.decimals.is_some());
+    if known {
+        return;
+    }
+    let p = provider.clone();
+    tokio::spawn(async move {
+        let _ = crate::token_metadata_chain_id::ensure(&p, quote, None).await;
+    });
 }
 
 /// One chunked getLogs covers EVERY launchpad: both factory addresses, both
@@ -1073,7 +1209,7 @@ fn note_v2_supply<P: Provider + Clone + Send + Sync + 'static>(provider: &P, c: 
 }
 
 fn launch_addresses() -> Vec<Address> {
-    [pons_factory(), flaunch_pm(), pons_v2_factory(), pools_launcher(), pools_fun(), sushi_launchpad()]
+    [pons_factory(), flaunch_pm(), pons_v2_factory(), pools_launcher(), pools_fun(), sushi_launchpad(), flap_portal()]
         .into_iter()
         .filter(|a| !a.is_zero())
         .collect()
@@ -1090,6 +1226,9 @@ fn launch_topics() -> Vec<B256> {
         // the signatures differ, so both are needed to see both feeds.
         IPartyFactory::TokenLaunched::SIGNATURE_HASH,
         ISushiLaunchpad::TokenLaunched::SIGNATURE_HASH,
+        // Flap: the creation, and the quote it is priced in when not native.
+        IFlapPortal::TokenCreated::SIGNATURE_HASH,
+        IFlapPortal::TokenQuoteSet::SIGNATURE_HASH,
     ]
 }
 
@@ -1097,7 +1236,7 @@ async fn scan_launchpads<P: Provider>(
     provider: &P,
     from: u64,
     to: u64,
-) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<PoolsCand>, Option<u64>) {
+) -> (Vec<(Address, Address, u64)>, Vec<FlCand>, Vec<PonsV2Cand>, Vec<PoolsCand>, Vec<FlapCand>, Option<u64>) {
     let mut logs = Vec::new();
     let (from, chunk) = clamp_scan("launch scan", from, to, LOG_CHUNK);
     let mut start = from;
@@ -1113,7 +1252,7 @@ async fn scan_launchpads<P: Provider>(
         // on every round, on a metered endpoint.
         let pads = launch_addresses();
         if pads.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(to));
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(to));
         }
         let filter = Filter::new()
             .address(pads)
@@ -1154,7 +1293,7 @@ async fn scan_launchpads<P: Provider>(
         }
         start = end + 1;
     }
-    let (mut pons, mut fl, v2, deployed, pt) = sort_launch_logs(&logs);
+    let (mut pons, mut fl, v2, deployed, pt, mut flap) = sort_launch_logs(&logs);
     // A creation names no pool, so ask the factory for it. One call per NEW
     // coin, and only for coins this scan has not already seen graduate.
     for (token, block) in deployed {
@@ -1172,15 +1311,18 @@ async fn scan_launchpads<P: Provider>(
         crate::trace(&format!("launch scan: {} pons v2 launch(es)", v2.len()));
     }
     crate::trace(&format!(
-        "launch scan {from}..{to}: {ok} chunks ok, {failed} failed, {} pons + {} flaunch",
+        "launch scan {from}..{to}: {ok} chunks ok, {failed} failed, {} pons + {} flaunch + {} flap",
         pons.len(),
-        fl.len()
+        fl.len(),
+        flap.len()
     ));
     pons.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
     pons.truncate(MAX_SCAN);
     fl.sort_by(|a, b| b.block.cmp(&a.block));
     fl.truncate(MAX_SCAN);
-    (pons, fl, v2, pt, covered)
+    flap.sort_by(|a, b| b.block.cmp(&a.block));
+    flap.truncate(MAX_SCAN);
+    (pons, fl, v2, pt, flap, covered)
 }
 
 /// One row from cached on-chain metadata + batch-read metrics. No RPC of its own: the
@@ -1233,7 +1375,7 @@ fn build_row(
     let tokens_per_eth = if grad.weth0() { p_raw } else if p_raw > 0.0 { 1.0 / p_raw } else { 0.0 };
     let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
     let mkt_cap_eth = f.supply * eth_per_token;
-    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let secs = ACTIVITY_WINDOW as f64 * crate::contracts::secs_per_block();
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
 
     Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, grad_pct: None, graduated: false, head_block: head, verified: false }
@@ -1260,7 +1402,7 @@ pub fn note_head(h: u64) {
 /// timing. Falls back to the row's own stamp only before any head is known.
 fn age_secs(r: &Row) -> f64 {
     let head = LIVE_HEAD.load(std::sync::atomic::Ordering::Relaxed).max(r.head_block);
-    head.saturating_sub(r.grad.launch_block) as f64 * SECS_PER_BLOCK
+    head.saturating_sub(r.grad.launch_block) as f64 * crate::contracts::secs_per_block()
 }
 
 // ---- Flaunch launch discovery ----
@@ -1458,7 +1600,7 @@ fn build_v2_row(
         launch_block: c.block,
         socials: f.as_ref().map(|f| f.socials.clone()).unwrap_or_default(),
     };
-    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let secs = ACTIVITY_WINDOW as f64 * crate::contracts::secs_per_block();
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
     Row {
         grad,
@@ -1468,6 +1610,100 @@ fn build_v2_row(
         my_bal,
         grad_pct: None,
         graduated: false,
+        head_block: head,
+        verified: false,
+    }
+}
+
+/// The 0.01-gas-token probe discovery quotes every Flap row with. Small
+/// enough to be a marginal price, large enough not to round to nothing.
+const FLAP_PROBE_WEI: u128 = 10_000_000_000_000_000;
+
+/// What one refresh read about a Flap launch. Zeroed for a row seeded before
+/// its first read.
+#[derive(Clone, Copy, Default)]
+struct FlapRead {
+    /// Quote per token, human, from the Portal's record (its curve price;
+    /// frozen after graduation).
+    price_quote: f64,
+    /// Gas token per token, human, from the probe — None when the Portal
+    /// would not quote a gas-token buy (a launch quoted in something else,
+    /// with the native swap disabled).
+    price_native: Option<f64>,
+    /// The Portal swaps gas token to the quote asset for a buyer.
+    native_swap: bool,
+    /// Quote held by the curve, in the quote's base units.
+    raised: f64,
+    progress: f64,
+    graduated: bool,
+}
+
+/// A row for a Flap launch, on its curve or graduated.
+///
+/// Three shapes, decided by what the launch is priced in and what the
+/// Portal will take for it:
+///
+/// - Quoted in the gas token: priced from the record on the curve, from the
+///   probe after graduation.
+/// - Quoted in something else (USD1, a tokenized stock) that the Portal will
+///   swap the gas token INTO for a buyer: traded and priced in the gas token,
+///   because that is what the trader holds. The raised figure is converted
+///   at the ratio of the two prices, which come from the same round.
+/// - Quoted in something else with no such swap: priced and traded in the
+///   quote asset itself, like a USDG-quoted pools.fun launch.
+fn build_flap_row(c: &FlapCand, r: FlapRead, my_bal: f64, swaps_in_window: usize, head: u64) -> Row {
+    let socials = fl_meta(c.token, &crate::net::ipfs_uri(&c.meta));
+    let supply = crate::token_metadata_chain_id::get(c.token)
+        .map(|f| f.supply)
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1_000_000_000.0);
+    let quote_dec = if c.quote.is_zero() {
+        18
+    } else {
+        crate::token_metadata_chain_id::get(c.quote).and_then(|f| f.decimals).unwrap_or(18)
+    };
+    let raised_quote = r.raised / 10f64.powi(quote_dec as i32);
+    let native_mode = c.quote.is_zero() || (r.native_swap && r.price_native.is_some());
+    let (quote, trade_quote, price, pooled) = if c.quote.is_zero() {
+        // Native launch: the record's price on the curve, the probe after.
+        let price = match (r.graduated, r.price_native) {
+            (true, Some(p)) => p,
+            _ => r.price_quote,
+        };
+        (engine::Quote::Eth, Address::ZERO, price, raised_quote)
+    } else if native_mode {
+        let pn = r.price_native.unwrap_or(0.0);
+        let pooled = if r.price_quote > 0.0 { raised_quote * pn / r.price_quote } else { 0.0 };
+        (engine::Quote::Eth, Address::ZERO, pn, pooled)
+    } else {
+        (
+            engine::Quote::Stable { token: c.quote, decimals: quote_dec },
+            c.quote,
+            r.price_quote,
+            raised_quote,
+        )
+    };
+    let grad = Grad {
+        token: c.token,
+        kind: engine::PoolKind::Flap { portal: flap_portal(), quote: trade_quote, on_dex: false },
+        quote,
+        sym: c.sym.clone(),
+        // The protocol's 1% curve rate, in hundredths of a bip, for the fee
+        // column. A tax token's tax comes on top; the Portal's quote has it.
+        fee: FLAP_FEE_BPS * 100,
+        launch_block: c.block,
+        socials,
+    };
+    let secs = ACTIVITY_WINDOW as f64 * crate::contracts::secs_per_block();
+    let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
+    Row {
+        grad,
+        pooled_eth: pooled,
+        mkt_cap_eth: supply * price,
+        tx_per_sec,
+        my_bal,
+        grad_pct: if r.progress > 0.0 || r.graduated { Some(r.progress) } else { None },
+        graduated: r.graduated,
         head_block: head,
         verified: false,
     }
@@ -1498,7 +1734,7 @@ fn build_fl_row(c: &FlCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window: u
     let tokens_per_eth = if fleth0 { p_raw } else if p_raw > 0.0 { 1.0 / p_raw } else { 0.0 };
     let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
     let mkt_cap_eth = supply * eth_per_token;
-    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let secs = ACTIVITY_WINDOW as f64 * crate::contracts::secs_per_block();
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
 
     Row { grad, pooled_eth, mkt_cap_eth, tx_per_sec, my_bal, grad_pct: None, graduated: false, head_block: head, verified: false }
@@ -1526,7 +1762,7 @@ fn build_pt_row(c: &PoolsCand, sqrt: f64, liq: f64, my_bal: f64, swaps_in_window
     let pooled_eth = if sqrt > 0.0 { liq / sqrt / 1e18 } else { 0.0 };
     let tokens_per_eth = sqrt * sqrt;
     let eth_per_token = if tokens_per_eth > 0.0 { 1.0 / tokens_per_eth } else { 0.0 };
-    let secs = ACTIVITY_WINDOW as f64 * SECS_PER_BLOCK;
+    let secs = ACTIVITY_WINDOW as f64 * crate::contracts::secs_per_block();
     let tx_per_sec = if secs > 0.0 { swaps_in_window as f64 / secs } else { 0.0 };
     Row {
         grad,
@@ -2048,6 +2284,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
     known_fl: &mut Vec<FlCand>,
     known_v2: &mut Vec<PonsV2Cand>,
     known_pt: &mut Vec<PoolsCand>,
+    known_flap: &mut Vec<FlapCand>,
     shared: &Arc<Mutex<Vec<Row>>>,
     head: u64,
 ) {
@@ -2077,7 +2314,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
     if live.is_empty() {
         return;
     }
-    let (mut pons, fl, v2, deployed, pt) = sort_launch_logs(&live);
+    let (mut pons, fl, v2, deployed, pt, flap) = sort_launch_logs(&live);
     // A creation pushed over the socket is the earliest anything can know
     // about a coin. Its pool is one call away, and the whole point of the
     // socket is not waiting for the next scan.
@@ -2093,7 +2330,7 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
             }
         }
     }
-    let (mut n_pons, mut n_fl, mut n_v2, mut n_pt) = (0usize, 0usize, 0usize, 0usize);
+    let (mut n_pons, mut n_fl, mut n_v2, mut n_pt, mut n_flap) = (0usize, 0usize, 0usize, 0usize, 0usize);
     for c in pons {
         crate::token_metadata_chain_id::record_launch(c.0, c.2);
         if !known.iter().any(|(t, _, _)| *t == c.0) {
@@ -2126,12 +2363,21 @@ async fn ingest_live<P: Provider + Clone + Send + Sync + 'static>(
             n_pt += 1;
         }
     }
-    if n_pons + n_fl + n_v2 + n_pt > 0 {
+    for c in flap {
+        if !known_flap.iter().any(|k| k.token == c.token) {
+            crate::trace(&format!("launch: flap {} {} block {} via ws", c.sym, c.token, c.block));
+            note_flap_launch(&c);
+            note_flap_quote(provider, c.quote);
+            known_flap.push(c);
+            n_flap += 1;
+        }
+    }
+    if n_pons + n_fl + n_v2 + n_pt + n_flap > 0 {
         crate::trace(&format!(
-            "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2 + {n_pt} pools, live"
+            "launch stream: {n_pons} pons + {n_fl} flaunch + {n_v2} pons v2 + {n_pt} pools + {n_flap} flap, live"
         ));
         // On the list before this function returns, not at the next round.
-        let seeded = seed_rows(shared, known, known_fl, known_pt, head);
+        let seeded = seed_rows(shared, known, known_fl, known_pt, known_flap, head);
         if seeded > 0 {
             crate::trace(&format!("discovery: {seeded} streamed row(s) on the list"));
         }
@@ -2185,6 +2431,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // true — so a saved one would come back as a venue that no longer exists.
     let mut known_v2: Vec<PonsV2Cand> = Vec::new();
     let mut known_pt: Vec<PoolsCand> = Vec::new();
+    // Flap launches. Curve and pool alike are one venue (the Portal), so a
+    // graduation changes a row's numbers, not its list.
+    let mut known_flap: Vec<FlapCand> = Vec::new();
     // The rolling swap tape: (block, pool key) per swap, across every
     // candidate pool at once, trimmed to the activity window. Feeds tx/sec.
     // Keyed by B256 so v3 pools (address, widened) and Flaunch pools (pool
@@ -2275,8 +2524,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // when the wide-logs endpoint is resting, and narrowed when it is rate
         // limited, and neither of those touches the stream. A launch that
         // arrives during a deferred scan is on screen anyway.
-        ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &mut known_pt, &shared, head)
-            .await;
+        ingest_live(
+            &stream, &provider, &mut known, &mut known_fl, &mut known_v2, &mut known_pt, &mut known_flap, &shared,
+            head,
+        )
+        .await;
         // Nobody is looking: keep collecting launches, stop paying for the
         // rest.
         //
@@ -2295,7 +2547,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         let visible = !stop.load(Ordering::Relaxed);
         let wide_ok = crate::rpc::shared().is_none_or(|b| b.wide_ready());
         if from <= head && wide_ok {
-            let (pons, fl, v2, pt, covered) = scan_launchpads(&provider, from, head).await;
+            let (pons, fl, v2, pt, flap, covered) = scan_launchpads(&provider, from, head).await;
             for c in pons {
                 crate::token_metadata_chain_id::record_launch(c.0, c.2);
                 if !known.iter().any(|(t, _, _)| *t == c.0) {
@@ -2322,6 +2574,14 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                     crate::trace(&format!("launch: pools {} block {} via scan", c.token, c.block));
                     note_pools_launch(&provider, &c);
                     known_pt.push(c);
+                }
+            }
+            for c in flap {
+                if !known_flap.iter().any(|k| k.token == c.token) {
+                    crate::trace(&format!("launch: flap {} {} block {} via scan", c.sym, c.token, c.block));
+                    note_flap_launch(&c);
+                    note_flap_quote(&provider, c.quote);
+                    known_flap.push(c);
                 }
             }
             // Only as far as the scan actually READ.
@@ -2370,6 +2630,8 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         known_v2.truncate(ROW_MAX);
         known_pt.sort_by(|a, b| b.block.cmp(&a.block));
         known_pt.truncate(ROW_MAX);
+        known_flap.sort_by(|a, b| b.block.cmp(&a.block));
+        known_flap.truncate(ROW_MAX);
         if let Ok(g) = pt_state().lock() {
             for c in known_pt.iter_mut() {
                 if c.pool_id.is_zero() {
@@ -2443,10 +2705,38 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         // narrow cap needs the wide endpoint, and hammering it mid-rest keeps
         // it benched. The cursor waits, so nothing is missed.
         let tape_wide = head.saturating_sub(sfrom) >= 10;
-        if sfrom <= head && !(pools.is_empty() && fl_ids.is_empty()) && (wide_ok || !tape_wide) {
+        let flap_live = !known_flap.is_empty() && !flap_portal().is_zero();
+        if sfrom <= head && !(pools.is_empty() && fl_ids.is_empty() && !flap_live) && (wide_ok || !tape_wide) {
             // The cursor only advances when EVERY tape read succeeded, so a
             // failed fetch never skips those blocks' swaps.
             let mut tape_ok = true;
+            // Flap: every curve trade on the chain comes off ONE contract, and
+            // the token is in the data rather than a topic — so one read
+            // covers every Flap row at once, keyed by token like a pool id.
+            if flap_live {
+                use alloy::sol_types::SolEvent as _;
+                let filter = Filter::new()
+                    .address(flap_portal())
+                    .event_signature(vec![
+                        IFlapPortal::TokenBought::SIGNATURE_HASH,
+                        IFlapPortal::TokenSold::SIGNATURE_HASH,
+                    ])
+                    .from_block(sfrom)
+                    .to_block(head);
+                match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter)).await {
+                    Ok(Ok(lgs)) => {
+                        for l in lgs {
+                            let d = l.data().data.as_ref();
+                            if let (Some(b), true) = (l.block_number, d.len() >= 64) {
+                                let token = Address::from_word(B256::from_slice(&d[32..64]));
+                                swaps.push_back((b, token.into_word()));
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => { tape_ok = false; crate::trace(&format!("discovery: flap tape failed: {e}")); }
+                    Err(_) => { tape_ok = false; crate::trace("discovery: flap tape timed out"); }
+                }
+            }
             if !pools.is_empty() {
                 let filter = Filter::new()
                     .address(pools)
@@ -2535,7 +2825,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         }
 
         // Every launch on the list, immediately. Measurement follows.
-        let seeded = seed_rows(&shared, &known, &known_fl, &known_pt, head);
+        let seeded = seed_rows(&shared, &known, &known_fl, &known_pt, &known_flap, head);
         if seeded > 0 {
             crate::trace(&format!("discovery: {seeded} new row(s) on the list"));
         }
@@ -2556,6 +2846,9 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             /// A pools.trade launch whose v4 pool exists. Auction launches
             /// have no pool yet and are not refreshed at all.
             Pt(PoolsCand),
+            /// A Flap launch, curve or graduated: the Portal's record is the
+            /// read either way.
+            Flap(FlapCand),
         }
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2570,11 +2863,13 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         due.extend(
             known_pt.iter().filter(|c| !c.pool_id.is_zero()).take(MAX_SCAN).copied().map(Due::Pt),
         );
+        due.extend(known_flap.iter().take(MAX_SCAN).cloned().map(Due::Flap));
         let tail: Vec<Due> = known
             .iter()
             .skip(MAX_SCAN)
             .map(|(t, p, b)| Due::Pons(*t, *p, *b))
             .chain(fl_live.iter().skip(MAX_SCAN).cloned().map(Due::Fl))
+            .chain(known_flap.iter().skip(MAX_SCAN).cloned().map(Due::Flap))
             .collect();
         // Only while someone is watching. Refreshing depth and tx/sec for rows
         // nobody is reading is the one thing genuinely worth skipping — new
@@ -2637,6 +2932,30 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                         calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
                     }
                 }
+                // The Portal's whole record in one call: status, reserve,
+                // circulating supply, price, progress. The second slot is a
+                // PROBE — what 0.01 of the gas token buys — which is the
+                // price after graduation (the record freezes) and the price
+                // in gas-token terms for a launch quoted in something else
+                // that the Portal will still sell for the gas token. The
+                // supply needs no call: every Flap token is 1e9.
+                Due::Flap(c) => {
+                    calls.push((flap_portal(), IFlapPortal::getTokenV7Call { token: c.token }.abi_encode()));
+                    calls.push((
+                        flap_portal(),
+                        IFlapPortal::quoteExactInputCall {
+                            params: IFlapPortal::FlapQuoteExactInputParams {
+                                inputToken: Address::ZERO,
+                                outputToken: c.token,
+                                inputAmount: U256::from(FLAP_PROBE_WEI),
+                            },
+                        }
+                        .abi_encode(),
+                    ));
+                    if with_bal {
+                        calls.push((c.token, IERC20::balanceOfCall { owner: trader }.abi_encode()));
+                    }
+                }
             }
         }
         // An honest pick: when every endpoint is resting, SKIP this round's
@@ -2654,7 +2973,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             None => disc_url
                 .clone()
                 .filter(|u| !u.trim().is_empty() && !u.contains("YOUR_"))
-                .unwrap_or_else(|| PUBLIC_RPC.to_string()),
+                .unwrap_or_else(|| public_rpc().to_string()),
         };
         let res = batch_call(&client, &url, &calls).await;
 
@@ -2732,6 +3051,48 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
                 Due::Pt(c) => {
                     let n = swap_count.get(&c.pool_id).copied().unwrap_or(0);
                     build_pt_row(c, sqrt, liq, my_bal, n, head)
+                }
+                // The Portal's record is a 17-word tuple of static fields, so
+                // word i is field i: status 0, reserve 1, circulating 2,
+                // price 3, dexSupplyThresh 8, quote 9, pool 13, progress 14.
+                Due::Flap(c) => {
+                    let raw = res.get(i * per).and_then(|o| o.as_ref());
+                    let Some(d) = raw.filter(|d| d.len() >= 17 * 32) else { continue };
+                    let w = |k: usize| U256::from_be_slice(&d[k * 32..(k + 1) * 32]);
+                    let status = w(0).to::<u64>() as u8;
+                    let raised = uf(w(1));
+                    let price = uf(w(3)) / 1e18;
+                    let native_swap = !w(10).is_zero();
+                    let progress = uf(w(14)) / 1e18;
+                    let quote_addr = Address::from_word(w(9).into());
+                    // The probe: gas token per token, when the Portal answered.
+                    let price_native = res
+                        .get(i * per + 1)
+                        .and_then(|o| o.as_ref())
+                        .filter(|d| d.len() >= 32)
+                        .map(|d| uf(U256::from_be_slice(&d[..32])) / 1e18)
+                        .filter(|out| *out > 0.0)
+                        .map(|out| FLAP_PROBE_WEI as f64 / 1e18 / out);
+                    let mut c = c.clone();
+                    if c.quote != quote_addr {
+                        c.quote = quote_addr;
+                        note_flap_quote(&provider, quote_addr);
+                    }
+                    let n = swap_count.get(&c.token.into_word()).copied().unwrap_or(0);
+                    build_flap_row(
+                        &c,
+                        FlapRead {
+                            price_quote: price,
+                            price_native,
+                            native_swap,
+                            raised,
+                            progress,
+                            graduated: status == engine::FLAP_STATUS_DEX,
+                        },
+                        my_bal,
+                        n,
+                        head,
+                    )
                 }
                 // The generic slots hold single numbers; a curve's first read
                 // returns TWO, so it is decoded from the raw response here
@@ -2827,8 +3188,11 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = stream.wait() => {
-                    ingest_live(&stream, &provider, &mut known, &mut known_fl, &mut known_v2, &mut known_pt, &shared, head)
-                        .await;
+                    ingest_live(
+                        &stream, &provider, &mut known, &mut known_fl, &mut known_v2, &mut known_pt,
+                        &mut known_flap, &shared, head,
+                    )
+                    .await;
                 }
             }
         }
@@ -3126,7 +3490,7 @@ async fn pool_swaps<L: Provider>(logs: &L, pool: Address, weth0: bool, from: u64
         let weth_amt = if weth0 { i256_to_f64(&d[0..32]) } else { i256_to_f64(&d[32..64]) };
         let is_buy = weth_amt > 0.0; // weth() INTO the pool = a buy
         let eth = weth_amt.abs() / 1e18;
-        let secs = l.block_number.unwrap_or(base).saturating_sub(base) as f64 * SECS_PER_BLOCK;
+        let secs = l.block_number.unwrap_or(base).saturating_sub(base) as f64 * crate::contracts::secs_per_block();
         out.push((secs, eth, recipient, is_buy, l.transaction_hash.unwrap_or_default()));
     }
     out
@@ -3168,7 +3532,7 @@ pub async fn screen_verified(term: &mut Term, verified: Vec<VerifiedPool>) -> ey
                     // stablecoin. Naming it "USDG" regardless labels an
                     // NVDA-quoted pool with the wrong asset.
                     let q = if v.quote.is_eth() {
-                        "ETH".to_string()
+                        crate::contracts::native_sym().to_string()
                     } else {
                         crate::token_metadata_chain_id::get(v.quote.addr())
                             .map(|f| f.sym)
@@ -3289,7 +3653,16 @@ fn json_f64(v: &serde_json::Value) -> f64 {
 /// (USD). Needs a browser UA (Cloudflare 403s the default agent). Top ~25,
 /// excluding WETH and zero-cap tokens. Pooled balance is filled later.
 async fn blockscout_top(client: &reqwest::Client) -> Vec<LeaderRow> {
-    let url = "https://robinhoodchain.blockscout.com/api/v2/tokens?type=ERC-20";
+    // Robinhood Chain's explorer, so Robinhood Chain's leaderboard. On any
+    // other chain this would rank tokens that are not here — an empty list
+    // is the truthful answer until the chain has a source of its own.
+    let url = match crate::chain_id() {
+        crate::contracts::ROBINHOOD_MAINNET => "https://robinhoodchain.blockscout.com/api/v2/tokens?type=ERC-20",
+        _ => {
+            crate::trace("top tokens: no leaderboard source for this chain");
+            return Vec::new();
+        }
+    };
     let req = client
         .get(url)
         .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -3376,7 +3749,7 @@ struct QuoteAsset {
 /// table baked at compile time would name Robinhood's WETH on every chain.
 fn quotes() -> [QuoteAsset; 2] {
     [
-        QuoteAsset { token: weth(), sym: "ETH", decimals: 18 },
+        QuoteAsset { token: weth(), sym: crate::contracts::native_sym(), decimals: 18 },
         // 6-dec, not 18. Reading a USDG reserve as 18 shows $2.6M of depth as 0.
         QuoteAsset { token: USDG, sym: "USDG", decimals: 6 },
     ]
@@ -3613,7 +3986,7 @@ pub async fn screen_top_tokens<P: Provider>(term: &mut Term, provider: &P, disc_
     let url = crate::rpc::shared()
         .map(|b| b.pick_url(false))
         .or_else(|| disc_url.filter(|u| !u.trim().is_empty() && !u.contains("YOUR_")))
-        .unwrap_or_else(|| PUBLIC_RPC.to_string());
+        .unwrap_or_else(|| public_rpc().to_string());
     let mut leader = blockscout_top(&client).await;
     // Depth in whatever the token is actually paired against, not in WETH
     // regardless. See `enrich_pooled`.
@@ -3714,6 +4087,9 @@ fn venue_tag(g: &Grad) -> &'static str {
         engine::PoolKind::PonsCurve { .. } => "Pons v2",
         // Graduated: same launchpad, now a pool.
         engine::PoolKind::PonsV2Pool { .. } => "Pons v2",
+        engine::PoolKind::Flap { .. } => "Flap",
+        // A Pancake pool reaches this feed only as a Flap graduate.
+        engine::PoolKind::PancakeV3 { .. } => "Flap",
         // In this list, a plain v4 row can only have come from the
         // pools.trade launcher — generic v4 pools arrive by CA or the pool
         // menu, never through discovery. Name the launchpad, not the AMM —
@@ -3732,7 +4108,7 @@ fn venue_tag(g: &Grad) -> &'static str {
 /// ride each row, because this table mixes quotes.
 fn quote_sym(g: &Grad) -> String {
     match g.quote {
-        engine::Quote::Eth => "ETH".to_string(),
+        engine::Quote::Eth => crate::contracts::native_sym().to_string(),
         engine::Quote::Stable { token, .. } => crate::stable_symbol(token),
     }
 }
@@ -3982,6 +4358,390 @@ mod flaunch_discovery_tests {
     }
 }
 
+/// Live, opt-in, BNB Chain. These pin the chain-id global to 56 for the
+/// process, so run them ALONE: `cargo test flap_live -- --ignored --nocapture
+/// --test-threads=1`. Any test that reads `venues()` alongside them would see
+/// BNB's table.
+#[cfg(test)]
+mod flap_live_tests {
+    use super::*;
+    use alloy::providers::Provider;
+
+    const BNB_RPC: &str = "https://bsc-rpc.publicnode.com";
+    // Binance's hot wallet — always funded, so a value-bearing eth_call from
+    // it does not fail on balance.
+    const FUNDED: Address = alloy::primitives::address!("8894E0a0c962CB723c1976a4421c95949bE2D4E3");
+
+    async fn bnb() -> impl Provider + Send + Sync {
+        crate::set_chain_id(crate::contracts::BNB_MAINNET);
+        alloy::providers::ProviderBuilder::new().on_builtin(BNB_RPC).await.expect("public BNB RPC")
+    }
+
+    /// The newest launches, decoded through the SAME path discovery uses.
+    async fn newest_launches<P: Provider>(p: &P, back: u64) -> (u64, Vec<FlapCand>) {
+        let head = p.get_block_number().await.expect("head");
+        let filter = Filter::new()
+            .address(flap_portal())
+            .event_signature(launch_topics())
+            .from_block(head.saturating_sub(back))
+            .to_block(head);
+        let logs = p.get_logs(&filter).await.expect("portal logs");
+        let (_, _, _, _, _, flap) = sort_launch_logs(&logs);
+        (head, flap)
+    }
+
+    /// Discovery's decode of a live TokenCreated, then the Portal's record
+    /// for it: on its curve, priced, with a total supply of 1e9.
+    #[tokio::test]
+    #[ignore]
+    async fn flap_live_launch_decodes_and_reads() {
+        let p = bnb().await;
+        let (head, cands) = newest_launches(&p, 400).await;
+        println!("{} flap launches in the last 400 blocks (head {head})", cands.len());
+        assert!(!cands.is_empty(), "the Portal launches dozens an hour; none decoded");
+        let c = &cands[0];
+        println!("newest: {} \"{}\" {} meta {} quote {:#x}", c.sym, c.name, c.token, c.meta, c.quote);
+        assert!(!c.sym.is_empty());
+        let st = engine::flap_state(&p, flap_portal(), c.token).await.expect("getTokenV7");
+        println!(
+            "status {} reserve {} circ {} price {} progress {} tax {} quote {:#x}",
+            st.status, st.reserve, st.circulatingSupply, st.price, st.progress, st.taxRate, st.quoteTokenAddress
+        );
+        assert!(st.status == engine::FLAP_STATUS_TRADABLE || st.status == engine::FLAP_STATUS_DEX);
+        assert!(uf(st.price) > 0.0, "a launch always has a marginal price");
+        let sup = IERC20::new(c.token, &p).totalSupply().call().await.expect("totalSupply")._0;
+        assert_eq!(uf(sup), 1e27, "1e9 tokens, 18 decimals, minted whole");
+        // The market read the engine uses, end to end.
+        let pref = engine::PoolRef {
+            kind: engine::PoolKind::Flap { portal: flap_portal(), quote: st.quoteTokenAddress, on_dex: false },
+            token: c.token,
+            quote: engine::Quote::Eth,
+            token_decimals: 18,
+        };
+        let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
+        println!("market: ready {} spot {} r0 {} r1 {} supply {}", m.ready, m.spot, m.r0, m.r1, m.supply);
+        assert!(m.ready && m.spot > 0.0);
+    }
+
+    /// A buy quote through the Portal, then the exact calldata the engine
+    /// would send, pre-flighted from a funded account. The two must agree in
+    /// spirit: the quote is positive and the send does not revert.
+    #[tokio::test]
+    #[ignore]
+    async fn flap_live_buy_quotes_and_preflights() {
+        let p = bnb().await;
+        // A NATIVE-quoted launch still on its curve, with SOME supply out —
+        // the quoter underflows on a sell larger than the circulating supply,
+        // which a real sell (bounded by a real balance) can never ask for.
+        // Fresh launches have next to nothing out, so pick from what is
+        // being TRADED rather than from what was just created.
+        let mut pick = None;
+        for (t, n) in traded_tokens(&p, 300).await.into_iter().take(12) {
+            if let Ok(st) = engine::flap_state(&p, flap_portal(), t).await {
+                println!("  {t:#x}: {n} trades, status {}, quote {:#x}", st.status, st.quoteTokenAddress);
+                if st.status == engine::FLAP_STATUS_TRADABLE && st.quoteTokenAddress.is_zero() {
+                    pick = Some((t, engine::units_to_f64(st.circulatingSupply, 18)));
+                    break;
+                }
+            }
+        }
+        let (token, circ) = pick.expect("the busiest launch is native-quoted and on its curve");
+        struct C { token: Address, sym: String }
+        let c = C { token, sym: format!("{token:#x}") };
+        let out = engine::flap_quote(&p, flap_portal(), c.token, Address::ZERO, true, 0.001, FUNDED, 18, 18)
+            .await
+            .expect("quote answers");
+        println!("0.001 BNB buys {out} {} (circulating {circ})", c.sym);
+        assert!(out > 0.0);
+        // Selling a slice of what is out there quotes a positive amount, and
+        // less than the buy price implies — the fee is charged both ways.
+        let slice = (circ * 0.05).min(out);
+        let back = engine::flap_quote(&p, flap_portal(), c.token, Address::ZERO, false, slice, FUNDED, 18, 18)
+            .await
+            .expect("sell quote answers");
+        println!("selling {slice} returns {back} BNB");
+        assert!(back > 0.0 && back < 0.001 * slice / out * 1.01, "fee both ways: {back}");
+        // The exact send, simulated.
+        let wei = U256::from(1_000_000_000_000_000u64);
+        let data: alloy::primitives::Bytes = crate::contracts::IFlapPortal::swapExactInputCall {
+            params: crate::contracts::IFlapPortal::FlapExactInputParams {
+                inputToken: Address::ZERO,
+                outputToken: c.token,
+                inputAmount: wei,
+                minOutputAmount: U256::ZERO,
+                permitData: alloy::primitives::Bytes::new(),
+            },
+        }
+        .abi_encode()
+        .into();
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(flap_portal())
+            .input(data.into())
+            .value(wei)
+            .from(FUNDED);
+        let res = p.call(&tx).await;
+        println!("preflight buy {} -> {:?}", c.sym, res.as_ref().map(|b| b.len()));
+        assert!(res.is_ok(), "buy preflight reverted: {:?}", res.err());
+        let got = U256::from_be_slice(&res.unwrap()[..32]);
+        println!("simulated fill {} vs quote {}", engine::units_to_f64(got, 18), out);
+        assert!((engine::units_to_f64(got, 18) - out).abs() / out < 0.02, "fill within 2% of the quote");
+    }
+
+    /// The most-traded token on the Portal in the last `back` blocks, and
+    /// how many trades it had there.
+    async fn busiest_token<P: Provider>(p: &P, back: u64) -> (Address, usize) {
+        let head = p.get_block_number().await.expect("head");
+        let filter = Filter::new()
+            .address(flap_portal())
+            .event_signature(vec![
+                crate::contracts::IFlapPortal::TokenBought::SIGNATURE_HASH,
+                crate::contracts::IFlapPortal::TokenSold::SIGNATURE_HASH,
+            ])
+            .from_block(head - back)
+            .to_block(head);
+        let logs = p.get_logs(&filter).await.expect("trade logs");
+        let mut by_token: std::collections::HashMap<Address, usize> = Default::default();
+        for l in &logs {
+            let d = l.data().data.as_ref();
+            if d.len() >= 64 {
+                *by_token.entry(Address::from_word(B256::from_slice(&d[32..64]))).or_default() += 1;
+            }
+        }
+        by_token.into_iter().max_by_key(|(_, n)| *n).expect("some trade in the window")
+    }
+
+    /// Every traded token in the window, busiest first.
+    async fn traded_tokens<P: Provider>(p: &P, back: u64) -> Vec<(Address, usize)> {
+        let head = p.get_block_number().await.expect("head");
+        let filter = Filter::new()
+            .address(flap_portal())
+            .event_signature(vec![
+                crate::contracts::IFlapPortal::TokenBought::SIGNATURE_HASH,
+                crate::contracts::IFlapPortal::TokenSold::SIGNATURE_HASH,
+            ])
+            .from_block(head - back)
+            .to_block(head);
+        let logs = p.get_logs(&filter).await.expect("trade logs");
+        let mut by_token: std::collections::HashMap<Address, usize> = Default::default();
+        for l in &logs {
+            let d = l.data().data.as_ref();
+            if d.len() >= 64 {
+                *by_token.entry(Address::from_word(B256::from_slice(&d[32..64]))).or_default() += 1;
+            }
+        }
+        let mut v: Vec<_> = by_token.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// The tape: the Portal's trades in a window, filtered to one token by
+    /// the address in the data — the token is not a topic.
+    #[tokio::test]
+    #[ignore]
+    async fn flap_live_tape_reads_the_portal() {
+        let p = bnb().await;
+        let head = p.get_block_number().await.expect("head");
+        let (token, n) = busiest_token(&p, 200).await;
+        println!("busiest: {token} with {n} trades");
+        let pref = engine::PoolRef {
+            kind: engine::PoolKind::Flap { portal: flap_portal(), quote: Address::ZERO, on_dex: false },
+            token,
+            quote: engine::Quote::Eth,
+            token_decimals: 18,
+        };
+        let swaps = engine::read_swaps(&p, pref, head - 200, head).await.expect("read_swaps");
+        println!("tape rows: {}", swaps.len());
+        for s in swaps.iter().take(3) {
+            println!("  {:?} {} BNB -> price {} tokens/BNB by {:#x}", s.action as u8, s.eth, s.price, s.trader);
+        }
+        assert_eq!(swaps.len(), n, "every trade log for the token becomes a tape row");
+        assert!(swaps.iter().all(|s| s.eth > 0.0 && s.price > 0.0));
+    }
+
+    /// A launch quoted in something other than the gas token, but sold for
+    /// it by the Portal: the market reads in gas-token terms, the buy
+    /// pre-flights with native value, and the reserve converts across.
+    #[tokio::test]
+    #[ignore]
+    async fn flap_live_cross_quote_trades_in_native() {
+        let p = bnb().await;
+        let mut pick = None;
+        for (t, n) in traded_tokens(&p, 400).await.into_iter().take(20) {
+            if let Ok(st) = engine::flap_state(&p, flap_portal(), t).await {
+                if st.status == engine::FLAP_STATUS_TRADABLE
+                    && !st.quoteTokenAddress.is_zero()
+                    && st.nativeToQuoteSwapEnabled
+                {
+                    println!("cross-quoted: {t:#x} ({n} trades) quoted in {:#x}", st.quoteTokenAddress);
+                    pick = Some((t, st));
+                    break;
+                }
+            }
+        }
+        let (token, st) = pick.expect("a live launch quoted in an ERC-20 with the native swap on");
+        let pref = engine::PoolRef {
+            kind: engine::PoolKind::Flap { portal: flap_portal(), quote: Address::ZERO, on_dex: false },
+            token,
+            quote: engine::Quote::Eth,
+            token_decimals: 18,
+        };
+        let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
+        let record_price = engine::units_to_f64(st.price, 18);
+        println!(
+            "market: spot {} tokens/BNB (record {record_price} quote/token) raised {} BNB (record {} quote units)",
+            m.spot, m.r0, engine::units_to_f64(st.reserve, 18)
+        );
+        assert!(m.ready && m.spot > 0.0, "priced in the gas token via the probe");
+        assert!(m.r0 >= 0.0);
+        let wei = U256::from(1_000_000_000_000_000u64);
+        let data: alloy::primitives::Bytes = crate::contracts::IFlapPortal::swapExactInputCall {
+            params: crate::contracts::IFlapPortal::FlapExactInputParams {
+                inputToken: Address::ZERO,
+                outputToken: token,
+                inputAmount: wei,
+                minOutputAmount: U256::ZERO,
+                permitData: alloy::primitives::Bytes::new(),
+            },
+        }
+        .abi_encode()
+        .into();
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(flap_portal())
+            .input(data.into())
+            .value(wei)
+            .from(FUNDED);
+        let res = p.call(&tx).await;
+        assert!(res.is_ok(), "native buy of a cross-quoted launch reverted: {:?}", res.err());
+        let got = engine::units_to_f64(U256::from_be_slice(&res.unwrap()[..32]), 18);
+        println!("0.001 BNB buys {got} (spot implies {})", m.spot * 0.001);
+        assert!((got - m.spot * 0.001).abs() / (m.spot * 0.001) < 0.05);
+    }
+
+    /// Graduation: a recent LaunchedToDEX, and what the pool it names IS —
+    /// a Pancake V3 pool answers fee(); a V2 pair does not. Both must be
+    /// classified, since the engine re-reads the launch by that answer.
+    #[tokio::test]
+    #[ignore]
+    async fn flap_live_graduations_classify() {
+        let p = bnb().await;
+        let head = p.get_block_number().await.expect("head");
+        let mut found = Vec::new();
+        let mut to = head;
+        for _ in 0..8 {
+            let from = to.saturating_sub(2_000);
+            let filter = Filter::new()
+                .address(flap_portal())
+                .event_signature(crate::contracts::IFlapPortal::LaunchedToDEX::SIGNATURE_HASH)
+                .from_block(from)
+                .to_block(to);
+            if let Ok(logs) = p.get_logs(&filter).await {
+                found.extend(logs);
+            }
+            if found.len() >= 3 {
+                break;
+            }
+            to = from - 1;
+        }
+        println!("{} graduations found", found.len());
+        assert!(!found.is_empty(), "no LaunchedToDEX in ~16k blocks");
+        for l in found.iter().take(5) {
+            let ev = crate::contracts::IFlapPortal::LaunchedToDEX::decode_log(&l.inner, true).expect("decode");
+            let st = engine::flap_state(&p, flap_portal(), ev.data.token).await.expect("getTokenV7");
+            assert_eq!(st.status, engine::FLAP_STATUS_DEX);
+            let pool = crate::contracts::IPancakeV3Pool::new(st.pool, &p);
+            let kind = match pool.fee().call().await {
+                Ok(f) => format!("pancake v3 fee {}", f._0),
+                Err(_) => "v2 pair (or other)".to_string(),
+            };
+            println!("  {} -> pool {:#x} = {kind}, tax {}", ev.data.token, st.pool, st.taxRate);
+            assert!(!st.pool.is_zero(), "a graduate names its pool");
+        }
+    }
+}
+
+/// Live, opt-in, BNB Chain: the PancakeSwap V3 venue end to end on a pool
+/// that always exists — CAKE/WBNB 0.25%. Same caveat as the Flap tests:
+/// run alone, `--test-threads=1`.
+#[cfg(test)]
+mod pancake_live_tests {
+    use super::*;
+    use alloy::providers::Provider;
+
+    const BNB_RPC: &str = "https://bsc-rpc.publicnode.com";
+    const CAKE: Address = alloy::primitives::address!("0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82");
+    const FUNDED: Address = alloy::primitives::address!("8894E0a0c962CB723c1976a4421c95949bE2D4E3");
+
+    async fn bnb() -> impl Provider + Send + Sync {
+        crate::set_chain_id(crate::contracts::BNB_MAINNET);
+        alloy::providers::ProviderBuilder::new().on_builtin(BNB_RPC).await.expect("public BNB RPC")
+    }
+
+    /// The factory finds the pool at Pancake's 2500 tier, its slot0 decodes
+    /// through the Pancake interface (the uint32 feeProtocol word), the tape
+    /// decodes Pancake's Swap topic, and a 0.001 BNB buy through the
+    /// SmartRouter pre-flights from a funded account.
+    #[tokio::test]
+    #[ignore]
+    async fn pancake_live_pool_reads_tapes_and_preflights() {
+        let p = bnb().await;
+        let fac = IV3Factory::new(crate::contracts::pancake_v3_factory(), &p);
+        let head = p.get_block_number().await.expect("head");
+        // Every tier the factory has for CAKE/WBNB; the busiest one in the
+        // window is the one to read.
+        let mut best: Option<(Address, u32, Vec<engine::Swap>)> = None;
+        for fee in crate::contracts::PANCAKE_V3_FEES {
+            let pool = fac.getPool(CAKE, weth(), fee.try_into().unwrap()).call().await.expect("getPool").pool;
+            if pool.is_zero() {
+                continue;
+            }
+            let pref = engine::PoolRef {
+                kind: engine::PoolKind::PancakeV3 { pool_addr: pool, quote: weth() },
+                token: CAKE,
+                quote: engine::Quote::Eth,
+                token_decimals: 18,
+            };
+            let swaps = engine::read_swaps(&p, pref, head - 300, head).await.expect("read_swaps");
+            println!("CAKE/WBNB fee {fee} pool {pool:#x}: {} swaps in 300 blocks", swaps.len());
+            if best.as_ref().is_none_or(|(_, _, s)| swaps.len() > s.len()) {
+                best = Some((pool, fee, swaps));
+            }
+        }
+        let (pool, fee, swaps) = best.expect("a CAKE/WBNB pool");
+        let pref = engine::PoolRef {
+            kind: engine::PoolKind::PancakeV3 { pool_addr: pool, quote: weth() },
+            token: CAKE,
+            quote: engine::Quote::Eth,
+            token_decimals: 18,
+        };
+        let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
+        println!("market: ready {} spot {} CAKE/BNB r0 {} r1 {} tick {}", m.ready, m.spot, m.r0, m.r1, m.tick);
+        assert!(m.ready && m.spot > 0.0 && m.r0 > 0.0);
+        println!("tape rows in 300 blocks: {}", swaps.len());
+        assert!(!swaps.is_empty(), "CAKE/WBNB trades every minute");
+        for s in swaps.iter().take(3) {
+            println!("  {:?} {} BNB @ {} CAKE/BNB", s.action as u8, s.eth, s.price);
+            assert!(s.eth > 0.0 && s.price > 0.0);
+        }
+        // Prices from the tape and from slot0 agree to a few percent.
+        let last = swaps.last().unwrap().price;
+        assert!((last - m.spot).abs() / m.spot < 0.05, "tape {last} vs slot0 {}", m.spot);
+        // The buy the engine would send, simulated.
+        let wei = 1_000_000_000_000_000u128;
+        let data = crate::v3::v3_buy_calldata_via(weth(), CAKE, fee, wei, 0, FUNDED, true);
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(crate::contracts::pancake_router())
+            .input(data.into())
+            .value(U256::from(wei))
+            .from(FUNDED);
+        let res = p.call(&tx).await;
+        println!("preflight buy -> {:?}", res.as_ref().map(|b| b.len()));
+        assert!(res.is_ok(), "buy preflight reverted: {:?}", res.err());
+        let got = engine::units_to_f64(U256::from_be_slice(&res.unwrap()[..32]), 18);
+        println!("0.001 BNB buys {got} CAKE (spot says {})", m.spot * 0.001);
+        assert!((got - m.spot * 0.001).abs() / (m.spot * 0.001) < 0.05);
+    }
+}
+
 #[cfg(test)]
 mod pons_v2_tests {
     use super::*;
@@ -4097,7 +4857,7 @@ mod pons_v2_tests {
         let now = age_secs(&stale);
         assert!(now > then, "the age must grow with the chain: {then} -> {now}");
         assert!(
-            (now - 100.0 * SECS_PER_BLOCK).abs() < f64::EPSILON,
+            (now - 100.0 * crate::contracts::secs_per_block()).abs() < f64::EPSILON,
             "and be told from the live head, not the row's own"
         );
     }

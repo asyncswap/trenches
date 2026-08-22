@@ -198,6 +198,27 @@ pub enum PoolKind {
     // pools.fun launches pair USDG, and those are an ERC-20 trade with no
     // wrapping rather than a native-ETH one.
     SushiV3 { pool_addr: Address, quote: Address },
+    // A Flap (flap.sh) launch. The Portal is factory, bonding curve and router
+    // in one contract: while the launch is on its curve the Portal prices and
+    // settles every trade itself, and after graduation the Portal keeps
+    // routing it into the DEX pool it migrated to. So there is ONE venue for
+    // the whole life of the token, and `on_dex` only records which phase it is
+    // in — it flips at graduation and never back.
+    //
+    // `quote` is what the launch is priced in: zero for the native gas token
+    // (BNB on BNB Chain, ETH on Robinhood), otherwise an approved ERC-20 such
+    // as USD1, and then the whole launch is denominated in it.
+    Flap { portal: Address, quote: Address, on_dex: bool },
+    // A PancakeSwap V3 pool: what a non-tax Flap launch on BNB Chain becomes
+    // at graduation, and where a pasted BNB Chain token is most likely to be
+    // trading. The same concentrated-liquidity maths as Uniswap v3, but a v3
+    // router is bound to its factory, so these trade through PancakeSwap's
+    // SmartRouter (SwapRouter02-shaped, verified live) rather than through
+    // SwapRouter02 — which would not find the pool at all.
+    //
+    // `quote` rides along like Sushi's: WBNB for a native-quoted pool, else the
+    // ERC-20 (a USD1-quoted Flap graduate) the pool is priced in.
+    PancakeV3 { pool_addr: Address, quote: Address },
 }
 
 /// The v4 pool id a pons v2 launch graduates into.
@@ -223,6 +244,8 @@ impl PoolKind {
             PoolKind::PonsCurve { .. } => "curve",
             PoolKind::PonsV2Pool { .. } => "pons2",
             PoolKind::SushiV3 { .. } => "sushi",
+            PoolKind::Flap { .. } => "flap",
+            PoolKind::PancakeV3 { .. } => "pancake",
         }
     }
 
@@ -237,6 +260,9 @@ impl PoolKind {
             PoolKind::PonsCurve { .. } => "Pons v2 curve",
             PoolKind::PonsV2Pool { .. } => "Pons v2",
             PoolKind::SushiV3 { .. } => "SushiSwap V3",
+            PoolKind::Flap { on_dex: false, .. } => "Flap curve",
+            PoolKind::Flap { on_dex: true, .. } => "Flap (graduated)",
+            PoolKind::PancakeV3 { .. } => "PancakeSwap V3",
         }
     }
 
@@ -255,6 +281,8 @@ impl PoolKind {
             PoolKind::FlaunchV4 { .. } => "FLAUNCH",
             PoolKind::V4 { .. } => "UNISWAP V4",
             PoolKind::SushiV3 { .. } => "POOLS.FUN",
+            PoolKind::Flap { .. } => "FLAP",
+            PoolKind::PancakeV3 { .. } => "PANCAKESWAP",
         }
     }
 
@@ -273,6 +301,8 @@ impl PoolKind {
             PoolKind::PonsCurve { .. } => "Pons v2",
             PoolKind::PonsV2Pool { .. } => "Pons v2",
             PoolKind::SushiV3 { .. } => "pools.fun",
+            PoolKind::Flap { .. } => "Flap",
+            PoolKind::PancakeV3 { .. } => "Pancake",
         }
     }
     pub fn is_v3(&self) -> bool {
@@ -282,7 +312,10 @@ impl PoolKind {
     /// before they can settle — as opposed to the v4 family, which grants
     /// through Permit2 instead.
     pub fn needs_router_approval(&self) -> bool {
-        matches!(self, PoolKind::V3 { .. } | PoolKind::SushiV3 { .. })
+        matches!(
+            self,
+            PoolKind::V3 { .. } | PoolKind::SushiV3 { .. } | PoolKind::Flap { .. } | PoolKind::PancakeV3 { .. }
+        )
     }
     /// The contract that allowance must name. Uniswap v3 settles through
     /// SwapRouter02; Sushi settles through RedSnwapper, which is both the entry
@@ -292,6 +325,10 @@ impl PoolKind {
     pub fn sell_spender(&self) -> Address {
         match self {
             PoolKind::SushiV3 { .. } => sushi_red_snwapper(),
+            // The Portal pulls a sold token itself — there is no router in
+            // front of it — so it is the spender, on the curve and after.
+            PoolKind::Flap { portal, .. } => *portal,
+            PoolKind::PancakeV3 { .. } => pancake_router(),
             _ => swap_router_02(),
         }
     }
@@ -303,7 +340,10 @@ impl PoolKind {
             | PoolKind::PonsV2Pool { pool_id, .. } => *pool_id == B256::ZERO,
             PoolKind::V3 { pool_addr, .. } => *pool_addr == Address::ZERO,
             PoolKind::PonsCurve { curve, .. } => *curve == Address::ZERO,
-            PoolKind::SushiV3 { pool_addr, .. } => *pool_addr == Address::ZERO,
+            PoolKind::SushiV3 { pool_addr, .. } | PoolKind::PancakeV3 { pool_addr, .. } => {
+                *pool_addr == Address::ZERO
+            }
+            PoolKind::Flap { portal, .. } => *portal == Address::ZERO,
         }
     }
 
@@ -311,7 +351,15 @@ impl PoolKind {
     /// Everything pool-shaped — tick, sqrt price, pool id, routing through a
     /// router — is meaningless until this is false.
     pub fn is_curve(&self) -> bool {
-        matches!(self, PoolKind::PonsCurve { .. })
+        matches!(self, PoolKind::PonsCurve { .. } | PoolKind::Flap { on_dex: false, .. })
+    }
+    /// The Flap launch's quote asset, when this is a Flap launch: zero for
+    /// the native gas token, else the ERC-20 the launch is priced in.
+    pub fn flap_quote(&self) -> Option<Address> {
+        match self {
+            PoolKind::Flap { quote, .. } => Some(*quote),
+            _ => None,
+        }
     }
 }
 
@@ -418,6 +466,8 @@ pub struct Bot {
     pub tick: i32,
     pub r0: f64, // ETH virtual reserve
     pub r1: f64, // token virtual reserve
+    /// A curve's virtual (quote, token) reserves — see `Market::virt`.
+    pub virt: (f64, f64),
     pub eth: f64,
     pub token_bal: f64,
     pub ready: bool,
@@ -680,6 +730,7 @@ pub async fn fetch_flaunch_meta(token_uri: &str) -> TokenSocials {
     if token_uri.trim().is_empty() {
         return TokenSocials::default();
     }
+    let token_uri = &crate::net::ipfs_uri(token_uri);
     // The URI is attacker-written on-chain data — the guard inside `fetch_json`
     // decides whether it is fetchable at all, and refuses anything aimed at
     // this machine. Every gateway at once: this document names the artwork, so
@@ -698,7 +749,8 @@ pub async fn fetch_flaunch_meta(token_uri: &str) -> TokenSocials {
         // The image is itself usually ipfs:// — store the gateway form so the
         // detail panes hold a URL a person can actually open.
         logo: {
-            let img = s(&["image", "imageIpfs"]);
+            // Flap writes the image as a bare CID; Flaunch as ipfs://.
+            let img = crate::net::ipfs_uri(&s(&["image", "imageIpfs"]));
             crate::net::metadata_url(&img).unwrap_or_default()
         },
         description: s(&["description"]),
@@ -733,6 +785,12 @@ impl Bot {
     }
 
     pub fn price(&self) -> f64 {
+        // A Flap launch's reserves are real depth, not a price: the Portal
+        // prices against virtual reserves, and `spot` is its marginal answer
+        // (the record's price on the curve, a live quote after).
+        if let PoolKind::Flap { .. } = self.pool.kind {
+            return self.spot;
+        }
         if self.r0 > 0.0 {
             self.r1 / self.r0
         } else {
@@ -1357,7 +1415,10 @@ impl Bot {
     }
 
     async fn pre_approve_exit<P: Provider>(&mut self, provider: &P) -> eyre::Result<()> {
-        if !self.has_v3_route() && !self.has_ur_route() {
+        // The active pool counts even when it is not in the routes list — a
+        // Flap or Pancake venue picked from discovery has no other route, and
+        // its sell still needs the grant.
+        if !self.has_v3_route() && !self.has_ur_route() && !self.pool.kind.needs_router_approval() {
             return Ok(());
         }
         let bal = IERC20::new(self.pool.token, provider)
@@ -1642,10 +1703,10 @@ fn order_fields(o: &Order) -> Vec<String> {
         }
         self.bought_qty = qty;
         self.bought_cost = cost;
-        // A block number, converted at this chain's ~10 blocks/sec. Better than
+        // A block number, converted at this chain's block time. Better than
         // no hold time; not presented as more than it is.
         if let Some(b) = opened {
-            let behind = head.saturating_sub(b) / 10;
+            let behind = (head.saturating_sub(b) as f64 * secs_per_block()) as u64;
             self.entry_at = Some(crate::ledger::now().saturating_sub(behind));
         }
         self.note(format!(
@@ -1857,6 +1918,10 @@ fn order_fields(o: &Order) -> Vec<String> {
     ///
     /// Cheap: one call, and only while a curve is actually open.
     pub async fn check_graduation<P: Provider>(&mut self, provider: &P) {
+        if let PoolKind::Flap { on_dex: false, .. } = self.pool.kind {
+            self.check_flap_graduation(provider).await;
+            return;
+        }
         let PoolKind::PonsCurve { .. } = self.pool.kind else { return };
         let f = IPonsV2Factory::new(pons_v2_factory(), provider);
         let Ok(rec) = f.getLaunchedToken(self.pool.token).call().await else { return };
@@ -1910,6 +1975,74 @@ fn order_fields(o: &Order) -> Vec<String> {
                 self.pool.sym
             )),
             _ => {}
+        }
+    }
+
+    /// A Flap launch graduates when its circulating supply reaches the
+    /// threshold: the Portal moves the reserve and the remaining tokens into a
+    /// DEX pool in the same transaction, and `status` flips to DEX. Trades
+    /// keep working through the Portal either way — this is about reading the
+    /// right market afterwards.
+    ///
+    /// Where the pool is a PancakeSwap V3 pool (the non-tax path on BNB
+    /// Chain), the launch is re-read as `PancakeV3`: the pool has a price, a
+    /// tick and a Swap tape of its own, and its router is one hop closer than
+    /// the Portal. Where it is a V2 pair (tax tokens, and every launch on
+    /// Robinhood Chain), the Portal stays the venue and `on_dex` is set so
+    /// the market read stops trusting the frozen curve price.
+    async fn check_flap_graduation<P: Provider>(&mut self, provider: &P) {
+        let PoolKind::Flap { portal, quote, on_dex: false } = self.pool.kind else { return };
+        let Ok(st) = flap_state(provider, portal, self.pool.token).await else { return };
+        if st.status != FLAP_STATUS_DEX {
+            return;
+        }
+        let quote_addr = if quote.is_zero() { weth() } else { quote };
+        // A Pancake V3 pool answers `fee()` and names our token as one side;
+        // a V2 pair has no `fee()`. Both reads fail on the zero address.
+        //
+        // NOT for a launch we trade in the gas token but the Portal priced in
+        // something else: its pool pairs THAT asset, and only the Portal
+        // bridges the two. It stays a Flap venue.
+        let cross = quote.is_zero() && !st.quoteTokenAddress.is_zero();
+        let mut pcs: Option<(Address, u32)> = None;
+        if !cross && !st.pool.is_zero() && !pancake_v3_factory().is_zero() {
+            let pool = IPancakeV3Pool::new(st.pool, provider);
+            let (cf, ct) = (pool.fee(), pool.token0());
+            let (fee, t0) = tokio::join!(cf.call(), ct.call());
+            if let (Ok(fee), Ok(t0)) = (fee, t0) {
+                let t0 = t0._0;
+                if t0 == self.pool.token || t0 == quote_addr {
+                    pcs = Some((st.pool, fee._0.to::<u32>()));
+                }
+            }
+        }
+        match pcs {
+            Some((pool_addr, fee)) => {
+                self.pool.kind = PoolKind::PancakeV3 { pool_addr, quote: quote_addr };
+                self.pool.fee = fee;
+                // A different spender now: the router, not the Portal.
+                self.v3_covered = false;
+                self.note(format!("{} graduated — now trading in its PancakeSwap V3 pool", self.pool.sym));
+                crate::events::info(
+                    "A Flap launch graduated to a PancakeSwap pool",
+                    &[
+                        ("coin", self.pool.sym.clone()),
+                        ("pool", format!("{pool_addr:#x}")),
+                        ("fee", fee.to_string()),
+                    ],
+                );
+            }
+            None => {
+                self.pool.kind = PoolKind::Flap { portal, quote, on_dex: true };
+                self.note(format!(
+                    "{} graduated — the Portal now routes it through its DEX pool",
+                    self.pool.sym
+                ));
+                crate::events::info(
+                    "A Flap launch graduated",
+                    &[("coin", self.pool.sym.clone()), ("pool", format!("{:#x}", st.pool))],
+                );
+            }
         }
     }
 
@@ -1981,6 +2114,9 @@ fn order_fields(o: &Order) -> Vec<String> {
         if m.r0 > 0.0 || m.r1 > 0.0 || m.full {
             self.r0 = m.r0;
             self.r1 = m.r1;
+        }
+        if m.virt.0 > 0.0 && m.virt.1 > 0.0 {
+            self.virt = m.virt;
         }
         // Trace on CHANGE (or once per few seconds), not on every render tick.
         // This line used to be written — and flushed — ten times a second
@@ -2113,6 +2249,14 @@ fn order_fields(o: &Order) -> Vec<String> {
                     Some(o) => o,
                     None => { self.logline(&format!("route {venue}: curve read failed")); continue; }
                 }
+            } else if let PoolKind::Flap { portal, quote, .. } = r.kind {
+                // The Portal's own quoter — fee, tax, buy quota and, after
+                // graduation, the pool it migrated to, all priced in.
+                let qd = self.pool.quote.decimals();
+                match flap_quote(provider, portal, r.token, quote, buying, amount, self.trader, qd, self.pool.token_decimals).await {
+                    Some(o) => o,
+                    None => { self.logline(&format!("route {venue}: portal quote failed")); continue; }
+                }
             } else {
                 // The light read: slot0 + liquidity, which is all the quote below
                 // uses. The full read here re-fetched balance, gas price and total
@@ -2173,6 +2317,11 @@ fn order_fields(o: &Order) -> Vec<String> {
             self.logline("route: none verified — falling back to active pool");
             let out = if let PoolKind::PonsCurve { curve, .. } = active.kind {
                 curve_quote(provider, curve, buying, amount, self.trader, 18, self.pool.token_decimals)
+                    .await
+                    .unwrap_or(0.0)
+            } else if let PoolKind::Flap { portal, quote, .. } = active.kind {
+                let qd = self.pool.quote.decimals();
+                flap_quote(provider, portal, active.token, quote, buying, amount, self.trader, qd, self.pool.token_decimals)
                     .await
                     .unwrap_or(0.0)
             } else {
@@ -2289,7 +2438,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         let eth_in = (self.eth * self.buy_frac).max(0.0);
         if eth_in <= 0.0 {
             self.skips += 1;
-            self.note("No ETH available to bid".into());
+            self.note(format!("No {} available to bid", native_sym()));
             return Ok(());
         }
         let wei = Wei::rounded(eth_in);
@@ -2303,7 +2452,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             self.note(format!("The bid would revert. {}", short_err(&e.to_string())));
             return Ok(());
         }
-        let label = format!("BID ~{:.6} ETH on {} [cca]", eth_in, self.pool.sym);
+        let label = format!("BID ~{:.6} {} on {} [cca]", eth_in, native_sym(), self.pool.sym);
         let nonce = self.take_nonce(provider).await?;
         let sent = provider.send_transaction(tx.with_nonce(nonce)).await;
         match self.spent_nonce(sent) {
@@ -2449,8 +2598,11 @@ fn order_fields(o: &Order) -> Vec<String> {
         // `max_price_move` — protects a thin pool even when your balance is big.
         let band = self.max_price_move;
         if band > 0.0 {
-            let l = (self.r0 * self.r1).sqrt();
-            let sqrt_p = (self.r1 / self.r0).sqrt();
+            // A curve prices against its virtual reserves; a pool against
+            // its real ones. Same constant-product maths either way.
+            let (r0, r1) = if self.virt.0 > 0.0 && self.virt.1 > 0.0 { self.virt } else { (self.r0, self.r1) };
+            let l = (r0 * r1).sqrt();
+            let sqrt_p = (r1 / r0).sqrt();
             let net_max = if buying {
                 l * (1.0 / (1.0 - band).sqrt() - 1.0) / sqrt_p
             } else {
@@ -2466,7 +2618,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             self.skips += 1;
             self.note(format!(
                 "skipped {} — no {} to spend (bal {:.6})",
-                side_str(side), if buying { "ETH" } else { &self.pool.sym }, balance_in
+                side_str(side), if buying { native_sym() } else { &self.pool.sym }, balance_in
             ));
             return Ok(());
         }
@@ -2503,10 +2655,18 @@ fn order_fields(o: &Order) -> Vec<String> {
         // CURVE — the curve pulls it, and there is no router and no Permit2 in
         // the path. Without it the buy reverts inside transferFrom, which reads
         // as the launch refusing the trade rather than as a missing approval.
+        // The same for a Flap launch priced in an ERC-20 (the Portal pulls
+        // it) and a stable-quoted Pancake pool (the router pulls it).
         if buying {
-            if let PoolKind::PonsCurve { curve, quote } = self.pool.kind {
-                if quote != Address::ZERO {
-                    let need = U256::from(Wei::rounded(amount_in).raw());
+            let quote_pull: Option<(Address, Address, &str)> = match self.pool.kind {
+                PoolKind::PonsCurve { curve, quote } if quote != Address::ZERO => Some((quote, curve, "curve")),
+                PoolKind::Flap { portal, quote, .. } if quote != Address::ZERO => Some((quote, portal, "Portal")),
+                PoolKind::PancakeV3 { quote, .. } if quote != weth() => Some((quote, pancake_router(), "router")),
+                _ => None,
+            };
+            if let Some((quote, curve, what)) = quote_pull {
+                {
+                    let need = U256::from(Wei::of_token(amount_in, self.pool.quote.decimals()).raw());
                     let erc = IERC20::new(quote, provider);
                     let have = erc
                         .allowance(self.trader, curve)
@@ -2515,7 +2675,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                         .map(|a| a._0)
                         .unwrap_or(U256::ZERO);
                     if have < need {
-                        self.note("Approving the quote asset for this launch's curve".into());
+                        self.note(format!("Approving the quote asset for this launch's {what}"));
                         let nonce = self.take_nonce(provider).await?;
                         // EXACT amount, like every other approval here. A curve
                         // is a per-launch contract, which is the last place to
@@ -2654,9 +2814,10 @@ fn order_fields(o: &Order) -> Vec<String> {
         // Pre-flight: if it would revert, skip — do NOT spend gas. Surface the
         // revert reason so the user can see WHY (not just "skipped").
         let label = format!(
-            "{} ~{:.6} ETH @ {:.6} [{} {}] liq_eth={:.6}",
+            "{} ~{:.6} {} @ {:.6} [{} {}] liq_eth={:.6}",
             side_str(side),
             if buying { amount_in } else { expected },
+            native_sym(),
             self.price(),
             route.kind.proto(),
             route.label,
@@ -2832,7 +2993,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         let eth_in = ((self.eth - two_tx_gas).max(0.0) * self.buy_frac).max(0.0);
         if eth_in <= 0.0 {
             self.skips += 1;
-            self.note("No ETH available to run the arb".into());
+            self.note(format!("No {} available to run the arb", native_sym()));
             return Ok(());
         }
         let est_net = eth_in * (gross - 1.0) - two_tx_gas;
@@ -2858,8 +3019,8 @@ fn order_fields(o: &Order) -> Vec<String> {
         let wei_min = Wei::of_token(tok_out * self.slip_floor(), self.pool.token_decimals);
         let (to1, data1, val1) = build_swap(bk, tok, bf, true, wei_in, wei_min, self.trader);
         let label1 = format!(
-            "ARB BUY ~{:.6} ETH @ {:.6} [{}]",
-            eth_in, if buy_on_a { pa } else { pbp }, bk.proto()
+            "ARB BUY ~{:.6} {} @ {:.6} [{}]",
+            eth_in, native_sym(), if buy_on_a { pa } else { pbp }, bk.proto()
         );
         let erc = IERC20::new(tok, provider);
         let bal_before = erc
@@ -2926,8 +3087,8 @@ fn order_fields(o: &Order) -> Vec<String> {
         let s_wei_min = Wei::rounded(eth_out * self.slip_floor());
         let (to2, data2, val2) = build_swap(sk, tok, sf, false, s_wei_in, s_wei_min, self.trader);
         let label2 = format!(
-            "ARB SELL {:.4} {} -> ~{:.6} ETH [{}]",
-            got, self.pool.sym, eth_out, sk.proto()
+            "ARB SELL {:.4} {} -> ~{:.6} {} [{}]",
+            got, self.pool.sym, eth_out, native_sym(), sk.proto()
         );
         self.send_raw(provider, to2, data2, val2, label2, Some(Side::Sell), eth_out, got).await;
         self.note(format!(
@@ -2975,6 +3136,24 @@ fn order_fields(o: &Order) -> Vec<String> {
                             let (mut weth_out, mut tok_in) = (U256::ZERO, U256::ZERO);
                             for lg in rc.inner.logs() {
                                 let tp = lg.topics();
+                                // A Flap sell pays native straight from the
+                                // Portal — no WETH moves — and the Portal says
+                                // what it paid in its own TokenSold: word 4 is
+                                // the quote received, after its fee.
+                                if let PoolKind::Flap { portal, .. } = self.pool.kind {
+                                    use alloy::sol_types::SolEvent as _;
+                                    if lg.address() == portal
+                                        && tp.first() == Some(&IFlapPortal::TokenSold::SIGNATURE_HASH)
+                                    {
+                                        let d = lg.data().data.as_ref();
+                                        if d.len() >= 5 * 32
+                                            && Address::from_word(B256::from_slice(&d[32..64])) == self.pool.token
+                                        {
+                                            weth_out = U256::from_be_slice(&d[4 * 32..5 * 32]);
+                                        }
+                                        continue;
+                                    }
+                                }
                                 if tp.len() < 3 || tp[0] != XFER {
                                     continue;
                                 }
@@ -2985,7 +3164,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                                 }
                                 let val = U256::from_be_slice(&d[d.len() - 32..]);
                                 if lg.address() == weth()
-                                    && (to == swap_router_02() || to == universal_router())
+                                    && (to == swap_router_02() || to == universal_router() || to == pancake_router())
                                 {
                                     weth_out = weth_out.saturating_add(val);
                                 } else if lg.address() == self.pool.token && to == self.trader {
@@ -3073,7 +3252,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                         }
                         // For sells, surface the ACTUAL ETH received (numeraire) — the key number.
                         match recv_eth {
-                            Some(eth) => self.logline(&format!("CONFIRMED {}  received {:.6} ETH  tx {}", p.label, eth, p.hash)),
+                            Some(eth) => self.logline(&format!("CONFIRMED {}  received {:.6} {}  tx {}", p.label, eth, native_sym(), p.hash)),
                             None => self.logline(&format!("CONFIRMED {}  tx {}", p.label, p.hash)),
                         }
                     } else {
@@ -3109,6 +3288,8 @@ fn order_fields(o: &Order) -> Vec<String> {
             PoolKind::V3 { .. }
             | PoolKind::SushiV3 { .. }
             | PoolKind::PonsCurve { .. }
+            | PoolKind::Flap { .. }
+            | PoolKind::PancakeV3 { .. }
             | PoolKind::PonsV2Pool { .. } => {
                 self.skips += 1;
                 self.push_order("ADD LP".into(), OrderStatus::Skipped, None);
@@ -3255,7 +3436,7 @@ fn order_fields(o: &Order) -> Vec<String> {
             .with_input(data)
             .with_value(U256::from(amount0_max))
             .with_from(self.trader);
-        let label = format!("ADD LP ~{:.6} ETH", a0 / 1e18);
+        let label = format!("ADD LP ~{:.6} {}", a0 / 1e18, native_sym());
         if let Err(e) = provider.call(&tx).await {
             self.skips += 1;
             self.push_order(label, OrderStatus::Skipped, None);
@@ -3575,7 +3756,7 @@ fn order_fields(o: &Order) -> Vec<String> {
         let dump_gas = Self::gas_for(provider, &probe, dump_gas).await;
         let tx = TransactionRequest::default().with_to(to).with_input(data).with_gas_limit(dump_gas).with_from(self.trader);
         // Report the sell in ETH numeraire (expected proceeds), not token units.
-        let label = format!("SELL ALL for {:.6} ETH @ {:.6} [{} {}] liq_eth={:.6}", expected, self.price(), route.kind.proto(), route.label, self.r0);
+        let label = format!("SELL ALL for {:.6} {} @ {:.6} [{} {}] liq_eth={:.6}", expected, native_sym(), self.price(), route.kind.proto(), route.label, self.r0);
         if let Err(e) = provider.call(&tx).await {
             self.skips += 1;
             self.push_order(label, OrderStatus::Skipped, None);
@@ -3748,6 +3929,11 @@ pub struct Market {
     /// be carried over rather than treated as newly-zero — without this the
     /// pool reads as illiquid seven times a second between full reads.
     pub full: bool,
+    /// A bonding curve's VIRTUAL reserves (quote, token), when the venue has
+    /// them: the constant-product pair the curve actually prices against.
+    /// The impact band uses these where they are set, since the real depth in
+    /// r0/r1 is not what a curve's price moves on. Zero for pools.
+    pub virt: (f64, f64),
 }
 
 /// Read price/liquidity + balances for a pool. Standalone so a background task
@@ -3775,6 +3961,17 @@ pub async fn read_price_only<P: Provider>(
     read_market_inner(provider, pref, trader, false).await
 }
 
+/// The trader's gas-token balance, or None when there is no trader. The zero
+/// address is not "nobody": on BNB Chain it holds tens of thousands of BNB,
+/// and reading it as the balance of an account nobody had unlocked sized the
+/// buy setting in the millions.
+async fn native_balance<P: Provider>(provider: &P, trader: Address) -> Option<U256> {
+    if trader.is_zero() {
+        return None;
+    }
+    crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)).await.ok()
+}
+
 async fn read_market_inner<P: Provider>(
     provider: &P,
     pref: PoolRef,
@@ -3782,17 +3979,9 @@ async fn read_market_inner<P: Provider>(
     full: bool,
 ) -> eyre::Result<Market> {
     let t0 = Instant::now();
-
     // No pool selected (empty network) — still show ETH + gas, empty market.
     if pref.kind.is_empty() {
-        let eth = if full {
-            crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader))
-                .await
-                .map(wei_to_f64)
-                .ok()
-        } else {
-            None
-        };
+        let eth = if full { native_balance(provider, trader).await.map(wei_to_f64) } else { None };
         let gas = provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0);
         return Ok(Market {
             eth,
@@ -3830,11 +4019,7 @@ async fn read_market_inner<P: Provider>(
             pref.quote.decimals(),
             pref.token_decimals
         ));
-        let eth = if full {
-            crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)).await.ok()
-        } else {
-            None
-        };
+        let eth = if full { native_balance(provider, trader).await } else { None };
         return Ok(Market {
             // Price is quote per token, the same orientation every other venue
             // reports, so the rest of the app needs no special case.
@@ -3853,11 +4038,115 @@ async fn read_market_inner<P: Provider>(
             gas_price: provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0),
             supply: 0.0,
             full,
+            virt: (0.0, 0.0),
+        });
+    }
+    // A Flap launch: the Portal is the source of truth for the whole life of
+    // the token. On the curve, `getTokenV7` carries the reserve, the
+    // circulating supply and the marginal price. After graduation the state
+    // record freezes, so the price is asked as a QUOTE — what a small buy
+    // returns through whatever pool the Portal migrated to — which works for
+    // a V3 pool and a V2 pair alike.
+    if let PoolKind::Flap { portal, quote, on_dex } = pref.kind {
+        let st = flap_state(provider, portal, pref.token).await?;
+        let qd = pref.quote.decimals();
+        // The record's reserve is in the LAUNCH's quote asset, which is not
+        // always what we trade in: a launch quoted in USD1 or a tokenized
+        // stock that the Portal will sell for the gas token is traded, and
+        // priced here, in the gas token — `quote` is zero while the record
+        // names the asset. Its decimals come from the facts cache; the
+        // record's `price` is a wad regardless.
+        let launch_quote_dec = if st.quoteTokenAddress.is_zero() {
+            18
+        } else {
+            crate::token_metadata_chain_id::get(st.quoteTokenAddress).and_then(|f| f.decimals).unwrap_or(18)
+        };
+        let raised_quote = units_to_f64(st.reserve, launch_quote_dec);
+        let record_price = units_to_f64(st.price, 18);
+        let mut quote_per_token = record_price;
+        let mut raised = raised_quote;
+        let dex_now = st.status == FLAP_STATUS_DEX || on_dex;
+        let cross = quote.is_zero() && !st.quoteTokenAddress.is_zero();
+        if dex_now || cross {
+            // A probe: what 0.01 of what we trade in buys, through the Portal.
+            // After graduation the record's price is frozen; across quotes
+            // it is in the wrong asset. Either way the Portal's own answer
+            // is the price, and it also converts the reserve for a cross
+            // launch — the ratio of the two prices IS gas token per quote.
+            if let Some(out) =
+                flap_quote(provider, portal, pref.token, quote, true, 0.01, trader, qd, pref.token_decimals).await
+            {
+                if out > 0.0 {
+                    quote_per_token = 0.01 / out;
+                    if cross && record_price > 0.0 {
+                        raised = raised_quote * quote_per_token / record_price;
+                    }
+                }
+            }
+        }
+        let cb_bal = erc.balanceOf(trader);
+        let cb_sup = erc.totalSupply();
+        let (bal, sup) = tokio::join!(cb_bal.call(), cb_sup.call());
+        let supply = sup.map(|s| units_to_f64(s._0, pref.token_decimals)).unwrap_or(0.0);
+        // Tokens still on the curve, in the same slot a pool's token reserve
+        // uses — depth on the token side, for the price-impact band.
+        let circ = units_to_f64(st.circulatingSupply, pref.token_decimals);
+        let on_curve = (supply - circ).max(0.0);
+        crate::trace(&format!(
+            "flap market: status={} raised={raised} circ={circ} price={quote_per_token} progress={} dex={dex_now}",
+            st.status,
+            units_to_f64(st.progress, 18)
+        ));
+        let eth = if full { native_balance(provider, trader).await } else { None };
+        let spot = if quote_per_token > 0.0 { 1.0 / quote_per_token } else { 0.0 };
+        // The curve is (x + h)(y + r) = k in the launch's quote: virtual
+        // token reserve x + h (x = tokens still on the curve), virtual quote
+        // reserve k / (x + h). Only while it IS a curve, and only in the asset
+        // we trade in — across quotes the virtual quote side is rescaled by
+        // the same ratio as the reserve.
+        let virt = if dex_now {
+            (0.0, 0.0)
+        } else {
+            // All three curve parameters are wads of their HUMAN values:
+            // (1e9 + h)(0 + r) = k holds in tokens and quote units.
+            let h = units_to_f64(st.h, 18);
+            let k = units_to_f64(st.k, 18);
+            let xh = on_curve + h;
+            if xh > 0.0 && k > 0.0 {
+                let mut vq = k / xh;
+                if cross && record_price > 0.0 {
+                    vq *= quote_per_token / record_price;
+                }
+                (vq, xh)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+        return Ok(Market {
+            sqrt_price: if quote_per_token > 0.0 { quote_per_token.sqrt() } else { 0.0 },
+            tick: 0,
+            // Depth as a person reads it: what the curve has raised, and the
+            // tokens still on it. Their ratio is the curve's AVERAGE price,
+            // not its marginal one — the curve prices against virtual
+            // reserves — so `Bot::price` reads `spot` for a Flap launch
+            // rather than r1/r0.
+            r0: raised,
+            r1: on_curve,
+            eth: eth.map(wei_to_f64),
+            token_bal: bal.ok().map(|b| units_to_f64(b._0, pref.token_decimals)),
+            ready: quote_per_token > 0.0,
+            spot,
+            one_sided: false,
+            read_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            gas_price: provider.get_gas_price().await.map(|g| g as f64).unwrap_or(0.0),
+            supply,
+            full,
+            virt,
         });
     }
     let (sqrt_p, tick, l) = match pref.kind {
         // Curves returned above; this arm exists only so the match is total.
-        PoolKind::PonsCurve { .. } => (0.0, 0, 0.0),
+        PoolKind::PonsCurve { .. } | PoolKind::Flap { .. } => (0.0, 0, 0.0),
         PoolKind::V4 { pool_id, .. }
         | PoolKind::FlaunchV4 { pool_id, .. }
         | PoolKind::PonsV2Pool { pool_id, .. } => {
@@ -3879,20 +4168,30 @@ async fn read_market_inner<P: Provider>(
             let s0 = s0?;
             (u160_to_f64(s0.sqrtPriceX96) / 2f64.powi(96), s0.tick.as_i32(), u128_to_f64(lq?._0))
         }
+        // Pancake's slot0 has a wider feeProtocol word; its own interface
+        // decodes it, and everything else is v3.
+        PoolKind::PancakeV3 { pool_addr, .. } => {
+            let pool = IPancakeV3Pool::new(pool_addr, provider);
+            let cb0 = pool.slot0();
+            let cbl = pool.liquidity();
+            let (s0, lq) = tokio::join!(cb0.call(), cbl.call());
+            let s0 = s0?;
+            (u160_to_f64(s0.sqrtPriceX96) / 2f64.powi(96), s0.tick.as_i32(), u128_to_f64(lq?._0))
+        }
     };
 
     let cb_tok = erc.balanceOf(trader);
     let cb_sup = erc.totalSupply();
     let (eth_bal, tok_bal, gas_price, supply) = if full {
         let (eth_bal, tok_bal, gas, sup) = tokio::join!(
-            crate::rpcstats::timed("eth_getBalance", provider.get_balance(trader)),
+            native_balance(provider, trader),
             crate::rpcstats::timed("balanceOf", cb_tok.call()),
             crate::rpcstats::timed("eth_gasPrice", provider.get_gas_price()),
             crate::rpcstats::timed("totalSupply", cb_sup.call()),
         );
         let td = pref.token_decimals;
         (
-            eth_bal.ok(),
+            eth_bal,
             tok_bal.ok().map(|b| b._0),
             gas.map(|g| g as f64).unwrap_or(0.0),
             sup.map(|s| units_to_f64(s._0, td)).unwrap_or(0.0),
@@ -3915,7 +4214,7 @@ async fn read_market_inner<P: Provider>(
     let tdi = pref.token_decimals as i32; // tracked-token decimals — read on-chain, NOT assumed
     let orient = |a_raw: f64, b_raw: f64| match pref.kind {
         // Curves returned above; this arm exists only so the match is total.
-        PoolKind::PonsCurve { .. } => (0.0, 0.0),
+        PoolKind::PonsCurve { .. } | PoolKind::Flap { .. } => (0.0, 0.0),
         // token0 = min(token, quote). If the tracked token sorts below the quote
         // it's token0 (a); the quote is token1 (b) → quote-side r0 = b.
         PoolKind::V4 { .. } => {
@@ -3939,7 +4238,7 @@ async fn read_market_inner<P: Provider>(
         // not 18-decimal, so scale the quote side by its own decimals rather
         // than a blanket 1e18. pools.fun mines the salt so the launch token
         // sorts below its quote, which makes the quote token1 in practice.
-        PoolKind::SushiV3 { quote, .. } => {
+        PoolKind::SushiV3 { quote, .. } | PoolKind::PancakeV3 { quote, .. } => {
             if quote < pref.token {
                 (a_raw / 10f64.powi(qd), b_raw / 10f64.powi(tdi))
             } else {
@@ -3981,7 +4280,9 @@ async fn read_market_inner<P: Provider>(
     // the market is live, one-sided. One extra read, only on illiquid pools.
     let one_sided = if l <= 0.0 && sqrt_p > 0.0 {
         let holder = match pref.kind {
-            PoolKind::V3 { pool_addr, .. } | PoolKind::SushiV3 { pool_addr, .. } => pool_addr,
+            PoolKind::V3 { pool_addr, .. }
+            | PoolKind::SushiV3 { pool_addr, .. }
+            | PoolKind::PancakeV3 { pool_addr, .. } => pool_addr,
             _ => pool_manager(), // v4 family: the singleton custodies every pool
         };
         crate::rpcstats::timed("balanceOf", erc.balanceOf(holder).call())
@@ -4005,6 +4306,7 @@ async fn read_market_inner<P: Provider>(
         gas_price,
         supply,
         full,
+        virt: (0.0, 0.0),
     })
 }
 
@@ -4183,6 +4485,9 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
     // routinely carries zero while the collect carries the money.
     const COLLECT_V3: B256 = alloy::primitives::b256!("70935338e69775456a85ddef226c395fb668b63fa0115f5f20610b388e6ca9c0");
     const MODLIQ_V4: B256 = alloy::primitives::b256!("f208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec");
+    // PancakeSwap V3's Swap: Uniswap's five data words plus two protocol-fee
+    // words, so a different topic0 and the same decoding for words 0..5.
+    const SWAP_PCS: B256 = alloy::primitives::b256!("19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83");
 
     // One filter per protocol (no topic0 filter — decode by topic0 below). v4:
     // scope to our pool via topic1 = pool id. v3: scope by pool address.
@@ -4237,6 +4542,110 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
             }
             return Ok(out);
         }
+        // Flap: the Portal emits the curve's trades itself, and indexes NONE of
+        // the fields — so this is every trade on the Portal in the window,
+        // filtered to this token by the address in the data. After graduation
+        // the Portal record names the DEX pool, and a V2 pair's own Swap is
+        // read from there (a graduate in a Pancake V3 pool is re-read as
+        // `PancakeV3` at graduation and never comes through this arm).
+        PoolKind::Flap { portal, quote, on_dex } => {
+            use alloy::sol_types::SolEvent as _;
+            let word = |b: &[u8], i: usize| -> U256 {
+                if b.len() < (i + 1) * 32 {
+                    return U256::ZERO;
+                }
+                U256::from_be_slice(&b[i * 32..(i + 1) * 32])
+            };
+            let mut out = Vec::new();
+            if on_dex {
+                let Ok(st) = flap_state(provider, portal, pref.token).await else { return Ok(out) };
+                if st.pool.is_zero() {
+                    return Ok(out);
+                }
+                let filter = Filter::new()
+                    .address(st.pool)
+                    .event_signature(IV2Pair::Swap::SIGNATURE_HASH)
+                    .from_block(from_block)
+                    .to_block(to_block);
+                let logs = crate::rpcstats::timed("eth_getLogs", provider.get_logs(&filter)).await?;
+                // A V2 pair sorts its two tokens by address, and a native
+                // launch pairs the WRAPPED gas token.
+                let quote_addr = if quote.is_zero() { weth() } else { quote };
+                let token_is_0 = pref.token < quote_addr;
+                for lg in &logs {
+                    let d = lg.data().data.as_ref();
+                    // amount0In, amount1In, amount0Out, amount1Out
+                    let (a0i, a1i, a0o, a1o) = (word(d, 0), word(d, 1), word(d, 2), word(d, 3));
+                    let (q_in, q_out, t_in, t_out) = if token_is_0 {
+                        (a1i, a1o, a0i, a0o)
+                    } else {
+                        (a0i, a0o, a1i, a1o)
+                    };
+                    let buying = !q_in.is_zero() && !t_out.is_zero();
+                    let (quote_raw, token_raw) = if buying { (q_in, t_out) } else { (q_out, t_in) };
+                    let q = units_to_f64(quote_raw, quote_dec);
+                    let t = units_to_f64(token_raw, token_dec);
+                    if q <= 0.0 || t <= 0.0 {
+                        continue;
+                    }
+                    out.push(Swap {
+                        action: if buying { TapeAction::Buy } else { TapeAction::Sell },
+                        eth: q,
+                        eth_wei: quote_raw.to_string().parse::<u128>().unwrap_or(0),
+                        price: t / q,
+                        // topic2 is `to`; the sender is a router. The taker's
+                        // address is not in a V2 Swap at all.
+                        trader: lg.topics().get(2).map(|w| Address::from_word(*w)).unwrap_or_default(),
+                        liq_eth: 0.0,
+                        tokens: t,
+                        block: lg.block_number.unwrap_or(0),
+                        tx: lg.transaction_hash.unwrap_or_default(),
+                        tick_lo: 0,
+                        tick_hi: 0,
+                        is_v4: false,
+                    });
+                }
+                return Ok(out);
+            }
+            let filter = Filter::new()
+                .address(portal)
+                .event_signature(vec![IFlapPortal::TokenBought::SIGNATURE_HASH, IFlapPortal::TokenSold::SIGNATURE_HASH])
+                .from_block(from_block)
+                .to_block(to_block);
+            let logs = crate::rpcstats::timed("eth_getLogs", provider.get_logs(&filter)).await?;
+            for lg in &logs {
+                let Some(t0) = lg.topics().first() else { continue };
+                let buying = *t0 == IFlapPortal::TokenBought::SIGNATURE_HASH;
+                let d = lg.data().data.as_ref();
+                // ts, token, buyer/seller, amount, eth, fee, postPrice
+                if Address::from_word(word(d, 1).into()) != pref.token {
+                    continue;
+                }
+                let who = Address::from_word(word(d, 2).into());
+                let token_raw = word(d, 3);
+                let quote_raw = word(d, 4);
+                let q = units_to_f64(quote_raw, quote_dec);
+                let t = units_to_f64(token_raw, token_dec);
+                if q <= 0.0 || t <= 0.0 {
+                    continue;
+                }
+                out.push(Swap {
+                    action: if buying { TapeAction::Buy } else { TapeAction::Sell },
+                    eth: q,
+                    eth_wei: quote_raw.to_string().parse::<u128>().unwrap_or(0),
+                    price: t / q,
+                    trader: who,
+                    liq_eth: 0.0,
+                    tokens: t,
+                    block: lg.block_number.unwrap_or(0),
+                    tx: lg.transaction_hash.unwrap_or_default(),
+                    tick_lo: 0,
+                    tick_hi: 0,
+                    is_v4: false,
+                });
+            }
+            return Ok(out);
+        }
         PoolKind::V4 { pool_id, .. } => (
             true, true,
             Filter::new().address(pool_manager()).topic1(pool_id).from_block(from_block).to_block(to_block),
@@ -4258,7 +4667,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         ),
         // Same Swap event, same decoding; the quote's side of the pool is
         // whichever address sorts lower.
-        PoolKind::SushiV3 { pool_addr, quote } => (
+        PoolKind::SushiV3 { pool_addr, quote } | PoolKind::PancakeV3 { pool_addr, quote } => (
             quote < pref.token, false,
             Filter::new().address(pool_addr).from_block(from_block).to_block(to_block),
         ),
@@ -4275,7 +4684,7 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
         let tx = lg.transaction_hash.unwrap_or_default();
 
         // Swap: amounts at words 0,1; sqrtPrice at word 2.
-        let is_swap = (v4 && t0 == SWAP_V4) || (!v4 && t0 == SWAP_V3);
+        let is_swap = (v4 && t0 == SWAP_V4) || (!v4 && (t0 == SWAP_V3 || t0 == SWAP_PCS));
         if is_swap {
             // Every amount here is in BASE UNITS, and the two sides can have
             // different decimals — a USDG-quoted pool is 6 on the quote side and
@@ -4412,7 +4821,8 @@ fn side_str(s: Side) -> &'static str {
 /// "ADD LP ~0.001 ETH". Returns None for token-denominated labels (sells) so the
 /// caller values them at price instead.
 fn eth_of_label(label: &str) -> Option<f64> {
-    let idx = label.find(" ETH")?;
+    // Labels name the chain's gas token — " ETH" here, " BNB" on BNB Chain.
+    let idx = label.find(" ETH").or_else(|| label.find(" BNB"))?;
     label[..idx]
         .rsplit([' ', '~'])
         .find(|s| !s.is_empty())
@@ -4668,6 +5078,77 @@ pub async fn curve_quote<P: Provider>(
         Some(units_to_f64(curve_sell_out(tokens_in, qr, tr, fee, tax), quote_decimals))
     }
 }
+/// Flap's `TokenStatus` values that matter here. 1 is Tradable (on its
+/// curve); 4 is DEX (graduated). 0 is Invalid, 5 Staged, 2 and 3 obsolete.
+pub const FLAP_STATUS_TRADABLE: u8 = 1;
+pub const FLAP_STATUS_DEX: u8 = 4;
+
+/// The Portal's record for a launch. Reverts for a token the Portal never
+/// launched — the caller reads that as "not a Flap token", not as an outage.
+pub async fn flap_state<P: Provider>(
+    provider: &P,
+    portal: Address,
+    token: Address,
+) -> eyre::Result<IFlapPortal::FlapTokenStateV7> {
+    let p = IFlapPortal::new(portal, provider);
+    Ok(crate::rpcstats::timed("flap.getTokenV7", p.getTokenV7(token).call()).await?.state)
+}
+
+/// Quote a Flap trade THROUGH THE PORTAL, in human units.
+///
+/// The Portal's own quoter, not the curve formula: it applies the protocol
+/// rate, the launch's tax where it has one, the per-origin buy quota where one
+/// is set — the quota is keyed by tx.origin, which is why `from` is the trader
+/// and not left blank — and, after graduation, whatever pool the launch moved
+/// to. Reproducing all of that off-chain is a second implementation to keep
+/// in step; one `eth_call` is the honest answer.
+///
+/// `quote` is the launch's quote asset (zero = native). Buys spend it, sells
+/// receive it. Amounts are human: quote units on a buy, tokens on a sell.
+#[allow(clippy::too_many_arguments)]
+pub async fn flap_quote<P: Provider>(
+    provider: &P,
+    portal: Address,
+    token: Address,
+    quote: Address,
+    buying: bool,
+    amount: f64,
+    trader: Address,
+    quote_decimals: u8,
+    token_decimals: u8,
+) -> Option<f64> {
+    let (input, output, amount_in) = if buying {
+        (quote, token, Wei::of_token(amount, quote_decimals))
+    } else {
+        (token, quote, Wei::of_token(amount, token_decimals))
+    };
+    if amount_in.raw() == 0 {
+        return Some(0.0);
+    }
+    let data: Bytes = IFlapPortal::quoteExactInputCall {
+        params: IFlapPortal::FlapQuoteExactInputParams {
+            inputToken: input,
+            outputToken: output,
+            inputAmount: U256::from(amount_in.raw()),
+        },
+    }
+    .abi_encode()
+    .into();
+    let tx = TransactionRequest::default().with_to(portal).with_input(data).with_from(trader);
+    let raw = match crate::rpcstats::timed("flap.quoteExactInput", provider.call(&tx)).await {
+        Ok(r) => r,
+        Err(e) => {
+            crate::trace(&format!("flap quote failed: {}", short_err(&e.to_string())));
+            return None;
+        }
+    };
+    if raw.len() < 32 {
+        return None;
+    }
+    let out = U256::from_be_slice(&raw[..32]);
+    Some(units_to_f64(out, if buying { token_decimals } else { quote_decimals }))
+}
+
 fn u160_to_f64(x: alloy::primitives::Uint<160, 3>) -> f64 {
     // Overflow-safe: a broken/empty pool's sqrtPriceX96 can sit near 2^160
     // (max tick), which overflows u128. Parse the decimal string instead.
@@ -4812,6 +5293,41 @@ fn build_swap(
             };
             let v = if buying { crate::sushi::buy_value(quote, wi) } else { U256::ZERO };
             (sushi_red_snwapper(), d, v)
+        }
+        // Flap: one call, on the curve and after it. The Portal is the router.
+        // Zero address stands for the native gas token on either side, and a
+        // native buy carries the amount as value; an ERC-20 quote is pulled
+        // after an approval and must send none. Sells always send none.
+        PoolKind::Flap { portal, quote, .. } => {
+            let (input, output) = if buying { (quote, token) } else { (token, quote) };
+            let data: Bytes = IFlapPortal::swapExactInputCall {
+                params: IFlapPortal::FlapExactInputParams {
+                    inputToken: input,
+                    outputToken: output,
+                    inputAmount: U256::from(wi),
+                    minOutputAmount: U256::from(wm),
+                    permitData: Bytes::new(),
+                },
+            }
+            .abi_encode()
+            .into();
+            let v = if buying && quote == Address::ZERO { U256::from(wi) } else { U256::ZERO };
+            (portal, data, v)
+        }
+        // PancakeSwap: SwapRouter02-shaped calldata to a different router.
+        // Native-quoted pools wrap the value sent; a stable-quoted one is an
+        // ERC-20 pull with no value. `fee` is the pool's real tier, read at
+        // resolution, and it is part of the route — Pancake's 2500 is not
+        // Uniswap's 3000.
+        PoolKind::PancakeV3 { quote, .. } => {
+            let native = quote == weth();
+            let d = if buying {
+                v3::v3_buy_calldata_via(quote, token, fee, wi, wm, trader, native)
+            } else {
+                v3::v3_sell_calldata_via(token, quote, fee, wi, wm, trader, native)
+            };
+            let v = if buying && native { value } else { U256::ZERO };
+            (pancake_router(), d, v)
         }
     }
 }

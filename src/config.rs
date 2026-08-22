@@ -107,6 +107,11 @@ pub struct Network {
     /// Chain family — `"evm"` (default) or `"solana"`.
     #[serde(default)]
     pub kind: ChainKind,
+    /// Keep this chain out of the picker. Deleting the entry works for chains
+    /// the file has always had; for one the app adds by default (BNB Chain),
+    /// an entry marked hidden is how to say "not for me" and have it stick.
+    #[serde(default)]
+    pub hidden: bool,
     /// RPC endpoint(s): one URL as a string, or several as a list, first is
     /// primary. Requests rotate across all of them with failover, and the
     /// transport steers each request to an endpoint that can answer it — so
@@ -586,6 +591,19 @@ pub fn starter_json() -> String {
                 "public_pools": []
             },
             {
+                "name": "bnb-mainnet",
+                "kind": "evm",
+                "chain_id": 56,
+                // Flap's home chain. Launches trade on the Flap Portal, then
+                // graduate into PancakeSwap; Uniswap v3/v4 are here too. The
+                // public endpoint rate-limits log scans hard — add a keyed one.
+                "rpc": ["https://bsc-rpc.publicnode.com"],
+                "rpc_alchemy_example": "https://bnb-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+                "ws_example": "wss://bsc-rpc.publicnode.com",
+                "tokens": [],
+                "public_pools": []
+            },
+            {
                 "name": "solana-mainnet",
                 // Explicitly null, not absent: Solana has no EVM chain id, and a
                 // reader should see that the question was asked and answered
@@ -618,6 +636,17 @@ pub fn starter_json() -> String {
         }
     }))
     .unwrap_or_default()
+}
+
+/// The chains the starter config ships with, parsed from it — one source.
+///
+/// A config written before a chain existed here never grows the entry by
+/// itself, and asking every user to hand-edit JSON to see BNB Chain is how a
+/// chain ships and nobody finds it. The caller appends any of these whose
+/// chain id (or, for Solana, kind) the loaded registry lacks — in memory, for
+/// the picker; the user's file is not rewritten.
+pub fn starter_networks() -> Vec<Network> {
+    serde_json::from_str::<Registry>(&starter_json()).map(|r| r.networks).unwrap_or_default()
 }
 
 /// The chains we develop against: a testnet and a local node.

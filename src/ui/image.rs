@@ -223,6 +223,9 @@ pub const FLAUNCH_PNG: &[u8] = include_bytes!("../../assets/flaunch.png");
 pub const POOLS_TRADE_PNG: &[u8] = include_bytes!("../../assets/pools-trade.png");
 pub const POOLS_FUN_PNG: &[u8] = include_bytes!("../../assets/pools-fun.png");
 pub const BASE_PNG: &[u8] = include_bytes!("../../assets/base.png");
+pub const BNB_PNG: &[u8] = include_bytes!("../../assets/bnb.png");
+pub const FLAP_PNG: &[u8] = include_bytes!("../../assets/flap.png");
+pub const PANCAKE_PNG: &[u8] = include_bytes!("../../assets/pancake.png");
 
 impl Venue {
     /// The venue spelled out for large type in the header.
@@ -233,6 +236,8 @@ impl Venue {
             Venue::Flaunch => "FLAUNCH".to_string(),
             Venue::PoolsTrade => "POOLS.TRADE".to_string(),
             Venue::PoolsFun => "POOLS.FUN".to_string(),
+            Venue::Flap => "FLAP".to_string(),
+            Venue::Pancake => "PANCAKESWAP".to_string(),
             Venue::Uniswap => "UNISWAP".to_string(),
             Venue::Chain => {
                 let n = network.to_lowercase();
@@ -240,6 +245,8 @@ impl Venue {
                     "SOLANA".to_string()
                 } else if n.starts_with("robinhood") {
                     "ROBINHOOD".to_string()
+                } else if n.starts_with("bnb") || n.starts_with("bsc") {
+                    "BNB CHAIN".to_string()
                 } else {
                     network.to_uppercase()
                 }
@@ -256,6 +263,8 @@ pub fn for_venue(venue: Venue, network: &str) -> Option<&'static [u8]> {
         Venue::Flaunch => Some(FLAUNCH_PNG),
         Venue::PoolsTrade => Some(POOLS_TRADE_PNG),
         Venue::PoolsFun => Some(POOLS_FUN_PNG),
+        Venue::Flap => Some(FLAP_PNG),
+        Venue::Pancake => Some(PANCAKE_PNG),
         Venue::Uniswap => Some(UNISWAP_PNG),
         Venue::Chain => for_network(network),
     }
@@ -288,6 +297,12 @@ pub enum Venue {
     /// pools.trade, Uniswap's launchpad. Detected from the facts file's
     /// launchpad tag, which discovery writes when it sees the launch.
     PoolsTrade,
+    /// Flap. Detected from the pool kind (`PoolKind::Flap`) — the Portal is
+    /// the venue for the life of the launch — and from the launchpad tag for
+    /// a graduate now trading in its Pancake pool.
+    Flap,
+    /// PancakeSwap, the AMM. A Flap graduate wears Flap's mark instead.
+    Pancake,
     /// A plain AMM trade.
     Uniswap,
     /// Nothing more specific known — fall back to the chain's own mark.
@@ -308,6 +323,8 @@ pub fn for_network(name: &str) -> Option<&'static [u8]> {
         Some(ROBINHOOD_PNG)
     } else if n.starts_with("base") {
         Some(BASE_PNG)
+    } else if n.starts_with("bnb") || n.starts_with("bsc") {
+        Some(BNB_PNG)
     } else {
         None
     }

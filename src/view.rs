@@ -751,6 +751,10 @@ pub fn pretty_network(name: &str) -> String {
         .split(['-', '_'])
         .filter(|w| !w.is_empty())
         .map(|w| {
+            // Initialisms stay upper-case: "Bnb Mainnet" is nobody's name.
+            if w.eq_ignore_ascii_case("bnb") || w.eq_ignore_ascii_case("bsc") {
+                return w.to_uppercase();
+            }
             let mut c = w.chars();
             match c.next() {
                 Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),

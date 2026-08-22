@@ -5,6 +5,8 @@ A terminal trading bot.
 **Available on**
 
 - Robinhood Chain
+- Base
+- BNB Chain
 - Solana
 
 **Supported protocols**
@@ -14,6 +16,8 @@ A terminal trading bot.
 - pons.family
 - Flaunch
 - pools.fun — SushiSwap V3
+- Flap — on BNB Chain and Robinhood Chain
+- PancakeSwap V3
 - pump.fun
 - PumpSwap AMM
 
