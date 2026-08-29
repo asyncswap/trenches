@@ -17,6 +17,7 @@ use std::io::Stdout;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use zeroize::Zeroizing;
 use ratatui::{prelude::*, widgets::*};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -949,11 +950,47 @@ pub fn input(term: &mut Term, title: &str, hint: &str) -> eyre::Result<Option<St
     }
 }
 
-pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
+/// Append to a secret buffer without leaving a copy of it behind.
+///
+/// `String::push` grows by reallocating: it copies what is already there into
+/// a new allocation and releases the old one exactly as it stood. So a secret
+/// typed into a growing `String` leaves every prefix of itself loose in the
+/// heap, for a core dump, a swap file, or whatever allocates that page next.
+/// Wrapping only the finished buffer does not help — by then those copies have
+/// been made and freed already.
+///
+/// So grow deliberately: move into the larger buffer and wipe the old one
+/// before it is released, which is what dropping the swapped-out `Zeroizing`
+/// does here.
+fn secret_push(buf: &mut Zeroizing<String>, s: &str) {
+    if buf.len() + s.len() > buf.capacity() {
+        let want = (buf.capacity() * 2).max(buf.len() + s.len() + 64);
+        let mut grown = Zeroizing::new(String::with_capacity(want));
+        grown.push_str(buf);
+        // After the swap `grown` holds the OLD allocation, and dropping it at
+        // the end of this function is what clears those bytes.
+        std::mem::swap(buf, &mut grown);
+    }
+    buf.push_str(s);
+}
+
+/// Read a secret — a password, a private key, a seed phrase — without echoing
+/// it.
+///
+/// Returns it already wrapped. The callers were each wrapping the `String` on
+/// arrival, which scrubbed the value they were handed but not the buffer it
+/// was typed into. The protection belongs at the source, so it is in the type
+/// now and there is nothing left for a caller to remember.
+///
+/// What this still does not reach: the terminal's own read buffer, one layer
+/// below `crossterm`, which holds the same bytes and is not ours to clear.
+pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<Zeroizing<String>>> {
     // This screen owns the terminal now: take down any image the previous one
     // left, which also marks every placement stale so it redraws on return.
     image::clear();
-    let mut buf = String::new();
+    // Room for the longest thing anyone types here — a 24-word seed phrase —
+    // so the common path never grows at all.
+    let mut buf = Zeroizing::new(String::with_capacity(256));
     loop {
         term.draw(|f| {
             // Same as the dashboards: without this the panel sits on the
@@ -983,7 +1020,13 @@ pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
                 // contains a repeated character. Without this, pasting a key
                 // silently lost bytes and the import failed as "not a valid
                 // private key".
-                Event::Paste(s) => buf.push_str(s.trim()),
+                // The event hands over a String holding the whole secret, so
+                // take it into a wrapper: that copy needs wiping too, not just
+                // ours.
+                Event::Paste(s) => {
+                    let s = Zeroizing::new(s);
+                    secret_push(&mut buf, s.trim());
+                }
                 Event::Key(k) => {
                     // A physical press reported twice is the whole reason
                     // `fresh_key` exists. Where the terminal tells us the event
@@ -1002,7 +1045,10 @@ pub fn password(term: &mut Term, title: &str) -> eyre::Result<Option<String>> {
                         KeyCode::Backspace => {
                             buf.pop();
                         }
-                        KeyCode::Char(c) => buf.push(c),
+                        KeyCode::Char(c) => {
+                            let mut enc = [0u8; 4];
+                            secret_push(&mut buf, c.encode_utf8(&mut enc));
+                        }
                         _ => {}
                     }
                 }
@@ -1028,6 +1074,59 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 
 
+
+#[cfg(test)]
+mod secret_buffer_tests {
+    use super::*;
+
+    /// The buffer a password is typed into must grow without dropping any of
+    /// it. Zeroizing the old allocation is the point of `secret_push`, but a
+    /// scrub that also loses a character would break every keystore unlock —
+    /// so pin the content, well past the initial capacity.
+    #[test]
+    fn a_secret_survives_being_grown() {
+        let mut buf = Zeroizing::new(String::with_capacity(8));
+        let typed = "correct horse battery staple, and then some more than fits";
+        for c in typed.chars() {
+            let mut enc = [0u8; 4];
+            secret_push(&mut buf, c.encode_utf8(&mut enc));
+        }
+        assert_eq!(buf.as_str(), typed);
+        assert!(buf.capacity() >= typed.len());
+    }
+
+    /// A paste arrives whole, and can exceed the buffer on its own.
+    #[test]
+    fn a_pasted_secret_is_appended_whole() {
+        let mut buf = Zeroizing::new(String::with_capacity(4));
+        secret_push(&mut buf, "abc");
+        secret_push(&mut buf, &"x".repeat(300));
+        assert_eq!(buf.len(), 303);
+        assert!(buf.starts_with("abcxxx"));
+    }
+
+    /// Multi-byte characters are pushed by their bytes, not by a count of
+    /// chars — a passphrase with an accent in it must round-trip exactly.
+    #[test]
+    fn multibyte_characters_are_not_truncated() {
+        let mut buf = Zeroizing::new(String::with_capacity(2));
+        for c in "pässwörd–ünïcödé".chars() {
+            let mut enc = [0u8; 4];
+            secret_push(&mut buf, c.encode_utf8(&mut enc));
+        }
+        assert_eq!(buf.as_str(), "pässwörd–ünïcödé");
+    }
+
+    /// Backspace still shortens it, and growing afterwards keeps the trim.
+    #[test]
+    fn a_correction_is_kept_when_the_buffer_grows() {
+        let mut buf = Zeroizing::new(String::with_capacity(4));
+        secret_push(&mut buf, "abcd");
+        buf.pop();
+        secret_push(&mut buf, "efgh");
+        assert_eq!(buf.as_str(), "abcefgh");
+    }
+}
 
 #[cfg(test)]
 mod paste_tests {

@@ -34,7 +34,6 @@ mod v4;
 mod view;
 mod wallet;
 
-use zeroize::Zeroizing;
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -2315,7 +2314,7 @@ async fn solana_app(
                 break;
             };
             let Some(pass) =
-                ui::password(terminal, &format!("Password for {ks}"))?.map(Zeroizing::new)
+                ui::password(terminal, &format!("Password for {ks}"))?
             else {
                 continue;
             };
@@ -2409,23 +2408,24 @@ fn wallet_screen(
         let Some(name) = ui::input(terminal, "Wallet name", "e.g. robin — becomes the file name")? else {
             continue;
         };
-        // Zeroizing: a pasted key or seed phrase is the whole wallet, and a
-        // plain String leaves it in the heap for whatever reads that page next
-        // — a core dump, swap, another allocation. Wrapping at the SOURCE means
-        // every path out of this loop scrubs it, including the `continue`s.
+        // A pasted key or seed phrase is the whole wallet, and a plain String
+        // leaves it in the heap for whatever reads that page next — a core
+        // dump, swap, another allocation. `ui::password` now returns it
+        // already wrapped, so it is scrubbed from the buffer it was typed into
+        // onwards, on every path out of this loop including the `continue`s.
         let secret = match i {
-            1 => ui::password(terminal, "Private key (hidden)")?.map(Zeroizing::new),
-            2 => ui::password(terminal, "Seed phrase (hidden)")?.map(Zeroizing::new),
+            1 => ui::password(terminal, "Private key (hidden)")?,
+            2 => ui::password(terminal, "Seed phrase (hidden)")?,
             _ => None,
         };
         if i > 0 && secret.is_none() {
             continue;
         }
-        let Some(pass) = ui::password(terminal, "Password for the new keystore")?.map(Zeroizing::new)
+        let Some(pass) = ui::password(terminal, "Password for the new keystore")?
         else {
             continue;
         };
-        let Some(again) = ui::password(terminal, "Password again")?.map(Zeroizing::new) else {
+        let Some(again) = ui::password(terminal, "Password again")? else {
             continue;
         };
         if pass != again {
@@ -2743,7 +2743,7 @@ async fn app(
                 break;
             };
             let Some(pass) =
-                ui::password(terminal, &format!("Password for {ks}"))?.map(Zeroizing::new)
+                ui::password(terminal, &format!("Password for {ks}"))?
             else {
                 continue;
             };

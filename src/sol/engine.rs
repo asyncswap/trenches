@@ -395,6 +395,35 @@ pub async fn token_balance(rpc: &Rpc, coin: &Coin, owner: &Pubkey) -> eyre::Resu
     Ok(super::units_to_tokens(rpc.token_balance(&account).await?))
 }
 
+/// How far below the formula's floor a simulation may pull protection, in
+/// percent.
+///
+/// The simulation is there because the formula cannot keep up with pump's fee
+/// tiers and boost reserves, so it has to be allowed to lower the floor — that
+/// is the entire feature, and `min` was how it did it. But the number it
+/// lowers the floor with is read out of an `simulateTransaction` response,
+/// and the endpoint that answers is not a trusted party: it can say the swap
+/// returns almost nothing, and a floor derived from almost nothing is a signed
+/// buy with no protection left on it. That is precisely the state a sandwich
+/// wants to find, and `min` placed no bound on it.
+///
+/// So the simulation still lowers the floor, but only this far. A quarter is
+/// wider than any honest gap between the fee-free quote and what the program
+/// actually pays; a disagreement past it is not fee math, and the floor stays
+/// where the formula put it. The buy may then revert instead of filling — loud,
+/// cheap and retryable, which an emptied floor is not.
+const MAX_SIM_HAIRCUT_PCT: f64 = 25.0;
+
+/// The floor to actually sign, given the formula's floor and the simulation's.
+///
+/// Bounded at both ends: the formula floor is the ceiling, because a
+/// simulation must not be able to talk protection UP past the honest quote
+/// either, and `MAX_SIM_HAIRCUT_PCT` below it is the floor of the floor.
+fn clamp_sim_floor(quote_floor: u64, sim_floor: u64) -> u64 {
+    let limit = trade::with_slippage(quote_floor, MAX_SIM_HAIRCUT_PCT, false);
+    sim_floor.clamp(limit.min(quote_floor), quote_floor)
+}
+
 /// Buy `sol_in` SOL worth of the coin, via `buy_exact_sol_in`.
 ///
 /// We spend an exact SOL amount and set a **token floor** — the natural shape for
@@ -446,7 +475,9 @@ pub async fn buy(
             // floor from THAT. One extra RPC per buy; correct under any fee
             // regime. The formula floor stays as the ceiling — a simulation
             // cannot talk the floor UP past the honest quote — and as the
-            // fallback when simulation is unavailable.
+            // fallback when simulation is unavailable. It is also the anchor
+            // the simulation may only move so far DOWN from, because the
+            // answer comes from the RPC: see `clamp_sim_floor`.
             let probe = amm_buy_ixs(keys, &user, sol_to_lamports(sol_in), 1, *sol_is_base);
             // The COIN side's ATA — which slot that is depends on orientation.
             let (coin_mint, coin_prog) = if *sol_is_base {
@@ -469,7 +500,13 @@ pub async fn buy(
                         if sim_out > 0 {
                             let sim_floor =
                                 trade::with_slippage(sim_out, slippage_pct.max(1.0), false);
-                            floor = sim_floor.min(min_tokens_out);
+                            floor = clamp_sim_floor(min_tokens_out, sim_floor);
+                            if sim_floor < floor {
+                                crate::trace(&format!(
+                                    "amm buy: simulation wanted a floor {sim_floor} against a quote floor of \
+                                     {min_tokens_out}; too far to be fee math, clamped to {floor}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -604,6 +641,51 @@ fn amm_sell_ixs(
         },
         trade::close_token_account(&wsol_ata, user, user, &wsol_prog),
     ]
+}
+
+#[cfg(test)]
+mod sim_floor_tests {
+    use super::*;
+
+    /// The trust boundary in one test: the simulated floor arrives from the
+    /// RPC, so it may move protection down only so far.
+    #[test]
+    fn a_simulation_can_lower_the_floor_but_not_empty_it() {
+        let quote = 1_000_000u64;
+
+        // The honest case, and the reason the simulation is consulted at all:
+        // a fee regime the formula does not model, a modest gap, taken as-is.
+        assert_eq!(clamp_sim_floor(quote, 900_000), 900_000);
+        assert_eq!(clamp_sim_floor(quote, 800_000), 800_000);
+
+        // Exactly at the limit, still honoured.
+        assert_eq!(clamp_sim_floor(quote, 750_000), 750_000);
+
+        // A hostile endpoint: "this swap returns almost nothing", which used to
+        // become the floor verbatim and leave the buy unprotected.
+        assert_eq!(clamp_sim_floor(quote, 1), 750_000);
+        assert_eq!(clamp_sim_floor(quote, 0), 750_000);
+        assert_eq!(clamp_sim_floor(quote, 500_000), 750_000);
+
+        // And it cannot talk protection UP past the honest quote either — an
+        // inflated floor is a buy that reverts on every attempt.
+        assert_eq!(clamp_sim_floor(quote, 5_000_000), quote);
+
+        // A zero quote floor has nothing to clamp against and must not panic.
+        assert_eq!(clamp_sim_floor(0, 12_345), 0);
+    }
+
+    /// Whatever the simulation says, the signed floor stays within the band.
+    #[test]
+    fn the_signed_floor_never_leaves_the_band() {
+        let quote = 987_654u64;
+        let low = trade::with_slippage(quote, MAX_SIM_HAIRCUT_PCT, false);
+        for sim in [0u64, 1, 7, 500_000, 740_000, 900_000, quote, quote + 1, u64::MAX] {
+            let f = clamp_sim_floor(quote, sim);
+            assert!(f >= low, "floor {f} fell below the {low} bound (sim {sim})");
+            assert!(f <= quote, "floor {f} rose above the quote {quote} (sim {sim})");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -89,18 +89,22 @@ Ranked by our own unease, not by what's easy to scan for:
 
 1. **The signing path end to end** — `src/wallet.rs`, `src/sol/wallet.rs`,
    `src/sol/{tx,trade,engine}.rs`, `src/engine.rs`. Password handling and
-   zeroization (the password currently lives as a plain `String`; an unused
-   zeroizing wrapper was recently deleted rather than wired up — we consider
-   this an open weakness). Keystore filename handling (a `name` becomes a
-   filename; there is a traversal guard + test, please try to beat it).
+   zeroization (`ui::password` now returns `Zeroizing<String>` and builds it
+   in a buffer that wipes each allocation before releasing it — see Fixed
+   below; the terminal's own read buffer below `crossterm` is still not ours
+   to clear). Keystore filename handling (a `name` becomes a filename; there
+   is a traversal guard + test, please try to beat it).
 2. **Slippage floors and quote math.** `min_tokens_out` / `min_sol_output`
    are the only thing standing between a user and a hostile fill. As of
    v0.2.4 the AMM buy path derives its floor from a `simulateTransaction`
    result (`Rpc::simulate_post_token`) — i.e. **a value returned by an RPC
-   endpoint now influences a signed transaction's protection**. That is a
-   deliberate trade-off; attack it. Fee math, boost/virtual reserves,
-   inverted-orientation pools (SOL as base vs quote) are all places a sign
-   error becomes a fund loss.
+   endpoint influences a signed transaction's protection**. Still true, and
+   still a deliberate trade-off, but it is now bounded at both ends by
+   `clamp_sim_floor`: the formula floor is the ceiling and 25% below it is
+   the floor, so a hostile endpoint can no longer drive protection to zero.
+   Attack the bound. Fee math, boost/virtual reserves, inverted-orientation
+   pools (SOL as base vs quote) are all places a sign error becomes a fund
+   loss.
 3. **Untrusted text into a terminal.** ANSI/control filtering happens in
    `clean_text`. We just fixed bidi/zero-width passthrough (see Fixed below).
    Look for other paths that print chain-derived strings without it — logs,
@@ -153,6 +157,23 @@ Ranked by our own unease, not by what's easy to scan for:
   per call at build time, `now + DEADLINE_WINDOW_SECS` (300s). Same mistake the
   Permit2 grant made and had already fixed. Test:
   `v4::flaunch_swap_tests::the_deadline_is_minutes_away_not_decades`.
+- **An RPC could empty the AMM buy floor.** The simulated floor was taken as
+  `sim_floor.min(min_tokens_out)` — capped above, unbounded below — so an
+  endpoint answering `simulateTransaction` with a near-zero post-balance set a
+  near-zero `min_tokens_out` on a signed buy. The simulation still lowers the
+  floor (that is the point of it: pump's fee tiers and boost reserves outrun
+  the formula), but no further than `MAX_SIM_HAIRCUT_PCT` (25%) below the
+  formula's floor; past that the buy reverts rather than filling unprotected.
+  `src/sol/engine.rs::clamp_sim_floor`, tests in `sim_floor_tests`.
+- **The password was typed into a plain, growing `String`.** Callers wrapped
+  the returned value in `Zeroizing`, which scrubbed the final buffer but not
+  the ones `String::push` had already reallocated away from — every prefix of
+  the password was left in freed heap. `ui::password` now returns
+  `Zeroizing<String>` (so the wrapping cannot be forgotten) and grows through
+  `ui::secret_push`, which wipes each allocation before releasing it; a pasted
+  secret's event `String` is wrapped too. Tests in
+  `ui::secret_buffer_tests`. Not reached: the terminal read buffer below
+  `crossterm`.
 
 ## Things we know are imperfect (context, not findings to pad)
 
