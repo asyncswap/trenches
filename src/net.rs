@@ -9,37 +9,150 @@
 //! on 8899, a cloud metadata endpoint. One guard, used by both sides, because
 //! the Solana path shipped it first and the EVM path went without.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// The host and port a URL addresses, credentials dropped, host lowercased.
+///
+/// Split out of `public_host` because the guard now needs the host as a name
+/// it can resolve, not only as a string it can pattern-match.
+fn host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    // An IPv6 literal wears brackets, and the colons inside them are not the
+    // port separator. The old one-line split treated them as one and reduced
+    // `[::1]` to an empty host — refused, but by accident, and it refused
+    // every public IPv6 literal the same way.
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (h, after) = inner.split_once(']')?;
+        (h, after.strip_prefix(':'))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(p) => p.parse().ok()?,
+        None if scheme.eq_ignore_ascii_case("http") => 80,
+        None => 443,
+    };
+    Some((host.to_ascii_lowercase(), port))
+}
+
+/// True when an address is one the wider internet could have answered with —
+/// not loopback, not private, link-local, or otherwise only-reachable-here.
+///
+/// The v6 arm used to check loopback and unspecified alone. That was survivable
+/// while only IP literals in a URL reached it; it is not, now that a resolver's
+/// answers do. `fc00::/7` and `fe80::/10` are the v6 spellings of the v4 ranges
+/// just above, and `::ffff:10.0.0.1` is the v4 ranges themselves wearing a v6
+/// address.
+pub fn public_ip(ip: IpAddr) -> bool {
+    fn public_v4(v4: Ipv4Addr) -> bool {
+        !(v4.is_loopback()
+            || v4.is_private()
+            || v4.is_link_local()
+            || v4.is_broadcast()
+            || v4.is_unspecified()
+            || v4.octets()[0] == 0
+            // Carrier-grade NAT and the cloud metadata neighbourhood.
+            || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+    }
+    fn public_v6(v6: Ipv6Addr) -> bool {
+        if v6.is_loopback() || v6.is_unspecified() {
+            return false;
+        }
+        // `::ffff:a.b.c.d` and the deprecated `::a.b.c.d` are v4 in a v6 coat.
+        if let Some(v4) = v6.to_ipv4() {
+            return public_v4(v4);
+        }
+        let head = v6.segments()[0];
+        !((head & 0xfe00) == 0xfc00 || (head & 0xffc0) == 0xfe80)
+    }
+    match ip {
+        IpAddr::V4(v4) => public_v4(v4),
+        IpAddr::V6(v6) => public_v6(v6),
+    }
+}
+
 /// True when a URL's host is a public name — not loopback, not private or
 /// link-local, not a bare `.local`.
+///
+/// This reads the string and nothing else, so it settles IP literals and only
+/// IP literals. A NAME that is not obviously local passes here and is decided
+/// later, by `guarded_client`, which resolves it. Keep both: this one is cheap,
+/// synchronous, and is what decides which candidate URLs are worth queueing.
 pub fn public_host(url: &str) -> bool {
-    let Some((_, rest)) = url.split_once("://") else { return false };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Strip credentials, then the port; keep the host.
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host).trim_matches(['[', ']']);
-    if host.is_empty() {
+    let Some((host, _)) = host_port(url) else { return false };
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
         return false;
     }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return false;
+    match host.parse::<IpAddr>() {
+        Ok(ip) => public_ip(ip),
+        // A name. Nothing in the string can settle it — see `guarded_client`.
+        Err(_) => true,
     }
-    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                !(v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_unspecified()
-                    || v4.octets()[0] == 0
-                    // Carrier-grade NAT and the cloud metadata neighbourhood.
-                    || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
-            }
-            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
-        };
+}
+
+/// Every address a name answered with, judged together.
+///
+/// All of them, not any of them: a name that answers with one public address
+/// and one loopback address is not half safe, it is a rebinding attempt with
+/// the answer already in it. An empty answer is refused too — there is nothing
+/// there to have approved.
+fn all_public(addrs: &[SocketAddr]) -> bool {
+    !addrs.is_empty() && addrs.iter().all(|a| public_ip(a.ip()))
+}
+
+/// An HTTP client that will only connect to where `url` resolved when we
+/// checked it.
+///
+/// `public_host` reads a string, and a name is not an address. Token metadata
+/// URIs are written by whoever launched the coin, so `evil.example` can carry
+/// an A record for `127.0.0.1`, `10.0.0.5` or `169.254.169.254`, and a guard
+/// that never resolves anything waves it straight through — the metadata-URI
+/// SSRF again, with a hostname where the IP literal used to be. Requiring
+/// HTTPS does not help: a DNS-01 challenge issues a publicly trusted
+/// certificate for a domain whose records point anywhere at all, because it
+/// proves control of the records and never asks whether the address answers
+/// from the internet.
+///
+/// So resolve it here, judge every address the name gave back, and pin the
+/// survivors onto the client. The pinning is the half that closes rebinding:
+/// left to itself `reqwest` resolves the name again when it connects, and the
+/// second answer does not have to be the one that was approved.
+pub async fn guarded_client(url: &str, timeout: std::time::Duration) -> Option<reqwest::Client> {
+    if !public_host(url) {
+        return None;
     }
-    true
+    let (host, port) = host_port(url)?;
+    // An IP literal was already judged, in full, by `public_host`. There is no
+    // name here to resolve and nothing a resolver could change underneath us.
+    if host.parse::<IpAddr>().is_ok() {
+        return reqwest::Client::builder().timeout(timeout).build().ok();
+    }
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(a) => a.collect(),
+        Err(e) => {
+            crate::trace(&format!("net: {host} did not resolve: {e}"));
+            return None;
+        }
+    };
+    if !all_public(&addrs) {
+        // Deliberately says nothing about which address: the answer is the
+        // attacker's, and echoing it back only confirms what they aimed at.
+        crate::trace(&format!("net: {host} resolves to an address this machine keeps to itself; refused"));
+        return None;
+    }
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .ok()
 }
 
 /// A metadata URI turned into a URL worth fetching, or `None`.
@@ -235,6 +348,100 @@ mod tests {
         }
     }
 
+    /// The finding this guard was rebuilt for: the string check never resolved
+    /// anything, so any name whose records point somewhere private walked past
+    /// it. The decision now happens on the ADDRESSES a name answers with, and
+    /// this is that decision, tested without a resolver in the way.
+    #[test]
+    fn a_name_is_judged_by_every_address_it_answers_with() {
+        let addr = |s: &str| SocketAddr::new(s.parse::<IpAddr>().unwrap(), 443);
+
+        // What an attacker's A record would hand back.
+        for private in ["127.0.0.1", "10.0.0.5", "192.168.1.7", "169.254.169.254", "100.64.0.1", "0.0.0.0"] {
+            assert!(!all_public(&[addr(private)]), "{private} must not be connected to");
+        }
+        // v6, which the old check let through with only loopback covered.
+        for private in ["::1", "fc00::1", "fd12:3456::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:10.0.0.5"] {
+            assert!(!all_public(&[addr(private)]), "{private} must not be connected to");
+        }
+        for public in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(all_public(&[addr(public)]), "{public} should be reachable");
+        }
+
+        // One good answer does not launder a bad one. This is the shape of a
+        // rebinding record, and "all" is what refuses it.
+        assert!(!all_public(&[addr("93.184.216.34"), addr("127.0.0.1")]));
+        // Nothing to approve is not the same as approved.
+        assert!(!all_public(&[]));
+    }
+
+    /// The host has to come out of the URL correctly before it can be resolved
+    /// — a mis-parse is a guard aimed at the wrong name.
+    #[test]
+    fn the_host_and_port_survive_the_url() {
+        assert_eq!(host_port("https://example.com/a.json"), Some(("example.com".into(), 443)));
+        assert_eq!(host_port("http://example.com/a.json"), Some(("example.com".into(), 80)));
+        assert_eq!(host_port("https://Example.COM:8443/x"), Some(("example.com".into(), 8443)));
+        // Credentials are not the host, and were the shape of an older trick.
+        assert_eq!(host_port("https://user:pw@example.com/x"), Some(("example.com".into(), 443)));
+        // Brackets: the colons inside them are the address, not a port.
+        assert_eq!(host_port("https://[2606:4700::1111]/x"), Some(("2606:4700::1111".into(), 443)));
+        assert_eq!(host_port("https://[::1]:8899/x"), Some(("::1".into(), 8899)));
+        assert_eq!(host_port("https:///nohost"), None);
+        assert_eq!(host_port("not a url"), None);
+    }
+
+    /// A public IPv6 literal is a public host. It was refused before only
+    /// because the bracket parse collapsed it to nothing.
+    #[test]
+    fn public_ipv6_literals_are_allowed_and_private_ones_are_not() {
+        assert!(public_host("https://[2606:4700:4700::1111]/meta.json"));
+        for bad in ["https://[::1]/x", "https://[fc00::1]/x", "https://[fe80::1]/x", "https://[::ffff:169.254.169.254]/x"] {
+            assert!(!public_host(bad), "{bad} should be refused");
+            assert!(metadata_url(bad).is_none(), "{bad} should not be fetched");
+        }
+    }
+
+    /// The guard is asynchronous now, and the string-refusable cases must still
+    /// be refused without ever reaching a resolver or a socket.
+    #[tokio::test]
+    async fn a_guarded_client_refuses_what_the_string_already_settles() {
+        let t = std::time::Duration::from_millis(500);
+        for bad in [
+            "https://127.0.0.1/x.json",
+            "https://10.0.0.5/x.json",
+            "https://169.254.169.254/latest/meta-data",
+            "https://localhost/x.json",
+            "https://nas.local/x.json",
+            "https://[::1]/x.json",
+        ] {
+            assert!(guarded_client(bad, t).await.is_none(), "{bad} should get no client");
+        }
+    }
+
+    /// The reported proof of concept, run against the real resolver.
+    ///
+    /// `localtest.me` is a public domain whose A record is 127.0.0.1 — exactly
+    /// the thing the report stood up with an `/etc/hosts` entry, and exactly
+    /// what an attacker puts in a coin's metadata URI. It has a valid public
+    /// name, no IP literal anywhere in the URL, and it could hold a trusted
+    /// certificate. `public_host` says yes to the string, and the client is
+    /// still refused, because the name is resolved before anything connects.
+    ///
+    /// Ignored by default: it is the one test here that needs DNS.
+    /// Run: cargo test --features solana ssrf_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ssrf_live_a_public_name_pointing_home_is_refused() {
+        let url = "https://localtest.me/meta.json";
+        assert!(public_host(url), "the string alone cannot tell — that is the bug");
+        assert!(metadata_url(url).is_some(), "and it passes the URI filter too");
+        assert!(
+            guarded_client(url, std::time::Duration::from_millis(2_000)).await.is_none(),
+            "resolving it must be what refuses it"
+        );
+    }
+
     #[test]
     fn plaintext_and_exotic_schemes_are_refused() {
         // http:// is refused even to a public host: the response decides what
@@ -300,4 +507,3 @@ mod ipfs_tests {
         assert!(fetch_urls("https://127.0.0.1/pic.png").is_empty());
     }
 }
-

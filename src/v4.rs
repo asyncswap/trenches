@@ -9,7 +9,45 @@ use alloy::sol_types::{SolCall, SolValue};
 
 use crate::contracts::*;
 
-pub const FAR_DEADLINE: u64 = 4_102_444_800; // year 2100
+/// How long a swap this app signs stays executable, in seconds.
+///
+/// This was `FAR_DEADLINE = 4_102_444_800` — the first second of the year 2100
+/// — stamped on every `execute()` and `modifyLiquidities()` built here. A
+/// router deadline exists to bound how long an already-SIGNED transaction can
+/// still land, and 2100 removes the bound: the transaction stays valid for the
+/// life of the account's nonce.
+///
+/// That bound is not academic here. The app signs and hands the raw
+/// transaction to its configured RPC, and that endpoint — an explicit trust
+/// boundary — is the party that decides when, or whether, it reaches a block.
+/// Holding it costs the endpoint nothing and, with 2100 in the field, expires
+/// nothing: it can be broadcast later, into a thin book or a dip arranged
+/// elsewhere, and still execute. `amountOutMinimum` bounds how bad the fill
+/// is; only the deadline bounds WHEN it happens.
+///
+/// It is the same mistake the Permit2 grant used to make, and was already
+/// fixed there (`engine.rs`: "a standing permission nobody remembers giving …
+/// and 2100 was exactly that"). The router call was left behind.
+///
+/// Five minutes. The app stops tracking a send after `PENDING_TTL` (90s), so a
+/// window much past a couple of minutes is already outliving the order it
+/// belongs to; the rest is margin for a clock that is not quite ours, since
+/// this is compared against `block.timestamp` and not against us.
+pub const DEADLINE_WINDOW_SECS: u64 = 300;
+
+/// The deadline to stamp on a call being built right now.
+///
+/// Read per call, so it is the moment of the send — not the moment the binary
+/// was built, which is what a constant made it. A clock that cannot answer
+/// yields a deadline already past, and the pre-flight `eth_call` every trade
+/// runs turns that into a skipped order rather than a burnt one.
+pub fn deadline() -> U256 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    U256::from(now.saturating_add(DEADLINE_WINDOW_SECS))
+}
 
 /// Build UniversalRouter.execute() calldata for a single-hop v4 exact-in swap
 /// on an ETH-paired pool. buy = ETH->token (send `amount_in` as value).
@@ -58,7 +96,7 @@ pub fn swap_calldata(
     IUniversalRouter::executeCall {
         commands,
         inputs,
-        deadline: U256::from(FAR_DEADLINE),
+        deadline: deadline(),
     }
     .abi_encode()
     .into()
@@ -107,7 +145,7 @@ pub fn flaunch_swap_calldata(token: Address, buy: bool, amount_in: u128, min_out
     IUniversalRouter::executeCall {
         commands,
         inputs,
-        deadline: U256::from(FAR_DEADLINE),
+        deadline: deadline(),
     }
     .abi_encode()
     .into()
@@ -156,7 +194,7 @@ pub fn hop_calldata(
     IUniversalRouter::executeCall {
         commands: Bytes::from(vec![V4_SWAP]),
         inputs: vec![v4_input.into()],
-        deadline: U256::from(FAR_DEADLINE),
+        deadline: deadline(),
     }
     .abi_encode()
     .into()
@@ -211,7 +249,7 @@ pub fn add_liquidity_calldata(
 
     IPositionManager::modifyLiquiditiesCall {
         unlockData: unlock.into(),
-        deadline: U256::from(FAR_DEADLINE),
+        deadline: deadline(),
     }
     .abi_encode()
     .into()
@@ -242,7 +280,7 @@ pub fn close_liquidity_calldata(
 
     IPositionManager::modifyLiquiditiesCall {
         unlockData: unlock.into(),
-        deadline: U256::from(FAR_DEADLINE),
+        deadline: deadline(),
     }
     .abi_encode()
     .into()
@@ -283,12 +321,74 @@ mod flaunch_swap_tests {
     const SDK_BUY: &str = "0x3593564c000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000f4865700000000000000000000000000000000000000000000000000000000000000000110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004a0000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000003070c0f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000003a000000000000000000000000000000000000000000000000000000000000002c00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000028000000000000000000000000000000000000000000000000000038d7ea4c68000000000000000000000000000000000000000000000000000ab54a98ceb1f0ad200000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000043c1117dafa3a3d0c7148eb48b301300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c000000000000000000000000ea22ae03085caf74ac3393f9902539fbe978688800000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000005cf8e499c7c466c7e2cf127bdf129f57151e65dc00000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000038d7ea4c6800000000000000000000000000000000000000000000000000000000000000000400000000000000000000000001111111111111111111111111111111111111111000000000000000000000000000000000000000000000000ab54a98ceb1f0ad2";
     const SDK_SELL: &str = "0x3593564c000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000f4865700000000000000000000000000000000000000000000000000000000000000000110000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004a0000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000003070c0f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000003a000000000000000000000000000000000000000000000000000000000000002c00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000028000000000000000000000000000000000000000000000000000038d7ea4c68000000000000000000000000000000000000000000000000000ab54a98ceb1f0ad200000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000043c1117dafa3a3d0c7148eb48b301300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000005cf8e499c7c466c7e2cf127bdf129f57151e65dc00000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c000000000000000000000000ea22ae03085caf74ac3393f9902539fbe978688800000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000038d7ea4c6800000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ab54a98ceb1f0ad2";
 
+    /// The deadline word, blanked.
+    ///
+    /// `execute(bytes,bytes[],uint256)` puts it in the third head slot, so it
+    /// is bytes 68..100 — after the selector and the two offsets. The fixtures
+    /// were generated against the old fixed 2100 constant and ours now moves
+    /// with the clock, so blank that one word on both sides and let every
+    /// other byte still compare exactly. The deadline itself is checked in
+    /// `the_deadline_is_minutes_away_not_decades`.
+    fn without_deadline(data: &[u8]) -> Vec<u8> {
+        let mut v = data.to_vec();
+        v[68..100].fill(0);
+        v
+    }
+
+    fn fixture(hex: &str) -> Vec<u8> {
+        alloy::hex::decode(hex.trim_start_matches("0x")).unwrap()
+    }
+
     #[test]
     fn flaunch_calldata_matches_sdk_fixture() {
         let buy = flaunch_swap_calldata(TOKEN, true, AMOUNT_IN, MIN_OUT);
-        assert_eq!(format!("0x{}", alloy::hex::encode(&buy)), SDK_BUY);
+        assert_eq!(without_deadline(&buy), without_deadline(&fixture(SDK_BUY)));
         let sell = flaunch_swap_calldata(TOKEN, false, AMOUNT_IN, MIN_OUT);
-        assert_eq!(format!("0x{}", alloy::hex::encode(&sell)), SDK_SELL);
+        assert_eq!(without_deadline(&sell), without_deadline(&fixture(SDK_SELL)));
+    }
+
+    /// The whole point of the change: a signed swap stops being executable.
+    ///
+    /// Whoever holds the raw transaction before it is broadcast — the RPC it
+    /// was handed to, first of all — must not be able to sit on it and pick a
+    /// better moment for themselves. That is only true while this field is
+    /// minutes away, so assert the magnitude, not just that it is non-zero: a
+    /// re-introduced year-2100 constant passes every other test in this file.
+    #[test]
+    fn the_deadline_is_minutes_away_not_decades() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let builders: Vec<Bytes> = vec![
+            flaunch_swap_calldata(TOKEN, true, AMOUNT_IN, MIN_OUT),
+            flaunch_swap_calldata(TOKEN, false, AMOUNT_IN, MIN_OUT),
+            swap_calldata(TOKEN, 3000, 60, true, AMOUNT_IN, MIN_OUT),
+            swap_calldata(TOKEN, 3000, 60, false, AMOUNT_IN, MIN_OUT),
+            hop_calldata(TOKEN, Address::ZERO, TOKEN, 60, true, AMOUNT_IN, MIN_OUT),
+        ];
+        for data in &builders {
+            let call = IUniversalRouter::executeCall::abi_decode(data, true).unwrap();
+            let d: u64 = call.deadline.to();
+            assert!(d > now, "already expired: {d} vs {now}");
+            assert!(
+                d <= now + DEADLINE_WINDOW_SECS + 2,
+                "a swap must not stay executable for {} seconds",
+                d - now
+            );
+        }
+
+        // And it moves. A constant computed once at startup would be just as
+        // stale by the hundredth trade of a session.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let later = IUniversalRouter::executeCall::abi_decode(
+            &flaunch_swap_calldata(TOKEN, true, AMOUNT_IN, MIN_OUT),
+            true,
+        )
+        .unwrap()
+        .deadline;
+        let first = IUniversalRouter::executeCall::abi_decode(&builders[0], true).unwrap().deadline;
+        assert!(later > first, "the deadline is not being recomputed per call");
     }
 
     #[test]
@@ -297,7 +397,7 @@ mod flaunch_swap_tests {
             let data = flaunch_swap_calldata(TOKEN, buy, AMOUNT_IN, MIN_OUT);
             let call = IUniversalRouter::executeCall::abi_decode(&data, true).unwrap();
             assert_eq!(call.commands.as_ref(), [V4_SWAP]);
-            assert_eq!(call.deadline, U256::from(FAR_DEADLINE));
+            assert!(call.deadline > U256::ZERO);
 
             let (actions, params): (Bytes, Vec<Bytes>) =
                 SolValue::abi_decode_params(&call.inputs[0], true).unwrap();

@@ -131,6 +131,28 @@ Ranked by our own unease, not by what's easy to scan for:
   from on-chain metadata, including `localhost`, RFC1918, `169.254.169.254`
   and `.local`. Now HTTPS-only with a public-host check; test in
   `src/sol/metadata.rs::tests`.
+- **SSRF via metadata URI, second pass: the guard never resolved the name.**
+  The fix above matched the host STRING, so it settled IP literals and nothing
+  else. A coin whose metadata URI named a domain the launcher controls — with
+  an A record for `127.0.0.1`, RFC1918 or `169.254.169.254` — walked straight
+  through, and HTTPS was no barrier (DNS-01 issues a trusted certificate for a
+  domain that points anywhere). `src/net.rs::guarded_client` now resolves the
+  host, judges **every** address it answers with, and **pins** the survivors
+  onto the `reqwest` client, so the connect cannot re-resolve to a different
+  answer than the one approved (DNS rebinding). Both attacker-URL fetch paths
+  — `art::fetch_one` and `art::one_json` — go through it. The IPv6 arm checked
+  only loopback/unspecified and now covers `fc00::/7`, `fe80::/10` and
+  v4-mapped forms. Tests in `src/net.rs::tests`, including an `--ignored` live
+  reproduction against a public name that resolves to loopback.
+- **EVM swap deadline was the year 2100.** Every `execute()` and
+  `modifyLiquidities()` in `src/v4.rs` carried `FAR_DEADLINE = 4_102_444_800`,
+  so a signed swap never expired: whoever held the raw transaction before
+  broadcast — the configured RPC, first of all — could sit on it and submit it
+  at a moment of their choosing. `amountOutMinimum` bounds how bad a fill is;
+  only the deadline bounds *when* it happens. Now `v4::deadline()`, computed
+  per call at build time, `now + DEADLINE_WINDOW_SECS` (300s). Same mistake the
+  Permit2 grant made and had already fixed. Test:
+  `v4::flaunch_swap_tests::the_deadline_is_minutes_away_not_decades`.
 
 ## Things we know are imperfect (context, not findings to pad)
 

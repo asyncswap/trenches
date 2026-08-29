@@ -123,10 +123,11 @@ async fn fetch_one(url: String) -> Option<std::sync::Arc<Vec<u8>>> {
     // once and never again.
     const CAP: usize = 2 * 1024 * 1024;
     async {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(4_000))
-            .build()
-            .ok()?;
+        // Not a plain client: the URL came off a coin's metadata, so the host
+        // has to be resolved and pinned before anything connects to it. See
+        // `net::guarded_client`.
+        let client =
+            crate::net::guarded_client(&url, std::time::Duration::from_millis(4_000)).await?;
         let mut resp = match client.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -305,10 +306,10 @@ pub async fn fetch_json(uri: &str, timeout_ms: u64) -> Option<serde_json::Value>
 }
 
 async fn one_json(url: String, timeout_ms: u64) -> Option<serde_json::Value> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .build()
-        .ok()?;
+    // Same guard as the art path: this URL is on-chain, attacker-written, and
+    // the host is only judged once it has been resolved and pinned.
+    let client =
+        crate::net::guarded_client(&url, std::time::Duration::from_millis(timeout_ms)).await?;
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
