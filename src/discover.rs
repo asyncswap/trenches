@@ -22,6 +22,7 @@
 
 use std::io::Stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1798,6 +1799,12 @@ pub struct FlaunchPool {
 
 pub async fn fetch_flaunch_pool<P: Provider>(provider: &P, token: Address) -> Option<FlaunchPool> {
     use alloy::sol_types::SolValue;
+    // Not deployed here. The launch scan already refuses to watch address zero
+    // for exactly this reason; this walk was still asking it, so every pasted
+    // BNB token that missed on Flap and Pancake bought an `eth_call` to nobody.
+    if flaunch_pm().is_zero() {
+        return None;
+    }
     let pm = IFlaunchPositionManager::new(flaunch_pm(), provider);
     let key = tokio::time::timeout(RPC_TIMEOUT, pm.poolKey(token).call())
         .await
@@ -1822,6 +1829,12 @@ pub async fn fetch_flaunch_by_id<P: Provider>(
     provider: &P,
     pool_id: B256,
 ) -> Option<(Address, FlaunchPool)> {
+    // Not deployed here — and this one matters more than the call above: it is
+    // a getLogs from block 0 across the whole chain, which on a chain with no
+    // Flaunch is a full-history scan guaranteed to find nothing.
+    if flaunch_pm().is_zero() {
+        return None;
+    }
     // The balanced transport steers this wide scan to an endpoint that can
     // answer it.
     let filter = Filter::new()
@@ -2235,11 +2248,26 @@ async fn verified_rows(
     rows
 }
 
-/// The discovery rows, alive for the whole process so leaving the screen and
-/// coming back does not start from nothing.
+/// The discovery rows for the chain currently selected, alive for the whole
+/// process so leaving the screen and coming back does not start from nothing.
+///
+/// Keyed by chain id, and the key is the whole point. This was ONE list for
+/// the process, and a chain change does not restart the process — so the rows
+/// you left behind stayed on the screen and were relabelled in the new chain's
+/// units. Base Flaunch launches sat on the BNB trenches list priced in BNB,
+/// under a venue that is not deployed there, and pressing Enter would have
+/// pointed the trader at a pool on a chain it was not connected to. A row
+/// belongs to the chain it launched on and to no other.
 fn rows_cache() -> Arc<Mutex<Vec<Row>>> {
-    static CACHE: std::sync::OnceLock<Arc<Mutex<Vec<Row>>>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default).clone()
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<u64, Arc<Mutex<Vec<Row>>>>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(crate::chain_id())
+        .or_default()
+        .clone()
 }
 
 /// Ceiling on the list, so a busy day cannot grow it without bound.
@@ -2431,8 +2459,17 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     trader: Address,
     shared: Arc<Mutex<Vec<Row>>>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     disc_url: Option<String>,
 ) {
+    // Released however this task ends, so the chain can get a new one.
+    let _alive = Alive(alive);
+    // The chain this task was spawned for. `provider`, `shared` and every
+    // address `contracts` hands out below were resolved for it, and none of
+    // them follow a chain change — so when the global moves, this task is
+    // finished. Reading a live global rather than trusting the spawn to be
+    // torn down is deliberate: nothing tears it down.
+    let my_chain = crate::chain_id();
     let client = reqwest::Client::new();
     // How far the launch log has been read. Everything below hangs off this:
     // the window is scanned once, and after that only the blocks that are new.
@@ -2481,7 +2518,7 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
         ],
     );
 
-    // Runs for the life of the process, NOT for the life of the screen.
+    // Runs for the life of the CHAIN, not for the life of the screen.
     //
     // This used to be `while !stop`, which read as "stop when nobody is
     // looking" and meant "end the task". Leaving the screen sets that flag, and
@@ -2489,7 +2526,17 @@ async fn run_discovery<P: Provider + Clone + Send + Sync + 'static>(
     // discovery, the loop exited, nothing respawned it, and every later visit
     // showed the rows frozen at the moment you walked away. `stop` is the
     // visibility gate below, and only that.
+    //
+    // Leaving the CHAIN is the one thing that does end it, checked below.
     loop {
+        // Left this chain: stop. Not "pause" — the provider, the launchpad
+        // addresses and the rows are all this chain's, so every read from here
+        // would be spent on a chain nobody is looking at, on a metered
+        // endpoint, to fill a list that is no longer on screen.
+        if crate::chain_id() != my_chain {
+            crate::trace(&format!("discovery: chain left {my_chain}, task ending"));
+            return;
+        }
         // A head read that did not answer is not block zero. It used to fall
         // back to 0, which made the window below `0..0` — a real getLogs call
         // for the genesis block, issued every round, finding nothing and
@@ -3230,27 +3277,50 @@ pub fn ensure_discovery<P: Provider + Clone + Send + Sync + 'static>(
     trader: Address,
     disc_url: Option<String>,
 ) {
-    let (stop, fresh) = discovery_task();
-    if fresh {
+    let (stop, alive) = discovery_task();
+    // `swap` and not a read-then-write: two callers arriving together must not
+    // both spawn, and the marker IS the claim on the slot.
+    if !alive.swap(true, Ordering::SeqCst) {
         // Background budgets until a screen opens and clears the flag.
         stop.store(true, Ordering::Relaxed);
-        tokio::spawn(run_discovery(provider.clone(), trader, rows_cache(), stop, disc_url));
+        tokio::spawn(run_discovery(provider.clone(), trader, rows_cache(), stop, alive, disc_url));
     }
 }
 
-/// The one discovery task's visibility flag, and whether this call created it.
+/// This chain's discovery task: its visibility flag, and the marker saying a
+/// task is running for it.
 ///
-/// `true` means the screen is closed. The task keeps running either way — see
-/// the visibility gate in `run_discovery` — so this decides how much work it
-/// does, not whether it exists.
-fn discovery_task() -> (Arc<AtomicBool>, bool) {
-    static TASK: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
-    let mut created = false;
-    let flag = TASK.get_or_init(|| {
-        created = true;
-        Arc::new(AtomicBool::new(false))
-    });
-    (flag.clone(), created)
+/// `stop` is visibility — `true` means the screen is closed. The task keeps
+/// running either way (see the gate in `run_discovery`), so it decides how
+/// much work is done, not whether the task exists.
+///
+/// `alive` is existence, and it is per-chain for the same reason the rows are.
+/// This was one process-wide `OnceLock`, so the FIRST chain whose trenches
+/// screen you opened got the only task there would ever be — every later chain
+/// found it already created, spawned nothing, and watched a task polling a
+/// different chain's provider fill a list it then relabelled as its own.
+fn discovery_task() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    static TASKS: std::sync::OnceLock<Mutex<HashMap<u64, (Arc<AtomicBool>, Arc<AtomicBool>)>>> =
+        std::sync::OnceLock::new();
+    TASKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(crate::chain_id())
+        // Starts visible and not alive: `ensure_discovery` claims the slot.
+        .or_insert_with(|| (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))))
+        .clone()
+}
+
+/// Clears a chain's `alive` marker however its task ends — returned, dropped
+/// or panicked. Without it a task that exited would leave the slot claimed
+/// forever, and returning to that chain would show a list nothing is filling.
+struct Alive(Arc<AtomicBool>);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The live discovery screen. Returns the chosen graduation to enter, or None
@@ -4397,6 +4467,95 @@ mod flap_live_tests {
         (head, flap)
     }
 
+    /// A graduated launch whose pool does NOT pair the gas token.
+    ///
+    /// QQQB ("Invesqo QQQ") is a tokenized equity, and Flap will sell a
+    /// launch quoted in it for BNB — so the app trades this coin in BNB and
+    /// its `PoolKind::Flap` carries a zero quote. Its PAIR holds no WBNB at
+    /// all. Sorting the coin against WBNB (which is what the tape used to do)
+    /// therefore put it on the wrong side of every amount: buys read as sells,
+    /// the token amount landed in the quote column, and the price came out
+    /// inverted — a market cap in the quintillions on screen.
+    ///
+    /// The pair is the authority on which token is `token0`. Assert it
+    /// disagrees with the sort, so the day this stops being a real case the
+    /// test says so rather than passing for the wrong reason.
+    #[tokio::test]
+    #[ignore = "live BNB Chain"]
+    async fn flap_live_a_cross_quoted_graduate_takes_its_side_from_the_pair() {
+        let p = bnb().await;
+        const COIN: Address = alloy::primitives::address!("6B38aB769adB7B696f13B039ff6E92925c757777");
+        let st = crate::engine::flap_state(&p, flap_portal(), COIN).await.expect("portal record");
+        assert_eq!(st.status, crate::engine::FLAP_STATUS_DEX, "this fixture is a graduate");
+        assert!(!st.pool.is_zero(), "a graduate names its pool");
+        assert!(!st.quoteTokenAddress.is_zero(), "and it is quoted in something that is not the gas token");
+
+        let pair = crate::contracts::IV2Pair::new(st.pool, &p);
+        let t0 = pair.token0().call().await.expect("pair token0")._0;
+        let coin_is_0 = t0 == COIN;
+
+        // What the pair says, against what sorting against WBNB would guess.
+        let guessed = COIN < weth();
+        assert_ne!(
+            coin_is_0, guessed,
+            "the whole point of this fixture is that the guess is wrong; if the pair changed, pick another"
+        );
+        // And the pair really does hold the launch quote, not wrapped native.
+        let held = crate::contracts::IERC20::new(st.quoteTokenAddress, &p)
+            .balanceOf(st.pool)
+            .call()
+            .await
+            .expect("quote balance")
+            ._0;
+        assert!(!held.is_zero(), "the pool holds the LAUNCH quote — that is the depth `Pooled` must read");
+    }
+
+    /// The market read of that same cross-quoted graduate.
+    ///
+    /// Two things it must get right, both of which it used to get wrong:
+    /// `Pooled` has to show the DEX pool's depth (the curve is empty after
+    /// graduation, so this read used to be 0/0), and that depth has to be
+    /// expressed in the asset we trade in — the pool holds a tokenized equity,
+    /// the header says BNB, and those are not the same number.
+    #[tokio::test]
+    #[ignore = "live BNB Chain"]
+    async fn flap_live_a_cross_quoted_graduate_reports_depth_in_what_we_trade_in() {
+        let p = bnb().await;
+        const COIN: Address = alloy::primitives::address!("6B38aB769adB7B696f13B039ff6E92925c757777");
+        let st = crate::engine::flap_state(&p, flap_portal(), COIN).await.expect("portal record");
+        let pref = engine::PoolRef {
+            // Zero quote: what the app does for a launch the Portal will sell
+            // for the gas token, which is the whole cross case.
+            kind: engine::PoolKind::Flap { portal: flap_portal(), quote: Address::ZERO, on_dex: true },
+            token: COIN,
+            quote: engine::Quote::Eth,
+            token_decimals: 18,
+            cross_rate: 1.0,
+        };
+        let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
+        println!("pooled quote {} tokens {} spot {} cross_rate {}", m.r0, m.r1, m.spot, m.cross_rate);
+
+        assert!(m.r0 > 0.0, "a graduate's depth is in its pool, not on the drained curve");
+        assert!(m.r1 > 0.0, "and so is the token side");
+        assert!(m.cross_rate > 0.0 && m.cross_rate.is_finite(), "the bridge must be a real rate");
+
+        // The pool's RAW quote holding, for comparison. `r0` is that amount
+        // carried into the gas token, so the two agree only when the rate is
+        // 1 — and here it must not be, because the assets differ.
+        let raw = crate::contracts::IERC20::new(st.quoteTokenAddress, &p)
+            .balanceOf(st.pool)
+            .call()
+            .await
+            .expect("pool quote balance")
+            ._0;
+        let raw = crate::engine::units_to_f64(raw, 18);
+        assert!((m.r0 - raw * m.cross_rate).abs() <= raw * m.cross_rate * 1e-6, "r0 IS the bridged holding");
+
+        // And the depth must be worth something sane in BNB — not the raw
+        // equity amount passed through unconverted, and not zero.
+        assert!(m.r0 > 0.0 && m.r0 < 1e9, "pooled depth in the gas token is a real quantity: {}", m.r0);
+    }
+
     /// Discovery's decode of a live TokenCreated, then the Portal's record
     /// for it: on its curve, priced, with a total supply of 1e9.
     #[tokio::test]
@@ -4424,6 +4583,7 @@ mod flap_live_tests {
             token: c.token,
             quote: engine::Quote::Eth,
             token_decimals: 18,
+            cross_rate: 1.0,
         };
         let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
         println!("market: ready {} spot {} r0 {} r1 {} supply {}", m.ready, m.spot, m.r0, m.r1, m.supply);
@@ -4555,6 +4715,7 @@ mod flap_live_tests {
             token,
             quote: engine::Quote::Eth,
             token_decimals: 18,
+            cross_rate: 1.0,
         };
         let swaps = engine::read_swaps(&p, pref, head - 200, head).await.expect("read_swaps");
         println!("tape rows: {}", swaps.len());
@@ -4591,6 +4752,7 @@ mod flap_live_tests {
             token,
             quote: engine::Quote::Eth,
             token_decimals: 18,
+            cross_rate: 1.0,
         };
         let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
         let record_price = engine::units_to_f64(st.price, 18);
@@ -4706,6 +4868,7 @@ mod pancake_live_tests {
                 token: CAKE,
                 quote: engine::Quote::Eth,
                 token_decimals: 18,
+                cross_rate: 1.0,
             };
             let swaps = engine::read_swaps(&p, pref, head - 300, head).await.expect("read_swaps");
             println!("CAKE/WBNB fee {fee} pool {pool:#x}: {} swaps in 300 blocks", swaps.len());
@@ -4719,6 +4882,7 @@ mod pancake_live_tests {
             token: CAKE,
             quote: engine::Quote::Eth,
             token_decimals: 18,
+            cross_rate: 1.0,
         };
         let m = engine::read_market(&p, pref, FUNDED).await.expect("read_market");
         println!("market: ready {} spot {} CAKE/BNB r0 {} r1 {} tick {}", m.ready, m.spot, m.r0, m.r1, m.tick);

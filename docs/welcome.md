@@ -14,10 +14,10 @@ A terminal trading bot.
 - Uniswap V3
 - Uniswap V4
 - pons.family
-- Flaunch
-- pools.fun — SushiSwap V3
+- Flaunch — on Base
+- pools.fun — SushiSwap V3, on Robinhood Chain
 - Flap — on BNB Chain and Robinhood Chain
-- PancakeSwap V3
+- PancakeSwap V3 — on BNB Chain
 - pump.fun
 - PumpSwap AMM
 

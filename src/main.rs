@@ -1707,6 +1707,9 @@ fn to_poolcfg(p: &SelPool) -> engine::PoolCfg {
         // still starts at $1: that is a prior about a peg, not a guess at a
         // market, and the feed corrects it either way.
         quote_usd: if p.quote.is_eth() { pricing::native_usd() } else { 1.0 },
+        // Same asset until a market read says otherwise. Only a cross-quoted
+        // Flap launch ever moves it off 1.
+        cross_rate: 1.0,
     }
 }
 
@@ -4695,7 +4698,16 @@ async fn run<P: Provider + Clone + Send + Sync + 'static>(
                                     0 => {
                                         // Paste a token address → auto-find its liquid WETH
                                         // v3 pool. Fast path for tokens found in the wild.
-                                        match ui::input(terminal, "Add token by contract address", "paste the CA (0x…, 20 bytes), or a 32-byte Flaunch pool id")? {
+                                        // The hint names only what THIS chain can resolve. It said
+                                        // "or a 32-byte Flaunch pool id" everywhere, including on
+                                        // chains with no Flaunch — offering an input that could
+                                        // only ever fail.
+                                        let hint = if contracts::flaunch_pm().is_zero() {
+                                            "paste the CA (0x…, 20 bytes)"
+                                        } else {
+                                            "paste the CA (0x…, 20 bytes), or a 32-byte Flaunch pool id"
+                                        };
+                                        match ui::input(terminal, "Add token by contract address", hint)? {
                                             Some(s) => match s.trim().parse::<alloy::primitives::Address>() {
                                                 Ok(token) => {
                                                     let sym = read_symbol(provider, token).await;

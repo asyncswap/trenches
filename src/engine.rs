@@ -409,6 +409,18 @@ pub struct PoolCfg {
     pub quote: Quote,       // what the pool is priced in (ETH or a stablecoin)
     pub quote_sym: String,  // display symbol for the quote side ("ETH", "USDG")
     pub quote_usd: f64,     // live USD value of one quote unit (fetched)
+    /// How much of the asset we TRADE IN one unit of the pool's own quote
+    /// asset is worth. `1.0` whenever they are the same asset, which is every
+    /// venue except one.
+    ///
+    /// Flap will sell a launch quoted in a tokenized equity for the gas token,
+    /// so the app trades such a coin in BNB while its POOL holds no BNB at
+    /// all. Every amount read out of that pool — a swap on the tape, the
+    /// pooled depth — is denominated in the equity, and printing it under a
+    /// header that says BNB, or multiplying it by BNB's dollar rate, is a unit
+    /// error the size of the gap between the two assets. This is the bridge,
+    /// and it is applied at the point a pool amount becomes a displayed one.
+    pub cross_rate: f64,
 }
 
 /// Copyable pool reference for the off-thread market reader.
@@ -418,6 +430,8 @@ pub struct PoolRef {
     pub token: Address,
     pub quote: Quote,
     pub token_decimals: u8,
+    /// See `PoolCfg::cross_rate`.
+    pub cross_rate: f64,
 }
 
 impl PoolCfg {
@@ -427,6 +441,7 @@ impl PoolCfg {
             token: self.token,
             quote: self.quote,
             token_decimals: self.token_decimals,
+            cross_rate: self.cross_rate,
         }
     }
 }
@@ -2160,6 +2175,10 @@ fn order_fields(o: &Order) -> Vec<String> {
         if m.supply > 0.0 {
             self.token_supply = m.supply;
         }
+        // Only a full read establishes it, and only a positive one is a rate.
+        if m.full && m.cross_rate > 0.0 {
+            self.pool.cross_rate = m.cross_rate;
+        }
         if was_ready && !self.ready {
             self.logline("STATE pool went ILLIQUID (no active liquidity)");
         } else if !was_ready && self.ready {
@@ -2236,6 +2255,9 @@ fn order_fields(o: &Order) -> Vec<String> {
                 token: r.token,
                 quote: Quote::Eth,
                 token_decimals: self.pool.token_decimals,
+                // Route probes quote through the router in the traded asset
+                // already; there is no pool amount here to bridge.
+                cross_rate: 1.0,
             };
             // A curve is not a constant-product pool from the quote's point of
             // view: buys are taxed off the input (fee + creator + snipe) and
@@ -3934,6 +3956,11 @@ pub struct Market {
     /// The impact band uses these where they are set, since the real depth in
     /// r0/r1 is not what a curve's price moves on. Zero for pools.
     pub virt: (f64, f64),
+    /// See `PoolCfg::cross_rate`. `1.0` for every venue that prices in the
+    /// asset it is traded in, which is all of them but a cross-quoted Flap
+    /// launch. Carried on the market read because that is the only place with
+    /// both prices in hand at once.
+    pub cross_rate: f64,
 }
 
 /// Read price/liquidity + balances for a pool. Standalone so a background task
@@ -4039,6 +4066,7 @@ async fn read_market_inner<P: Provider>(
             supply: 0.0,
             full,
             virt: (0.0, 0.0),
+            cross_rate: 1.0,
         });
     }
     // A Flap launch: the Portal is the source of truth for the whole life of
@@ -4067,6 +4095,9 @@ async fn read_market_inner<P: Provider>(
         let mut raised = raised_quote;
         let dex_now = st.status == FLAP_STATUS_DEX || on_dex;
         let cross = quote.is_zero() && !st.quoteTokenAddress.is_zero();
+        // 1.0 unless the pool prices in an asset we do not trade in; filled in
+        // from the pool's own ratio below, where both sides are in hand.
+        let mut cross_rate = 1.0f64;
         if dex_now || cross {
             // A probe: what 0.01 of what we trade in buys, through the Portal.
             // After graduation the record's price is frozen; across quotes
@@ -4091,7 +4122,7 @@ async fn read_market_inner<P: Provider>(
         // Tokens still on the curve, in the same slot a pool's token reserve
         // uses — depth on the token side, for the price-impact band.
         let circ = units_to_f64(st.circulatingSupply, pref.token_decimals);
-        let on_curve = (supply - circ).max(0.0);
+        let mut on_curve = (supply - circ).max(0.0);
         crate::trace(&format!(
             "flap market: status={} raised={raised} circ={circ} price={quote_per_token} progress={} dex={dex_now}",
             st.status,
@@ -4099,6 +4130,42 @@ async fn read_market_inner<P: Provider>(
         ));
         let eth = if full { native_balance(provider, trader).await } else { None };
         let spot = if quote_per_token > 0.0 { 1.0 / quote_per_token } else { 0.0 };
+        // After graduation the CURVE is empty by definition — `st.reserve` is
+        // zero and every token has been distributed, so `raised` and
+        // `on_curve` are both zero and the Pool box read "Pooled 0 / 0" for a
+        // launch with a live, deep market behind it. The depth did not vanish;
+        // it moved to the pool the Portal migrated to, and that is where it
+        // has to be read from.
+        //
+        // Balances of the pool address, not `getReserves()`: a Flap graduate
+        // can land in a V2 pair or a concentrated pool, and what the pool
+        // HOLDS is the one question both answer the same way. It also sidesteps
+        // the ordering question entirely — no sorting, no token0 call.
+        if dex_now && !st.pool.is_zero() {
+            // The pair's own quote asset, which is the LAUNCH's quote — not
+            // whatever we happen to trade in. A launch quoted in a tokenized
+            // equity is bought with the gas token through the Portal, but its
+            // pool holds no gas token at all, so asking for the wrong one here
+            // is how both sides came back zero.
+            let pq = if st.quoteTokenAddress.is_zero() { weth() } else { st.quoteTokenAddress };
+            let qerc = IERC20::new(pq, provider);
+            let cb_q = qerc.balanceOf(st.pool);
+            let cb_t = erc.balanceOf(st.pool);
+            let (pooled_q, pooled_t) = tokio::join!(cb_q.call(), cb_t.call());
+            let pooled_q = pooled_q.map(|b| units_to_f64(b._0, launch_quote_dec)).unwrap_or(0.0);
+            let pooled_t = pooled_t.map(|b| units_to_f64(b._0, pref.token_decimals)).unwrap_or(0.0);
+            if pooled_q > 0.0 || pooled_t > 0.0 {
+                // What one unit of the POOL's quote asset is worth in the asset
+                // we trade in. The pool ratio gives pool-quote per token; the
+                // Portal's probe gives traded-asset per token; their ratio is
+                // the bridge, and it needs no price feed for the third asset.
+                if cross && pooled_q > 0.0 && quote_per_token > 0.0 {
+                    cross_rate = quote_per_token * pooled_t / pooled_q;
+                }
+                raised = pooled_q * cross_rate;
+                on_curve = pooled_t;
+            }
+        }
         // The curve is (x + h)(y + r) = k in the launch's quote: virtual
         // token reserve x + h (x = tokens still on the curve), virtual quote
         // reserve k / (x + h). Only while it IS a curve, and only in the asset
@@ -4142,6 +4209,7 @@ async fn read_market_inner<P: Provider>(
             supply,
             full,
             virt,
+            cross_rate,
         });
     }
     let (sqrt_p, tick, l) = match pref.kind {
@@ -4307,6 +4375,7 @@ async fn read_market_inner<P: Provider>(
         supply,
         full,
         virt: (0.0, 0.0),
+        cross_rate: 1.0,
     })
 }
 
@@ -4568,10 +4637,34 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
                     .from_block(from_block)
                     .to_block(to_block);
                 let logs = crate::rpcstats::timed("eth_getLogs", provider.get_logs(&filter)).await?;
-                // A V2 pair sorts its two tokens by address, and a native
-                // launch pairs the WRAPPED gas token.
-                let quote_addr = if quote.is_zero() { weth() } else { quote };
-                let token_is_0 = pref.token < quote_addr;
+                // ASK the pair which side the coin is on. It used to be
+                // inferred — `pref.token < quote_addr`, with `quote_addr`
+                // falling back to wrapped native — and that inference is wrong
+                // for exactly the launches this arm exists to serve.
+                //
+                // A launch quoted in a tokenized equity that the Portal will
+                // also sell for the gas token is TRADED in the gas token, so
+                // `quote` is zero here while the pair holds no wrapped native
+                // at all. Sorting the coin against WBNB instead of against the
+                // real quote put it on the wrong side of every field: buys
+                // read as sells, the token amount landed in the quote column,
+                // and the price came out inverted — off by the square of the
+                // pool ratio, which is how a 1e18 market cap gets on screen.
+                //
+                // The pair knows. One call, once per tape read, and it cannot
+                // be wrong.
+                let pair = IV2Pair::new(st.pool, provider);
+                let token_is_0 = match crate::rpcstats::timed("eth_call", pair.token0().call()).await {
+                    Ok(t) => t._0 == pref.token,
+                    // Unanswered is not "assume". Sorting against the launch's
+                    // OWN quote (not wrapped native) is the closest thing to
+                    // the truth available without the call.
+                    Err(_) => {
+                        let q = if quote.is_zero() { st.quoteTokenAddress } else { quote };
+                        let q = if q.is_zero() { weth() } else { q };
+                        pref.token < q
+                    }
+                };
                 for lg in &logs {
                     let d = lg.data().data.as_ref();
                     // amount0In, amount1In, amount0Out, amount1Out
@@ -4583,7 +4676,12 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
                     };
                     let buying = !q_in.is_zero() && !t_out.is_zero();
                     let (quote_raw, token_raw) = if buying { (q_in, t_out) } else { (q_out, t_in) };
-                    let q = units_to_f64(quote_raw, quote_dec);
+                    // The pair's amounts are in the POOL's quote asset. For a
+                    // cross-quoted launch that is not what the column header
+                    // says, nor what `quote_usd` prices — so bridge it here,
+                    // once, at the point a pool amount becomes a shown one.
+                    // `1.0` for every other pool, which is every other pool.
+                    let q = units_to_f64(quote_raw, quote_dec) * pref.cross_rate;
                     let t = units_to_f64(token_raw, token_dec);
                     if q <= 0.0 || t <= 0.0 {
                         continue;
@@ -4591,6 +4689,9 @@ pub async fn read_swaps<P: Provider>(provider: &P, pref: PoolRef, from_block: u6
                     out.push(Swap {
                         action: if buying { TapeAction::Buy } else { TapeAction::Sell },
                         eth: q,
+                        // Deliberately NOT scaled: this is the raw amount that
+                        // moved, and it keys the copy-step dedup. A converted
+                        // value is a display number, not an identity.
                         eth_wei: quote_raw.to_string().parse::<u128>().unwrap_or(0),
                         price: t / q,
                         // topic2 is `to`; the sender is a router. The taker's
