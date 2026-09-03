@@ -32,7 +32,17 @@ pub struct Pending {
     pub eth_amt: f64, // ETH spent (buy) or received (sell)
     pub tok_amt: f64, // tokens received (buy) or sold (sell)
     pub position_id: Option<U256>, // v4 position tokenId for mint/burn txs
+    /// When it was sent. A transaction that is neither mined nor in any
+    /// mempool has to be given up on at some point, and "how long has this
+    /// been in the air" is the only way to know when that point is.
+    pub sent: std::time::Instant,
 }
+
+/// How long a transaction may go without a receipt before we ask whether it
+/// still exists anywhere. Long enough that a slow node, a reorg or a
+/// congested block is just waiting; short enough that being stuck is not a
+/// state you sit in for the rest of the session.
+const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum OrderStatus {
@@ -2482,6 +2492,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
                 self.pending.push(Pending {
+                    sent: std::time::Instant::now(),
                     hash,
                     label,
                     side: None,
@@ -2887,7 +2898,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 self.note(format!("SENT {}  tx {}", label, hash));
                 // Record fill for cost-basis accounting (applied on confirm).
                 let (eth_amt, tok_amt) = if buying { (amount_in, expected) } else { (expected, amount_in) };
-                self.pending.push(Pending { hash, label, side: Some(side), eth_amt, tok_amt, position_id: None });
+                self.pending.push(Pending { hash, label, side: Some(side), eth_amt, tok_amt, position_id: None, sent: std::time::Instant::now() });
             }
             Err(e) => {
                 self.fails += 1;
@@ -2956,7 +2967,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
                 self.note(format!("SENT {}  tx {}", label, hash));
-                self.pending.push(Pending { hash, label, side, eth_amt, tok_amt, position_id: None });
+                self.pending.push(Pending { hash, label, side, eth_amt, tok_amt, position_id: None, sent: std::time::Instant::now() });
                 Some(hash)
             }
             Err(e) => {
@@ -3296,7 +3307,42 @@ fn order_fields(o: &Order) -> Vec<String> {
                         self.logline(&format!("REVERTED {}  tx {}", p.label, p.hash));
                     }
                 }
-                _ => idx += 1,
+                // No receipt yet. That is normal for a few seconds — and
+                // permanent for a transaction that was dropped from the
+                // mempool or replaced by one with a different hash.
+                //
+                // This arm used to be `idx += 1` and nothing else, so a
+                // transaction that never landed stayed in `self.pending` for
+                // the rest of the session. Every entry there with a `side`
+                // trips the duplicate guard, so ONE dropped trade meant every
+                // later buy and every later sell-all was refused with "a trade
+                // is already pending" — including the exit from a position you
+                // were trying to get out of. There is no key that clears it.
+                //
+                // So: after the TTL, ask whether the transaction exists at
+                // all. `get_transaction_by_hash` answering `None` means no
+                // node has it, mined or pending — it is gone, and holding a
+                // slot for it helps nobody. Anything else (found, or the node
+                // did not answer) keeps waiting, because the cost of dropping
+                // a live trade is far higher than the cost of waiting longer.
+                _ => {
+                    let p = &self.pending[idx];
+                    if p.sent.elapsed() < PENDING_TTL {
+                        idx += 1;
+                        continue;
+                    }
+                    if !matches!(provider.get_transaction_by_hash(hash).await, Ok(None)) {
+                        idx += 1;
+                        continue;
+                    }
+                    let p = self.pending.remove(idx);
+                    self.fails += 1;
+                    self.settle_order(p.hash, OrderStatus::Failed, 0, 0.0);
+                    self.logline(&format!("DROPPED {}  never mined, gone from the mempool  tx {}", p.label, p.hash));
+                    // Said on the status line too: the trade did NOT happen,
+                    // and the position is whatever it was before it was sent.
+                    self.note(format!("{} never landed — it was dropped from the mempool. Nothing traded", p.label));
+                }
             }
         }
     }
@@ -3483,7 +3529,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
                 self.note(format!("PLACED {}  tx {}", label, hash));
                 self.mint_liq.insert(hash, liquidity); // link tx -> minted L
-                self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
+                self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id, sent: std::time::Instant::now() });
             }
             Err(e) => {
                 self.fails += 1;
@@ -3607,7 +3653,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 let hash = *p.tx_hash();
                 self.push_order_valued(label.clone(), OrderStatus::Pending, Some(hash), expected_quote);
                 self.note(format!("PLACED {}  tx {}", label, hash));
-                self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
+                self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id, sent: std::time::Instant::now() });
             }
             Err(e) => {
                 self.fails += 1;
@@ -3815,7 +3861,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 self.last_side = Side::Sell;
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
                 self.note(format!("SENT {}  tx {}", label, hash));
-                self.pending.push(Pending { hash, label, side: Some(Side::Sell), eth_amt: expected, tok_amt: amount_in, position_id: None });
+                self.pending.push(Pending { hash, label, side: Some(Side::Sell), eth_amt: expected, tok_amt: amount_in, position_id: None, sent: std::time::Instant::now() });
             }
             Err(e) => {
                 self.fails += 1;
@@ -3852,7 +3898,7 @@ fn order_fields(o: &Order) -> Vec<String> {
                 let hash = *p.tx_hash();
                 self.push_order(label.clone(), OrderStatus::Pending, Some(hash));
                 self.note(format!("PLACED {label}  tx {}", hash));
-                self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id });
+                self.pending.push(Pending { hash, label, side: None, eth_amt: 0.0, tok_amt: 0.0, position_id: burn_id, sent: std::time::Instant::now() });
             }
             Err(e) => {
                 self.fails += 1;
