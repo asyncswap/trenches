@@ -552,8 +552,16 @@ pub fn merge_tape(tape: &mut Vec<SolSwap>, fresh: Vec<SolSwap>) -> Vec<SolSwap> 
     // Oldest first: the log reads chronologically, the table newest-first.
     let mut added = add.clone();
     added.sort_by(|a, b| {
-        (a.slot, a.block_time.unwrap_or(i64::MIN), &a.signature, a.event_idx)
-            .cmp(&(b.slot, b.block_time.unwrap_or(i64::MIN), &b.signature, b.event_idx))
+        // Oldest first, so the mirror of the table's order: within a slot the
+        // HIGHEST rank is the oldest.
+        (a.slot, a.block_time.unwrap_or(i64::MIN))
+            .cmp(&(b.slot, b.block_time.unwrap_or(i64::MIN)))
+            .then_with(|| match (a.ord, b.ord) {
+                (Some(x), Some(y)) => y.cmp(&x),
+                _ => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.signature.cmp(&b.signature))
+            .then_with(|| a.event_idx.cmp(&b.event_idx))
     });
     tape.extend(add);
     // Slot first — the chain's own order. Time only covers a missing slot,
@@ -561,7 +569,24 @@ pub fn merge_tape(tape: &mut Vec<SolSwap>, fresh: Vec<SolSwap>) -> Vec<SolSwap> 
     tape.sort_by(|a, b| {
         (b.slot, b.block_time.unwrap_or(i64::MIN))
             .cmp(&(a.slot, a.block_time.unwrap_or(i64::MIN)))
+            // Execution order within the slot: 0 is the newest, so ascending
+            // keeps the newest-first reading of the table. This replaces the
+            // signature as the tiebreak, which sorted a burst alphabetically.
+            //
+            // ONLY when both rows carry a rank. An unranked row (socket, or
+            // your own fill injected on confirmation) must not be compared
+            // against a ranked one — `Option`'s own ordering puts `None`
+            // first, which would sort exactly those rows to the top of the
+            // slot and pin your trades there.
+            .then_with(|| match (a.ord, b.ord) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ => std::cmp::Ordering::Equal,
+            })
+            // Rows that cannot be compared by rank fall back to where they
+            // always were. Stable, if arbitrary, which is what a tiebreak of
+            // last resort has to be.
             .then_with(|| a.signature.cmp(&b.signature))
+            // Legs WITHIN one transaction always read in execution order.
             .then_with(|| a.event_idx.cmp(&b.event_idx))
     });
     tape.truncate(TAPE_RING);
@@ -920,6 +945,23 @@ pub struct SolSwap {
     /// (ties broke by SIGNATURE — alphabetical, i.e. random): the pooled
     /// column jumped around while gmgn, sorting by slot, read smoothly.
     pub slot: u64,
+    /// Where this transaction sat in the newest-first batch it was fetched in
+    /// — 0 is the newest. Within one slot that IS execution order reversed,
+    /// because `getSignaturesForAddress` returns an account's transactions in
+    /// the chain's own order.
+    ///
+    /// Slot alone does not order a busy coin: several trades land in the same
+    /// slot and the tie used to break on the base58 SIGNATURE, which is
+    /// alphabetical — i.e. random. A burst of trades in one slot came out
+    /// shuffled, and the pooled column jumped up and down between rows that
+    /// were supposed to read as a sequence.
+    ///
+    /// Comparable within a batch, which is where the shuffling was visible:
+    /// a burst arrives in one fetch. Two rows from different rounds fall back
+    /// to the signature as before — no worse than it was, and right for the
+    /// case that showed.
+    #[serde(default)]
+    pub ord: Option<u32>,
     /// True when the trader is us.
     pub mine: bool,
 }
@@ -1091,8 +1133,14 @@ pub async fn pool_tape(
     }
 
     let mut out = Vec::new();
-    for (sig, tx) in fetched {
-        out.extend(curve_swaps_in_tx(&tx, &sig, mint, trader));
+    // `fetched` holds the RPC's newest-first order; its index is the rank the
+    // tape sorts same-slot rows by.
+    for (rank, (sig, tx)) in fetched.into_iter().enumerate() {
+        let mut rows = curve_swaps_in_tx(&tx, &sig, mint, trader);
+        for r in rows.iter_mut() {
+            r.ord = Some(rank as u32);
+        }
+        out.append(&mut rows);
     }
     TapeBatch { rows: out, scanned, unanswered, fresh_total }
 }
@@ -1146,6 +1194,14 @@ pub fn curve_swaps_in_tx(
                 event_idx,
                 block_time,
                 slot,
+                // Stamped by the fetch loop, which is the thing that knows the
+                // batch's newest-first order. A pure decoder cannot — and a
+                // row that arrives any other way (the socket, your own fill
+                // injected on confirmation) genuinely has no rank. `None`
+                // says so. It used to default to 0, i.e. "newest in this
+                // slot", which quietly pinned every one of your own trades to
+                // the top of its slot.
+                ord: None,
             });
             event_idx += 1;
         }
@@ -1348,8 +1404,14 @@ pub async fn amm_tape(
     }
 
     let mut out = Vec::new();
-    for (sig, tx) in fetched {
-        out.extend(amm_swaps_in_tx(&tx, &sig, pool, trader, token_decimals, sol_is_base, total_supply));
+    // Same as the curve tape: batch position is same-slot execution order.
+    for (rank, (sig, tx)) in fetched.into_iter().enumerate() {
+        let mut rows =
+            amm_swaps_in_tx(&tx, &sig, pool, trader, token_decimals, sol_is_base, total_supply);
+        for r in rows.iter_mut() {
+            r.ord = Some(rank as u32);
+        }
+        out.append(&mut rows);
     }
     TapeBatch { rows: out, scanned, unanswered, fresh_total }
 }
@@ -1458,6 +1520,8 @@ pub fn amm_swaps_in_tx(
                 event_idx,
                 block_time: block_time.or(Some(ts)),
                 slot,
+                // Stamped by the fetch loop — see the curve decoder.
+                ord: None,
             });
             event_idx += 1;
         }
@@ -1790,6 +1854,7 @@ mod shape_tests {
             block_time: Some(0),
             slot: 1,
             mine: true,
+            ord: None,
         }];
         assert!(tape_view(&swaps, 0, 20, 150.0).is_well_formed());
     }
@@ -2107,6 +2172,7 @@ mod tape_view_tests {
                 block_time: Some(i as i64),
                 slot: i as u64,
                 mine: false,
+                ord: None,
             })
             .collect()
     }
@@ -2154,6 +2220,7 @@ mod tape_merge_tests {
             block_time: Some(t),
             slot: t.max(0) as u64,
             mine: false,
+            ord: None,
         }
     }
 
@@ -2166,6 +2233,69 @@ mod tape_merge_tests {
         merge_tape(&mut tape, vec![swap("d", 4), swap("c", 3)]);
         let sigs: Vec<&str> = tape.iter().map(|t| t.signature.as_str()).collect();
         assert_eq!(sigs, vec!["d", "c", "b"], "newest first, nothing lost");
+    }
+
+    /// Same slot, so the tie has to be broken by something. It used to be the
+    /// base58 signature — alphabetical, which is to say random — and a burst
+    /// of trades inside one slot came out shuffled against the order they
+    /// actually executed in.
+    #[test]
+    fn trades_in_one_slot_read_in_execution_order_not_alphabetical() {
+        // `ord` is the position in the RPC's newest-first batch: 0 is newest.
+        // Signatures are chosen so alphabetical order is the REVERSE of
+        // execution order — if the sort still leans on them, this fails.
+        let mut a = swap("aaa", 5); // oldest of the three
+        a.ord = Some(2);
+        let mut b = swap("mmm", 5);
+        b.ord = Some(1);
+        let mut c = swap("zzz", 5); // newest
+        c.ord = Some(0);
+
+        let mut tape = Vec::new();
+        merge_tape(&mut tape, vec![a, b, c]);
+        let sigs: Vec<&str> = tape.iter().map(|t| t.signature.as_str()).collect();
+        assert_eq!(sigs, vec!["zzz", "mmm", "aaa"], "newest-first WITHIN the slot");
+    }
+
+    /// An unranked row must not jump the queue.
+    ///
+    /// Your own fill is injected straight from its signature the moment it
+    /// confirms, and the socket pushes rows too — neither goes through the
+    /// ranked batch fetch, so neither has an `ord`. Comparing `None` against
+    /// `Some` with the derived ordering puts `None` first, which pinned every
+    /// one of your own trades to the top of its slot and kept it there.
+    #[test]
+    fn a_row_with_no_batch_rank_does_not_pin_to_the_top_of_its_slot() {
+        let mut ranked_newest = swap("aaa", 7);
+        ranked_newest.ord = Some(0);
+        let mut ranked_older = swap("bbb", 7);
+        ranked_older.ord = Some(1);
+        // No rank: arrived by socket or as our own injected fill.
+        let unranked = swap("ccc", 7);
+
+        let mut tape = Vec::new();
+        merge_tape(&mut tape, vec![ranked_older, unranked, ranked_newest]);
+        let sigs: Vec<&str> = tape.iter().map(|t| t.signature.as_str()).collect();
+        // The ranked pair keeps its own order; the unranked row falls back to
+        // the signature tiebreak rather than outranking both.
+        assert_eq!(sigs[0], "aaa", "the batch's newest still leads");
+        assert!(sigs.contains(&"ccc"), "and nothing is dropped");
+        assert_ne!(sigs[0], "ccc", "an unranked row must not claim the top");
+    }
+
+    /// The slot still outranks the batch position: a row from an older slot
+    /// belongs below, whatever rank it happened to be fetched at.
+    #[test]
+    fn the_slot_still_decides_before_the_batch_position() {
+        let mut old_but_first = swap("aaa", 4);
+        old_but_first.ord = Some(0);
+        let mut new_but_last = swap("bbb", 9);
+        new_but_last.ord = Some(7);
+
+        let mut tape = Vec::new();
+        merge_tape(&mut tape, vec![old_but_first, new_but_last]);
+        let sigs: Vec<&str> = tape.iter().map(|t| t.signature.as_str()).collect();
+        assert_eq!(sigs, vec!["bbb", "aaa"], "slot 9 above slot 4");
     }
 
     fn leg(sig: &str, idx: usize, kind: SwapKind) -> SolSwap {

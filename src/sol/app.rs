@@ -1123,6 +1123,15 @@ pub struct SolOrder {
     /// Market cap (SOL) at order time — the entry point, as on the EVM side.
     pub mc: f64,
     pub pooled: f64,
+    /// Whether this order's cost basis, realized PnL and ledger row have been
+    /// written yet.
+    ///
+    /// Settling is deferred until the TRANSACTION has been read, because
+    /// `sol` above is what the order was SENT for — a pre-trade estimate — and
+    /// booking money against an estimate is how a losing round trip was
+    /// reported as a profit. A confirmed order that has not been decoded yet
+    /// is confirmed and unbooked, and the next reap round tries again.
+    pub booked: bool,
 }
 
 pub struct SolBot {
@@ -1530,6 +1539,7 @@ impl SolBot {
             sig,
             mc,
             pooled,
+            booked: false,
         });
         while self.orders.len() > RING {
             self.orders.pop_front();
@@ -1616,6 +1626,10 @@ impl SolBot {
                 sig: Some(s.signature.clone()),
                 mc: s.mkt_cap_sol,
                 pooled: s.pooled_sol,
+                // History, rebuilt for the Orders panel from the saved tape.
+                // Already booked in the session that made them — re-settling
+                // would count last week's PnL again on every start.
+                booked: true,
             });
         }
     }
@@ -1644,6 +1658,10 @@ impl SolBot {
         // real events under a dozen lines the moment a coin is selected.
         let first_fill = self.tape.is_empty();
         let added = discover::merge_tape(&mut self.tape, snap.tape.clone());
+        // Any confirmed order whose fill has now landed on the tape gets its
+        // real numbers booked. Cheap and idempotent: it walks the order ring
+        // and stops at the first order it cannot settle yet.
+        self.settle_from_tape();
         // New rows -> the coin's history file (debounced). This is what makes
         // a restart pick the story back up instead of starting it over.
         if !added.is_empty() {
@@ -1708,12 +1726,17 @@ impl SolBot {
         let Ok(statuses) = self.rpc.signatures_ok(&sigs).await else { return };
         for ((i, sig), status) in pending.into_iter().zip(statuses) {
             let Some(ok) = status else { continue };
-            let (action, sol, sold_tok) = match self.orders.get(i) {
-                Some(o) => (o.action, o.sol, o.tokens),
+            let (action, est_sol, booked) = match self.orders.get(i) {
+                Some(o) => (o.action, o.sol, o.booked),
                 None => continue,
             };
             if let Some(o) = self.orders.get_mut(i) {
                 o.state = if ok { OrderState::Confirmed } else { OrderState::Failed };
+            }
+            // Settled already on an earlier round — the status was all that
+            // was outstanding.
+            if booked {
+                continue;
             }
             // Neither a transfer nor a USDC/SOL swap is a trade in the sense
             // the rest of this loop means. Both settle like one — the signature
@@ -1729,6 +1752,12 @@ impl SolBot {
             // inject its rows into the tape — same decoders, same channel,
             // deduped by the seen-set like everything else. This is what
             // makes "buy, then sell immediately" reliable.
+            //
+            // OFF THIS THREAD, always. `reap` runs in the app loop, and an
+            // awaited RPC call here stalls the frame AND the poll behind it —
+            // the tape stops catching trades and the whole screen goes
+            // sluggish. The retry ladder belongs in a spawned task; what it
+            // finds comes back through the tape.
             if ok {
                 if let (Some(coin), Some(fills)) = (&self.coin, &self.fills_tx) {
                     let tgt = poll_target(coin, &self.signer.pubkey(), None);
@@ -1763,20 +1792,87 @@ impl SolBot {
                         }
                     });
                 }
+                // Booked from the TAPE, in `settle_from_tape` — pure memory, no
+                // await, and the tape row carries what actually filled rather
+                // than what was quoted. Confirmed-and-unbooked is an honest
+                // state to sit in for a round; confirmed-and-wrong is not.
+                continue;
             }
+            // Only the failure path reaches here — the confirmed one continued
+            // above — and it books no money, just the count and the message.
+            // `est_sol` is the quote, which is the honest thing to name for a
+            // trade that never filled: there is no fill to name instead.
+            if let Some(o) = self.orders.get_mut(i) {
+                o.booked = true;
+            }
+            self.fails += 1;
             // The WHOLE signature. A truncated one cannot be pasted into an
             // explorer, matched against a fill, or quoted in a bug report —
             // which is the entire reason it is written down.
-            let short = sig.clone();
-            if !ok {
-                self.fails += 1;
-                crate::events::error(
-                    "Trade reverted",
-                    &[("side", action.to_string()), ("sol", format!("{sol:.6}")), ("sig", short.clone())],
-                );
-                self.note(format!("The {action} for {sol:.6} SOL reverted, signature {short}"));
-                continue;
+            let short = sig;
+            crate::events::error(
+                "Trade reverted",
+                &[("side", action.to_string()), ("sol", format!("{est_sol:.6}")), ("sig", short.clone())],
+            );
+            self.note(format!("The {action} for {est_sol:.6} SOL reverted, signature {short}"));
+        }
+    }
+
+    /// Book a confirmed trade from what the chain says it FILLED, not from
+    /// what it was quoted at.
+    ///
+    /// Pure memory: called from `absorb`, which runs every frame and must
+    /// never await. The tape row it reads is put there by the spawned fetch
+    /// in `reap` (and by the socket), so the RPC cost lives off this thread.
+    ///
+    /// The order's own `sol` is the pre-trade quote. Settling against it
+    /// turned a round trip that LOST 0.00134 SOL into a reported +0.002051
+    /// profit — the sell was quoted 0.124543 and filled 0.119819, the buy was
+    /// booked at its own quote, and the two errors compounded instead of
+    /// cancelling. It reached the status line, the session `realized`, and the
+    /// permanent ledger, while the tape showed the true numbers on screen.
+    fn settle_from_tape(&mut self) {
+        loop {
+            // One order per pass: booking mutates `self`, so the row lookup
+            // and the write cannot overlap borrows.
+            let found = self.orders.iter().enumerate().find_map(|(i, o)| {
+                if o.state != OrderState::Confirmed || o.booked {
+                    return None;
+                }
+                if !matches!(o.action, "BUY" | "SELL") {
+                    return None;
+                }
+                let sig = o.sig.clone()?;
+                // Our legs of that transaction, on this side. An arbitrage tx
+                // carries both sides and a sandwich carries someone else's.
+                let want_buy = o.action == "BUY";
+                let (mut sol, mut tok) = (0.0f64, 0.0f64);
+                for r in self.tape.iter().filter(|r| {
+                    r.mine
+                        && r.signature == sig
+                        && matches!(r.kind, discover::SwapKind::Buy) == want_buy
+                }) {
+                    sol += r.sol;
+                    tok += r.tokens;
+                }
+                if sol <= 0.0 {
+                    // Not on the tape yet. Leave it; the fetch is in flight.
+                    return None;
+                }
+                Some((i, o.action, sig, sol, tok))
+            });
+            let Some((i, action, sig, sol, tok)) = found else { return };
+            if let Some(o) = self.orders.get_mut(i) {
+                o.sol = sol;
+                if tok > 0.0 {
+                    o.tokens = tok;
+                }
+                o.booked = true;
             }
+            // Cloned, not moved: `sig` is named again further down.
+            let short = sig.clone();
+            // A sell retires the slice of basis it actually sent in.
+            let sold_tok = tok;
             self.trades += 1;
             // Cost basis: buys add, sells realise against what was paid.
             if action == "BUY" {
